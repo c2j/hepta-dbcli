@@ -61,4 +61,6 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 uuid = { version = "1", default-features = false, features = ["std"] }
 gaussdb = { git = "https://github.com/c2j/rust-opengauss", optional = true, features = [
     "with-chrono-0_4", "with-rust_decimal-1", "with-serde_json-1", "with-uuid-1",
+    "tls-native-tls",
 ] }
+native-tls = "0.2"
