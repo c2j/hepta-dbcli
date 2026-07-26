@@ -64,3 +64,4 @@ gaussdb = { git = "https://github.com/c2j/rust-opengauss", optional = true, feat
     "tls-native-tls",
 ] }
 native-tls = "0.2"
+openssl = { version = "0.10", features = ["vendored"] }
