@@ -25,12 +25,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cross
-        run: cargo install cross --locked
-      - name: Build
-        run: cross build --release --target x86_64-unknown-linux-gnu -p polar-mysql
-      - run: strip target/x86_64-unknown-linux-gnu/release/${{ env.BINARY_NAME }}
+      - name: Build in Ubuntu 20.04 (glibc 2.31)
+        run: |
+          docker run --rm \
+            -v "$(pwd)":/project -w /project \
+            -v "$HOME/.cargo/registry":/root/.cargo/registry \
+            ubuntu:20.04 \
+            bash -c "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y curl build-essential pkg-config libdbus-1-dev
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              . \$HOME/.cargo/env
+              cargo build --release -p polar-mysql
+              strip target/release/hepta_dbcli
+            "
       - name: Set version
         id: version
         run: |
@@ -43,7 +52,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           ARTIFACT_NAME="${{ env.BINARY_NAME }}-${VERSION}-x86_64-unknown-linux-gnu"
           mkdir -p "${ARTIFACT_NAME}"
-          cp "target/x86_64-unknown-linux-gnu/release/${{ env.BINARY_NAME }}" "${ARTIFACT_NAME}/"
+          cp "target/release/${{ env.BINARY_NAME }}" "${ARTIFACT_NAME}/"
           zip -r "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}"
       - uses: actions/upload-artifact@v4
         with:
