@@ -122,6 +122,7 @@ pub(crate) struct NamedConnection {
     pub port: Option<u16>,
     pub user: Option<String>,
     pub password: Option<String>,
+    #[serde(alias = "dbname")]
     pub database: Option<String>,
     pub sslmode: Option<String>,
     pub statement_timeout: Option<String>,
