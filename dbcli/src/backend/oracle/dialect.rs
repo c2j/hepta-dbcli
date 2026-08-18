@@ -1,4 +1,5 @@
-use crate::backend::Dialect;
+use crate::backend::error::DbError;
+use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec};
 
 pub(crate) struct OracleDialect;
 
@@ -137,6 +138,217 @@ impl Dialect for OracleDialect {
     fn supports_hash_comment(&self) -> bool {
         false
     }
+
+    fn begin_snapshot_sql(&self) -> &str {
+        "SET TRANSACTION READ ONLY"
+    }
+
+    fn snapshot_scn_sql(&self) -> Option<&'static str> {
+        Some("SELECT CURRENT_SCN FROM V$DATABASE")
+    }
+
+    fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
+        let q = format!("\"{}\"", col.name.replace('"', "\"\""));
+        let base = col.data_type.trim().to_uppercase();
+        let inner = match base.as_str() {
+            s if s.starts_with("TIMESTAMP") => {
+                format!("TO_CHAR({q}, 'YYYY-MM-DD HH24:MI:SS.FF6')")
+            }
+            "DATE" => format!("TO_CHAR({q}, 'YYYY-MM-DD')"),
+            "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" => q.clone(),
+            "RAW" | "LONG RAW" => format!("RAWTOHEX({q})"),
+            "CLOB" | "NCLOB" | "BLOB" | "LONG" | "BFILE" => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' is excluded from checksum normalization (LOB); \
+                     use --columns to select comparable columns",
+                    col.name, col.data_type
+                )));
+            }
+            s if s.starts_with("NUMBER")
+                || s.starts_with("DECIMAL")
+                || s.starts_with("NUMERIC") =>
+            {
+                // 标度保留掩码（§九 + 评审）：TO_CHAR 默认丢前导零/尾零，
+                // NUMBER(p,s) 须按声明标度补齐以与 MySQL CAST(DECIMAL) 对齐
+                match oracle_number_scale(&base) {
+                    Some(scale) if scale > 0 => {
+                        let mask = format!("FM{}0D{}", "9".repeat(30), "0".repeat(scale as usize));
+                        format!("TO_CHAR({q}, '{mask}')")
+                    }
+                    _ => format!("TO_CHAR({q})"),
+                }
+            }
+            "INTEGER" | "SMALLINT" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => {
+                format!("TO_CHAR({q})")
+            }
+            other => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' has no normalization rule",
+                    col.name, other
+                )));
+            }
+        };
+        Ok(if col.nullable {
+            format!("COALESCE({inner}, '␀NULL␀')")
+        } else {
+            inner
+        })
+    }
+
+    fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+        }
+        if let Some((modulus, bucket)) = spec.bucket {
+            conds.push(format!(
+                "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), {modulus}) = {bucket}"
+            ));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let slice = |i: u32| {
+            format!(
+                "TO_CHAR(MOD(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(h), {:2}, 8), 'XXXXXXXX')), POWER(2,64))) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT TO_CHAR(COUNT(*)) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
+    fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
+        let cols: Vec<String> = if spec.raw_exprs {
+            spec.columns.clone()
+        } else {
+            spec.columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect()
+        };
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let mut conds: Vec<String> = Vec::new();
+        if let Some((lo, hi)) = spec.range {
+            conds.push(format!(
+                "\"{}\" >= {lo} AND \"{}\" < {hi}",
+                spec.key_column, spec.key_column
+            ));
+        }
+        if let Some(last) = spec.last_key {
+            conds.push(format!("\"{}\" > {last}", spec.key_column));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\nWHERE {}", conds.join("\n  AND "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nFETCH FIRST {} ROWS ONLY",
+            cols.join(", "),
+            spec.key_column,
+            spec.page_size
+        )
+    }
+
+    fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let Some((modulus, bucket)) = spec.bucket else {
+            return String::from("-- error: bucket spec required for multiset query");
+        };
+        let concat = spec.normalized_exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let mut conds = vec![format!(
+            "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), {modulus}) = {bucket}"
+        )];
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        format!(
+            "SELECT h, TO_CHAR(COUNT(*)) AS cnt\nFROM (\n  SELECT LOWER(RAWTOHEX({row_hash})) AS h\n  FROM {table}\n  WHERE {}\n) t\nGROUP BY h",
+            conds.join("\n    AND ")
+        )
+    }
+
+    fn render_iblt_sql(&self, spec: &crate::backend::IbltSqlSpec) -> Result<String, DbError> {
+        // Oracle 21c+/23ai 原生 BIT_XOR_AGG（§16.3-F8 实测）；19c 无聚合 →
+        // 路由层在版本探测后降级 hashdiff，不在此生成奇偶模板。
+        let m = spec.cells_per_subtable;
+        let concat = spec.normalized_exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\n  WHERE ({f})"))
+            .unwrap_or_default();
+        let val_xor = |i: u32| {
+            format!(
+                "TO_CHAR(BIT_XOR_AGG(TO_NUMBER(SUBSTR(RAWTOHEX(h), {:2}, 8), 'XXXXXXXX'))) AS val_xor_{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        Ok(format!(
+            "SELECT g.grp AS grp,\n       MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), g.grp * 8 - 7, 8), 'XXXXXXXX'), {m}) AS cell,\n       TO_CHAR(COUNT(*)) AS cnt,\n       TO_CHAR(BIT_XOR_AGG(k)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp FROM dual UNION ALL SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual UNION ALL SELECT 4 FROM dual) g\nGROUP BY g.grp, cell",
+            val_xor(1),
+            val_xor(2),
+            val_xor(3),
+            val_xor(4),
+            key = spec.key_expr
+        ))
+    }
+}
+
+/// 从 "NUMBER(p,s)" 形态解析标度 s（无括号或无标度 → None）。
+fn oracle_number_scale(data_type_upper: &str) -> Option<u32> {
+    let open = data_type_upper.find('(')?;
+    let close = data_type_upper.rfind(')')?;
+    let inner = &data_type_upper[open + 1..close];
+    let scale = inner.split(',').nth(1)?.trim();
+    if scale == "*" {
+        return None;
+    }
+    scale.parse().ok()
 }
 
 #[cfg(test)]
@@ -251,5 +463,94 @@ mod tests {
     #[test]
     fn test_no_hash_comment() {
         assert!(!OracleDialect.supports_hash_comment());
+    }
+
+    fn col(name: &str, ty: &str, nullable: bool) -> crate::backend::ColumnNormSpec {
+        crate::backend::ColumnNormSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn test_snapshot_sql_and_scn() {
+        let d = OracleDialect;
+        assert_eq!(d.begin_snapshot_sql(), "SET TRANSACTION READ ONLY");
+        assert_eq!(
+            d.snapshot_scn_sql(),
+            Some("SELECT CURRENT_SCN FROM V$DATABASE")
+        );
+    }
+
+    #[test]
+    fn test_normalize_expr_matrix() {
+        let d = OracleDialect;
+        assert_eq!(
+            d.normalize_expr(&col("ID", "NUMBER", false)).unwrap(),
+            "TO_CHAR(\"ID\")"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("AMOUNT", "NUMBER", true)).unwrap(),
+            "COALESCE(TO_CHAR(\"AMOUNT\"), '␀NULL␀')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("CREATED", "DATE", false)).unwrap(),
+            "TO_CHAR(\"CREATED\", 'YYYY-MM-DD')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("TS", "TIMESTAMP(6)", false)).unwrap(),
+            "TO_CHAR(\"TS\", 'YYYY-MM-DD HH24:MI:SS.FF6')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("DATA", "RAW", true)).unwrap(),
+            "COALESCE(RAWTOHEX(\"DATA\"), '␀NULL␀')"
+        );
+        assert!(d.normalize_expr(&col("DOC", "CLOB", true)).is_err());
+    }
+
+    #[test]
+    fn test_checksum_sql_with_scn_and_bucket() {
+        let d = OracleDialect;
+        let spec = crate::backend::ChecksumSqlSpec {
+            schema: Some("SCOTT".into()),
+            table: "ORDERS".into(),
+            key_column: Some("ID".into()),
+            range: Some((0, 1000)),
+            bucket: Some((8, 5)),
+            filter: None,
+            scn: Some(2162471),
+            normalized_exprs: vec!["TO_CHAR(\"ID\")".into()],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(sql.contains("STANDARD_HASH(TO_CHAR(\"ID\"), 'MD5')"));
+        assert!(sql.contains("FROM \"SCOTT\".\"ORDERS\" AS OF SCN 2162471"));
+        assert!(sql.contains(
+            "TO_CHAR(MOD(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(h),  1, 8), 'XXXXXXXX')), POWER(2,64))) AS s1"
+        ));
+        assert!(sql.contains("MOD(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH("));
+        assert!(sql.contains(", 8) = 5"));
+        assert!(sql.contains("\"ID\" >= 0 AND \"ID\" < 1000"));
+    }
+
+    #[test]
+    fn test_keyset_page_sql() {
+        let d = OracleDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "ORDERS".into(),
+            columns: vec!["ID".into()],
+            raw_exprs: false,
+            key_column: "ID".into(),
+            range: None,
+            last_key: Some(42),
+            page_size: 8192,
+            filter: None,
+            scn: Some(2162471),
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(sql.contains("FROM \"ORDERS\" AS OF SCN 2162471"));
+        assert!(sql.contains("\"ID\" > 42"));
+        assert!(sql.contains("FETCH FIRST 8192 ROWS ONLY"));
     }
 }

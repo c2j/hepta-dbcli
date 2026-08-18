@@ -1,0 +1,57 @@
+# delta-diff Phase 0 技术可行性验证环境
+#
+# 三个独立实例（容器名/端口与 tests/docker-compose.yml 的集成测试环境隔离，可共存）：
+#   mysql      mysql:8                    13306 -> 3306
+#   opengauss  opengauss/opengauss:5.0.0  15432 -> 5432
+#   polardbx   polardbx/polardb-x         18527 -> 8527（amd64 镜像，ARM 主机经 Rosetta 运行，启动慢）
+#
+# 用法：
+#   docker compose -f tests/delta-diff-verify/docker-compose.yml up -d
+#   python3 tests/delta-diff-verify/gen_fixture.py          # 生成 fixture SQL + expected.json
+#   python3 tests/delta-diff-verify/verify.py               # 执行全部验证项并输出 PASS/FAIL
+#   docker compose -f tests/delta-diff-verify/docker-compose.yml down -v
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: ddverify-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: verify123
+      MYSQL_DATABASE: verify
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pverify123"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  opengauss:
+    image: opengauss/opengauss:5.0.0
+    container_name: ddverify-opengauss
+    environment:
+      GS_PASSWORD: Verify@123
+      GS_DB: verify
+    ports:
+      - "15432:5432"
+    healthcheck:
+      # 官方镜像 gsql 不在 PATH 且需 LD_LIBRARY_PATH（/usr/local/opengauss/{bin,lib}）
+      test: ["CMD-SHELL", "export LD_LIBRARY_PATH=/usr/local/opengauss/lib && /usr/local/opengauss/bin/gsql -U gaussdb -W $$GS_PASSWORD -d verify -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  polardbx:
+    image: polardbx/polardb-x:latest
+    container_name: ddverify-polardbx
+    platform: linux/amd64 # PolarDB-X 官方镜像仅 amd64；ARM 主机经 Rosetta 模拟，启动需数分钟
+    ports:
+      - "18527:8527"
+    healthcheck:
+      # 默认账号 polardbx_root（空密码）；实例就绪前 SELECT 1 会失败，重试窗口放宽
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P8527 -upolardbx_root -e 'SELECT 1' 2>/dev/null | grep -q 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 60
+      start_period: 120s

@@ -147,6 +147,128 @@ pub trait Dialect: Send + Sync {
     fn supports_dollar_quote(&self) -> bool {
         false
     }
+
+    // ── delta-diff Adapters (docs/delta-diff 设计文档 §7.2) ──
+
+    /// SQL statement(s) opening a snapshot transaction (v2.1 §8.2).
+    /// PolarDB-X must be detected at runtime via `is_polardbx_version` and use
+    /// `begin_snapshot_sql_polardbx` instead (§16.3-F5).
+    fn begin_snapshot_sql(&self) -> &str;
+
+    /// PolarDB-X fallback: two statements (SET isolation + START TRANSACTION READ ONLY).
+    /// Only the MySQL-family dialect returns Some.
+    fn begin_snapshot_sql_polardbx(&self) -> Option<[&'static str; 2]> {
+        None
+    }
+
+    /// Oracle only: SQL to read the current SCN for AS OF SCN flashback anchoring.
+    fn snapshot_scn_sql(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Hash function capability for row hashing (v2.1 §11.3-5).
+    fn hash_capability(&self) -> HashCapability {
+        HashCapability::Md5
+    }
+
+    /// Normalize a column value to its canonical text form for cross-db hashing
+    /// (v2.1 §九). Returns Err for unmappable/unsupported column types.
+    fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError>;
+
+    /// Render the order-independent bit-slice checksum SQL (v2.1 §十).
+    fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
+
+    /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
+    fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
+
+    /// Render a bucket multiset query (v2.1 §6.3 BucketDiffer)：
+    /// `SELECT h, COUNT(*) FROM (SELECT <row_hash> AS h FROM t WHERE <bucket pred>) GROUP BY h`。
+    /// spec.bucket 必须存在；返回 (row_hash, count) 行集，客户端做多重集合比对。
+    fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String;
+
+    /// Render an IBLT summary SQL（Addendum A v1.1 §三，j=4 哈希子表）。
+    /// 返回行集 (grp, cell, cnt, key_xor, val_xor_1..4)；桶位 j 取 val_xor 第 j 切片
+    /// （对齐约束 §1.4）。GaussDB 无 bit_xor 聚合 → 逐位奇偶 SUM（宽列）；
+    /// Oracle <21c 无 BIT_XOR_AGG → Err(Unsupported)。
+    fn render_iblt_sql(&self, spec: &IbltSqlSpec) -> Result<String, DbError>;
+}
+
+/// Specification for an IBLT summary query（Addendum A v1.1 §三）。
+#[derive(Debug, Clone)]
+pub struct IbltSqlSpec {
+    pub schema: Option<String>,
+    pub table: String,
+    /// key 表达式（定长整数：数值列或 epoch 转换），用于 key_xor
+    pub key_expr: String,
+    /// §九 规范化表达式（row_hash = MD5(concat_ws('#', ...))）
+    pub normalized_exprs: Vec<String>,
+    /// 每个哈希子表的桶数（m = ⌈3d/4⌉，总桶数 k=4m≈3d）
+    pub cells_per_subtable: u64,
+    pub filter: Option<String>,
+    /// Oracle AS OF SCN anchor（快照模式）
+    pub scn: Option<u64>,
+}
+
+/// Hash function capability of a backend (v2.1 §7.2).
+/// GaussDB stays on Md5 — hash_any_extended probed missing on openGauss 5.0.0 (§16.3-F4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashCapability {
+    Md5,
+    Crc32Chain,
+}
+
+/// PolarDB-X detection from a VERSION() string (v2.1 §16.3-F5).
+pub(crate) fn is_polardbx_version(version: &str) -> bool {
+    version.to_uppercase().contains("PXC")
+}
+
+/// Column metadata for `Dialect::normalize_expr` (v2.1 §九).
+#[derive(Debug, Clone)]
+pub struct ColumnNormSpec {
+    pub name: String,
+    /// Backend-native type string (MySQL COLUMN_TYPE e.g. "decimal(20,6)";
+    /// GaussDB format_type e.g. "numeric(20,6)"; Oracle DATA_TYPE e.g. "NUMBER").
+    pub data_type: String,
+    pub nullable: bool,
+}
+
+/// Specification for one bit-slice checksum query (v2.1 §十).
+#[derive(Debug, Clone)]
+pub struct ChecksumSqlSpec {
+    pub schema: Option<String>,
+    pub table: String,
+    /// Key column used for range predicates (hashdiff); unused in pure bucket mode.
+    pub key_column: Option<String>,
+    /// Key range [lo, hi).
+    pub range: Option<(i64, i64)>,
+    /// Content bucket predicate: (modulus, bucket).
+    pub bucket: Option<(u64, u64)>,
+    /// Extra WHERE condition (user --where), appended as-is.
+    pub filter: Option<String>,
+    /// Oracle AS OF SCN anchor (snapshot mode).
+    pub scn: Option<u64>,
+    /// Normalized per-column expressions (from normalize_expr), select order.
+    pub normalized_exprs: Vec<String>,
+}
+
+/// Specification for one keyset pagination fetch (v2.1 §6.2.2).
+#[derive(Debug, Clone)]
+pub struct KeysetPageSpec {
+    pub schema: Option<String>,
+    pub table: String,
+    /// Columns to select, key column first.
+    pub columns: Vec<String>,
+    /// true: `columns` 为 SQL 表达式（规范化表达式），渲染时不加引号；
+    /// false: 列名，按 identifier_quote 加引号。
+    /// 行级跨库比较统一用规范化表达式（§九-2：两侧文本表示字节级一致）。
+    pub raw_exprs: bool,
+    pub key_column: String,
+    pub range: Option<(i64, i64)>,
+    pub last_key: Option<i64>,
+    pub page_size: usize,
+    pub filter: Option<String>,
+    /// Oracle AS OF SCN anchor (snapshot mode).
+    pub scn: Option<u64>,
 }
 
 // ─── BackendFactory — Creates Backends from Configuration ───────────

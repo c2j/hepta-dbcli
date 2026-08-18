@@ -1,0 +1,96 @@
+name: delta-diff-bench
+
+# 25M 行容器化基准（设计文档 §11.4）：双表注入已知差异，断言差异计数精确、
+# perf 埋点齐全、耗时低于宽松门禁（SLO 数字以实测回填 §11.1 为准）。
+# 周跑 + 手动触发；SLO 回归门禁在 Phase 1 实测定稿后再收紧。
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: bench-25m-mysql
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      mysql:
+        image: mysql:8
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: testpass
+          MYSQL_DATABASE: bench
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -ptestpass"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config python3
+      - run: cargo build
+
+      - name: Build 25M-row table pair
+        run: |
+          docker exec ${{ job.services.mysql.id }} mysql -u root -ptestpass bench -e "
+            CREATE TABLE bench_t (id INT AUTO_INCREMENT PRIMARY KEY, c1 VARCHAR(32), c2 BIGINT);
+            INSERT INTO bench_t (c1, c2) SELECT CONCAT('s', n), n FROM (
+              SELECT a.x + b.x*10 + c.x*100 AS n FROM
+              (SELECT 0 x UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+              (SELECT 0 x UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+              (SELECT 0 x UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c
+            ) t;
+          "
+          for i in $(seq 1 15); do
+            docker exec ${{ job.services.mysql.id }} mysql -u root -ptestpass bench -e \
+              "INSERT INTO bench_t (c1, c2) SELECT CONCAT(c1, 'x'), c2 FROM bench_t;"
+          done
+          docker exec ${{ job.services.mysql.id }} mysql -u root -ptestpass bench -e "
+            DELETE FROM bench_t WHERE id > 25000000;
+            CREATE TABLE bench_t2 AS SELECT * FROM bench_t;
+            ALTER TABLE bench_t2 ADD PRIMARY KEY (id);
+            UPDATE bench_t2 SET c1 = CONCAT(c1, '-D') WHERE id % 25000 = 0;
+            SELECT COUNT(*) AS rows_left FROM bench_t;
+          "
+
+      - name: Write config
+        run: |
+          cat > /tmp/bench.toml <<'EOF'
+          [connections.l]
+          url = "mysql://root:testpass@127.0.0.1:3306/bench"
+          [connections.r]
+          url = "mysql://root:testpass@127.0.0.1:3306/bench"
+          EOF
+
+      - name: Run delta-diff and assert
+        run: |
+          START=$(date +%s)
+          EXIT=0
+          ./target/debug/hepta_dbcli delta-diff --config /tmp/bench.toml \
+            --left l --right r --left-table bench_t --right-table bench_t2 \
+            --strategy hashdiff --consistency none \
+            --format json --output /tmp/report.json || EXIT=$?
+          ELAPSED=$(( $(date +%s) - START ))
+          [ "$EXIT" = "1" ] || { echo "expected exit 1 (diff), got $EXIT"; exit 1; }
+          python3 - "$ELAPSED" <<'PY'
+          import json, sys
+          elapsed = int(sys.argv[1])
+          r = json.load(open("/tmp/report.json"))
+          s = r["summary"]
+          assert s["modified"] == 1000, f"modified={s['modified']} != 1000"
+          assert s["left_total"] == 25000000, s
+          assert r["perf"]["queries_total"] > 0, "perf.queries_total missing"
+          gate = 900
+          assert elapsed < gate, f"bench took {elapsed}s > gate {gate}s"
+          print(f"PASS: 25M rows, 1000 injected diffs found exactly; "
+                f"elapsed={elapsed}s; queries={r['perf']['queries_total']}")
+          PY

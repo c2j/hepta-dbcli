@@ -59,37 +59,39 @@ impl DbConn for MySqlConn {
     }
 
     async fn exec(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
-        let string_params: Vec<String> = params
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .collect();
-
-        let rows: Vec<mysql_async::Row> = match string_params.len() {
-            0 => self
+        if params.is_empty() {
+            let rows: Vec<mysql_async::Row> = self
                 .conn
                 .query(sql)
                 .await
-                .map_err(|e| DbError::query_with_source("Exec query failed", e))?,
-            1 => self
-                .conn
-                .exec(sql, (string_params[0].as_str(),))
-                .await
-                .map_err(|e| DbError::query_with_source("Exec failed", e))?,
-            2 => self
-                .conn
-                .exec(sql, (string_params[0].as_str(), string_params[1].as_str()))
-                .await
-                .map_err(|e| DbError::query_with_source("Exec failed", e))?,
-            _ => {
-                return Err(DbError::unsupported(format!(
-                    "MySQL exec supports 0-2 params, got {}",
-                    string_params.len()
-                )));
-            }
-        };
+                .map_err(|e| DbError::query_with_source("Exec query failed", e))?;
+            return Ok(Self::rows_to_query_result(rows));
+        }
+
+        let bound: Vec<mysql_async::Value> = params
+            .iter()
+            .map(|v| match v {
+                Value::Null => mysql_async::Value::NULL,
+                Value::Bool(b) => mysql_async::Value::from(*b),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        mysql_async::Value::from(i)
+                    } else if let Some(u) = n.as_u64() {
+                        mysql_async::Value::from(u)
+                    } else {
+                        mysql_async::Value::from(n.as_f64().unwrap_or(f64::NAN))
+                    }
+                }
+                Value::String(s) => mysql_async::Value::from(s.as_bytes()),
+                other => mysql_async::Value::from(other.to_string().into_bytes()),
+            })
+            .collect();
+
+        let rows: Vec<mysql_async::Row> = self
+            .conn
+            .exec(sql, mysql_async::Params::Positional(bound))
+            .await
+            .map_err(|e| DbError::query_with_source("Exec failed", e))?;
 
         Ok(Self::rows_to_query_result(rows))
     }

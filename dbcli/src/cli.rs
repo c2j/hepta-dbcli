@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::output;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputFormat {
     Table,
     Json,

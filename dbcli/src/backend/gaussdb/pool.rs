@@ -10,54 +10,65 @@ use crate::backend::{DbConn, DbPool};
 use super::conn::GaussdbConn;
 use super::GaussdbDialect;
 
-/// Single-connection pool — wraps one Arc<gaussdb::Client> with
-/// multiplexed queries over one TCP connection. acquire() returns a
-/// new wrapper pointing at the same underlying client. If the TCP
-/// connection dies, the pool must be recreated (no auto-reconnect).
+/// 真多连接池（delta-diff Phase 2 重构）：每次 acquire() 建立独立 TCP 连接，
+/// 使每连接可持有独立快照事务（v2.1 §8.2 前置项；此前为单连接 Arc<Client>
+/// 共享，多连接独立事务在物理上不可能）。
+/// 代价是连接建立开销，与 Oracle 后端的专连专用模式一致。
 pub(crate) struct GaussdbPool {
-    client: Arc<gaussdb::Client>,
+    conn_str: String,
+    tls: Option<gaussdb::native_tls::MakeTlsConnector>,
 }
 
 pub(crate) async fn create_gaussdb_pool(url: &str) -> Result<GaussdbPool, DbError> {
     let conn_str = normalize_gaussdb_url(url);
-
-    let client = match parse_sslmode(&conn_str) {
-        Some(sslmode) => {
-            let tls = build_tls(sslmode)?;
-            let (client, connection) = gaussdb::connect(&conn_str, tls).await.map_err(|e| {
-                DbError::connection(format!(
-                    "GaussDB connect failed: {} (target: {}, sslmode={:?})",
-                    e,
-                    redact_password(&conn_str),
-                    sslmode,
-                ))
-            })?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
-        None => {
-            let (client, connection) = gaussdb::connect(&conn_str, NoTls).await.map_err(|e| {
-                DbError::connection(format!(
-                    "GaussDB connect failed: {} (target: {})",
-                    e,
-                    redact_password(&conn_str)
-                ))
-            })?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
+    let tls = match parse_sslmode(&conn_str) {
+        Some(sslmode) => Some(build_tls(sslmode)?),
+        None => None,
     };
+    let pool = GaussdbPool { conn_str, tls };
+    // 建池即验证连通性（对齐 connect_with_fallback 的 acquire 验证语义）
+    let _ = pool.connect_one().await?;
+    Ok(pool)
+}
 
-    let _ = client
-        .simple_query("SET default_transaction_read_only = ON")
-        .await;
-    Ok(GaussdbPool {
-        client: Arc::new(client),
-    })
+impl GaussdbPool {
+    async fn connect_one(&self) -> Result<gaussdb::Client, DbError> {
+        let client = match &self.tls {
+            Some(tls) => {
+                let (client, connection) = gaussdb::connect(&self.conn_str, tls.clone())
+                    .await
+                    .map_err(|e| {
+                        DbError::connection(format!(
+                            "GaussDB connect failed: {} (target: {})",
+                            e,
+                            redact_password(&self.conn_str)
+                        ))
+                    })?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+            }
+            None => {
+                let (client, connection) =
+                    gaussdb::connect(&self.conn_str, NoTls).await.map_err(|e| {
+                        DbError::connection(format!(
+                            "GaussDB connect failed: {} (target: {})",
+                            e,
+                            redact_password(&self.conn_str)
+                        ))
+                    })?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+            }
+        };
+        let _ = client
+            .simple_query("SET default_transaction_read_only = ON")
+            .await;
+        Ok(client)
+    }
 }
 
 /// Convert gaussdb:// URL to postgres:// so tokio-postgres's
@@ -129,8 +140,9 @@ fn build_tls(sslmode: SslMode) -> Result<gaussdb::native_tls::MakeTlsConnector, 
 #[async_trait]
 impl DbPool for GaussdbPool {
     async fn acquire(&self) -> Result<Box<dyn DbConn + Send>, DbError> {
+        let client = self.connect_one().await?;
         Ok(Box::new(GaussdbConn {
-            client: Arc::clone(&self.client),
+            client: Arc::new(client),
             dialect: GaussdbDialect,
         }))
     }

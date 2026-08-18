@@ -4,6 +4,7 @@ mod backend;
 mod cli;
 mod config;
 mod connection;
+mod delta_diff;
 mod interactive;
 mod logger;
 mod output;
@@ -82,6 +83,12 @@ enum Commands {
 
     /// Store password in OS keychain
     StorePassword {},
+
+    /// Compare table data between two connections
+    DeltaDiff {
+        #[command(flatten)]
+        args: Box<delta_diff::cmd::DeltaDiffArgs>,
+    },
 
     /// Execute SQL from command line
     Cli {
@@ -967,6 +974,10 @@ async fn main() {
         }
         Some(Commands::StorePassword {}) => {
             handle_store_password(cli.name, cli.config);
+        }
+        Some(Commands::DeltaDiff { args }) => {
+            let code = delta_diff::run(*args, cli.config).await;
+            std::process::exit(code);
         }
         Some(Commands::Cli {
             sql,

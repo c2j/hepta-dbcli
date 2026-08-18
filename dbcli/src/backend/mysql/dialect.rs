@@ -1,4 +1,5 @@
-use crate::backend::Dialect;
+use crate::backend::error::DbError;
+use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, HashCapability, KeysetPageSpec};
 
 pub(crate) struct MySqlDialect;
 
@@ -91,5 +92,333 @@ impl Dialect for MySqlDialect {
 
     fn supports_hash_comment(&self) -> bool {
         true
+    }
+
+    fn begin_snapshot_sql(&self) -> &str {
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
+    }
+
+    fn begin_snapshot_sql_polardbx(&self) -> Option<[&'static str; 2]> {
+        Some([
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "START TRANSACTION READ ONLY",
+        ])
+    }
+
+    fn hash_capability(&self) -> HashCapability {
+        HashCapability::Md5
+    }
+
+    fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
+        let q = format!("`{}`", col.name.replace('`', "``"));
+        let base = col
+            .data_type
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let inner = match base.as_str() {
+            "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year"
+            | "bit" => format!("CAST({q} AS CHAR)"),
+            "decimal" | "numeric" => format!("CAST({q} AS CHAR)"),
+            "float" | "double" | "real" => format!("CAST({q} AS CHAR)"),
+            "datetime" | "timestamp" => {
+                format!("DATE_FORMAT({q}, '%Y-%m-%d %H:%i:%s.%f')")
+            }
+            "date" => format!("DATE_FORMAT({q}, '%Y-%m-%d')"),
+            "time" => format!("CAST({q} AS CHAR)"),
+            "char" | "varchar" | "enum" | "set" => q.clone(),
+            "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => {
+                format!("HEX({q})")
+            }
+            "tinytext" | "text" | "mediumtext" | "longtext" | "json" | "geometry" => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' is excluded from checksum normalization (LOB/JSON); \
+                     use --columns to select comparable columns",
+                    col.name, col.data_type
+                )));
+            }
+            other => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' has no normalization rule",
+                    col.name, other
+                )));
+            }
+        };
+        Ok(if col.nullable {
+            format!("COALESCE({inner}, '␀NULL␀')")
+        } else {
+            inner
+        })
+    }
+
+    fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("`{key}` >= {lo} AND `{key}` < {hi}"));
+        }
+        if let Some((modulus, bucket)) = spec.bucket {
+            conds.push(format!(
+                "MOD(CONV(SUBSTRING({row_hash}, 1, 8), 16, 10), {modulus}) = {bucket}"
+            ));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let slice = |i: u32| {
+            format!(
+                "MOD(SUM(CONV(SUBSTRING(h, {:2}, 8), 16, 10)), 18446744073709551616) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
+    fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
+        let cols: Vec<String> = if spec.raw_exprs {
+            spec.columns.clone()
+        } else {
+            spec.columns
+                .iter()
+                .map(|c| format!("`{}`", c.replace('`', "``")))
+                .collect()
+        };
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let Some((lo, hi)) = spec.range {
+            conds.push(format!(
+                "`{}` >= {lo} AND `{}` < {hi}",
+                spec.key_column, spec.key_column
+            ));
+        }
+        if let Some(last) = spec.last_key {
+            conds.push(format!("`{}` > {last}", spec.key_column));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\nWHERE {}", conds.join("\n  AND "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY `{}`\nLIMIT {}",
+            cols.join(", "),
+            spec.key_column,
+            spec.page_size
+        )
+    }
+
+    fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let Some((modulus, bucket)) = spec.bucket else {
+            return String::from("-- error: bucket spec required for multiset query");
+        };
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let mut conds = vec![format!(
+            "MOD(CONV(SUBSTRING({row_hash}, 1, 8), 16, 10), {modulus}) = {bucket}"
+        )];
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        format!(
+            "SELECT h, COUNT(*) AS cnt\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}\n  WHERE {}\n) t\nGROUP BY h",
+            conds.join("\n    AND ")
+        )
+    }
+
+    fn render_iblt_sql(&self, spec: &crate::backend::IbltSqlSpec) -> Result<String, DbError> {
+        let m = spec.cells_per_subtable;
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\n  WHERE ({f})"))
+            .unwrap_or_default();
+        let val_xor = |i: u32| {
+            format!(
+                "BIT_XOR(CONV(SUBSTRING(h, {:2}, 8), 16, 10)) AS val_xor_{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        Ok(format!(
+            "SELECT g.grp AS grp,\n       MOD(CONV(SUBSTRING(h, g.grp * 8 - 7, 8), 16, 10), {m}) AS cell,\n       COUNT(*) AS cnt,\n       BIT_XOR(CAST(k AS UNSIGNED)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            val_xor(1),
+            val_xor(2),
+            val_xor(3),
+            val_xor(4),
+            key = spec.key_expr
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::is_polardbx_version;
+
+    fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
+        ColumnNormSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn snapshot_sql_variants() {
+        let d = MySqlDialect;
+        assert_eq!(
+            d.begin_snapshot_sql(),
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
+        );
+        let pdx = d.begin_snapshot_sql_polardbx().expect("mysql family");
+        assert_eq!(pdx[0], "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        assert_eq!(pdx[1], "START TRANSACTION READ ONLY");
+        assert!(d.snapshot_scn_sql().is_none());
+    }
+
+    #[test]
+    fn polardbx_version_detection() {
+        assert!(is_polardbx_version("5.6.29-PXC-5.4.19-SNAPSHOT"));
+        assert!(is_polardbx_version("8.0.30-pxc-cluster"));
+        assert!(!is_polardbx_version("8.0.36-0ubuntu0.22.04.1"));
+        assert!(!is_polardbx_version("5.7.44-log"));
+    }
+
+    #[test]
+    fn normalize_expr_matrix() {
+        let d = MySqlDialect;
+        assert_eq!(
+            d.normalize_expr(&col("id", "int", false)).unwrap(),
+            "CAST(`id` AS CHAR)"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("amount", "decimal(20,6)", true))
+                .unwrap(),
+            "COALESCE(CAST(`amount` AS CHAR), '␀NULL␀')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("create_time", "datetime", true))
+                .unwrap(),
+            "COALESCE(DATE_FORMAT(`create_time`, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("name", "varchar(32)", false))
+                .unwrap(),
+            "`name`"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("flag", "tinyint(1)", false)).unwrap(),
+            "CAST(`flag` AS CHAR)"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("data", "blob", true)).unwrap(),
+            "COALESCE(HEX(`data`), '␀NULL␀')"
+        );
+        assert!(d.normalize_expr(&col("doc", "text", true)).is_err());
+        assert!(d.normalize_expr(&col("j", "json", true)).is_err());
+    }
+
+    #[test]
+    fn checksum_sql_full_table() {
+        let d = MySqlDialect;
+        let spec = ChecksumSqlSpec {
+            schema: Some("test".into()),
+            table: "orders".into(),
+            key_column: None,
+            range: None,
+            bucket: None,
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["CAST(`id` AS CHAR)".into(), "`name`".into()],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(
+            sql.contains("MOD(SUM(CONV(SUBSTRING(h,  1, 8), 16, 10)), 18446744073709551616) AS s1")
+        );
+        assert!(
+            sql.contains("MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4")
+        );
+        assert!(sql.contains("MD5(CONCAT_WS('#', CAST(`id` AS CHAR), `name`))"));
+        assert!(sql.contains("FROM `test`.`orders`"));
+        assert!(!sql.contains("WHERE"));
+        assert!(
+            !sql.contains("CAST(SUM"),
+            "saturating CAST form must not appear"
+        );
+    }
+
+    #[test]
+    fn checksum_sql_range_bucket_filter() {
+        let d = MySqlDialect;
+        let spec = ChecksumSqlSpec {
+            schema: None,
+            table: "orders".into(),
+            key_column: Some("id".into()),
+            range: Some((0, 1000)),
+            bucket: Some((8, 3)),
+            filter: Some("status = 'paid'".into()),
+            scn: None,
+            normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(sql.contains("`id` >= 0 AND `id` < 1000"));
+        assert!(sql.contains("MOD(CONV(SUBSTRING(MD5("));
+        assert!(sql.contains(", 8) = 3"));
+        assert!(sql.contains("(status = 'paid')"));
+    }
+
+    #[test]
+    fn keyset_page_sql() {
+        let d = MySqlDialect;
+        let spec = KeysetPageSpec {
+            schema: Some("test".into()),
+            table: "orders".into(),
+            columns: vec!["id".into(), "amount".into()],
+            raw_exprs: false,
+            key_column: "id".into(),
+            range: Some((0, 100000)),
+            last_key: Some(8191),
+            page_size: 8192,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(sql.contains("SELECT `id`, `amount`"));
+        assert!(sql.contains("`id` >= 0 AND `id` < 100000"));
+        assert!(sql.contains("`id` > 8191"));
+        assert!(sql.contains("ORDER BY `id`\nLIMIT 8192"));
     }
 }
