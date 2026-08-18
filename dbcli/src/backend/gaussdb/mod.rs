@@ -8,7 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::backend::error::DbError;
-use crate::backend::{BackendFactory, DbPool, Dialect};
+use crate::backend::{
+    BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec,
+};
 use crate::config::TimeoutConfig;
 
 use self::pool::create_gaussdb_pool;
@@ -108,10 +110,276 @@ impl Dialect for GaussdbDialect {
     fn supports_dollar_quote(&self) -> bool {
         true
     }
+
+    fn begin_snapshot_sql(&self) -> &str {
+        "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    }
+
+    fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
+        let q = format!("\"{}\"", col.name.replace('"', "\"\""));
+        let base = col
+            .data_type
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let inner = match base.as_str() {
+            "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint" | "oid" => {
+                format!("{q}::text")
+            }
+            "numeric" | "decimal" | "money" => format!("{q}::text"),
+            "real" | "double precision" | "float4" | "float8" => format!("{q}::text"),
+            "boolean" | "bool" => format!("{q}::int::text"),
+            "timestamp without time zone" | "timestamp" => {
+                format!("to_char({q}, 'YYYY-MM-DD HH24:MI:SS.US')")
+            }
+            "timestamp with time zone" | "timestamptz" => {
+                format!("to_char({q} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")
+            }
+            "date" => format!("to_char({q}, 'YYYY-MM-DD')"),
+            "time without time zone" | "time" => format!("{q}::text"),
+            "character" | "character varying" | "char" | "varchar" | "name" | "bpchar" => q.clone(),
+            "bytea" => format!("encode({q}, 'hex')"),
+            "text" | "json" | "jsonb" | "xml" | "clob" => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' is excluded from checksum normalization (LOB/JSON); \
+                     use --columns to select comparable columns",
+                    col.name, col.data_type
+                )));
+            }
+            other => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' has no normalization rule",
+                    col.name, other
+                )));
+            }
+        };
+        Ok(if col.nullable {
+            format!("COALESCE({inner}, '␀NULL␀')")
+        } else {
+            inner
+        })
+    }
+
+    fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+        }
+        if let Some((modulus, bucket)) = spec.bucket {
+            conds.push(format!(
+                "MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) = {bucket}"
+            ));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let slice = |i: u32| {
+            format!(
+                "MOD(SUM(('x' || SUBSTR(h, {:2}, 8))::bit(32)::bigint), 18446744073709551616) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
+    fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
+        let cols: Vec<String> = if spec.raw_exprs {
+            spec.columns.clone()
+        } else {
+            spec.columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect()
+        };
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let Some((lo, hi)) = spec.range {
+            conds.push(format!(
+                "\"{}\" >= {lo} AND \"{}\" < {hi}",
+                spec.key_column, spec.key_column
+            ));
+        }
+        if let Some(last) = spec.last_key {
+            conds.push(format!("\"{}\" > {last}", spec.key_column));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\nWHERE {}", conds.join("\n  AND "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nLIMIT {}",
+            cols.join(", "),
+            spec.key_column,
+            spec.page_size
+        )
+    }
+
+    fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let Some((modulus, bucket)) = spec.bucket else {
+            return String::from("-- error: bucket spec required for multiset query");
+        };
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let mut conds = vec![format!(
+            "MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) = {bucket}"
+        )];
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        format!(
+            "SELECT h, COUNT(*) AS cnt\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}\n  WHERE {}\n) t\nGROUP BY h",
+            conds.join("\n    AND ")
+        )
+    }
+
+    fn render_iblt_sql(&self, spec: &crate::backend::IbltSqlSpec) -> Result<String, DbError> {
+        // openGauss 5.0.0 无 bit_xor 聚合（§16.3-F4）→ 逐位奇偶 SUM：
+        // XOR 第 i 位 = SUM((val >> i) & 1) mod 2；key 64 位 + val 4×32 位共 192 列。
+        let m = spec.cells_per_subtable;
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\n  WHERE ({f})"))
+            .unwrap_or_default();
+        let mut cols = Vec::with_capacity(196);
+        cols.push("COUNT(*) AS cnt".to_string());
+        for b in 0..64 {
+            cols.push(format!("MOD(SUM(((k::bigint >> {b}) & 1)), 2) AS kx_{b}"));
+        }
+        for s_idx in 1..=4u32 {
+            for b in 0..32 {
+                cols.push(format!(
+                    "MOD(SUM(((('x' || SUBSTR(h, {:2}, 8))::bit(32)::bigint >> {b}) & 1)), 2) AS vx{s_idx}_{b}",
+                    (s_idx - 1) * 8 + 1
+                ));
+            }
+        }
+        Ok(format!(
+            "SELECT g.grp AS grp,\n       MOD(('x' || SUBSTR(h, g.grp * 8 - 7, 8))::bit(32)::bigint, {m}) AS cell,\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nJOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            cols.join(",\n       "),
+            key = spec.key_expr
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
+        ColumnNormSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn snapshot_sql_rr_read_only() {
+        let d = GaussdbDialect;
+        assert_eq!(
+            d.begin_snapshot_sql(),
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        );
+        assert!(d.snapshot_scn_sql().is_none());
+        assert!(d.begin_snapshot_sql_polardbx().is_none());
+    }
+
+    #[test]
+    fn normalize_expr_matrix() {
+        let d = GaussdbDialect;
+        assert_eq!(
+            d.normalize_expr(&col("id", "int4", false)).unwrap(),
+            "\"id\"::text"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("amount", "numeric(20,6)", true))
+                .unwrap(),
+            "COALESCE(\"amount\"::text, '␀NULL␀')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("ts", "timestamp without time zone", true))
+                .unwrap(),
+            "COALESCE(to_char(\"ts\", 'YYYY-MM-DD HH24:MI:SS.US'), '␀NULL␀')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("tz", "timestamp with time zone", false))
+                .unwrap(),
+            "to_char(\"tz\" AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("flag", "boolean", false)).unwrap(),
+            "\"flag\"::int::text"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("data", "bytea", true)).unwrap(),
+            "COALESCE(encode(\"data\", 'hex'), '␀NULL␀')"
+        );
+        assert!(d.normalize_expr(&col("doc", "text", true)).is_err());
+    }
+
+    #[test]
+    fn checksum_sql_shape() {
+        let d = GaussdbDialect;
+        let spec = ChecksumSqlSpec {
+            schema: None,
+            table: "orders".into(),
+            key_column: Some("id".into()),
+            range: Some((0, 1000)),
+            bucket: None,
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["\"id\"::text".into()],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(sql.contains("('x' || SUBSTR(h,  1, 8))::bit(32)::bigint"));
+        assert!(sql.contains("MOD(SUM(("));
+        assert!(sql.contains("18446744073709551616"));
+        assert!(sql.contains("\"id\" >= 0 AND \"id\" < 1000"));
+        assert!(sql.contains("MD5(concat_ws('#', \"id\"::text))"));
+    }
 }
 
 #[cfg(all(test, feature = "integration"))]
 mod integration_tests {
+    use crate::backend::{DbConn, DbPool};
+
     #[tokio::test]
     async fn gaussdb_connect_and_select_one() {
         let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
@@ -130,5 +398,35 @@ mod integration_tests {
             .expect("query failed");
         let val: i32 = row.get(0);
         assert_eq!(val, 1);
+    }
+
+    /// Phase 2 池重构验收：两次 acquire 得到独立连接，可并发持有各自快照事务。
+    #[tokio::test]
+    async fn gaussdb_pool_independent_snapshot_sessions() {
+        let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
+            return;
+        };
+        let pool = super::pool::create_gaussdb_pool(&url)
+            .await
+            .expect("pool creation failed");
+        let mut c1 = pool.acquire().await.expect("acquire c1");
+        let mut c2 = pool.acquire().await.expect("acquire c2");
+
+        c1.query_drop("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .expect("c1 begin");
+        c2.query_drop("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .expect("c2 begin");
+
+        let n1 = c1.query("SELECT COUNT(*) FROM pg_catalog.pg_class").await;
+        let n2 = c2.query("SELECT COUNT(*) FROM pg_catalog.pg_class").await;
+        assert!(
+            n1.is_ok() && n2.is_ok(),
+            "concurrent snapshot queries must not bleed session state"
+        );
+
+        c1.query_drop("COMMIT").await.expect("c1 commit");
+        c2.query_drop("COMMIT").await.expect("c2 commit");
     }
 }

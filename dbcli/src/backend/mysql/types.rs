@@ -1,4 +1,4 @@
-use mysql_async::consts::ColumnType;
+use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::FromValue;
 use mysql_async::Row;
 use serde_json::{json, Value};
@@ -9,10 +9,11 @@ pub(crate) fn format_row_value(row: &Row, idx: usize) -> Value {
         return Value::Null;
     }
     let col_type = columns[idx].column_type();
-    format_value_by_type(row, idx, col_type)
+    let is_binary = columns[idx].flags().contains(ColumnFlags::BINARY_FLAG);
+    format_value_by_type(row, idx, col_type, is_binary)
 }
 
-fn format_value_by_type(row: &Row, idx: usize, col_type: ColumnType) -> Value {
+fn format_value_by_type(row: &Row, idx: usize, col_type: ColumnType, is_binary: bool) -> Value {
     match col_type {
         ColumnType::MYSQL_TYPE_NULL => Value::Null,
 
@@ -65,9 +66,23 @@ fn format_value_by_type(row: &Row, idx: usize, col_type: ColumnType) -> Value {
         ColumnType::MYSQL_TYPE_TINY_BLOB
         | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
         | ColumnType::MYSQL_TYPE_LONG_BLOB
-        | ColumnType::MYSQL_TYPE_BLOB => get_bytes(row, idx).map_or(Value::Null, |bytes| {
-            Value::String(format!("0x{}", hex_encode(&bytes)))
-        }),
+        | ColumnType::MYSQL_TYPE_BLOB => {
+            if is_binary {
+                get_bytes(row, idx).map_or(Value::Null, |bytes| {
+                    Value::String(format!("0x{}", hex_encode(&bytes)))
+                })
+            } else {
+                // 二进制协议下 TEXT 与 information_schema 字符串列被上报为 BLOB 类型
+                // 但无 BINARY_FLAG——按 UTF-8 文本解码，非法 UTF-8 回退 hex。
+                match get_bytes(row, idx) {
+                    Some(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => Value::String(s),
+                        Err(e) => Value::String(format!("0x{}", hex_encode(e.as_bytes()))),
+                    },
+                    None => Value::Null,
+                }
+            }
+        }
 
         _ => get_str(row, idx).map_or(Value::Null, Value::String),
     }
