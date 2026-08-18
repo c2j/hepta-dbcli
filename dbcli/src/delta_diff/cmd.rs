@@ -2,7 +2,7 @@
 //
 // Implements §2.2 of the delta-diff design doc: the full parameter list,
 // mutual-exclusion rules, and the exit-code contract (§2.3) for the
-// argument layer. Strategy execution lives elsewhere (stubbed).
+// argument layer. Strategy execution lives in the engine/strategy modules.
 
 use clap::Args;
 
@@ -110,7 +110,7 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub update_since: Option<String>,
 
-    /// 比对策略：auto | hashdiff | joindiff | bucketdiff
+    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: Strategy,
 

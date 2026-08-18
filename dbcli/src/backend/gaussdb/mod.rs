@@ -291,7 +291,7 @@ impl Dialect for GaussdbDialect {
             }
         }
         Ok(format!(
-            "SELECT g.grp AS grp,\n       MOD(('x' || SUBSTR(h, g.grp * 8 - 7, 8))::bit(32)::bigint, {m}) AS cell,\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nJOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            "SELECT g.grp AS grp,\n       MOD(('x' || SUBSTR(h, g.grp * 8 - 7, 8))::bit(32)::bigint, {m}) AS cell,\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
             cols.join(",\n       "),
             key = spec.key_expr
         ))
@@ -378,7 +378,7 @@ mod tests {
 
 #[cfg(all(test, feature = "integration"))]
 mod integration_tests {
-    use crate::backend::{DbConn, DbPool};
+    use crate::backend::{DbPool, Dialect};
 
     #[tokio::test]
     async fn gaussdb_connect_and_select_one() {
@@ -428,5 +428,62 @@ mod integration_tests {
 
         c1.query_drop("COMMIT").await.expect("c1 commit");
         c2.query_drop("COMMIT").await.expect("c2 commit");
+    }
+
+    /// 活库执行生产形态 IBLT 摘要 SQL（4 子表 CROSS JOIN 分组），
+    /// 防止裸 JOIN 等方言语法差异回潮（PR#24 评审）。
+    #[tokio::test]
+    async fn gaussdb_iblt_summary_sql_executes_live() {
+        let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
+            return;
+        };
+        let (client, connection) = gaussdb::connect(&url, gaussdb::NoTls)
+            .await
+            .expect("GaussDB connect failed; check GAUSSDB_TEST_URL");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .simple_query("DROP TABLE IF EXISTS iblt_probe")
+            .await
+            .expect("drop probe");
+        client
+            .simple_query("CREATE TABLE iblt_probe (id bigint PRIMARY KEY, v varchar(32))")
+            .await
+            .expect("create probe");
+        client
+            .simple_query(
+                "INSERT INTO iblt_probe VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+            )
+            .await
+            .expect("insert probe");
+
+        let spec = crate::backend::IbltSqlSpec {
+            schema: None,
+            table: "iblt_probe".to_string(),
+            key_expr: "\"id\"".to_string(),
+            normalized_exprs: vec![
+                "\"id\"::text".to_string(),
+                "COALESCE(\"v\"::text, '\\N')".to_string(),
+            ],
+            cells_per_subtable: 1,
+            filter: None,
+            scn: None,
+        };
+        let sql = super::GaussdbDialect
+            .render_iblt_sql(&spec)
+            .expect("render");
+        let result = client.simple_query(&sql).await;
+        client
+            .simple_query("DROP TABLE IF EXISTS iblt_probe")
+            .await
+            .expect("cleanup probe");
+        let msgs = result.expect("iblt summary SQL must execute on openGauss");
+        let n_rows = msgs
+            .iter()
+            .filter(|m| matches!(m, gaussdb::SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(n_rows, 4, "expect one row per hash subtable");
     }
 }

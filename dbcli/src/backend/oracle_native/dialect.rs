@@ -328,7 +328,7 @@ impl Dialect for OracleDialect {
             )
         };
         Ok(format!(
-            "SELECT g.grp AS grp,\n       MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), g.grp * 8 - 7, 8), 'XXXXXXXX'), {m}) AS cell,\n       TO_CHAR(COUNT(*)) AS cnt,\n       TO_CHAR(BIT_XOR_AGG(k)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nJOIN (SELECT 1 AS grp FROM dual UNION ALL SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual UNION ALL SELECT 4 FROM dual) g\nGROUP BY g.grp, cell",
+            "SELECT g.grp AS grp,\n       MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), g.grp * 8 - 7, 8), 'XXXXXXXX'), {m}) AS cell,\n       TO_CHAR(COUNT(*)) AS cnt,\n       TO_CHAR(BIT_XOR_AGG(k)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp FROM dual UNION ALL SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual UNION ALL SELECT 4 FROM dual) g\nGROUP BY g.grp, cell",
             val_xor(1),
             val_xor(2),
             val_xor(3),

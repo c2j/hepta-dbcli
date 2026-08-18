@@ -1,8 +1,7 @@
 // ─── delta-diff: table data comparison between two connections ────────
 //
-// CLI skeleton per design doc §二/§四: argument parsing (cmd.rs),
+// CLI entry per design doc §二/§四: argument parsing (cmd.rs),
 // connection-name resolution and the exit-code contract (§2.3).
-// Strategy execution is stubbed (Phase 1-5).
 
 use std::path::PathBuf;
 

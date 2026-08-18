@@ -84,7 +84,7 @@ enum Commands {
     /// Store password in OS keychain
     StorePassword {},
 
-    /// Compare table data between two connections (strategy execution stubbed)
+    /// Compare table data between two connections
     DeltaDiff {
         #[command(flatten)]
         args: Box<delta_diff::cmd::DeltaDiffArgs>,

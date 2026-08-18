@@ -273,7 +273,7 @@ impl Dialect for MySqlDialect {
             )
         };
         Ok(format!(
-            "SELECT g.grp AS grp,\n       MOD(CONV(SUBSTRING(h, g.grp * 8 - 7, 8), 16, 10), {m}) AS cell,\n       COUNT(*) AS cnt,\n       BIT_XOR(CAST(k AS UNSIGNED)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nJOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            "SELECT g.grp AS grp,\n       MOD(CONV(SUBSTRING(h, g.grp * 8 - 7, 8), 16, 10), {m}) AS cell,\n       COUNT(*) AS cnt,\n       BIT_XOR(CAST(k AS UNSIGNED)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
             val_xor(1),
             val_xor(2),
             val_xor(3),
