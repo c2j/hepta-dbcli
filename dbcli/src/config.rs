@@ -396,6 +396,7 @@ fn build_db_url(
         None => String::new(),
     };
     let ssl_part = match sslmode {
+        Some(mode) if scheme.eq_ignore_ascii_case("gaussdb") => gaussdb_ssl_url_param(mode),
         Some(mode)
             if mode.eq_ignore_ascii_case("require")
                 || mode.eq_ignore_ascii_case("required")
@@ -411,6 +412,16 @@ fn build_db_url(
         "{}://{}{}:{}{}{}",
         scheme, auth_part, host, port, db_part, ssl_part
     )
+}
+
+fn gaussdb_ssl_url_param(mode: &str) -> &'static str {
+    match mode.to_ascii_lowercase().as_str() {
+        "disable" | "disabled" | "false" | "0" | "no" | "none" => "?sslmode=disable",
+        "require" | "required" | "true" | "1" | "yes" => "?sslmode=require",
+        "verify-ca" | "verify_ca" => "?sslmode=verify-ca",
+        "verify-full" | "verify_full" => "?sslmode=verify-full",
+        _ => "",
+    }
 }
 
 fn urlencode(s: &str) -> String {
@@ -997,5 +1008,32 @@ database = "mysql"
             .contains("could not find password field"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_gaussdb_ssl_url_param() {
+        assert_eq!(gaussdb_ssl_url_param("disable"), "?sslmode=disable");
+        assert_eq!(gaussdb_ssl_url_param("DISABLED"), "?sslmode=disable");
+        assert_eq!(gaussdb_ssl_url_param("require"), "?sslmode=require");
+        assert_eq!(gaussdb_ssl_url_param("verify-ca"), "?sslmode=verify-ca");
+        assert_eq!(gaussdb_ssl_url_param("verify-full"), "?sslmode=verify-full");
+        assert_eq!(gaussdb_ssl_url_param("bogus"), "");
+    }
+
+    #[test]
+    fn test_build_db_url_gaussdb_sslmode_passthrough() {
+        let url = build_db_url(
+            "gaussdb",
+            "db.example.com",
+            8000,
+            "myuser",
+            Some("p@ss"),
+            Some("mydb"),
+            Some("disable"),
+        );
+        assert!(url.starts_with("gaussdb://myuser:p%40ss@db.example.com:8000/mydb?sslmode=disable"));
+
+        let url = build_db_url("gaussdb", "h", 5432, "u", None, None, Some("verify-full"));
+        assert!(url.ends_with("?sslmode=verify-full"));
     }
 }

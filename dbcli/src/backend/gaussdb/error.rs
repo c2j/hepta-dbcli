@@ -82,13 +82,17 @@ pub(crate) fn extract_pg_error(
     None
 }
 
+/// Render a PG error message with SQLSTATE prefix (shared by query + connect paths).
+pub(crate) fn render_pg_error(op: &str, sqlstate: &str, message: &str) -> String {
+    format!("GaussDB {} failed: [SQLSTATE {}] {}", op, sqlstate, message)
+}
+
 /// Wrap a gaussdb::Error into a DbError with PG structured details embedded
 /// in the display message.
 pub(crate) fn wrap_gaussdb_error(op: &str, err: gaussdb::Error) -> crate::backend::error::DbError {
     let pg_info = extract_pg_error(&err);
     let msg = if let Some(info) = pg_info {
-        format!(
-            "GaussDB {} failed: [SQLSTATE {}] {}",
+        render_pg_error(
             op,
             info["sqlstate"].as_str().unwrap_or("?"),
             info["message"].as_str().unwrap_or("?"),
@@ -97,6 +101,31 @@ pub(crate) fn wrap_gaussdb_error(op: &str, err: gaussdb::Error) -> crate::backen
         format!("GaussDB {} failed: {}", op, err)
     };
     crate::backend::error::DbError::query_with_source(msg, err)
+}
+
+/// Wrap a gaussdb::Error from a connection attempt into a DbError with PG
+/// structured details embedded in the display message. Mirrors
+/// `wrap_gaussdb_error` but classifies as ConnectionFailed and appends the
+/// (already password-redacted) target.
+pub(crate) fn wrap_gaussdb_connect_error(
+    err: gaussdb::Error,
+    target: &str,
+) -> crate::backend::error::DbError {
+    let pg_info = extract_pg_error(&err);
+    let msg = if let Some(info) = pg_info {
+        format!(
+            "{} (target: {})",
+            render_pg_error(
+                "connect",
+                info["sqlstate"].as_str().unwrap_or("?"),
+                info["message"].as_str().unwrap_or("?"),
+            ),
+            target,
+        )
+    } else {
+        format!("GaussDB connect failed: {} (target: {})", err, target)
+    };
+    crate::backend::error::DbError::connection_with_source(msg, err)
 }
 
 #[cfg(test)]
@@ -136,5 +165,13 @@ mod tests {
         assert_eq!(sqlstate_to_sqlcode("42501"), -199);
         assert_eq!(sqlstate_to_sqlcode("42601"), -104);
         assert_eq!(sqlstate_to_sqlcode("42703"), -206);
+    }
+
+    #[test]
+    fn test_render_pg_error_shape() {
+        assert_eq!(
+            render_pg_error("query", "28P01", "password authentication failed"),
+            "GaussDB query failed: [SQLSTATE 28P01] password authentication failed"
+        );
     }
 }
