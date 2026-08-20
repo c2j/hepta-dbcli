@@ -577,13 +577,51 @@ async fn do_gaussdb_check(
                 }
                 Err(e) => {
                     eprintln!("  \u{2717} GaussDB  — FAILED to acquire: {}", e);
+                    let msg = e.to_string();
+                    for hint in gaussdb_failure_hints(&msg) {
+                        eprintln!("    hint: {}", hint);
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("  \u{2717} GaussDB  — FAILED: {}", e);
+            let msg = e.to_string();
+            for hint in gaussdb_failure_hints(&msg) {
+                eprintln!("    hint: {}", hint);
+            }
         }
     }
+}
+
+#[cfg(feature = "gaussdb")]
+fn gaussdb_failure_hints(err_msg: &str) -> Vec<&'static str> {
+    let lower = err_msg.to_ascii_lowercase();
+    let mut hints: Vec<&'static str> = Vec::new();
+    if err_msg.contains("28P01") || lower.contains("password authentication failed") {
+        hints.push(
+            "password rejected: verify it, or re-run `hepta_dbcli store-password --name <connection>`",
+        );
+        hints.push(
+            "keyring namespaces differ: hepta uses service `hepta-dbcli` (account `{name}#{hash}`), \
+             the standalone `gaussdb` CLI uses `gaussdb`/`gaussdb-mcp` (account `{user}@{host}/{dbname}`) — they are not shared",
+        );
+    }
+    if err_msg.contains("3D000") || err_msg.contains("3F000") {
+        hints.push(
+            "database does not exist: check `database` (alias `dbname`); do not set both fields",
+        );
+    }
+    if lower.contains("tls") || lower.contains("ssl") {
+        hints.push(
+            "if the server has no TLS, set `sslmode = \"disable\"` in the connection section",
+        );
+    }
+    if hints.is_empty() {
+        hints.push("check host, port, user, password, and network reachability");
+        hints.push("if the server has no TLS, set `sslmode = \"disable\"`");
+    }
+    hints
 }
 
 async fn handle_check_connection(
@@ -1030,5 +1068,45 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "gaussdb"))]
+mod gaussdb_hint_tests {
+    use super::gaussdb_failure_hints;
+
+    #[test]
+    fn hint_for_bad_password() {
+        let hints = gaussdb_failure_hints(
+            "GaussDB connect failed: [SQLSTATE 28P01] password authentication failed",
+        );
+        assert!(hints.iter().any(|h| h.contains("store-password")));
+        // password auth failure reached the server; TLS was never the problem
+        assert!(!hints.iter().any(|h| h.contains("sslmode")));
+    }
+
+    #[test]
+    fn hint_for_missing_database() {
+        let hints = gaussdb_failure_hints("[SQLSTATE 3D000] database \"mydb\" does not exist");
+        assert!(hints.iter().any(|h| h.contains("database does not exist")));
+    }
+
+    #[test]
+    fn hint_for_missing_role_is_not_database() {
+        let hints = gaussdb_failure_hints("FATAL: role \"foo\" does not exist");
+        assert!(!hints.iter().any(|h| h.contains("database does not exist")));
+    }
+
+    #[test]
+    fn hint_for_tls_failure() {
+        let hints = gaussdb_failure_hints("GaussDB connect failed: error performing TLS handshake");
+        assert!(hints.iter().any(|h| h.contains("sslmode")));
+    }
+
+    #[test]
+    fn hint_fallback_non_empty() {
+        let hints =
+            gaussdb_failure_hints("GaussDB connect failed: error communicating with the server");
+        assert!(!hints.is_empty());
     }
 }

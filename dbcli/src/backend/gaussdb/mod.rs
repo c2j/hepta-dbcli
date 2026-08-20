@@ -486,4 +486,33 @@ mod integration_tests {
             .count();
         assert_eq!(n_rows, 4, "expect one row per hash subtable");
     }
+
+    /// 连接失败必须暴露 SQLSTATE + 服务端消息，而非裸 "db error"（issue #25）。
+    #[tokio::test]
+    async fn gaussdb_connect_error_surfaces_sqlstate() {
+        let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
+            return;
+        };
+        // GAUSSDB_TEST_URL 为 libpq key=value 形式；用错误密码替换原值以触发认证失败。
+        // URL 形式（gaussdb://…）不含 "password="，无法安全注入，直接跳过。
+        let Some(pos) = url.find("password=") else {
+            return;
+        };
+        let value_start = pos + "password=".len();
+        let value_end = url[value_start..]
+            .find(char::is_whitespace)
+            .map(|i| value_start + i)
+            .unwrap_or(url.len());
+        let bad = format!("{}__wrong__{}", &url[..value_start], &url[value_end..]);
+        let err = super::pool::create_gaussdb_pool(&bad).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SQLSTATE") || msg.contains("password authentication failed"),
+            "connect error must surface server reason, got: {msg}"
+        );
+        assert!(
+            !msg.starts_with("GaussDB connect failed: db error"),
+            "must not be bare 'db error', got: {msg}"
+        );
+    }
 }

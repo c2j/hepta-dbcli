@@ -8,6 +8,7 @@ use crate::backend::error::DbError;
 use crate::backend::{DbConn, DbPool};
 
 use super::conn::GaussdbConn;
+use super::error;
 use super::GaussdbDialect;
 
 /// 真多连接池（delta-diff Phase 2 重构）：每次 acquire() 建立独立 TCP 连接，
@@ -38,11 +39,7 @@ impl GaussdbPool {
                 let (client, connection) = gaussdb::connect(&self.conn_str, tls.clone())
                     .await
                     .map_err(|e| {
-                        DbError::connection(format!(
-                            "GaussDB connect failed: {} (target: {})",
-                            e,
-                            redact_password(&self.conn_str)
-                        ))
+                        error::wrap_gaussdb_connect_error(e, &redact_password(&self.conn_str))
                     })?;
                 tokio::spawn(async move {
                     let _ = connection.await;
@@ -52,11 +49,7 @@ impl GaussdbPool {
             None => {
                 let (client, connection) =
                     gaussdb::connect(&self.conn_str, NoTls).await.map_err(|e| {
-                        DbError::connection(format!(
-                            "GaussDB connect failed: {} (target: {})",
-                            e,
-                            redact_password(&self.conn_str)
-                        ))
+                        error::wrap_gaussdb_connect_error(e, &redact_password(&self.conn_str))
                     })?;
                 tokio::spawn(async move {
                     let _ = connection.await;
@@ -145,5 +138,48 @@ impl DbPool for GaussdbPool {
             client: Arc::new(client),
             dialect: GaussdbDialect,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_gaussdb_url_rewrites_scheme() {
+        assert_eq!(
+            normalize_gaussdb_url("gaussdb://u:p@h:5432/db"),
+            "postgres://u:p@h:5432/db"
+        );
+        assert_eq!(
+            normalize_gaussdb_url("postgres://u@h/db"),
+            "postgres://u@h/db"
+        );
+    }
+
+    #[test]
+    fn test_parse_sslmode_values() {
+        assert_eq!(
+            parse_sslmode("gaussdb://h/db?sslmode=require"),
+            Some(SslMode::Require)
+        );
+        assert_eq!(
+            parse_sslmode("gaussdb://h/db?sslmode=verify-ca"),
+            Some(SslMode::VerifyCa)
+        );
+        assert_eq!(
+            parse_sslmode("gaussdb://h/db?sslmode=verify-full"),
+            Some(SslMode::VerifyFull)
+        );
+        assert_eq!(parse_sslmode("gaussdb://h/db?sslmode=disable"), None);
+        assert_eq!(parse_sslmode("gaussdb://h/db"), None);
+    }
+
+    #[test]
+    fn test_redact_password_url() {
+        assert_eq!(
+            redact_password("postgres://myuser:s3cret@db.example.com:8000/mydb"),
+            "postgres://myuser:****@db.example.com:8000/mydb"
+        );
     }
 }
