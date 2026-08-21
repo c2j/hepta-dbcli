@@ -3,6 +3,6 @@ resolver = "2"
 members = ["dbcli"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
