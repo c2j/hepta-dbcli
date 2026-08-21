@@ -20,6 +20,15 @@ pub(crate) struct GaussdbPool {
     tls: Option<gaussdb::native_tls::MakeTlsConnector>,
 }
 
+impl std::fmt::Debug for GaussdbPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GaussdbPool")
+            .field("conn_str", &redact_password(&self.conn_str))
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
+}
+
 pub(crate) async fn create_gaussdb_pool(url: &str) -> Result<GaussdbPool, DbError> {
     let conn_str = normalize_gaussdb_url(url);
     let tls = match parse_sslmode(&conn_str) {
