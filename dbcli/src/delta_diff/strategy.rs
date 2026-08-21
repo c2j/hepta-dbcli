@@ -23,6 +23,7 @@ pub(crate) struct DiffContext {
     pub(crate) left_pool: Arc<dyn DbPool>,
     pub(crate) right_pool: Arc<dyn DbPool>,
     pub(crate) key_column: String,
+    pub(crate) key_columns: Vec<String>,
     pub(crate) filter: Option<String>,
     /// 增量比对（--update-column/--update-since）：(列, 窗口表达式)，
     /// 谓词由 side_filter 按方言渲染
@@ -140,6 +141,7 @@ mod filter_tests {
             left_pool: dummy_pool(),
             right_pool: dummy_pool(),
             key_column: "id".into(),
+            key_columns: vec!["id".into()],
             filter: filter.map(str::to_string),
             incremental: inc.map(|(a, b)| (a.to_string(), b.to_string())),
             bisection_factor: 32,

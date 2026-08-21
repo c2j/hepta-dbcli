@@ -331,6 +331,7 @@ async fn execute_diff_inner(
         left_pool: lpool,
         right_pool: rpool,
         key_column: routed.key_column,
+        key_columns: routed.key_columns,
         filter,
         incremental,
         bisection_factor: args.bisection_factor,

@@ -120,6 +120,7 @@ pub(crate) async fn run_diff(
         left_pool: Arc::clone(&left.pool),
         right_pool: Arc::clone(&right.pool),
         key_column: routed.key_column,
+        key_columns: routed.key_columns,
         filter: opts.filter.clone(),
         incremental: opts.incremental.clone(),
         bisection_factor: opts.bisection_factor.max(2),
