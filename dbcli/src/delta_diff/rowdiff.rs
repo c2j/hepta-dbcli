@@ -153,7 +153,7 @@ fn row_key_tuple(row: &[Value], arity: usize) -> Vec<Value> {
     row[..n].to_vec()
 }
 
-fn as_number(v: &Value) -> Option<f64> {
+fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse().ok(),
@@ -162,10 +162,19 @@ fn as_number(v: &Value) -> Option<f64> {
 }
 
 fn cmp_value(l: &Value, r: &Value) -> std::cmp::Ordering {
-    if let (Some(ln), Some(rn)) = (as_number(l), as_number(r)) {
-        return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
+    match (l, r) {
+        (Value::Number(_), _) | (_, Value::Number(_)) => match (as_f64(l), as_f64(r)) {
+            (Some(ln), Some(rn)) => {
+                return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
+            }
+            _ => {}
+        },
+        _ => {}
     }
-    l.to_string().cmp(&r.to_string())
+    match (l.as_str(), r.as_str()) {
+        (Some(ls), Some(rs)) => ls.cmp(rs),
+        _ => l.to_string().cmp(&r.to_string()),
+    }
 }
 
 fn cmp_key(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
@@ -318,6 +327,14 @@ mod tests {
         assert_eq!(cmp_key(&a, &b), std::cmp::Ordering::Equal);
         let c = vec![json!(1), json!("y")];
         assert_eq!(cmp_key(&a, &c), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_key_two_numeric_strings_stay_lexical() {
+        assert_eq!(
+            cmp_key(&[json!("10")], &[json!("2")]),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

@@ -34,6 +34,29 @@ impl TablePlan {
             .map(|c| dialect.normalize_expr(c))
             .collect()
     }
+
+    /// Checksum / bucket-hash expressions: key columns first (even if
+    /// `--columns` excluded them), then remaining compare columns.
+    pub(crate) fn identity_hash_exprs(
+        &self,
+        dialect: &dyn Dialect,
+    ) -> Result<Vec<String>, DbError> {
+        let q = dialect.identifier_quote();
+        let mut exprs = Vec::new();
+        for k in &self.key_columns {
+            if let Some(spec) = self.norm_specs.iter().find(|s| &s.name == k) {
+                exprs.push(dialect.normalize_expr(spec)?);
+            } else {
+                exprs.push(crate::backend::quote_ident(q, k));
+            }
+        }
+        for spec in &self.norm_specs {
+            if !self.key_columns.iter().any(|k| k == &spec.name) {
+                exprs.push(dialect.normalize_expr(spec)?);
+            }
+        }
+        Ok(exprs)
+    }
 }
 
 // ─── Plan Building ─────────────────────────────────────────────────────
@@ -311,6 +334,31 @@ mod tests {
     use crate::backend::mysql::dialect::MySqlDialect;
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn identity_hash_exprs_includes_key_excluded_from_columns() {
+        let plan = TablePlan {
+            key_columns: vec!["id".into()],
+            compare_columns: vec!["c_int".into()],
+            norm_specs: vec![ColumnNormSpec {
+                name: "c_int".into(),
+                data_type: "int".into(),
+                nullable: false,
+            }],
+            warnings: vec![],
+        };
+        let exprs = plan
+            .identity_hash_exprs(&MySqlDialect)
+            .expect("identity exprs");
+        assert!(
+            exprs.iter().any(|e| e.contains("`id`")),
+            "key must be in checksum hash: {exprs:?}"
+        );
+        assert!(
+            exprs.iter().any(|e| e.contains("c_int")),
+            "compare col must remain: {exprs:?}"
+        );
+    }
 
     // ── Mock connection serving canned metadata results ──
 
