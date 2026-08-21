@@ -132,19 +132,20 @@ async fn dry_run_inner(
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
 
-    let (lminmax, rminmax) =
-        if routed.strategy.name() != "bucketdiff" && !routed.key_column.is_empty() {
-            (
-                min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
-                    .await
-                    .ok(),
-                min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
-                    .await
-                    .ok(),
-            )
-        } else {
-            (None, None)
-        };
+    let (lminmax, rminmax) = if routed.key_columns.len() == 1
+        && matches!(routed.strategy.name(), "hashdiff" | "iblt" | "joindiff")
+    {
+        (
+            min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
+                .await
+                .ok(),
+            min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
+                .await
+                .ok(),
+        )
+    } else {
+        (None, None)
+    };
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -161,8 +162,11 @@ async fn dry_run_inner(
         "\n  left             : {}.{} ({})\n  right            : {}.{} ({})",
         lschema, ltable, left.name, rschema, rtable, right.name
     ));
-    if !routed.key_column.is_empty() {
-        out.push_str(&format!("\n  key              : {}", routed.key_column));
+    if !routed.key_columns.is_empty() {
+        out.push_str(&format!(
+            "\n  key              : {}",
+            format_dry_run_key(&routed.key_columns)
+        ));
     }
     out.push_str(&format!(
         "\n  compare columns  : {} (left) / {} (right)",
@@ -537,5 +541,19 @@ fn format_name(fmt: crate::cli::OutputFormat) -> &'static str {
         crate::cli::OutputFormat::Json => "json",
         crate::cli::OutputFormat::Vertical => "vertical",
         crate::cli::OutputFormat::Csv => "csv",
+    }
+}
+
+fn format_dry_run_key(key_columns: &[String]) -> String {
+    key_columns.join(",")
+}
+
+#[cfg(test)]
+mod dry_run_format_tests {
+    use super::format_dry_run_key;
+
+    #[test]
+    fn composite_keys_join_with_comma() {
+        assert_eq!(format_dry_run_key(&["k1".into(), "k2".into()]), "k1,k2");
     }
 }

@@ -709,17 +709,10 @@ impl DbMcp {
                 ));
             }
         }
-        let strategy = match params.strategy.as_deref() {
-            None | Some("auto") => None,
-            Some("hashdiff") => Some(crate::delta_diff::cmd::Strategy::Hashdiff),
-            Some("joindiff") => Some(crate::delta_diff::cmd::Strategy::Joindiff),
-            Some("bucketdiff") => Some(crate::delta_diff::cmd::Strategy::Bucketdiff),
-            Some("iblt") => Some(crate::delta_diff::cmd::Strategy::Iblt),
-            Some(other) => {
-                return Err(McpError::invalid_request(
-                    format!("unknown strategy '{other}'"),
-                    None,
-                ));
+        let strategy = match parse_delta_diff_strategy(params.strategy.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(McpError::invalid_request(e, None));
             }
         };
         let snapshot = !matches!(params.consistency.as_deref(), Some("none"));
@@ -800,3 +793,36 @@ impl DbMcp {
     instructions = "MCP server for MySQL/PolarDB-X/Oracle/GaussDB database introspection with multi-connection support"
 )]
 impl ServerHandler for DbMcp {}
+
+fn parse_delta_diff_strategy(
+    raw: Option<&str>,
+) -> Result<Option<crate::delta_diff::cmd::Strategy>, String> {
+    match raw {
+        None | Some("auto") => Ok(None),
+        Some("hashdiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Hashdiff)),
+        Some("joindiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Joindiff)),
+        Some("bucketdiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Bucketdiff)),
+        Some("iblt") => Ok(Some(crate::delta_diff::cmd::Strategy::Iblt)),
+        Some("keyeddiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Keyeddiff)),
+        Some(other) => Err(format!("unknown strategy '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod delta_diff_strategy_tests {
+    use super::parse_delta_diff_strategy;
+    use crate::delta_diff::cmd::Strategy;
+
+    #[test]
+    fn parses_keyeddiff() {
+        assert_eq!(
+            parse_delta_diff_strategy(Some("keyeddiff")).unwrap(),
+            Some(Strategy::Keyeddiff)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown() {
+        assert!(parse_delta_diff_strategy(Some("magic")).is_err());
+    }
+}
