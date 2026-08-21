@@ -191,7 +191,7 @@ async fn dry_run_inner(
             ));
         }
         _ => {
-            out.push_str("\n  key domain       : (keyless — bucketdiff)");
+            out.push_str("\n  key domain       : (not applicable — bucketdiff)");
         }
     }
     out.push_str(&format!(
