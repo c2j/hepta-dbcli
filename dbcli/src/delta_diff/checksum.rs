@@ -5,6 +5,8 @@
 // row into a ChecksumTuple {count, s1..s4}. Cross-database equality of
 // the tuple is the consistency assertion for a shard.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
@@ -68,6 +70,43 @@ pub(crate) async fn run_checksum_sql(
         .first()
         .ok_or_else(|| DbError::query("delta-diff: checksum query returned no rows"))?;
     parse_tuple_row(row)
+}
+
+pub(crate) async fn run_batch_checksum(
+    conn: &mut dyn DbConn,
+    spec: &ChecksumSqlSpec,
+    verbose: bool,
+) -> Result<BTreeMap<u64, ChecksumTuple>, DbError> {
+    let sql = conn.dialect().render_batch_checksum_sql(spec);
+    if verbose {
+        eprintln!("[sql] {sql}");
+    }
+    let result = conn.query(&sql).await?;
+    parse_batch_rows(&result.rows)
+}
+
+fn parse_batch_rows(rows: &[Vec<Value>]) -> Result<BTreeMap<u64, ChecksumTuple>, DbError> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        if row.len() < 6 {
+            return Err(DbError::query(format!(
+                "delta-diff: batch checksum row has {} columns, expected 6",
+                row.len()
+            )));
+        }
+        let bkt = value_to_u64(&row[0])?;
+        let tuple = ChecksumTuple {
+            count: value_to_u64(&row[1])?,
+            s: [
+                value_to_u64(&row[2])?,
+                value_to_u64(&row[3])?,
+                value_to_u64(&row[4])?,
+                value_to_u64(&row[5])?,
+            ],
+        };
+        out.insert(bkt, tuple);
+    }
+    Ok(out)
 }
 
 fn parse_tuple_row(row: &[Value]) -> Result<ChecksumTuple, DbError> {
@@ -205,6 +244,17 @@ mod tests {
         assert!(tuples_equal(&a, &b));
         assert!(!tuples_equal(&a, &c));
         assert!(!tuples_equal(&a, &d));
+    }
+
+    #[test]
+    fn parse_batch_rows_maps_bucket_to_tuple() {
+        let rows = vec![
+            vec![json!(0), json!(10), json!(1), json!(2), json!(3), json!(4)],
+            vec![json!(3), json!(0), json!(0), json!(0), json!(0), json!(0)],
+        ];
+        let m = parse_batch_rows(&rows).unwrap();
+        assert_eq!(m.get(&0).unwrap().count, 10);
+        assert_eq!(m.get(&3).unwrap().count, 0);
     }
 
     // ── Value coercion: number and string forms ──

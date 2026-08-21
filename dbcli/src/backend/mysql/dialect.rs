@@ -194,6 +194,42 @@ impl Dialect for MySqlDialect {
         )
     }
 
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("`{key}` >= {lo} AND `{key}` < {hi}"));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
+        let bkt = format!("MOD(CONV(SUBSTRING(h, 1, 8), 16, 10), {modulus})");
+        let slice = |i: u32| {
+            format!(
+                "MOD(SUM(CONV(SUBSTRING(h, {:2}, 8), 16, 10)), 18446744073709551616) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -459,5 +495,29 @@ mod tests {
             "sql={sql}"
         );
         assert!(sql.contains("ORDER BY `k1`, `k2`"));
+    }
+
+    #[test]
+    fn batch_checksum_sql_groups_by_mod_expression() {
+        let d = MySqlDialect;
+        let spec = ChecksumSqlSpec {
+            schema: None,
+            table: "orders".into(),
+            key_column: None,
+            range: None,
+            bucket: Some((8, 0)),
+            filter: Some("x=1".into()),
+            scn: None,
+            normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
+        };
+        let sql = d.render_batch_checksum_sql(&spec);
+        assert!(
+            sql.contains("GROUP BY MOD(CONV(SUBSTRING(h, 1, 8), 16, 10), 8)"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("GROUP BY bkt"), "must not GROUP BY alias");
+        assert!(sql.contains("(x=1)"));
+        assert!(sql.contains("COUNT(*) AS cnt"));
+        assert!(sql.contains("AS s1"));
     }
 }

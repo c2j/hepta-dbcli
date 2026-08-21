@@ -237,6 +237,45 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
+        let bkt = format!("MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), 1, 8), 'XXXXXXXX'), {modulus})");
+        let slice = |i: u32| {
+            format!(
+                "TO_CHAR(MOD(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(h), {:2}, 8), 'XXXXXXXX')), POWER(2,64))) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT {bkt} AS bkt,\n  TO_CHAR(COUNT(*)) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -584,5 +623,28 @@ mod tests {
         assert!(sql.contains("ORDER BY \"K1\", \"K2\""));
         assert!(sql.contains("FETCH FIRST 50 ROWS ONLY"));
         assert!(!sql.contains("(K1,K2) >"));
+    }
+
+    #[test]
+    fn batch_checksum_sql_groups_by_mod_expression() {
+        let d = OracleDialect;
+        let spec = crate::backend::ChecksumSqlSpec {
+            schema: None,
+            table: "ORDERS".into(),
+            key_column: None,
+            range: None,
+            bucket: Some((8, 0)),
+            filter: Some("x=1".into()),
+            scn: None,
+            normalized_exprs: vec!["TO_CHAR(\"ID\")".into()],
+        };
+        let sql = d.render_batch_checksum_sql(&spec);
+        assert!(
+            sql.contains("GROUP BY MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), 1, 8), 'XXXXXXXX'), 8)"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("GROUP BY bkt"));
+        assert!(sql.contains("(x=1)"));
+        assert!(sql.contains("TO_CHAR(COUNT(*)) AS cnt"));
     }
 }

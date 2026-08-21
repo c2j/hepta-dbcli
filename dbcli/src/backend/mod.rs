@@ -178,6 +178,11 @@ pub trait Dialect: Send + Sync {
     /// Render the order-independent bit-slice checksum SQL (v2.1 §十).
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
 
+    /// Scan-once checksum: one row per `MOD(hash, N)` bucket.
+    /// `spec.bucket = Some((modulus, _))`; the per-bucket equality predicate is omitted.
+    /// GROUP BY the `MOD(...)` expression, never a select alias.
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
+
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 
