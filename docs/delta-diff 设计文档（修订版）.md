@@ -113,7 +113,7 @@ delta-diff
   --threads <N>              总并发度（两侧各自不超过 ⌈N/2⌉ 个会话）[默认: 4]
   --statement-timeout <SEC>  单条查询超时 [默认: 300]
   --checkpoint <FILE>        断点续传文件路径（JSONL，见 §13.2）
-  --verbose                  显示分片级进度
+  --verbose                  显示分片级进度与每步执行的 SQL（输出到 stderr）
 ```
 
 ### 2.3 退出码（CI/CD 契约）

@@ -162,7 +162,7 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub checkpoint: Option<String>,
 
-    /// 显示分片级进度
+    /// 输出分片级进度及每步执行的 SQL 到 stderr（避免在共享 CI 日志中泄露 --where 内容）
     #[arg(long)]
     pub verbose: bool,
 

@@ -346,6 +346,7 @@ async fn execute_diff_inner(
         iblt_capacity: args.iblt_capacity,
         strict: args.strict,
         scns: std::sync::OnceLock::new(),
+        verbose: args.verbose,
     };
 
     let result = routed

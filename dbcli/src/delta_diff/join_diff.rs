@@ -34,7 +34,14 @@ impl DiffStrategy for JoinDiffer {
         let t0 = Instant::now();
         let mut queries = 0u64;
 
+        ctx.vlog(format!(
+            "[delta-diff] strategy=joindiff consistency={} key={}",
+            ctx.consistency.as_str(),
+            ctx.key_column
+        ));
+
         let sql = join_diff_sql(ctx, left)?;
+        ctx.vlog(format!("[sql] {sql}"));
         let result = left.query(&sql).await?;
         queries += 1;
 
@@ -79,6 +86,15 @@ impl DiffStrategy for JoinDiffer {
             },
             duration_ms: t0.elapsed().as_millis() as u64,
         };
+
+        ctx.vlog(format!(
+            "[shard] join {} left={} right={} diff={} ({}ms)",
+            if diffs.is_empty() { "match" } else { "diff" },
+            ltotal,
+            rtotal,
+            diffs.len(),
+            t0.elapsed().as_millis()
+        ));
 
         let mut report = assemble(ctx, vec![shard], diffs, ctx.sample_limit);
         report.started_at = started;
@@ -144,6 +160,8 @@ async fn fetch_diff_rows(
         let rspec = point_spec(ctx, false, k, q, conn.dialect())?;
         let lsql = conn.dialect().render_keyset_page_sql(&lspec);
         let rsql = conn.dialect().render_keyset_page_sql(&rspec);
+        ctx.vlog(format!("[sql:left] {lsql}"));
+        ctx.vlog(format!("[sql:right] {rsql}"));
         let lrow = conn.query(&lsql).await?.rows.into_iter().next();
         let rrow = conn.query(&rsql).await?.rows.into_iter().next();
         d.left = lrow;
@@ -200,9 +218,9 @@ async fn count_rows(
         .as_ref()
         .map(|f| format!(" WHERE ({f})"))
         .unwrap_or_default();
-    let r = conn
-        .query(&format!("SELECT COUNT(*) FROM {table}{where_clause}"))
-        .await?;
+    let sql = format!("SELECT COUNT(*) FROM {table}{where_clause}");
+    ctx.vlog(format!("[sql] {sql}"));
+    let r = conn.query(&sql).await?;
     Ok(r.rows
         .first()
         .and_then(|row| row.first())

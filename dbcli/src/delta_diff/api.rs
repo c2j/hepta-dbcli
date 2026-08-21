@@ -35,6 +35,7 @@ pub(crate) struct DiffOptions {
     pub(crate) snapshot: bool,
     pub(crate) recheck: bool,
     pub(crate) checkpoint: Option<String>,
+    pub(crate) verbose: bool,
 }
 
 pub(crate) async fn run_diff(
@@ -140,6 +141,7 @@ pub(crate) async fn run_diff(
         iblt_capacity: opts.iblt_capacity.max(16),
         strict: opts.strict,
         scns: std::sync::OnceLock::new(),
+        verbose: opts.verbose,
     };
 
     let report = routed

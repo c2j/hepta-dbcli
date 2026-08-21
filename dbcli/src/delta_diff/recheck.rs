@@ -16,6 +16,7 @@ pub(crate) async fn recheck_diffs(
     left_spec: &KeysetPageSpec,
     right_spec: &KeysetPageSpec,
     diffs: &mut [DiffRow],
+    verbose: bool,
 ) -> Result<u64, DbError> {
     let mut confirmed = 0u64;
     for d in diffs.iter_mut() {
@@ -29,8 +30,8 @@ pub(crate) async fn recheck_diffs(
             confirmed += 1;
             continue;
         };
-        let lrow = point_query(left, left_spec, k).await?;
-        let rrow = point_query(right, right_spec, k).await?;
+        let lrow = point_query(left, left_spec, k, verbose).await?;
+        let rrow = point_query(right, right_spec, k, verbose).await?;
         let now_equal = match (&lrow, &rrow) {
             (Some(l), Some(r)) => l[1..] == r[1..],
             (None, None) => true,
@@ -48,6 +49,7 @@ async fn point_query(
     conn: &mut (dyn DbConn + Send),
     spec: &KeysetPageSpec,
     key: i64,
+    verbose: bool,
 ) -> Result<Option<Vec<Value>>, DbError> {
     let point = KeysetPageSpec {
         range: Some((key, key + 1)),
@@ -56,6 +58,9 @@ async fn point_query(
         ..spec.clone()
     };
     let sql = conn.dialect().render_keyset_page_sql(&point);
+    if verbose {
+        eprintln!("[sql] {sql}");
+    }
     let r = conn.query(&sql).await?;
     Ok(r.rows.into_iter().next())
 }
@@ -127,7 +132,7 @@ mod tests {
             status: DiffStatus::Modified,
             confirmed: true,
         }];
-        let n = recheck_diffs(&mut left, &mut right, &spec(), &spec(), &mut diffs)
+        let n = recheck_diffs(&mut left, &mut right, &spec(), &spec(), &mut diffs, false)
             .await
             .unwrap();
         assert_eq!(n, 0);
@@ -151,7 +156,7 @@ mod tests {
             status: DiffStatus::Modified,
             confirmed: false,
         }];
-        let n = recheck_diffs(&mut left, &mut right, &spec(), &spec(), &mut diffs)
+        let n = recheck_diffs(&mut left, &mut right, &spec(), &spec(), &mut diffs, false)
             .await
             .unwrap();
         assert_eq!(n, 1);

@@ -37,18 +37,26 @@ impl DiffStrategy for BucketDiffer {
         let started = Utc::now();
         let mut queries = 0u64;
 
+        ctx.vlog(format!(
+            "[delta-diff] strategy=bucketdiff consistency={} threads={} threshold={}",
+            ctx.consistency.as_str(),
+            ctx.threads,
+            ctx.bisection_threshold
+        ));
+
         if ctx.consistency == ConsistencyMode::Snapshot {
-            open_snapshot(left).await?;
-            open_snapshot(right).await?;
+            open_snapshot(left, ctx.verbose).await?;
+            open_snapshot(right, ctx.verbose).await?;
             let _ = ctx.scns.set((
-                crate::delta_diff::hash_diff::capture_scn(left).await?,
-                crate::delta_diff::hash_diff::capture_scn(right).await?,
+                crate::delta_diff::hash_diff::capture_scn(left, ctx.verbose).await?,
+                crate::delta_diff::hash_diff::capture_scn(right, ctx.verbose).await?,
             ));
         }
 
         let result = self.diff_inner(left, right, ctx, &mut queries).await;
 
         if ctx.consistency == ConsistencyMode::Snapshot {
+            ctx.vlog("[sql] COMMIT");
             let _ = left.query_drop("COMMIT").await;
             let _ = right.query_drop("COMMIT").await;
         }
@@ -78,14 +86,29 @@ impl BucketDiffer {
             let t0 = Instant::now();
             let lspec = bucket_checksum_spec(ctx, true, n, b, left.dialect())?;
             let rspec = bucket_checksum_spec(ctx, false, n, b, right.dialect())?;
-            let (l, r) = tokio::join!(run_checksum(left, &lspec), run_checksum(right, &rspec));
+            let (l, r) = tokio::join!(
+                run_checksum(left, &lspec, ctx.verbose),
+                run_checksum(right, &rspec, ctx.verbose)
+            );
             let (l, r) = (l?, r?);
             *queries += 2;
             if l != r {
                 diff_buckets.push(b);
                 shards.push(shard_of_bucket(n, b, l, r, ShardStatus::Diff, t0));
+                ctx.vlog(format!(
+                    "[shard] bucket-{b}/{n} diff left={} right={} diff=1 ({}ms)",
+                    l.count,
+                    r.count,
+                    t0.elapsed().as_millis()
+                ));
             } else {
                 shards.push(shard_of_bucket(n, b, l, r, ShardStatus::Match, t0));
+                ctx.vlog(format!(
+                    "[shard] bucket-{b}/{n} match left={} right={} diff=0 ({}ms)",
+                    l.count,
+                    r.count,
+                    t0.elapsed().as_millis()
+                ));
             }
         }
 
@@ -109,6 +132,8 @@ impl BucketDiffer {
                     *b,
                     right.dialect(),
                 )?);
+            ctx.vlog(format!("[sql:left] {lsql}"));
+            ctx.vlog(format!("[sql:right] {rsql}"));
             let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
             *queries += 2;
             rows.extend(multiset_diff(lr?.rows, rr?.rows));
@@ -141,6 +166,7 @@ async fn estimate_rows(
 ) -> Result<u64, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let sql = conn.dialect().list_tables().to_string();
+    ctx.vlog(format!("[sql] {sql}"));
     let r = conn.query(&sql).await?;
     let schema_idx = r.columns.iter().position(|c| c == "schema_name");
     let table_idx = r.columns.iter().position(|c| c == "table_name");
