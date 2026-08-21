@@ -69,14 +69,18 @@ pub(crate) async fn build_table_plan(
     let key_columns = if explicit_key.is_empty() {
         primary_key_columns(&idx_result)
     } else {
+        let mut keys = Vec::with_capacity(explicit_key.len());
         for k in explicit_key {
-            if !columns.iter().any(|c| &c.name == k) {
-                return Err(DbError::config(format!(
-                    "delta-diff: --key column '{k}' not found in '{schema}.{table}'"
-                )));
+            match find_column_ci(&columns, k) {
+                Some(col) => keys.push(col.name.clone()),
+                None => {
+                    return Err(DbError::config(format!(
+                        "delta-diff: --key column '{k}' not found in '{schema}.{table}'"
+                    )))
+                }
             }
         }
-        explicit_key.to_vec()
+        keys
     };
 
     let mut compare_columns = Vec::new();
@@ -98,7 +102,7 @@ pub(crate) async fn build_table_plan(
         }
     } else {
         for name in explicit_columns {
-            let col = columns.iter().find(|c| &c.name == name).ok_or_else(|| {
+            let col = find_column_ci(&columns, name).ok_or_else(|| {
                 DbError::config(format!(
                     "delta-diff: --columns column '{name}' not found in '{schema}.{table}'"
                 ))
@@ -156,9 +160,8 @@ fn inline_schema_table(sql: &str, schema: &str, table: &str, scheme: &str) -> St
         "oracle" => sql
             .replacen(":1", &esc(schema), 1)
             .replacen(":2", &esc(table), 1),
-        "gaussdb" => sql
-            .replacen("$1", &esc(schema), 1)
-            .replacen("$2", &esc(table), 1),
+        // $1/$2 may repeat (LOWER($2) in WHERE + ORDER BY exact-match tiebreak).
+        "gaussdb" => sql.replace("$1", &esc(schema)).replace("$2", &esc(table)),
         _ => sql
             .replacen('?', &esc(schema), 1)
             .replacen('?', &esc(table), 1),
@@ -188,6 +191,17 @@ fn parse_column_row(row: &[Value]) -> ColumnRow {
         name: value_str(row.first()),
         data_type: value_str(row.get(1)),
         nullable: value_bool(row.get(2)),
+    }
+}
+
+fn find_column_ci<'a>(columns: &'a [ColumnRow], name: &str) -> Option<&'a ColumnRow> {
+    if let Some(c) = columns.iter().find(|c| c.name == name) {
+        return Some(c);
+    }
+    let mut ci = columns.iter().filter(|c| c.name.eq_ignore_ascii_case(name));
+    match (ci.next(), ci.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }
 
@@ -498,6 +512,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_key_case_insensitive_resolves_to_catalog_case() {
+        // --key "ID" (user uppercase) must match catalog "id" and canonicalize
+        // to the catalog's case, since downstream SQL double-quotes the key.
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let key = vec!["ID".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+            .await
+            .unwrap();
+        assert_eq!(plan.key_columns, vec!["id"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_columns_case_insensitive_matches() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let explicit = vec!["ID".to_string(), "C_INT".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+            .await
+            .unwrap();
+        assert_eq!(plan.compare_columns, vec!["id", "c_int"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_key_prefers_exact_case_match() {
+        let cols = as_result(vec![
+            col_row("id", "int", false, "PRI"),
+            col_row("ID", "int", true, ""),
+        ]);
+        let mut conn = mock(cols, primary_index("id"));
+        let key = vec!["ID".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+            .await
+            .unwrap();
+        assert_eq!(plan.key_columns, vec!["ID"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_key_ambiguous_case_errors() {
+        let cols = as_result(vec![
+            col_row("ID", "int", false, "PRI"),
+            col_row("Id", "int", true, ""),
+        ]);
+        let mut conn = mock(cols, primary_index("ID"));
+        let key = vec!["id".to_string()];
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("id"), "{err}");
+    }
+
+    #[tokio::test]
     async fn missing_table_errors() {
         let mut conn = mock(as_result(vec![]), as_result(vec![]));
         let err = build_table_plan(&mut conn, "verify", "nope", &[], &[])
@@ -569,5 +633,18 @@ mod tests {
         assert_eq!(value_str(Some(&json!("PRI"))), "PRI");
         assert_eq!(value_str(Some(&json!("0xZZ"))), "0xZZ");
         assert_eq!(value_str(Some(&json!("0x6"))), "0x6");
+    }
+
+    // ── Inline fallback ──
+
+    #[test]
+    fn inline_schema_table_replaces_all_gaussdb_markers() {
+        let sql = "WHERE LOWER(n.nspname) = LOWER($1) AND LOWER(c.relname) = LOWER($2) \
+                   ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC LIMIT 1";
+        let out = inline_schema_table(sql, "bigfund", "dat_fund_cjqs", "gaussdb");
+        assert!(!out.contains("$1"));
+        assert!(!out.contains("$2"));
+        assert!(out.contains("'bigfund'"));
+        assert!(out.contains("'dat_fund_cjqs'"));
     }
 }

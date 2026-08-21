@@ -53,11 +53,11 @@ impl Dialect for GaussdbDialect {
     }
 
     fn table_columns(&self) -> &str {
-        "SELECT a.attname::text AS column_name, pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS data_type, NOT a.attnotnull AS nullable, pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text AS default_value, a.attnum::int4 AS ordinal_position, col_description(a.attrelid, a.attnum)::text AS comment, ic.relname::text AS column_key FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum) LEFT JOIN (pg_catalog.pg_index ix JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid AND ix.indisprimary) ON (ix.indrelid = a.attrelid AND a.attnum = ANY(ix.indkey)) WHERE a.attrelid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $2 AND n.nspname = $1) AND NOT a.attisdropped AND attnum > 0 ORDER BY a.attnum"
+        "SELECT a.attname::text AS column_name, pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS data_type, NOT a.attnotnull AS nullable, pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text AS default_value, a.attnum::int4 AS ordinal_position, col_description(a.attrelid, a.attnum)::text AS comment, ic.relname::text AS column_key FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum) LEFT JOIN (pg_catalog.pg_index ix JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid AND ix.indisprimary) ON (ix.indrelid = a.attrelid AND a.attnum = ANY(ix.indkey)) WHERE a.attrelid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1) AND NOT a.attisdropped AND attnum > 0 ORDER BY a.attnum"
     }
 
     fn table_indexes(&self) -> &str {
-        "SELECT i.relname::text AS index_name, ix.indisunique AS is_unique, ix.indisprimary AS is_primary, pg_catalog.pg_get_indexdef(ix.indexrelid)::text AS columns, am.amname::text AS index_type FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE n.nspname = $1 AND t.relname = $2 ORDER BY i.relname"
+        "SELECT i.relname::text AS index_name, ix.indisunique AS is_unique, ix.indisprimary AS is_primary, pg_catalog.pg_get_indexdef(ix.indexrelid)::text AS columns, am.amname::text AS index_type FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE t.oid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1) ORDER BY i.relname"
     }
 
     fn read_only_prefixes(&self) -> &[&str] {
@@ -308,6 +308,27 @@ mod tests {
             data_type: ty.to_string(),
             nullable,
         }
+    }
+
+    #[test]
+    fn table_columns_case_insensitive_schema_table() {
+        let d = GaussdbDialect;
+        let sql = d.table_columns();
+        assert!(sql.contains("LOWER(c.relname) = LOWER($2)"));
+        assert!(sql.contains("LOWER(n.nspname) = LOWER($1)"));
+        assert!(sql.contains("ORDER BY (c.relname = $2) DESC"));
+        assert!(sql.contains("LIMIT 1"));
+    }
+
+    #[test]
+    fn table_indexes_case_insensitive_schema_table() {
+        let d = GaussdbDialect;
+        let sql = d.table_indexes();
+        assert!(sql.contains("t.oid = (SELECT c.oid"));
+        assert!(sql.contains("LOWER(c.relname) = LOWER($2)"));
+        assert!(sql.contains("LOWER(n.nspname) = LOWER($1)"));
+        assert!(sql.contains("ORDER BY (c.relname = $2) DESC"));
+        assert!(sql.contains("LIMIT 1"));
     }
 
     #[test]

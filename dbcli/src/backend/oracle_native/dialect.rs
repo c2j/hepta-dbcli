@@ -60,7 +60,7 @@ impl Dialect for OracleDialect {
          FROM all_tab_columns c \
          LEFT JOIN all_col_comments com \
            ON com.OWNER = c.OWNER AND com.TABLE_NAME = c.TABLE_NAME AND com.COLUMN_NAME = c.COLUMN_NAME \
-         WHERE c.OWNER = :1 AND c.TABLE_NAME = :2 \
+         WHERE UPPER(c.OWNER) = UPPER(:1) AND UPPER(c.TABLE_NAME) = UPPER(:2) \
          ORDER BY c.COLUMN_ID"
     }
 
@@ -78,7 +78,7 @@ impl Dialect for OracleDialect {
            ON c.OWNER = i.OWNER \
            AND c.INDEX_NAME = i.INDEX_NAME \
            AND c.CONSTRAINT_TYPE = 'P' \
-         WHERE i.OWNER = :1 AND i.TABLE_NAME = :2 \
+         WHERE UPPER(i.OWNER) = UPPER(:1) AND UPPER(i.TABLE_NAME) = UPPER(:2) \
          ORDER BY i.INDEX_NAME"
     }
 
@@ -389,6 +389,22 @@ mod tests {
         assert!(sql.contains("LISTAGG"));
         assert!(sql.contains("all_indexes"));
         assert!(sql.contains("all_ind_columns"));
+    }
+
+    #[test]
+    fn test_table_columns_case_insensitive_owner_table() {
+        let d = OracleDialect;
+        let sql = d.table_columns();
+        assert!(sql.contains("UPPER(c.OWNER) = UPPER(:1)"));
+        assert!(sql.contains("UPPER(c.TABLE_NAME) = UPPER(:2)"));
+    }
+
+    #[test]
+    fn test_table_indexes_case_insensitive_owner_table() {
+        let d = OracleDialect;
+        let sql = d.table_indexes();
+        assert!(sql.contains("UPPER(i.OWNER) = UPPER(:1)"));
+        assert!(sql.contains("UPPER(i.TABLE_NAME) = UPPER(:2)"));
     }
 
     #[test]
