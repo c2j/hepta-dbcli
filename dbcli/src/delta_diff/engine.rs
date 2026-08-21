@@ -10,7 +10,7 @@ use crate::config::ResolvedConnection;
 use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
 use crate::delta_diff::metadata::TablePlan;
 use crate::delta_diff::strategy::DiffStrategy;
-use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff};
+use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff};
 
 pub(crate) struct Route {
     pub(crate) strategy: Box<dyn DiffStrategy>,
@@ -156,6 +156,13 @@ fn route_impl(
                 "strategy 'iblt' requires a single integer key",
                 &non_bisectable_reason(lplan, rplan, &key),
             ));
+        }
+        Strategy::Keyeddiff => {
+            return Ok(Route {
+                strategy: Box::new(keyed_diff::KeyedDiffer),
+                key_column: key.clone().unwrap_or_default(),
+                warnings,
+            });
         }
     };
 

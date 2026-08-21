@@ -18,6 +18,7 @@ pub(crate) enum Strategy {
     Joindiff,
     Bucketdiff,
     Iblt,
+    Keyeddiff,
 }
 
 impl std::fmt::Display for Strategy {
@@ -28,6 +29,7 @@ impl std::fmt::Display for Strategy {
             Strategy::Joindiff => "joindiff",
             Strategy::Bucketdiff => "bucketdiff",
             Strategy::Iblt => "iblt",
+            Strategy::Keyeddiff => "keyeddiff",
         };
         write!(f, "{s}")
     }
@@ -110,7 +112,7 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub update_since: Option<String>,
 
-    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt
+    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: Strategy,
 
@@ -280,6 +282,24 @@ mod tests {
         assert_eq!(args.left_table_name(), Some("orders"));
         assert_eq!(args.right_table_name(), Some("orders"));
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn strategy_keyeddiff_parses() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--strategy",
+            "keyeddiff",
+        ])
+        .expect("parse");
+        assert_eq!(args.strategy, Strategy::Keyeddiff);
+        assert_eq!(args.strategy.to_string(), "keyeddiff");
     }
 
     #[test]

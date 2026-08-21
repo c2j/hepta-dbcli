@@ -15,6 +15,7 @@ pub(crate) mod engine;
 pub(crate) mod hash_diff;
 pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
+pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
 pub(crate) mod output;
 pub(crate) mod progress;
