@@ -105,7 +105,7 @@ mod tests {
             table: "t".into(),
             columns: vec!["id".into(), "v".into()],
             raw_exprs: false,
-            key_column: "id".into(),
+            key_columns: vec!["id".into()],
             range: None,
             last_key: None,
             page_size: 8192,

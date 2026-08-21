@@ -243,7 +243,7 @@ impl Dialect for OracleDialect {
         } else {
             spec.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
         let mut table = match &spec.schema {
@@ -253,16 +253,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds: Vec<String> = Vec::new();
-        if let Some((lo, hi)) = spec.range {
-            conds.push(format!(
-                "\"{}\" >= {lo} AND \"{}\" < {hi}",
-                spec.key_column, spec.key_column
-            ));
-        }
-        if let Some(last) = spec.last_key {
-            conds.push(format!("\"{}\" > {last}", spec.key_column));
-        }
+        let mut conds = crate::backend::keyset_key_conds('"', spec);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -272,9 +263,9 @@ impl Dialect for OracleDialect {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
         format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nFETCH FIRST {} ROWS ONLY",
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
             cols.join(", "),
-            spec.key_column,
+            crate::backend::keyset_order_by('"', spec),
             spec.page_size
         )
     }

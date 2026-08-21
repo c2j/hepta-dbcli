@@ -243,7 +243,7 @@ impl Dialect for OracleDialect {
         } else {
             spec.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
         let mut table = match &spec.schema {
@@ -253,16 +253,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds: Vec<String> = Vec::new();
-        if let Some((lo, hi)) = spec.range {
-            conds.push(format!(
-                "\"{}\" >= {lo} AND \"{}\" < {hi}",
-                spec.key_column, spec.key_column
-            ));
-        }
-        if let Some(last) = spec.last_key {
-            conds.push(format!("\"{}\" > {last}", spec.key_column));
-        }
+        let mut conds = crate::backend::keyset_key_conds('"', spec);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -272,9 +263,9 @@ impl Dialect for OracleDialect {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
         format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nFETCH FIRST {} ROWS ONLY",
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
             cols.join(", "),
-            spec.key_column,
+            crate::backend::keyset_order_by('"', spec),
             spec.page_size
         )
     }
@@ -557,9 +548,9 @@ mod tests {
             table: "ORDERS".into(),
             columns: vec!["ID".into()],
             raw_exprs: false,
-            key_column: "ID".into(),
+            key_columns: vec!["ID".into()],
             range: None,
-            last_key: Some(42),
+            last_key: Some(vec![serde_json::json!(42)]),
             page_size: 8192,
             filter: None,
             scn: Some(2162471),
@@ -568,5 +559,30 @@ mod tests {
         assert!(sql.contains("FROM \"ORDERS\" AS OF SCN 2162471"));
         assert!(sql.contains("\"ID\" > 42"));
         assert!(sql.contains("FETCH FIRST 8192 ROWS ONLY"));
+    }
+
+    #[test]
+    fn keyset_page_sql_composite_next_page() {
+        let d = OracleDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "T".into(),
+            columns: vec!["K1".into(), "K2".into()],
+            raw_exprs: false,
+            key_columns: vec!["K1".into(), "K2".into()],
+            range: None,
+            last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
+            page_size: 50,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("(\"K1\" > 10) OR (\"K1\" = 10 AND \"K2\" > 'ab')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("ORDER BY \"K1\", \"K2\""));
+        assert!(sql.contains("FETCH FIRST 50 ROWS ONLY"));
+        assert!(!sql.contains("(K1,K2) >"));
     }
 }

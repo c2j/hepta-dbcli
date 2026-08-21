@@ -207,23 +207,14 @@ impl Dialect for GaussdbDialect {
         } else {
             spec.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
         let table = match &spec.schema {
             Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
             None => format!("\"{}\"", spec.table),
         };
-        let mut conds: Vec<String> = Vec::new();
-        if let Some((lo, hi)) = spec.range {
-            conds.push(format!(
-                "\"{}\" >= {lo} AND \"{}\" < {hi}",
-                spec.key_column, spec.key_column
-            ));
-        }
-        if let Some(last) = spec.last_key {
-            conds.push(format!("\"{}\" > {last}", spec.key_column));
-        }
+        let mut conds = crate::backend::keyset_key_conds('"', spec);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -233,9 +224,9 @@ impl Dialect for GaussdbDialect {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
         format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nLIMIT {}",
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nLIMIT {}",
             cols.join(", "),
-            spec.key_column,
+            crate::backend::keyset_order_by('"', spec),
             spec.page_size
         )
     }
@@ -394,6 +385,30 @@ mod tests {
         assert!(sql.contains("18446744073709551616"));
         assert!(sql.contains("\"id\" >= 0 AND \"id\" < 1000"));
         assert!(sql.contains("MD5(concat_ws('#', \"id\"::text))"));
+    }
+
+    #[test]
+    fn keyset_page_sql_composite_next_page() {
+        let d = GaussdbDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["k1".into(), "k2".into()],
+            raw_exprs: false,
+            key_columns: vec!["k1".into(), "k2".into()],
+            range: None,
+            last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
+            page_size: 50,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("(\"k1\" > 10) OR (\"k1\" = 10 AND \"k2\" > 'ab')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("ORDER BY \"k1\", \"k2\""));
+        assert!(!sql.contains("(k1,k2) >"));
     }
 }
 

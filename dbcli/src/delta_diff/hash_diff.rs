@@ -550,7 +550,7 @@ pub(crate) fn keyset_spec(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_column: ctx.key_column.clone(),
+        key_columns: vec![ctx.key_column.clone()],
         range: None,
         last_key: None,
         page_size: 8192,

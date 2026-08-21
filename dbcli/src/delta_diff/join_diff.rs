@@ -192,7 +192,7 @@ fn point_spec(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_column: ctx.key_column.clone(),
+        key_columns: vec![ctx.key_column.clone()],
         range: Some((key, key + 1)),
         last_key: None,
         page_size: 1,

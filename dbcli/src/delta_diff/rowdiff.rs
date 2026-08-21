@@ -151,7 +151,7 @@ struct PageCursor<'a> {
     conn: &'a mut (dyn DbConn + Send),
     base: &'a KeysetPageSpec,
     range: (i64, i64),
-    last_key: Option<i64>,
+    last_key: Option<Vec<Value>>,
     exhausted: bool,
     verbose: bool,
 }
@@ -179,9 +179,9 @@ impl<'a> PageCursor<'a> {
             table: self.base.table.clone(),
             columns: self.base.columns.clone(),
             raw_exprs: self.base.raw_exprs,
-            key_column: self.base.key_column.clone(),
+            key_columns: self.base.key_columns.clone(),
             range: Some(self.range),
-            last_key: self.last_key,
+            last_key: self.last_key.clone(),
             page_size: PAGE_SIZE,
             filter: self.base.filter.clone(),
             scn: self.base.scn,
@@ -195,7 +195,7 @@ impl<'a> PageCursor<'a> {
             self.exhausted = true;
         }
         if let Some(last) = result.rows.last() {
-            self.last_key = Some(row_key(last));
+            self.last_key = Some(vec![Value::from(row_key(last))]);
         }
         Ok(result.rows)
     }
@@ -248,7 +248,7 @@ mod tests {
             table: "t".into(),
             columns: vec!["id".into(), "v".into()],
             raw_exprs: false,
-            key_column: "id".into(),
+            key_columns: vec!["id".into()],
             range: None,
             last_key: None,
             page_size: PAGE_SIZE,

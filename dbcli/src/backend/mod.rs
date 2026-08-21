@@ -262,19 +262,88 @@ pub struct ChecksumSqlSpec {
 pub struct KeysetPageSpec {
     pub schema: Option<String>,
     pub table: String,
-    /// Columns to select, key column first.
+    /// Columns to select, key columns first.
     pub columns: Vec<String>,
     /// true: `columns` 为 SQL 表达式（规范化表达式），渲染时不加引号；
     /// false: 列名，按 identifier_quote 加引号。
     /// 行级跨库比较统一用规范化表达式（§九-2：两侧文本表示字节级一致）。
     pub raw_exprs: bool,
-    pub key_column: String,
+    /// Key columns in PK order. First column is used for optional i64 `range`.
+    pub key_columns: Vec<String>,
     pub range: Option<(i64, i64)>,
-    pub last_key: Option<i64>,
+    /// Exclusive lower bound of the last seen key tuple (JSON numbers/strings).
+    pub last_key: Option<Vec<Value>>,
     pub page_size: usize,
     pub filter: Option<String>,
     /// Oracle AS OF SCN anchor (snapshot mode).
     pub scn: Option<u64>,
+}
+
+pub(crate) fn quote_ident(quote: char, name: &str) -> String {
+    let doubled = name.replace(quote, &format!("{quote}{quote}"));
+    format!("{quote}{doubled}{quote}")
+}
+
+pub(crate) fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => {
+            if *b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+pub(crate) fn render_tuple_gt(quote: char, keys: &[String], last: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for i in 0..keys.len().min(last.len()) {
+        let mut ands = Vec::new();
+        for (key, val) in keys.iter().zip(last.iter()).take(i) {
+            ands.push(format!(
+                "{} = {}",
+                quote_ident(quote, key),
+                sql_literal(val)
+            ));
+        }
+        ands.push(format!(
+            "{} > {}",
+            quote_ident(quote, &keys[i]),
+            sql_literal(&last[i])
+        ));
+        parts.push(format!("({})", ands.join(" AND ")));
+    }
+    parts.join(" OR ")
+}
+
+pub(crate) fn keyset_key_conds(quote: char, spec: &KeysetPageSpec) -> Vec<String> {
+    let mut conds = Vec::new();
+    if let (Some(k), Some((lo, hi))) = (spec.key_columns.first(), spec.range) {
+        let qk = quote_ident(quote, k);
+        conds.push(format!("{qk} >= {lo} AND {qk} < {hi}"));
+    }
+    if let Some(last) = &spec.last_key {
+        if !spec.key_columns.is_empty() && !last.is_empty() {
+            conds.push(format!(
+                "({})",
+                render_tuple_gt(quote, &spec.key_columns, last)
+            ));
+        }
+    }
+    conds
+}
+
+pub(crate) fn keyset_order_by(quote: char, spec: &KeysetPageSpec) -> String {
+    spec.key_columns
+        .iter()
+        .map(|c| quote_ident(quote, c))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ─── BackendFactory — Creates Backends from Configuration ───────────
