@@ -1,5 +1,7 @@
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, HashCapability, KeysetPageSpec};
+use crate::backend::{
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, HashCapability, KeysetPageSpec, NULL_SENTINEL,
+};
 
 pub(crate) struct MySqlDialect;
 
@@ -147,7 +149,7 @@ impl Dialect for MySqlDialect {
             }
         };
         Ok(if col.nullable {
-            format!("COALESCE({inner}, '␀NULL␀')")
+            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
         } else {
             inner
         })
@@ -327,12 +329,12 @@ mod tests {
         assert_eq!(
             d.normalize_expr(&col("amount", "decimal(20,6)", true))
                 .unwrap(),
-            "COALESCE(CAST(`amount` AS CHAR), '␀NULL␀')"
+            "COALESCE(CAST(`amount` AS CHAR), '\u{1f}NULL\u{1f}')"
         );
         assert_eq!(
             d.normalize_expr(&col("create_time", "datetime", true))
                 .unwrap(),
-            "COALESCE(DATE_FORMAT(`create_time`, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀')"
+            "COALESCE(DATE_FORMAT(`create_time`, '%Y-%m-%d %H:%i:%s.%f'), '\u{1f}NULL\u{1f}')"
         );
         assert_eq!(
             d.normalize_expr(&col("name", "varchar(32)", false))
@@ -345,7 +347,7 @@ mod tests {
         );
         assert_eq!(
             d.normalize_expr(&col("data", "blob", true)).unwrap(),
-            "COALESCE(HEX(`data`), '␀NULL␀')"
+            "COALESCE(HEX(`data`), '\u{1f}NULL\u{1f}')"
         );
         assert!(d.normalize_expr(&col("doc", "text", true)).is_err());
         assert!(d.normalize_expr(&col("j", "json", true)).is_err());

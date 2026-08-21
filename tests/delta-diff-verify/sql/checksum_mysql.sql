@@ -6,13 +6,13 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
   
@@ -25,13 +25,13 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
   WHERE id >= 1 AND id < 501
@@ -44,13 +44,13 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
   WHERE id >= 501 AND id < 1001
@@ -63,13 +63,13 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
   WHERE id >= 1001 AND id < 1501
@@ -82,13 +82,13 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
   WHERE id >= 1501 AND id < 2001
@@ -101,16 +101,16 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
-  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), '␀NULL␀'), COALESCE(CAST(c_int AS CHAR), '␀NULL␀'), COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'), COALESCE(c_vc, '␀NULL␀'), COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'), COALESCE(CAST(c_null AS CHAR), '␀NULL␀'))), 1, 8), 16, 10), 8) = 0
+  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), 'NULL'), COALESCE(CAST(c_int AS CHAR), 'NULL'), COALESCE(CAST(c_dec AS CHAR), 'NULL'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'), COALESCE(c_vc, 'NULL'), COALESCE(CAST(c_bool AS CHAR), 'NULL'), COALESCE(CAST(c_null AS CHAR), 'NULL'))), 1, 8), 16, 10), 8) = 0
 ) t;
 SELECT 'bucket-8-3' AS case_name;
 SELECT COUNT(*) AS cnt,
@@ -120,16 +120,16 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
-  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), '␀NULL␀'), COALESCE(CAST(c_int AS CHAR), '␀NULL␀'), COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'), COALESCE(c_vc, '␀NULL␀'), COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'), COALESCE(CAST(c_null AS CHAR), '␀NULL␀'))), 1, 8), 16, 10), 8) = 3
+  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), 'NULL'), COALESCE(CAST(c_int AS CHAR), 'NULL'), COALESCE(CAST(c_dec AS CHAR), 'NULL'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'), COALESCE(c_vc, 'NULL'), COALESCE(CAST(c_bool AS CHAR), 'NULL'), COALESCE(CAST(c_null AS CHAR), 'NULL'))), 1, 8), 16, 10), 8) = 3
 ) t;
 SELECT 'bucket-8-7' AS case_name;
 SELECT COUNT(*) AS cnt,
@@ -139,14 +139,14 @@ SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h, 25, 8), 16, 10)), 18446744073709551616) AS s4
 FROM (
   SELECT MD5(CONCAT_WS('#',
-    COALESCE(CAST(id AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_int AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'),
-    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'),
-    COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'),
-    COALESCE(CAST(c_null AS CHAR), '␀NULL␀')
+    COALESCE(CAST(id AS CHAR), 'NULL'),
+    COALESCE(CAST(c_int AS CHAR), 'NULL'),
+    COALESCE(CAST(c_dec AS CHAR), 'NULL'),
+    COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'),
+    COALESCE(c_vc, 'NULL'),
+    COALESCE(CAST(c_bool AS CHAR), 'NULL'),
+    COALESCE(CAST(c_null AS CHAR), 'NULL')
   )) AS h
   FROM verify_t
-  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), '␀NULL␀'), COALESCE(CAST(c_int AS CHAR), '␀NULL␀'), COALESCE(CAST(c_dec AS CHAR), '␀NULL␀'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), '␀NULL␀'), COALESCE(c_vc, '␀NULL␀'), COALESCE(CAST(c_bool AS CHAR), '␀NULL␀'), COALESCE(CAST(c_null AS CHAR), '␀NULL␀'))), 1, 8), 16, 10), 8) = 7
+  WHERE MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#', COALESCE(CAST(id AS CHAR), 'NULL'), COALESCE(CAST(c_int AS CHAR), 'NULL'), COALESCE(CAST(c_dec AS CHAR), 'NULL'), COALESCE(DATE_FORMAT(c_dt, '%Y-%m-%d %H:%i:%s.%f'), 'NULL'), COALESCE(c_vc, 'NULL'), COALESCE(CAST(c_bool AS CHAR), 'NULL'), COALESCE(CAST(c_null AS CHAR), 'NULL'))), 1, 8), 16, 10), 8) = 7
 ) t;

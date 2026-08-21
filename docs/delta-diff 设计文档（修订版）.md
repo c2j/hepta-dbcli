@@ -726,7 +726,7 @@ hash 比对要求两侧列值**文本表示字节级一致**。`sql/normalize.rs
 | DATE | `DATE_FORMAT(c,'%Y-%m-%d')` | `to_char(c,'YYYY-MM-DD')` | `TO_CHAR(c,'YYYY-MM-DD')` |
 | 字符串 | 原样 ⚠ 两侧字符集/排序规则需一致，启动时校验并告警 | 同左 | 同左 |
 | BOOLEAN | `CAST(c AS CHAR)`（0/1）✅实测 | `c::int::text`（0/1）★ 对齐 MySQL，实测一致 ✅实测 | `TO_CHAR(c)` |
-| NULL | `CONCAT_WS` 跳过 NULL，故用哨兵：`COALESCE(<expr>, '␀NULL␀')` | 同左 | 同左 |
+| NULL | `CONCAT_WS` 跳过 NULL，故用哨兵：`COALESCE(<expr>, '<0x1F>NULL<0x1F>')`（原始字节 0x1F（Unit Separator）包裹 "NULL"，ASCII 编码安全，issue #27） | 同左 | 同左 |
 | BLOB/BYTEA/RAW | `HEX(c)` | `encode(c,'hex')` | `RAWTOHEX(c)` |
 | LOB (CLOB/TEXT 大字段) | 默认排除并告警；`--columns` 显式指定时按前 4000 字节 hex | 同左 | 同左 |
 

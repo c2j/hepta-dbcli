@@ -60,6 +60,12 @@ impl GaussdbPool {
         let _ = client
             .simple_query("SET default_transaction_read_only = ON")
             .await;
+        // 防御性兜底（issue #27）：驱动启动握手已协商 client_encoding=UTF8
+        // （rust-opengauss connect_raw.rs），此处再显式 SET，防止未来驱动行为
+        // 变化时服务端回落到库默认编码，误读本驱动按 UTF-8 发送的字面量。
+        if let Err(e) = client.simple_query("SET client_encoding = 'UTF8'").await {
+            tracing::warn!("failed to set client_encoding=UTF8: {e}");
+        }
         Ok(client)
     }
 }

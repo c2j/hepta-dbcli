@@ -11,7 +11,7 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 SQL_DIR = os.path.join(HERE, "sql")
 ROWS = 2000
-NULL_SENTINEL = "␀NULL␀"
+NULL_SENTINEL = "\x1fNULL\x1f"
 
 MYSQL_CHECKSUM_SQL = """SELECT COUNT(*) AS cnt,
   MOD(SUM(CONV(SUBSTRING(h,  1, 8), 16, 10)), 18446744073709551616) AS s1,
