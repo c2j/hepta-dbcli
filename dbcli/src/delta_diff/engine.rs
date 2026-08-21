@@ -68,14 +68,19 @@ fn route_impl(
 
     let strategy: Box<dyn DiffStrategy> = match strategy_hint.unwrap_or(Strategy::Auto) {
         Strategy::Hashdiff => {
-            let k = key.clone().filter(|_| bisectable).ok_or_else(|| {
-                "hashdiff requires a single bisectable integer key (§6.4)".to_string()
-            })?;
-            return Ok(Route {
-                strategy: Box::new(hash_diff::HashDiffer),
-                key_column: k,
+            if bisectable {
+                return Ok(Route {
+                    strategy: Box::new(hash_diff::HashDiffer),
+                    key_column: key.clone().unwrap_or_default(),
+                    warnings,
+                });
+            }
+            return Ok(bucketdiff_fallback(
+                &key,
                 warnings,
-            });
+                "strategy 'hashdiff' requires a single integer key",
+                &non_bisectable_reason(lplan, rplan, &key),
+            ));
         }
         Strategy::Bucketdiff => {
             return Ok(Route {
@@ -85,18 +90,28 @@ fn route_impl(
             });
         }
         Strategy::Joindiff => {
-            let k = key
-                .clone()
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| "joindiff requires a comparison key".to_string())?;
+            let Some(k) = key.clone().filter(|k| !k.is_empty()) else {
+                return Ok(bucketdiff_fallback(
+                    &key,
+                    warnings,
+                    "strategy 'joindiff' requires a single comparison key",
+                    &non_bisectable_reason(lplan, rplan, &key),
+                ));
+            };
             if !same_conn || !mysql_family {
+                if !bisectable {
+                    return Ok(bucketdiff_fallback(
+                        &key,
+                        warnings,
+                        "strategy 'joindiff' is unavailable across connections or non-MySQL; \
+                         its hashdiff fallback requires a single integer key",
+                        &non_bisectable_reason(lplan, rplan, &key),
+                    ));
+                }
                 warnings.push(
                     "joindiff requires same-connection MySQL-family; falling back to hashdiff"
                         .to_string(),
                 );
-                if !bisectable {
-                    return Err("hashdiff fallback requires a bisectable integer key".into());
-                }
                 return Ok(Route {
                     strategy: Box::new(hash_diff::HashDiffer),
                     key_column: k,
@@ -117,9 +132,10 @@ fn route_impl(
                 );
                 Box::new(bucket_diff::BucketDiffer)
             }
-            (Some(k), false) => {
+            (Some(_), false) => {
                 warnings.push(format!(
-                    "key '{k}' is not a bisectable integer column (§6.4); falling back to bucketdiff"
+                    "{}; falling back to bucketdiff",
+                    non_bisectable_reason(lplan, rplan, &key)
                 ));
                 Box::new(bucket_diff::BucketDiffer)
             }
@@ -127,14 +143,19 @@ fn route_impl(
             (Some(_), true) => Box::new(iblt_diff::IbltDiffer),
         },
         Strategy::Iblt => {
-            let k = key.clone().filter(|_| bisectable).ok_or_else(|| {
-                "iblt requires a single bisectable integer key (§6.4)".to_string()
-            })?;
-            return Ok(Route {
-                strategy: Box::new(iblt_diff::IbltDiffer),
-                key_column: k,
+            if bisectable {
+                return Ok(Route {
+                    strategy: Box::new(iblt_diff::IbltDiffer),
+                    key_column: key.clone().unwrap_or_default(),
+                    warnings,
+                });
+            }
+            return Ok(bucketdiff_fallback(
+                &key,
                 warnings,
-            });
+                "strategy 'iblt' requires a single integer key",
+                &non_bisectable_reason(lplan, rplan, &key),
+            ));
         }
     };
 
@@ -180,6 +201,46 @@ fn is_int_key(plan: &TablePlan, key: &str) -> bool {
             | "numeric"
             | "decimal"
     )
+}
+
+/// 可读的「键不可切分」原因描述（不引用 §6.4 等内部章节号）。
+fn non_bisectable_reason(lplan: &TablePlan, rplan: &TablePlan, key: &Option<String>) -> String {
+    if let Some(k) = key {
+        let compared = |p: &TablePlan| p.norm_specs.iter().any(|s| &s.name == k);
+        if !compared(lplan) || !compared(rplan) {
+            return format!("key column '{k}' is not among the compared columns");
+        }
+        return format!("key column '{k}' is not an integer type");
+    }
+    let (ln, rn) = (lplan.key_columns.len(), rplan.key_columns.len());
+    if ln == 0 && rn == 0 {
+        return "table has no key".to_string();
+    }
+    if ln == 0 || rn == 0 {
+        return "key is missing on one side".to_string();
+    }
+    if lplan.key_columns != rplan.key_columns {
+        return "key columns differ between the two sides".to_string();
+    }
+    format!("composite key ({ln} columns)")
+}
+
+/// 需要单列整型键的策略不可用时，回退 bucketdiff 并附加可读告警。
+fn bucketdiff_fallback(
+    key: &Option<String>,
+    mut warnings: Vec<String>,
+    requirement: &str,
+    reason: &str,
+) -> Route {
+    warnings.push(format!(
+        "{reason}; {requirement} — falling back to bucketdiff \
+         (row-content multiset comparison)"
+    ));
+    Route {
+        strategy: Box::new(bucket_diff::BucketDiffer),
+        key_column: key.clone().unwrap_or_default(),
+        warnings,
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +316,8 @@ mod tests {
         .unwrap();
         assert_eq!(r.strategy.name(), "bucketdiff");
         assert!(!r.warnings.is_empty());
+        assert!(r.warnings[0].contains("is not an integer type"));
+        assert!(!r.warnings[0].contains('§'));
     }
 
     #[test]
@@ -298,26 +361,180 @@ mod tests {
     }
 
     #[test]
-    fn explicit_iblt_requires_bisectable_key() {
-        assert!(route(
-            &args(Strategy::Iblt),
-            &conn("mysql://a/t"),
-            &conn("mysql://b/t"),
-            &plan(vec!["code"], "varchar(32)"),
-            &plan(vec!["code"], "varchar(32)")
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn explicit_hashdiff_requires_bisectable_key() {
-        assert!(route(
+    fn explicit_hashdiff_falls_back_for_string_key() {
+        let r = route(
             &args(Strategy::Hashdiff),
             &conn("mysql://a/t"),
             &conn("mysql://b/t"),
             &plan(vec!["code"], "varchar(32)"),
-            &plan(vec!["code"], "varchar(32)")
+            &plan(vec!["code"], "varchar(32)"),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("is not an integer type")));
+    }
+
+    #[test]
+    fn explicit_hashdiff_falls_back_for_composite_key() {
+        let r = route(
+            &args(Strategy::Hashdiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["id", "tenant_id"], "int"),
+            &plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r.warnings.iter().any(|w| w.contains("composite key")));
+    }
+
+    #[test]
+    fn explicit_hashdiff_falls_back_for_keyless() {
+        let r = route(
+            &args(Strategy::Hashdiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r.warnings.iter().any(|w| w.contains("no key")));
+    }
+
+    #[test]
+    fn explicit_iblt_falls_back_for_string_key() {
+        let r = route(
+            &args(Strategy::Iblt),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["code"], "varchar(32)"),
+            &plan(vec!["code"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("is not an integer type")));
+    }
+
+    #[test]
+    fn explicit_iblt_falls_back_for_composite_key() {
+        let r = route(
+            &args(Strategy::Iblt),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["id", "tenant_id"], "int"),
+            &plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r.warnings.iter().any(|w| w.contains("composite key")));
+    }
+
+    #[test]
+    fn explicit_joindiff_cross_instance_nonint_falls_back_to_bucketdiff() {
+        let r = route(
+            &args(Strategy::Joindiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["code"], "varchar(32)"),
+            &plan(vec!["code"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r.warnings.iter().any(|w| w.contains("joindiff")));
+    }
+
+    #[test]
+    fn warning_text_has_no_section_ref() {
+        let scenarios = [
+            (Strategy::Hashdiff, vec!["code"], "varchar(32)"),
+            (Strategy::Hashdiff, vec!["id", "tenant_id"], "int"),
+            (Strategy::Hashdiff, vec![], "int"),
+            (Strategy::Iblt, vec!["code"], "varchar(32)"),
+            (Strategy::Iblt, vec!["id", "tenant_id"], "int"),
+            (Strategy::Joindiff, vec!["code"], "varchar(32)"),
+            (Strategy::Auto, vec!["code"], "varchar(32)"),
+        ];
+        for (strat, keys, ty) in scenarios {
+            let r = route(
+                &args(strat),
+                &conn("mysql://a/t"),
+                &conn("mysql://b/t"),
+                &plan(keys.clone(), ty),
+                &plan(keys, ty),
+            )
+            .unwrap();
+            for w in &r.warnings {
+                assert!(!w.contains('§'), "warning leaks section ref: {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_bisectable_reason_cases() {
+        let varchar = plan(vec!["code"], "varchar(32)");
+        let composite = plan(vec!["id", "tenant_id"], "int");
+        let keyless = plan(vec![], "int");
+        let single = plan(vec!["id"], "int");
+
+        assert_eq!(
+            non_bisectable_reason(&varchar, &varchar, &Some("code".into())),
+            "key column 'code' is not an integer type"
+        );
+        assert_eq!(
+            non_bisectable_reason(&keyless, &keyless, &None),
+            "table has no key"
+        );
+        assert_eq!(
+            non_bisectable_reason(&single, &plan(vec!["uid"], "int"), &None),
+            "key columns differ between the two sides"
+        );
+        assert_eq!(
+            non_bisectable_reason(&composite, &composite, &None),
+            "composite key (2 columns)"
+        );
+        assert_eq!(
+            non_bisectable_reason(&keyless, &single, &None),
+            "key is missing on one side"
+        );
+    }
+
+    #[test]
+    fn non_bisectable_reason_for_excluded_key_column() {
+        // --columns excludes the integer PK, so is_int_key cannot see its type.
+        let excluded = TablePlan {
+            key_columns: vec!["id".to_string()],
+            compare_columns: vec!["c1".to_string()],
+            norm_specs: vec![ColumnNormSpec {
+                name: "c1".to_string(),
+                data_type: "int".to_string(),
+                nullable: false,
+            }],
+            warnings: vec![],
+        };
+        assert_eq!(
+            non_bisectable_reason(&excluded, &excluded, &Some("id".into())),
+            "key column 'id' is not among the compared columns"
+        );
+    }
+
+    #[test]
+    fn explicit_joindiff_falls_back_for_composite_key() {
+        let r = route(
+            &args(Strategy::Joindiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://a/t"),
+            &plan(vec!["id", "tenant_id"], "int"),
+            &plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        assert!(r.warnings.iter().any(|w| w.contains("composite key")));
     }
 }
