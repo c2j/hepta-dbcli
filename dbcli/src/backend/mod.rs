@@ -183,6 +183,9 @@ pub trait Dialect: Send + Sync {
     /// GROUP BY the `MOD(...)` expression, never a select alias.
     fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
 
+    /// Bucket membership predicate using the same hash template as checksum.
+    fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String;
+
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 

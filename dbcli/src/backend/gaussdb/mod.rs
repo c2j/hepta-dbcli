@@ -237,6 +237,12 @@ impl Dialect for GaussdbDialect {
         )
     }
 
+    fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String {
+        let concat = exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        format!("MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) = {bucket}")
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()

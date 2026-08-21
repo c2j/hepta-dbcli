@@ -7,7 +7,10 @@
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::backend::{quote_ident, DbConn, DbError, KeysetPageSpec};
+use std::collections::BTreeMap;
+
+use crate::backend::{quote_ident, ChecksumSqlSpec, DbConn, DbError, KeysetPageSpec};
+use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
 use crate::delta_diff::report::{
     DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, ShardResult, ShardStatus, TableRef,
@@ -119,12 +122,86 @@ impl KeyedDiffer {
             return Ok((keys_only_diffs(&rows, arity, true), left_total, right_total));
         }
 
-        let lspec = full_row_spec(ctx, true, left.dialect())?;
-        let rspec = full_row_spec(ctx, false, right.dialect())?;
-        let detail = row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
-        *queries += estimate_page_queries(left_total, right_total);
-        Ok((detail.rows, left_total, right_total))
+        if left_total.max(right_total) <= ctx.fetch_all_threshold {
+            let lspec = full_row_spec(ctx, true, left.dialect(), None)?;
+            let rspec = full_row_spec(ctx, false, right.dialect(), None)?;
+            let detail =
+                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            *queries += estimate_page_queries(left_total, right_total);
+            return Ok((detail.rows, left_total, right_total));
+        }
+
+        let n = {
+            let per = ctx.bisection_threshold.max(1);
+            (left_total.max(right_total).div_ceil(per)).clamp(1, 1024)
+        };
+        let lspec = batch_spec(ctx, true, left.dialect(), n)?;
+        let rspec = batch_spec(ctx, false, right.dialect(), n)?;
+        let (lmap, rmap) = tokio::join!(
+            run_batch_checksum(left, &lspec, ctx.verbose),
+            run_batch_checksum(right, &rspec, ctx.verbose)
+        );
+        *queries += 2;
+        let lmap = lmap?;
+        let rmap = rmap?;
+        let buckets = diff_bucket_ids(&lmap, &rmap, n);
+        if buckets.is_empty() {
+            return Ok((Vec::new(), left_total, right_total));
+        }
+
+        let mut rows = Vec::new();
+        for b in buckets {
+            let lpred = left.dialect().render_bucket_predicate(
+                &ctx.left.plan.normalized_exprs(left.dialect())?,
+                n,
+                b,
+            );
+            let rpred = right.dialect().render_bucket_predicate(
+                &ctx.right.plan.normalized_exprs(right.dialect())?,
+                n,
+                b,
+            );
+            let lspec = full_row_spec(ctx, true, left.dialect(), Some(&lpred))?;
+            let rspec = full_row_spec(ctx, false, right.dialect(), Some(&rpred))?;
+            let detail =
+                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            *queries += 2;
+            rows.extend(detail.rows);
+        }
+        Ok((rows, left_total, right_total))
     }
+}
+
+fn diff_bucket_ids(
+    left: &BTreeMap<u64, ChecksumTuple>,
+    right: &BTreeMap<u64, ChecksumTuple>,
+    n: u64,
+) -> Vec<u64> {
+    (0..n)
+        .filter(|b| {
+            left.get(b).copied().unwrap_or_else(ChecksumTuple::zero)
+                != right.get(b).copied().unwrap_or_else(ChecksumTuple::zero)
+        })
+        .collect()
+}
+
+fn batch_spec(
+    ctx: &DiffContext,
+    is_left: bool,
+    dialect: &dyn crate::backend::Dialect,
+    modulus: u64,
+) -> Result<ChecksumSqlSpec, DbError> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    Ok(ChecksumSqlSpec {
+        schema: side.schema.clone(),
+        table: side.table.clone(),
+        key_column: None,
+        range: None,
+        bucket: Some((modulus, 0)),
+        filter: side_filter(ctx, dialect.url_scheme()),
+        scn: ctx.scn_of(is_left),
+        normalized_exprs: side.plan.normalized_exprs(dialect)?,
+    })
 }
 
 fn estimate_page_queries(left_total: u64, right_total: u64) -> u64 {
@@ -213,6 +290,7 @@ fn full_row_spec(
     ctx: &DiffContext,
     is_left: bool,
     dialect: &dyn crate::backend::Dialect,
+    extra_pred: Option<&str>,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let q = dialect.identifier_quote();
@@ -234,7 +312,15 @@ fn full_row_spec(
         range: None,
         last_key: None,
         page_size: PAGE_SIZE,
-        filter: side_filter(ctx, dialect.url_scheme()),
+        filter: {
+            let base = side_filter(ctx, dialect.url_scheme());
+            match (base, extra_pred) {
+                (Some(f), Some(p)) => Some(format!("({f}) AND ({p})")),
+                (Some(f), None) => Some(f),
+                (None, Some(p)) => Some(p.to_string()),
+                (None, None) => None,
+            }
+        },
         scn: ctx.scn_of(is_left),
     })
 }
@@ -355,6 +441,35 @@ mod tests {
             sql,
             "SELECT COUNT(*) AS cnt FROM `s`.`t` WHERE (bcrq='20260114')"
         );
+    }
+
+    #[test]
+    fn buckets_that_differ() {
+        let mut l = std::collections::BTreeMap::new();
+        l.insert(
+            1,
+            crate::delta_diff::checksum::ChecksumTuple {
+                count: 5,
+                s: [1, 0, 0, 0],
+            },
+        );
+        let mut r = std::collections::BTreeMap::new();
+        r.insert(
+            1,
+            crate::delta_diff::checksum::ChecksumTuple {
+                count: 5,
+                s: [1, 0, 0, 0],
+            },
+        );
+        r.insert(
+            2,
+            crate::delta_diff::checksum::ChecksumTuple {
+                count: 3,
+                s: [9, 0, 0, 0],
+            },
+        );
+        let d = diff_bucket_ids(&l, &r, 4);
+        assert_eq!(d, vec![2]);
     }
 
     #[test]
