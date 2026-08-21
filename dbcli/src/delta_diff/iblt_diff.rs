@@ -51,13 +51,33 @@ impl DiffStrategy for IbltDiffer {
         ctx: &DiffContext,
     ) -> Result<DiffReport, DbError> {
         let started = Utc::now();
+        ctx.vlog(format!(
+            "[delta-diff] strategy=iblt consistency={} key={} capacity={} strict={}",
+            ctx.consistency.as_str(),
+            ctx.key_column,
+            ctx.iblt_capacity,
+            ctx.strict
+        ));
         match self.try_iblt(left, right, ctx).await {
             Ok(mut report) => {
                 report.started_at = started;
                 report.finished_at = Utc::now();
+                ctx.vlog(format!(
+                    "[shard] iblt {} left={} right={} diff={}",
+                    if report.has_diff() { "diff" } else { "match" },
+                    report.summary.left_total,
+                    report.summary.right_total,
+                    report.summary.missing_left
+                        + report.summary.missing_right
+                        + report.summary.modified
+                ));
                 Ok(report)
             }
             Err(IbltFailure::Capacity) if !ctx.strict => {
+                ctx.vlog(format!(
+                    "[delta-diff] iblt capacity exceeded (d > {}), falling back to hashdiff",
+                    ctx.iblt_capacity
+                ));
                 let mut report = hash_diff::HashDiffer.diff(left, right, ctx).await?;
                 report.warnings.push(format!(
                     "fallback: hashdiff (iblt capacity exceeded, d > {})",
@@ -72,6 +92,10 @@ impl DiffStrategy for IbltDiffer {
             // §2.3 + §16.3-F8：方言能力不足（如 Oracle 19c 无 BIT_XOR_AGG）也透明回退；
             // --strict 下原样报错
             Err(IbltFailure::Db(e)) if !ctx.strict => {
+                ctx.vlog(format!(
+                    "[delta-diff] iblt unavailable on this backend ({}), falling back to hashdiff",
+                    e
+                ));
                 let mut report = hash_diff::HashDiffer.diff(left, right, ctx).await?;
                 report.warnings.push(format!(
                     "fallback: hashdiff (iblt unavailable on this backend: {})",
@@ -107,13 +131,17 @@ impl IbltDiffer {
         let mut queries = 0u64;
 
         if ctx.consistency == ConsistencyMode::Snapshot {
-            open_snapshot(left).await.map_err(IbltFailure::Db)?;
-            open_snapshot(right).await.map_err(IbltFailure::Db)?;
+            open_snapshot(left, ctx.verbose)
+                .await
+                .map_err(IbltFailure::Db)?;
+            open_snapshot(right, ctx.verbose)
+                .await
+                .map_err(IbltFailure::Db)?;
             let _ = ctx.scns.set((
-                hash_diff::capture_scn(left)
+                hash_diff::capture_scn(left, ctx.verbose)
                     .await
                     .map_err(IbltFailure::Db)?,
-                hash_diff::capture_scn(right)
+                hash_diff::capture_scn(right, ctx.verbose)
                     .await
                     .map_err(IbltFailure::Db)?,
             ));
@@ -124,6 +152,7 @@ impl IbltDiffer {
             .await;
 
         if ctx.consistency == ConsistencyMode::Snapshot {
+            ctx.vlog("[sql] COMMIT");
             let _ = left.query_drop("COMMIT").await;
             let _ = right.query_drop("COMMIT").await;
         }
@@ -133,7 +162,7 @@ impl IbltDiffer {
         if ctx.recheck && !diffs.is_empty() {
             let lspec = hash_diff::keyset_spec(ctx, true, left.dialect())?;
             let rspec = hash_diff::keyset_spec(ctx, false, right.dialect())?;
-            recheck_diffs(left, right, &lspec, &rspec, &mut diffs).await?;
+            recheck_diffs(left, right, &lspec, &rspec, &mut diffs, ctx.verbose).await?;
             queries += 2 * diffs.len() as u64;
         }
 
@@ -159,6 +188,8 @@ impl IbltDiffer {
     ) -> Result<(Vec<DiffRow>, &'static str, u64, u64), IbltFailure> {
         let lsql = render_iblt(left, ctx, m, true).map_err(IbltFailure::Db)?;
         let rsql = render_iblt(right, ctx, m, false).map_err(IbltFailure::Db)?;
+        ctx.vlog(format!("[sql:left] {lsql}"));
+        ctx.vlog(format!("[sql:right] {rsql}"));
 
         let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
         *queries += 2;

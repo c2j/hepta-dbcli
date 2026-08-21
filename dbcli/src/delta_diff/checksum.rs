@@ -46,9 +46,10 @@ pub(crate) fn tuples_equal(a: &ChecksumTuple, b: &ChecksumTuple) -> bool {
 pub(crate) async fn run_checksum(
     conn: &mut dyn DbConn,
     spec: &ChecksumSqlSpec,
+    verbose: bool,
 ) -> Result<ChecksumTuple, DbError> {
     let sql = conn.dialect().render_checksum_sql(spec);
-    run_checksum_sql(conn, &sql).await
+    run_checksum_sql(conn, &sql, verbose).await
 }
 
 /// Execute a pre-rendered checksum SQL (none-mode parallel tasks render
@@ -56,7 +57,11 @@ pub(crate) async fn run_checksum(
 pub(crate) async fn run_checksum_sql(
     conn: &mut dyn DbConn,
     sql: &str,
+    verbose: bool,
 ) -> Result<ChecksumTuple, DbError> {
+    if verbose {
+        eprintln!("[sql] {sql}");
+    }
     let result = conn.query(sql).await?;
     let row = result
         .rows
@@ -293,7 +298,7 @@ mod tests {
             ],
             last_sql: String::new(),
         };
-        let t = run_checksum(&mut conn, &spec()).await.unwrap();
+        let t = run_checksum(&mut conn, &spec(), false).await.unwrap();
         assert_eq!(
             t.as_array(),
             [
@@ -335,7 +340,7 @@ mod tests {
             }
         }
         let mut conn = EmptyConn;
-        let err = run_checksum(&mut conn, &spec()).await.unwrap_err();
+        let err = run_checksum(&mut conn, &spec(), false).await.unwrap_err();
         assert!(err.to_string().contains("no rows"), "{err}");
     }
 }
@@ -449,7 +454,7 @@ mod integration_tests {
                     .normalized_exprs(self.conn.dialect())
                     .expect("normalized_exprs failed"),
             };
-            run_checksum(&mut *self.conn, &spec)
+            run_checksum(&mut *self.conn, &spec, false)
                 .await
                 .expect("run_checksum failed")
         }

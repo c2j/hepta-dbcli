@@ -47,17 +47,28 @@ impl DiffStrategy for HashDiffer {
             shard_ms: Vec::new(),
         };
 
+        ctx.vlog(format!(
+            "[delta-diff] strategy=hashdiff consistency={} key={} threads={} bisection_factor={} threshold={}",
+            ctx.consistency.as_str(),
+            ctx.key_column,
+            ctx.threads,
+            ctx.bisection_factor,
+            ctx.bisection_threshold
+        ));
+
         if ctx.consistency == ConsistencyMode::Snapshot {
-            open_snapshot(left).await?;
-            open_snapshot(right).await?;
-            let _ = ctx
-                .scns
-                .set((capture_scn(left).await?, capture_scn(right).await?));
+            open_snapshot(left, ctx.verbose).await?;
+            open_snapshot(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((
+                capture_scn(left, ctx.verbose).await?,
+                capture_scn(right, ctx.verbose).await?,
+            ));
         }
 
         let result = self.diff_inner(left, right, ctx, &mut counters).await;
 
         if ctx.consistency == ConsistencyMode::Snapshot {
+            ctx.vlog("[sql] COMMIT");
             let _ = left.query_drop("COMMIT").await;
             let _ = right.query_drop("COMMIT").await;
         }
@@ -67,7 +78,7 @@ impl DiffStrategy for HashDiffer {
         if ctx.recheck && !diffs.is_empty() {
             let lspec = keyset_spec(ctx, true, left.dialect())?;
             let rspec = keyset_spec(ctx, false, right.dialect())?;
-            recheck_diffs(left, right, &lspec, &rspec, &mut diffs).await?;
+            recheck_diffs(left, right, &lspec, &rspec, &mut diffs, ctx.verbose).await?;
             counters.queries += 2 * diffs.len() as u64;
         }
 
@@ -176,6 +187,8 @@ impl HashDiffer {
                 seg,
                 right.dialect(),
             )?);
+            ctx.vlog(format!("[sql:left] {lsql}"));
+            ctx.vlog(format!("[sql:right] {rsql}"));
             let (lp, rp) = (Arc::clone(&ctx.left_pool), Arc::clone(&ctx.right_pool));
             let sem = Arc::clone(&sem);
             set.spawn(async move {
@@ -185,9 +198,10 @@ impl HashDiffer {
                     .map_err(|e| DbError::query(format!("semaphore: {e}")))?;
                 let t0 = Instant::now();
                 let (mut lc, mut rc) = (lp.acquire().await?, rp.acquire().await?);
+                // SQL 已在父循环按序打印（ctx.vlog），任务内不重复输出
                 let (l, r) = tokio::join!(
-                    run_checksum_sql(&mut *lc, &lsql),
-                    run_checksum_sql(&mut *rc, &rsql)
+                    run_checksum_sql(&mut *lc, &lsql, false),
+                    run_checksum_sql(&mut *rc, &rsql, false)
                 );
                 Ok((seg.0, seg.1, l?, r?, t0.elapsed().as_millis() as u64))
             });
@@ -218,6 +232,9 @@ impl HashDiffer {
         if let Some(cp) = &ctx.checkpoint {
             let id = format!("{}-{}", range.0, range.1);
             if let Some((lc, rc, dc)) = cp.lock().await.completed(&id) {
+                ctx.vlog(format!(
+                    "[shard] {id} skipped left={lc} right={rc} diff={dc}"
+                ));
                 shards.push(ShardResult {
                     shard_id: id,
                     key_range: (Value::from(range.0), Value::from(range.1)),
@@ -232,7 +249,10 @@ impl HashDiffer {
         }
         let lspec = checksum_spec(ctx, true, range, left.dialect())?;
         let rspec = checksum_spec(ctx, false, range, right.dialect())?;
-        let (lsum, rsum) = tokio::join!(run_checksum(left, &lspec), run_checksum(right, &rspec));
+        let (lsum, rsum) = tokio::join!(
+            run_checksum(left, &lspec, ctx.verbose),
+            run_checksum(right, &rspec, ctx.verbose)
+        );
         let (lsum, rsum) = (lsum?, rsum?);
         counters.queries += 2;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -268,6 +288,10 @@ impl HashDiffer {
             ));
             self.record_checkpoint(ctx, range, "Match", lsum.count, rsum.count, 0)
                 .await?;
+            ctx.vlog(format!(
+                "[shard] {}-{} match left={} right={} diff=0 ({}ms)",
+                range.0, range.1, lsum.count, rsum.count, elapsed_ms
+            ));
             return Ok(());
         }
 
@@ -276,20 +300,25 @@ impl HashDiffer {
             let t0 = Instant::now();
             let lspec = keyset_spec(ctx, true, left.dialect())?;
             let rspec = keyset_spec(ctx, false, right.dialect())?;
-            let detail = row_level_diff(left, right, &lspec, &rspec, range).await?;
+            let detail = row_level_diff(left, right, &lspec, &rspec, range, ctx.verbose).await?;
             counters.queries += 2 * (1 + detail.left_count.max(detail.right_count) / 8192);
             let n = detail.rows.len() as u64;
             diffs.extend(detail.rows);
+            let total_ms = elapsed_ms + t0.elapsed().as_millis() as u64;
             shards.push(shard_result(
                 range,
                 lsum,
                 rsum,
                 ShardStatus::Diff,
                 n,
-                elapsed_ms + t0.elapsed().as_millis() as u64,
+                total_ms,
             ));
             self.record_checkpoint(ctx, range, "Diff", lsum.count, rsum.count, n)
                 .await?;
+            ctx.vlog(format!(
+                "[shard] {}-{} diff left={} right={} diff={} ({}ms)",
+                range.0, range.1, lsum.count, rsum.count, n, total_ms
+            ));
             return Ok(());
         }
 
@@ -334,7 +363,10 @@ impl HashDiffer {
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
-pub(crate) async fn open_snapshot(conn: &mut (dyn DbConn + Send)) -> Result<(), DbError> {
+pub(crate) async fn open_snapshot(
+    conn: &mut (dyn DbConn + Send),
+    verbose: bool,
+) -> Result<(), DbError> {
     let (scheme, snapshot_sql, polardbx_sql) = {
         let d = conn.dialect();
         (
@@ -344,6 +376,9 @@ pub(crate) async fn open_snapshot(conn: &mut (dyn DbConn + Send)) -> Result<(), 
         )
     };
     if scheme == "mysql" {
+        if verbose {
+            eprintln!("[sql] SELECT VERSION()");
+        }
         let version: Option<String> = conn
             .query("SELECT VERSION()")
             .await
@@ -352,6 +387,10 @@ pub(crate) async fn open_snapshot(conn: &mut (dyn DbConn + Send)) -> Result<(), 
         if let Some(v) = version {
             if crate::backend::is_polardbx_version(&v) {
                 if let Some([set_iso, start]) = polardbx_sql {
+                    if verbose {
+                        eprintln!("[sql] {set_iso}");
+                        eprintln!("[sql] {start}");
+                    }
                     conn.query_drop(set_iso).await?;
                     conn.query_drop(start).await?;
                     return Ok(());
@@ -359,15 +398,24 @@ pub(crate) async fn open_snapshot(conn: &mut (dyn DbConn + Send)) -> Result<(), 
             }
         }
     }
+    if verbose {
+        eprintln!("[sql] {snapshot_sql}");
+    }
     conn.query_drop(&snapshot_sql).await
 }
 
 /// Oracle 快照模式下捕获 CURRENT_SCN（§8.2；其余方言返回 None）。
-pub(crate) async fn capture_scn(conn: &mut (dyn DbConn + Send)) -> Result<Option<u64>, DbError> {
+pub(crate) async fn capture_scn(
+    conn: &mut (dyn DbConn + Send),
+    verbose: bool,
+) -> Result<Option<u64>, DbError> {
     let sql = match conn.dialect().snapshot_scn_sql() {
         Some(s) => s.to_string(),
         None => return Ok(None),
     };
+    if verbose {
+        eprintln!("[sql] {sql}");
+    }
     let r = conn.query(&sql).await?;
     let scn = r
         .rows
@@ -402,6 +450,7 @@ async fn key_range(
         "SELECT MIN({q}{key}{q}), MAX({q}{key}{q}) FROM {table}{where_clause}",
         key = ctx.key_column
     );
+    ctx.vlog(format!("[sql] {sql}"));
     let r = conn.query(&sql).await?;
     let Some(row) = r.rows.first() else {
         return Ok((None, None));

@@ -45,6 +45,8 @@ pub(crate) struct DiffContext {
     pub(crate) strict: bool,
     /// Oracle AS OF SCN 锚点（左, 右），快照开启后由策略捕获（§8.2）
     pub(crate) scns: std::sync::OnceLock<(Option<u64>, Option<u64>)>,
+    /// 输出分片级进度与每步 SQL 到 stderr（§2.2 --verbose）
+    pub(crate) verbose: bool,
 }
 
 impl DiffContext {
@@ -53,6 +55,13 @@ impl DiffContext {
         self.scns
             .get()
             .and_then(|(l, r)| if is_left { *l } else { *r })
+    }
+
+    /// verbose 诊断输出（stderr；stdout 保留给报告，避免污染机器可读输出）。
+    pub(crate) fn vlog(&self, msg: impl std::fmt::Display) {
+        if self.verbose {
+            eprintln!("{msg}");
+        }
     }
 }
 
@@ -144,6 +153,7 @@ mod filter_tests {
             iblt_capacity: 65536,
             strict: false,
             scns: std::sync::OnceLock::new(),
+            verbose: false,
         }
     }
 
@@ -197,5 +207,18 @@ mod filter_tests {
             side_filter(&c, "mysql"),
             Some("ts >= '2026-08-01 00:00:00'".into())
         );
+    }
+
+    #[test]
+    fn verbose_flag_default_false() {
+        let c = ctx(None, None);
+        assert!(!c.verbose);
+    }
+
+    #[test]
+    fn verbose_flag_settable() {
+        let mut c = ctx(None, None);
+        c.verbose = true;
+        assert!(c.verbose);
     }
 }
