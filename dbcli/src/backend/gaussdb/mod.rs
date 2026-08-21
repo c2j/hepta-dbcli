@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::backend::error::DbError;
 use crate::backend::{
-    BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec,
+    BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec, NULL_SENTINEL,
 };
 use crate::config::TimeoutConfig;
 
@@ -156,7 +156,7 @@ impl Dialect for GaussdbDialect {
             }
         };
         Ok(if col.nullable {
-            format!("COALESCE({inner}, '␀NULL␀')")
+            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
         } else {
             inner
         })
@@ -331,12 +331,12 @@ mod tests {
         assert_eq!(
             d.normalize_expr(&col("amount", "numeric(20,6)", true))
                 .unwrap(),
-            "COALESCE(\"amount\"::text, '␀NULL␀')"
+            "COALESCE(\"amount\"::text, '\u{1f}NULL\u{1f}')"
         );
         assert_eq!(
             d.normalize_expr(&col("ts", "timestamp without time zone", true))
                 .unwrap(),
-            "COALESCE(to_char(\"ts\", 'YYYY-MM-DD HH24:MI:SS.US'), '␀NULL␀')"
+            "COALESCE(to_char(\"ts\", 'YYYY-MM-DD HH24:MI:SS.US'), '\u{1f}NULL\u{1f}')"
         );
         assert_eq!(
             d.normalize_expr(&col("tz", "timestamp with time zone", false))
@@ -349,7 +349,7 @@ mod tests {
         );
         assert_eq!(
             d.normalize_expr(&col("data", "bytea", true)).unwrap(),
-            "COALESCE(encode(\"data\", 'hex'), '␀NULL␀')"
+            "COALESCE(encode(\"data\", 'hex'), '\u{1f}NULL\u{1f}')"
         );
         assert!(d.normalize_expr(&col("doc", "text", true)).is_err());
     }

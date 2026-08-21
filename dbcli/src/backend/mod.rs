@@ -222,6 +222,12 @@ pub(crate) fn is_polardbx_version(version: &str) -> bool {
     version.to_uppercase().contains("PXC")
 }
 
+/// NULL 哨兵：`COALESCE` 回退值，用于跨库行哈希（v2.1 §九）。
+/// 纯 ASCII（Unit Separator 0x1F 包裹 "NULL"），避免 U+2400（␀）在 GBK 等
+/// 多字节编码库上无法表示而触发 SQLSTATE 22P05（issue #27）。
+/// 所有后端必须使用同一哨兵，跨库比较语义才一致。
+pub(crate) const NULL_SENTINEL: &str = "\u{1f}NULL\u{1f}";
+
 /// Column metadata for `Dialect::normalize_expr` (v2.1 §九).
 #[derive(Debug, Clone)]
 pub struct ColumnNormSpec {
@@ -321,6 +327,24 @@ pub(crate) fn ssl_url_param_for_scheme(scheme: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_sentinel_is_ascii_safe() {
+        assert_eq!(
+            NULL_SENTINEL, "\u{1f}NULL\u{1f}",
+            "changing the sentinel changes every row hash; keep it ASCII-safe (issue #27)"
+        );
+        assert!(
+            NULL_SENTINEL.bytes().all(|b| b < 0x80),
+            "NULL sentinel must be pure ASCII so it is representable in GBK/LATIN1/UTF-8"
+        );
+        assert!(
+            !NULL_SENTINEL
+                .bytes()
+                .any(|b| b == 0x00 || b == b'\'' || b == b'\\'),
+            "NUL is invalid in PG text; quote/backslash would break the SQL literal"
+        );
+    }
 
     #[test]
     fn test_default_port_mysql() {

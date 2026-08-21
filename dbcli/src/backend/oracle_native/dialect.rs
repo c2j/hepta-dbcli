@@ -1,5 +1,5 @@
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec};
+use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, NULL_SENTINEL};
 
 pub(crate) struct OracleDialect;
 
@@ -189,7 +189,7 @@ impl Dialect for OracleDialect {
             }
         };
         Ok(if col.nullable {
-            format!("COALESCE({inner}, '␀NULL␀')")
+            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
         } else {
             inner
         })
@@ -462,5 +462,39 @@ mod tests {
     #[test]
     fn test_no_hash_comment() {
         assert!(!OracleDialect.supports_hash_comment());
+    }
+
+    fn col(name: &str, ty: &str, nullable: bool) -> crate::backend::ColumnNormSpec {
+        crate::backend::ColumnNormSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn test_normalize_expr_matrix() {
+        let d = OracleDialect;
+        assert_eq!(
+            d.normalize_expr(&col("ID", "NUMBER", false)).unwrap(),
+            "TO_CHAR(\"ID\")"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("AMOUNT", "NUMBER", true)).unwrap(),
+            "COALESCE(TO_CHAR(\"AMOUNT\"), '\u{1f}NULL\u{1f}')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("CREATED", "DATE", false)).unwrap(),
+            "TO_CHAR(\"CREATED\", 'YYYY-MM-DD')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("TS", "TIMESTAMP(6)", false)).unwrap(),
+            "TO_CHAR(\"TS\", 'YYYY-MM-DD HH24:MI:SS.FF6')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("DATA", "RAW", true)).unwrap(),
+            "COALESCE(RAWTOHEX(\"DATA\"), '\u{1f}NULL\u{1f}')"
+        );
+        assert!(d.normalize_expr(&col("DOC", "CLOB", true)).is_err());
     }
 }

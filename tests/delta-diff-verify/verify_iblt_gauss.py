@@ -12,7 +12,7 @@ import sys
 import time
 
 sys.path.insert(0, ".")
-from gen_fixture import build_rows, row_hash_mysql_norm  # noqa: E402
+from gen_fixture import NULL_SENTINEL, build_rows, row_hash_mysql_norm  # noqa: E402
 
 K = 8
 KEY_BITS = 64
@@ -44,11 +44,11 @@ SELECT MOD(('x' || SUBSTR(h, 1, 8))::bit(32)::bigint, {K}) AS cell,
        {val_bits}
 FROM (
   SELECT MD5(concat_ws('#',
-    COALESCE(id::text, '␀NULL␀'), COALESCE(c_int::text, '␀NULL␀'),
-    COALESCE(c_dec::text, '␀NULL␀'),
-    COALESCE(to_char(c_dt, 'YYYY-MM-DD HH24:MI:SS.US'), '␀NULL␀'),
-    COALESCE(c_vc, '␀NULL␀'), COALESCE(c_bool::int::text, '␀NULL␀'),
-    COALESCE(c_null::text, '␀NULL␀'))) AS h, id
+    COALESCE(id::text, '{NULL_SENTINEL}'), COALESCE(c_int::text, '{NULL_SENTINEL}'),
+    COALESCE(c_dec::text, '{NULL_SENTINEL}'),
+    COALESCE(to_char(c_dt, 'YYYY-MM-DD HH24:MI:SS.US'), '{NULL_SENTINEL}'),
+    COALESCE(c_vc, '{NULL_SENTINEL}'), COALESCE(c_bool::int::text, '{NULL_SENTINEL}'),
+    COALESCE(c_null::text, '{NULL_SENTINEL}'))) AS h, id
   FROM verify_t
 ) t
 GROUP BY cell ORDER BY cell;

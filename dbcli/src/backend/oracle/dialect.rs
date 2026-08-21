@@ -1,5 +1,5 @@
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec};
+use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, NULL_SENTINEL};
 
 pub(crate) struct OracleDialect;
 
@@ -189,7 +189,7 @@ impl Dialect for OracleDialect {
             }
         };
         Ok(if col.nullable {
-            format!("COALESCE({inner}, '␀NULL␀')")
+            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
         } else {
             inner
         })
@@ -492,7 +492,7 @@ mod tests {
         );
         assert_eq!(
             d.normalize_expr(&col("AMOUNT", "NUMBER", true)).unwrap(),
-            "COALESCE(TO_CHAR(\"AMOUNT\"), '␀NULL␀')"
+            "COALESCE(TO_CHAR(\"AMOUNT\"), '\u{1f}NULL\u{1f}')"
         );
         assert_eq!(
             d.normalize_expr(&col("CREATED", "DATE", false)).unwrap(),
@@ -504,7 +504,7 @@ mod tests {
         );
         assert_eq!(
             d.normalize_expr(&col("DATA", "RAW", true)).unwrap(),
-            "COALESCE(RAWTOHEX(\"DATA\"), '␀NULL␀')"
+            "COALESCE(RAWTOHEX(\"DATA\"), '\u{1f}NULL\u{1f}')"
         );
         assert!(d.normalize_expr(&col("DOC", "CLOB", true)).is_err());
     }

@@ -20,6 +20,15 @@ pub(crate) struct GaussdbPool {
     tls: Option<gaussdb::native_tls::MakeTlsConnector>,
 }
 
+impl std::fmt::Debug for GaussdbPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GaussdbPool")
+            .field("conn_str", &redact_password(&self.conn_str))
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
+}
+
 pub(crate) async fn create_gaussdb_pool(url: &str) -> Result<GaussdbPool, DbError> {
     let conn_str = normalize_gaussdb_url(url);
     let tls = match parse_sslmode(&conn_str) {
@@ -60,6 +69,12 @@ impl GaussdbPool {
         let _ = client
             .simple_query("SET default_transaction_read_only = ON")
             .await;
+        // 防御性兜底（issue #27）：驱动启动握手已协商 client_encoding=UTF8
+        // （rust-opengauss connect_raw.rs），此处再显式 SET，防止未来驱动行为
+        // 变化时服务端回落到库默认编码，误读本驱动按 UTF-8 发送的字面量。
+        if let Err(e) = client.simple_query("SET client_encoding = 'UTF8'").await {
+            tracing::warn!("failed to set client_encoding=UTF8: {e}");
+        }
         Ok(client)
     }
 }
