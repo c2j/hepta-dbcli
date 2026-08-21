@@ -757,6 +757,7 @@ impl DbMcp {
         };
         let opts = crate::delta_diff::api::DiffOptions {
             iblt_capacity: 65536,
+            fetch_all_threshold: 4096,
             strict: false,
             strategy,
             key: params.key_columns.clone().unwrap_or_default(),

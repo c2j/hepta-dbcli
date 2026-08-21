@@ -346,6 +346,7 @@ async fn execute_diff_inner(
         route_warnings: routed.warnings,
         checkpoint,
         iblt_capacity: args.iblt_capacity,
+        fetch_all_threshold: args.fetch_all_threshold,
         strict: args.strict,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,

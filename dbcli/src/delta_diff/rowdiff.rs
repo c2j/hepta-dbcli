@@ -24,7 +24,7 @@ pub(crate) async fn row_level_diff(
     right: &mut (dyn DbConn + Send),
     left_spec: &KeysetPageSpec,
     right_spec: &KeysetPageSpec,
-    range: (i64, i64),
+    range: Option<(i64, i64)>,
     key_arity: usize,
     verbose: bool,
 ) -> Result<RangeDiff, DbError> {
@@ -200,7 +200,7 @@ fn diff_row_n(row: &[Value], arity: usize, is_left: bool, status: DiffStatus) ->
 struct PageCursor<'a> {
     conn: &'a mut (dyn DbConn + Send),
     base: &'a KeysetPageSpec,
-    range: (i64, i64),
+    range: Option<(i64, i64)>,
     last_key: Option<Vec<Value>>,
     key_arity: usize,
     exhausted: bool,
@@ -211,7 +211,7 @@ impl<'a> PageCursor<'a> {
     fn new(
         conn: &'a mut (dyn DbConn + Send),
         base: &'a KeysetPageSpec,
-        range: (i64, i64),
+        range: Option<(i64, i64)>,
         key_arity: usize,
         verbose: bool,
     ) -> Self {
@@ -233,7 +233,7 @@ impl<'a> PageCursor<'a> {
             columns: self.base.columns.clone(),
             raw_exprs: self.base.raw_exprs,
             key_columns: self.base.key_columns.clone(),
-            range: Some(self.range),
+            range: self.range,
             last_key: self.last_key.clone(),
             page_size: PAGE_SIZE,
             filter: self.base.filter.clone(),
@@ -337,9 +337,17 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "B"), (4, "d"), (5, "e")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), 1, false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(diff.rows.len(), 3);
         assert_eq!(diff.rows[0].status, DiffStatus::Modified);
         assert_eq!(diff.rows[0].key, Value::from(2));
@@ -359,9 +367,17 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), 1, false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(diff.rows.is_empty());
         assert_eq!(diff.left_count, 2);
         assert_eq!(diff.right_count, 2);
@@ -377,9 +393,17 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), 1, false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(diff.rows.len(), 2);
         assert!(diff
             .rows

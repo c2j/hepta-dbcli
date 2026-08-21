@@ -175,6 +175,10 @@ pub(crate) struct DeltaDiffArgs {
     /// 与 --strategy iblt 联用：解码失败时报错（exit 2）而非回退
     #[arg(long)]
     pub strict: bool,
+
+    /// Keyeddiff: pull all filtered rows when max(COUNT) is at most this (default 4096)
+    #[arg(long, default_value_t = 4096)]
+    pub fetch_all_threshold: u64,
 }
 
 // ─── Helpers & validation ──────────────────────────────────────────────
@@ -268,6 +272,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.strategy, Strategy::Auto);
+        assert_eq!(args.fetch_all_threshold, 4096);
         assert_eq!(args.bisection_factor, 32);
         assert_eq!(args.bisection_threshold, 16384);
         assert_eq!(args.consistency, ConsistencyMode::Snapshot);
