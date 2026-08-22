@@ -552,6 +552,7 @@ pub(crate) fn keyset_spec(
         columns,
         raw_exprs: true,
         key_columns: vec![ctx.key_column.clone()],
+        string_key: vec![false],
         range: None,
         last_key: None,
         page_size: 8192,

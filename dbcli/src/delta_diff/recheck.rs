@@ -106,6 +106,7 @@ mod tests {
             columns: vec!["id".into(), "v".into()],
             raw_exprs: false,
             key_columns: vec!["id".into()],
+            string_key: vec![false],
             range: None,
             last_key: None,
             page_size: 8192,

@@ -278,6 +278,8 @@ pub struct KeysetPageSpec {
     pub raw_exprs: bool,
     /// Key columns in PK order. First column is used for optional i64 `range`.
     pub key_columns: Vec<String>,
+    /// Parallel to `key_columns`: true if that key is a string type (needs binary collation).
+    pub string_key: Vec<bool>,
     pub range: Option<(i64, i64)>,
     /// Exclusive lower bound of the last seen key tuple (JSON numbers/strings).
     pub last_key: Option<Vec<Value>>,
@@ -320,25 +322,44 @@ pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
     }
 }
 
+pub(crate) fn key_sort_expr(quote: char, name: &str, is_string: bool, scheme: &str) -> String {
+    let q = quote_ident(quote, name);
+    if !is_string {
+        return q;
+    }
+    match scheme {
+        "mysql" => format!("{q} COLLATE utf8mb4_bin"),
+        "gaussdb" => format!("{q} COLLATE \"C\""),
+        "oracle" => format!("NLSSORT({q},'NLS_SORT=BINARY')"),
+        _ => q,
+    }
+}
+
+fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
+    spec.string_key.get(i).copied().unwrap_or(false)
+}
+
 pub(crate) fn render_tuple_gt(
     quote: char,
-    keys: &[String],
+    spec: &KeysetPageSpec,
     last: &[Value],
     backslash_escape: bool,
+    scheme: &str,
 ) -> String {
+    let keys = &spec.key_columns;
     let mut parts = Vec::new();
     for i in 0..keys.len().min(last.len()) {
         let mut ands = Vec::new();
-        for (key, val) in keys.iter().zip(last.iter()).take(i) {
+        for j in 0..i {
             ands.push(format!(
                 "{} = {}",
-                quote_ident(quote, key),
-                sql_literal(val, backslash_escape)
+                key_sort_expr(quote, &keys[j], is_string_key(spec, j), scheme),
+                sql_literal(&last[j], backslash_escape)
             ));
         }
         ands.push(format!(
             "{} > {}",
-            quote_ident(quote, &keys[i]),
+            key_sort_expr(quote, &keys[i], is_string_key(spec, i), scheme),
             sql_literal(&last[i], backslash_escape)
         ));
         parts.push(format!("({})", ands.join(" AND ")));
@@ -350,6 +371,7 @@ pub(crate) fn keyset_key_conds(
     quote: char,
     spec: &KeysetPageSpec,
     backslash_escape: bool,
+    scheme: &str,
 ) -> Vec<String> {
     let mut conds = Vec::new();
     if let (Some(k), Some((lo, hi))) = (spec.key_columns.first(), spec.range) {
@@ -360,17 +382,18 @@ pub(crate) fn keyset_key_conds(
         if !spec.key_columns.is_empty() && !last.is_empty() {
             conds.push(format!(
                 "({})",
-                render_tuple_gt(quote, &spec.key_columns, last, backslash_escape)
+                render_tuple_gt(quote, spec, last, backslash_escape, scheme)
             ));
         }
     }
     conds
 }
 
-pub(crate) fn keyset_order_by(quote: char, spec: &KeysetPageSpec) -> String {
+pub(crate) fn keyset_order_by(quote: char, spec: &KeysetPageSpec, scheme: &str) -> String {
     spec.key_columns
         .iter()
-        .map(|c| quote_ident(quote, c))
+        .enumerate()
+        .map(|(i, c)| key_sort_expr(quote, c, is_string_key(spec, i), scheme))
         .collect::<Vec<_>>()
         .join(", ")
 }

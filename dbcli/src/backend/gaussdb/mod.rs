@@ -256,7 +256,7 @@ impl Dialect for GaussdbDialect {
             Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
             None => format!("\"{}\"", spec.table),
         };
-        let mut conds = crate::backend::keyset_key_conds('"', spec, false);
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false, "gaussdb");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -268,7 +268,7 @@ impl Dialect for GaussdbDialect {
         format!(
             "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nLIMIT {}",
             cols.join(", "),
-            crate::backend::keyset_order_by('"', spec),
+            crate::backend::keyset_order_by('"', spec, "gaussdb"),
             spec.page_size
         )
     }
@@ -438,6 +438,7 @@ mod tests {
             columns: vec!["k1".into(), "k2".into()],
             raw_exprs: false,
             key_columns: vec!["k1".into(), "k2".into()],
+            string_key: vec![false, false],
             range: None,
             last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
             page_size: 50,

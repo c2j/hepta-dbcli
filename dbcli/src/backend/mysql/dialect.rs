@@ -249,7 +249,7 @@ impl Dialect for MySqlDialect {
             Some(s) => format!("`{}`.`{}`", s, spec.table),
             None => format!("`{}`", spec.table),
         };
-        let mut conds = crate::backend::keyset_key_conds('`', spec, true);
+        let mut conds = crate::backend::keyset_key_conds('`', spec, true, "mysql");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -261,7 +261,7 @@ impl Dialect for MySqlDialect {
         format!(
             "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nLIMIT {}",
             cols.join(", "),
-            crate::backend::keyset_order_by('`', spec),
+            crate::backend::keyset_order_by('`', spec, "mysql"),
             spec.page_size
         )
     }
@@ -444,6 +444,7 @@ mod tests {
             columns: vec!["id".into(), "amount".into()],
             raw_exprs: false,
             key_columns: vec!["id".into()],
+            string_key: vec![false],
             range: Some((0, 100000)),
             last_key: Some(vec![serde_json::json!(8191)]),
             page_size: 8192,
@@ -466,6 +467,7 @@ mod tests {
             columns: vec!["k1".into(), "k2".into(), "payload".into()],
             raw_exprs: false,
             key_columns: vec!["k1".into(), "k2".into()],
+            string_key: vec![false, false],
             range: None,
             last_key: None,
             page_size: 100,
@@ -489,6 +491,7 @@ mod tests {
             columns: vec!["k1".into(), "k2".into()],
             raw_exprs: false,
             key_columns: vec!["k1".into(), "k2".into()],
+            string_key: vec![false, false],
             range: None,
             last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
             page_size: 50,
@@ -501,6 +504,47 @@ mod tests {
             "sql={sql}"
         );
         assert!(sql.contains("ORDER BY `k1`, `k2`"));
+    }
+
+    #[test]
+    fn keyset_order_by_string_key_uses_utf8mb4_bin() {
+        let spec = KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["code".into()],
+            raw_exprs: false,
+            key_columns: vec!["code".into()],
+            string_key: vec![true],
+            range: None,
+            last_key: None,
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let sql = MySqlDialect.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("ORDER BY `code` COLLATE utf8mb4_bin"),
+            "sql={sql}"
+        );
+    }
+
+    #[test]
+    fn keyset_order_by_int_key_has_no_collate() {
+        let spec = KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["id".into()],
+            raw_exprs: false,
+            key_columns: vec!["id".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: None,
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let sql = MySqlDialect.render_keyset_page_sql(&spec);
+        assert!(!sql.contains("COLLATE"), "sql={sql}");
     }
 
     #[test]

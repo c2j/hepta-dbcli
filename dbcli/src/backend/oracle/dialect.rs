@@ -300,7 +300,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds = crate::backend::keyset_key_conds('"', spec, false);
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false, "oracle");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -312,7 +312,7 @@ impl Dialect for OracleDialect {
         format!(
             "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
             cols.join(", "),
-            crate::backend::keyset_order_by('"', spec),
+            crate::backend::keyset_order_by('"', spec, "oracle"),
             spec.page_size
         )
     }
@@ -596,6 +596,7 @@ mod tests {
             columns: vec!["ID".into()],
             raw_exprs: false,
             key_columns: vec!["ID".into()],
+            string_key: vec![false],
             range: None,
             last_key: Some(vec![serde_json::json!(42)]),
             page_size: 8192,
@@ -617,6 +618,7 @@ mod tests {
             columns: vec!["K1".into(), "K2".into()],
             raw_exprs: false,
             key_columns: vec!["K1".into(), "K2".into()],
+            string_key: vec![false, false],
             range: None,
             last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
             page_size: 50,

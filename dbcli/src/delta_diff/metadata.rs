@@ -37,6 +37,46 @@ impl TablePlan {
 
     /// Checksum / bucket-hash expressions: key columns first (even if
     /// `--columns` excluded them), then remaining compare columns.
+    pub(crate) fn key_is_string(data_type: &str) -> bool {
+        let b = data_type
+            .split('(')
+            .next()
+            .unwrap_or(data_type)
+            .trim()
+            .to_lowercase();
+        matches!(
+            b.as_str(),
+            "char"
+                | "varchar"
+                | "varchar2"
+                | "nvarchar"
+                | "nvarchar2"
+                | "text"
+                | "tinytext"
+                | "mediumtext"
+                | "longtext"
+                | "clob"
+                | "nclob"
+                | "bpchar"
+                | "name"
+                | "character"
+                | "character varying"
+        )
+    }
+
+    pub(crate) fn string_key_flags(&self) -> Vec<bool> {
+        self.key_columns
+            .iter()
+            .map(|k| {
+                self.norm_specs
+                    .iter()
+                    .find(|s| &s.name == k)
+                    .map(|s| Self::key_is_string(&s.data_type))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub(crate) fn identity_hash_exprs(
         &self,
         dialect: &dyn Dialect,

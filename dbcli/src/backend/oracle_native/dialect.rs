@@ -300,7 +300,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds = crate::backend::keyset_key_conds('"', spec, false);
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false, "oracle");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -312,7 +312,7 @@ impl Dialect for OracleDialect {
         format!(
             "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
             cols.join(", "),
-            crate::backend::keyset_order_by('"', spec),
+            crate::backend::keyset_order_by('"', spec, "oracle"),
             spec.page_size
         )
     }
