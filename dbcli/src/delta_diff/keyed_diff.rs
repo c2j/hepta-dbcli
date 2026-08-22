@@ -125,17 +125,9 @@ impl KeyedDiffer {
         if left_total.max(right_total) <= ctx.fetch_all_threshold {
             let lspec = full_row_spec(ctx, true, left.dialect(), None)?;
             let rspec = full_row_spec(ctx, false, right.dialect(), None)?;
-            let detail = row_level_diff(
-                left,
-                right,
-                &lspec,
-                &rspec,
-                None,
-                arity,
-                ctx.verbose,
-                queries,
-            )
-            .await?;
+            let detail =
+                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            *queries += detail.queries;
             return Ok((detail.rows, left_total, right_total));
         }
 
@@ -171,17 +163,9 @@ impl KeyedDiffer {
             );
             let lspec = full_row_spec(ctx, true, left.dialect(), Some(&lpred))?;
             let rspec = full_row_spec(ctx, false, right.dialect(), Some(&rpred))?;
-            let detail = row_level_diff(
-                left,
-                right,
-                &lspec,
-                &rspec,
-                None,
-                arity,
-                ctx.verbose,
-                queries,
-            )
-            .await?;
+            let detail =
+                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            *queries += detail.queries;
             rows.extend(detail.rows);
         }
         Ok((rows, left_total, right_total))

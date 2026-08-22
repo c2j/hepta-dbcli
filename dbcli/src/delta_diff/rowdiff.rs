@@ -15,6 +15,7 @@ pub(crate) struct RangeDiff {
     pub(crate) rows: Vec<DiffRow>,
     pub(crate) left_count: u64,
     pub(crate) right_count: u64,
+    pub(crate) queries: u64,
 }
 
 /// 双侧 keyset 分页归并。两侧各自持有分页 spec（表名/schema 可不同）。
@@ -27,19 +28,20 @@ pub(crate) async fn row_level_diff(
     range: Option<(i64, i64)>,
     key_arity: usize,
     verbose: bool,
-    queries: &mut u64,
 ) -> Result<RangeDiff, DbError> {
     let arity = key_arity.max(1);
     let mut left_page = PageCursor::new(left, left_spec, range, arity, verbose);
     let mut right_page = PageCursor::new(right, right_spec, range, arity, verbose);
+    let mut queries = 0u64;
     let mut out = RangeDiff {
         rows: Vec::new(),
         left_count: 0,
         right_count: 0,
+        queries: 0,
     };
 
-    let mut lbuf = fetch_page(&mut left_page, queries).await?;
-    let mut rbuf = fetch_page(&mut right_page, queries).await?;
+    let mut lbuf = fetch_page(&mut left_page, &mut queries).await?;
+    let mut rbuf = fetch_page(&mut right_page, &mut queries).await?;
     let (mut li, mut ri) = (0usize, 0usize);
 
     loop {
@@ -53,12 +55,12 @@ pub(crate) async fn row_level_diff(
                     &mut out,
                     Side::Right,
                     arity,
-                    queries,
+                    &mut queries,
                 )
                 .await?;
                 break;
             }
-            lbuf = fetch_page(&mut left_page, queries).await?;
+            lbuf = fetch_page(&mut left_page, &mut queries).await?;
             li = 0;
             continue;
         }
@@ -71,12 +73,12 @@ pub(crate) async fn row_level_diff(
                     &mut out,
                     Side::Left,
                     arity,
-                    queries,
+                    &mut queries,
                 )
                 .await?;
                 break;
             }
-            rbuf = fetch_page(&mut right_page, queries).await?;
+            rbuf = fetch_page(&mut right_page, &mut queries).await?;
             ri = 0;
             continue;
         }
@@ -113,6 +115,7 @@ pub(crate) async fn row_level_diff(
             }
         }
     }
+    out.queries = queries;
     Ok(out)
 }
 
@@ -402,7 +405,6 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "B"), (4, "d"), (5, "e")])]),
             dialect: MySqlDialect,
         };
-        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -411,11 +413,10 @@ mod tests {
             Some((0, 100)),
             1,
             false,
-            &mut queries,
         )
         .await
         .unwrap();
-        assert_eq!(queries, 2);
+        assert_eq!(diff.queries, 2);
         assert_eq!(diff.rows.len(), 3);
         assert_eq!(diff.rows[0].status, DiffStatus::Modified);
         assert_eq!(diff.rows[0].key, Value::from(2));
@@ -435,7 +436,6 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -444,11 +444,10 @@ mod tests {
             Some((0, 100)),
             1,
             false,
-            &mut queries,
         )
         .await
         .unwrap();
-        assert_eq!(queries, 2);
+        assert_eq!(diff.queries, 2);
         assert!(diff.rows.is_empty());
         assert_eq!(diff.left_count, 2);
         assert_eq!(diff.right_count, 2);
@@ -464,7 +463,6 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -473,11 +471,10 @@ mod tests {
             Some((0, 100)),
             1,
             false,
-            &mut queries,
         )
         .await
         .unwrap();
-        assert_eq!(queries, 2);
+        assert_eq!(diff.queries, 2);
         assert_eq!(diff.rows.len(), 2);
         assert!(diff
             .rows
