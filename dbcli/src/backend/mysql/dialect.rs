@@ -214,7 +214,16 @@ impl Dialect for MySqlDialect {
             format!("\n  WHERE {}", conds.join("\n    AND "))
         };
         let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
-        let bkt = format!("MOD(CONV(SUBSTRING(h, 1, 8), 16, 10), {modulus})");
+        let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
+            (format!("SELECT {row_hash} AS h"), "h".to_string())
+        } else {
+            let key_hash = format!("MD5(CONCAT_WS('#', {}))", spec.key_hash_exprs.join(", "));
+            (
+                format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
+                "kh".to_string(),
+            )
+        };
+        let bkt = format!("MOD(CONV(SUBSTRING({bkt_src}, 1, 8), 16, 10), {modulus})");
         let slice = |i: u32| {
             format!(
                 "MOD(SUM(CONV(SUBSTRING(h, {:2}, 8), 16, 10)), 18446744073709551616) AS s{i}",
@@ -222,7 +231,7 @@ impl Dialect for MySqlDialect {
             )
         };
         format!(
-            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  {inner_select}\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
             slice(1),
             slice(2),
             slice(3),
@@ -398,6 +407,7 @@ mod tests {
             filter: None,
             scn: None,
             normalized_exprs: vec!["CAST(`id` AS CHAR)".into(), "`name`".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_checksum_sql(&spec);
         assert!(
@@ -427,6 +437,7 @@ mod tests {
             filter: Some("status = 'paid'".into()),
             scn: None,
             normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_checksum_sql(&spec);
         assert!(sql.contains("`id` >= 0 AND `id` < 1000"));
@@ -548,6 +559,38 @@ mod tests {
     }
 
     #[test]
+    fn batch_checksum_sql_buckets_by_key_hash_when_set() {
+        let spec = ChecksumSqlSpec {
+            schema: None,
+            table: "t".into(),
+            key_column: None,
+            range: None,
+            bucket: Some((8, 0)),
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["CAST(`id` AS CHAR)".into(), "`payload`".into()],
+            key_hash_exprs: vec!["CAST(`id` AS CHAR)".into()],
+        };
+        let sql = MySqlDialect.render_batch_checksum_sql(&spec);
+        assert!(
+            sql.contains("MD5(CONCAT_WS('#', CAST(`id` AS CHAR))) AS kh"),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("MD5(CONCAT_WS('#', CAST(`id` AS CHAR), `payload`)) AS h"),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY MOD(CONV(SUBSTRING(kh, 1, 8), 16, 10), 8)"),
+            "sql={sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY MOD(CONV(SUBSTRING(h, 1, 8)"),
+            "sql={sql}"
+        );
+    }
+
+    #[test]
     fn batch_checksum_sql_groups_by_mod_expression() {
         let d = MySqlDialect;
         let spec = ChecksumSqlSpec {
@@ -559,6 +602,7 @@ mod tests {
             filter: Some("x=1".into()),
             scn: None,
             normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_batch_checksum_sql(&spec);
         assert!(

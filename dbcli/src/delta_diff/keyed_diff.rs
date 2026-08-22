@@ -152,12 +152,12 @@ impl KeyedDiffer {
         let mut rows = Vec::new();
         for b in buckets {
             let lpred = left.dialect().render_bucket_predicate(
-                &ctx.left.plan.identity_hash_exprs(left.dialect())?,
+                &ctx.left.plan.key_hash_exprs(left.dialect())?,
                 n,
                 b,
             );
             let rpred = right.dialect().render_bucket_predicate(
-                &ctx.right.plan.identity_hash_exprs(right.dialect())?,
+                &ctx.right.plan.key_hash_exprs(right.dialect())?,
                 n,
                 b,
             );
@@ -201,6 +201,7 @@ fn batch_spec(
         filter: side_filter(ctx, dialect.url_scheme()),
         scn: ctx.scn_of(is_left),
         normalized_exprs: side.plan.identity_hash_exprs(dialect)?,
+        key_hash_exprs: side.plan.key_hash_exprs(dialect)?,
     })
 }
 

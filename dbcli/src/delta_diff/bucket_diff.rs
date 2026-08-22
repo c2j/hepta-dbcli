@@ -280,6 +280,7 @@ fn bucket_checksum_spec(
         filter: side_filter(ctx, dialect.url_scheme()),
         scn: ctx.scn_of(is_left),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
+        key_hash_exprs: vec![],
     })
 }
 

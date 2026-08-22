@@ -260,7 +260,20 @@ impl Dialect for OracleDialect {
             format!("\n  WHERE {}", conds.join("\n    AND "))
         };
         let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
-        let bkt = format!("MOD(TO_NUMBER(SUBSTR(RAWTOHEX(h), 1, 8), 'XXXXXXXX'), {modulus})");
+        let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
+            (format!("SELECT {row_hash} AS h"), "h".to_string())
+        } else {
+            let key_hash = format!(
+                "STANDARD_HASH({}, 'MD5')",
+                spec.key_hash_exprs.join(" || '#' || ")
+            );
+            (
+                format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
+                "kh".to_string(),
+            )
+        };
+        let bkt =
+            format!("MOD(TO_NUMBER(SUBSTR(RAWTOHEX({bkt_src}), 1, 8), 'XXXXXXXX'), {modulus})");
         let slice = |i: u32| {
             format!(
                 "TO_CHAR(MOD(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(h), {:2}, 8), 'XXXXXXXX')), POWER(2,64))) AS s{i}",
@@ -268,7 +281,7 @@ impl Dialect for OracleDialect {
             )
         };
         format!(
-            "SELECT {bkt} AS bkt,\n  TO_CHAR(COUNT(*)) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            "SELECT {bkt} AS bkt,\n  TO_CHAR(COUNT(*)) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  {inner_select}\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
             slice(1),
             slice(2),
             slice(3),
@@ -575,6 +588,7 @@ mod tests {
             filter: None,
             scn: Some(2162471),
             normalized_exprs: vec!["TO_CHAR(\"ID\")".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_checksum_sql(&spec);
         assert!(sql.contains("STANDARD_HASH(TO_CHAR(\"ID\"), 'MD5')"));
@@ -647,6 +661,7 @@ mod tests {
             filter: Some("x=1".into()),
             scn: None,
             normalized_exprs: vec!["TO_CHAR(\"ID\")".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_batch_checksum_sql(&spec);
         assert!(

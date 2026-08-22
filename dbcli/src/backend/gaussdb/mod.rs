@@ -221,7 +221,16 @@ impl Dialect for GaussdbDialect {
             format!("\n  WHERE {}", conds.join("\n    AND "))
         };
         let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
-        let bkt = format!("MOD(('x' || SUBSTR(h, 1, 8))::bit(32)::bigint, {modulus})");
+        let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
+            (format!("SELECT {row_hash} AS h"), "h".to_string())
+        } else {
+            let key_hash = format!("MD5(concat_ws('#', {}))", spec.key_hash_exprs.join(", "));
+            (
+                format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
+                "kh".to_string(),
+            )
+        };
+        let bkt = format!("MOD(('x' || SUBSTR({bkt_src}, 1, 8))::bit(32)::bigint, {modulus})");
         let slice = |i: u32| {
             format!(
                 "MOD(SUM(('x' || SUBSTR(h, {:2}, 8))::bit(32)::bigint), 18446744073709551616) AS s{i}",
@@ -229,7 +238,7 @@ impl Dialect for GaussdbDialect {
             )
         };
         format!(
-            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  SELECT {row_hash} AS h\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  {inner_select}\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
             slice(1),
             slice(2),
             slice(3),
@@ -420,6 +429,7 @@ mod tests {
             filter: None,
             scn: None,
             normalized_exprs: vec!["\"id\"::text".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_checksum_sql(&spec);
         assert!(sql.contains("('x' || SUBSTR(h,  1, 8))::bit(32)::bigint"));
@@ -466,6 +476,7 @@ mod tests {
             filter: Some("x=1".into()),
             scn: None,
             normalized_exprs: vec!["\"id\"::text".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_batch_checksum_sql(&spec);
         assert!(
@@ -566,6 +577,7 @@ mod integration_tests {
             table: "iblt_probe".to_string(),
             key_expr: "\"id\"".to_string(),
             normalized_exprs: vec![
+            key_hash_exprs: vec![],
                 "\"id\"::text".to_string(),
                 "COALESCE(\"v\"::text, '\\N')".to_string(),
             ],

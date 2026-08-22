@@ -211,6 +211,7 @@ mod tests {
             filter: None,
             scn: None,
             normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
+            key_hash_exprs: vec![],
         }
     }
 
@@ -503,6 +504,7 @@ mod integration_tests {
                     .plan
                     .normalized_exprs(self.conn.dialect())
                     .expect("normalized_exprs failed"),
+                key_hash_exprs: vec![],
             };
             run_checksum(&mut *self.conn, &spec, false)
                 .await

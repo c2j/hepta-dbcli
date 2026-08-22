@@ -77,10 +77,7 @@ impl TablePlan {
             .collect()
     }
 
-    pub(crate) fn identity_hash_exprs(
-        &self,
-        dialect: &dyn Dialect,
-    ) -> Result<Vec<String>, DbError> {
+    pub(crate) fn key_hash_exprs(&self, dialect: &dyn Dialect) -> Result<Vec<String>, DbError> {
         let q = dialect.identifier_quote();
         let mut exprs = Vec::new();
         for k in &self.key_columns {
@@ -90,6 +87,14 @@ impl TablePlan {
                 exprs.push(crate::backend::quote_ident(q, k));
             }
         }
+        Ok(exprs)
+    }
+
+    pub(crate) fn identity_hash_exprs(
+        &self,
+        dialect: &dyn Dialect,
+    ) -> Result<Vec<String>, DbError> {
+        let mut exprs = self.key_hash_exprs(dialect)?;
         for spec in &self.norm_specs {
             if !self.key_columns.iter().any(|k| k == &spec.name) {
                 exprs.push(dialect.normalize_expr(spec)?);
@@ -398,6 +403,8 @@ mod tests {
             exprs.iter().any(|e| e.contains("c_int")),
             "compare col must remain: {exprs:?}"
         );
+        let key = plan.key_hash_exprs(&MySqlDialect).unwrap();
+        assert_eq!(&exprs[..key.len()], &key[..]);
     }
 
     // ── Mock connection serving canned metadata results ──

@@ -263,6 +263,9 @@ pub struct ChecksumSqlSpec {
     pub scn: Option<u64>,
     /// Normalized per-column expressions (from normalize_expr), select order.
     pub normalized_exprs: Vec<String>,
+    /// If nonempty, `MOD(hash(key_hash_exprs), N)` assigns buckets; slices still use `normalized_exprs`.
+    /// Empty means bucket by `normalized_exprs` (bucketdiff / content hash).
+    pub key_hash_exprs: Vec<String>,
 }
 
 /// Specification for one keyset pagination fetch (v2.1 §6.2.2).
