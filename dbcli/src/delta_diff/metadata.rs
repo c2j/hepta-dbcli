@@ -183,12 +183,85 @@ pub(crate) async fn build_table_plan(
         }
     }
 
+    push_key_shape_warnings(
+        &mut warnings,
+        &key_columns,
+        &columns,
+        &idx_result,
+        !explicit_key.is_empty(),
+    );
+
     Ok(TablePlan {
         key_columns,
         compare_columns,
         norm_specs,
         warnings,
     })
+}
+
+fn is_temporal_type(ty: &str) -> bool {
+    let b = ty.split('(').next().unwrap_or(ty).trim().to_lowercase();
+    matches!(
+        b.as_str(),
+        "date"
+            | "datetime"
+            | "timestamp"
+            | "timestamptz"
+            | "time"
+            | "timetz"
+            | "year"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+    )
+}
+
+fn index_covers_unique(idx: &QueryResult, keys: &[String]) -> bool {
+    let mut want: Vec<String> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+    want.sort();
+    for r in &idx.rows {
+        if !(value_bool(r.get(1)) || value_bool(r.get(2))) {
+            continue;
+        }
+        let mut have: Vec<String> = parse_index_columns(&value_str(r.get(3)))
+            .into_iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        have.sort();
+        if have == want {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_key_shape_warnings(
+    warnings: &mut Vec<String>,
+    keys: &[String],
+    columns: &[ColumnRow],
+    idx: &QueryResult,
+    explicit_key: bool,
+) {
+    for k in keys {
+        if let Some(col) = find_column_ci(columns, k) {
+            if col.nullable {
+                warnings.push(format!(
+                    "key column '{k}' is nullable; NULL keys are skipped by keyset pagination"
+                ));
+            }
+            if is_temporal_type(&col.data_type) {
+                warnings.push(format!(
+                    "key column '{k}' is temporal; Oracle keyset pagination depends on NLS_DATE_FORMAT"
+                ));
+            }
+        }
+    }
+    if explicit_key && !keys.is_empty() && !index_covers_unique(idx, keys) {
+        warnings.push(
+            "explicit --key is not backed by a unique/primary index; \
+             duplicate keys can drop rows at page boundaries"
+                .to_string(),
+        );
+    }
 }
 
 // ─── Metadata Row Parsing ──────────────────────────────────────────────
@@ -584,6 +657,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn nullable_key_adds_warning() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_int".into()])
+            .await
+            .unwrap();
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("nullable")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn date_key_adds_warning() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_dt".into()])
+            .await
+            .unwrap();
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("temporal")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn non_unique_explicit_key_adds_warning() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_vc".into()])
+            .await
+            .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("unique/primary index")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_key_has_no_uniqueness_warning() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+            .await
+            .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|w| !w.contains("unique/primary index")),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[tokio::test]
