@@ -61,8 +61,15 @@ impl DiffStrategy for KeyedDiffer {
             let _ = right.query_drop("COMMIT").await;
         }
 
-        let (diff_rows, left_total, right_total) = result?;
-        let mut report = assemble(ctx, diff_rows, left_total, right_total, ctx.sample_limit);
+        let (diff_rows, left_total, right_total, extra_warnings) = result?;
+        let mut report = assemble(
+            ctx,
+            diff_rows,
+            left_total,
+            right_total,
+            ctx.sample_limit,
+            extra_warnings,
+        );
         report.started_at = started;
         report.finished_at = Utc::now();
         report.perf.queries_total = queries;
@@ -77,7 +84,7 @@ impl KeyedDiffer {
         right: &mut (dyn DbConn + Send),
         ctx: &DiffContext,
         queries: &mut u64,
-    ) -> Result<(Vec<DiffRow>, u64, u64), DbError> {
+    ) -> Result<(Vec<DiffRow>, u64, u64, Vec<String>), DbError> {
         let lq = left.dialect().identifier_quote();
         let rq = right.dialect().identifier_quote();
         let lfilter = side_filter(ctx, left.dialect().url_scheme());
@@ -102,7 +109,7 @@ impl KeyedDiffer {
         let right_total = parse_count(&rr?)?;
 
         if left_total == 0 && right_total == 0 {
-            return Ok((Vec::new(), 0, 0));
+            return Ok((Vec::new(), 0, 0, Vec::new()));
         }
 
         let arity = ctx.key_columns.len().max(1);
@@ -110,16 +117,34 @@ impl KeyedDiffer {
         if left_total == 0 {
             let spec = keys_only_spec(ctx, false, right.dialect())?;
             let rows = fetch_all_pages(right, &spec, ctx.verbose, queries).await?;
+            let mut extra = Vec::new();
+            if let Some(w) =
+                fetch_count_mismatch_warning("empty-left", 0, 0, right_total, rows.len() as u64)
+            {
+                extra.push(w);
+            }
             return Ok((
                 keys_only_diffs(&rows, arity, false),
                 left_total,
                 right_total,
+                extra,
             ));
         }
         if right_total == 0 {
             let spec = keys_only_spec(ctx, true, left.dialect())?;
             let rows = fetch_all_pages(left, &spec, ctx.verbose, queries).await?;
-            return Ok((keys_only_diffs(&rows, arity, true), left_total, right_total));
+            let mut extra = Vec::new();
+            if let Some(w) =
+                fetch_count_mismatch_warning("empty-right", left_total, rows.len() as u64, 0, 0)
+            {
+                extra.push(w);
+            }
+            return Ok((
+                keys_only_diffs(&rows, arity, true),
+                left_total,
+                right_total,
+                extra,
+            ));
         }
 
         if left_total.max(right_total) <= ctx.fetch_all_threshold {
@@ -128,7 +153,17 @@ impl KeyedDiffer {
             let detail =
                 row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
             *queries += detail.queries;
-            return Ok((detail.rows, left_total, right_total));
+            let mut extra = Vec::new();
+            if let Some(w) = fetch_count_mismatch_warning(
+                "fetch-all",
+                left_total,
+                detail.left_count,
+                right_total,
+                detail.right_count,
+            ) {
+                extra.push(w);
+            }
+            return Ok((detail.rows, left_total, right_total, extra));
         }
 
         let n = {
@@ -146,10 +181,11 @@ impl KeyedDiffer {
         let rmap = rmap?;
         let buckets = diff_bucket_ids(&lmap, &rmap, n);
         if buckets.is_empty() {
-            return Ok((Vec::new(), left_total, right_total));
+            return Ok((Vec::new(), left_total, right_total, Vec::new()));
         }
 
         let mut rows = Vec::new();
+        let mut extra = Vec::new();
         for b in buckets {
             let lpred = left.dialect().render_bucket_predicate(
                 &ctx.left.plan.key_hash_exprs(left.dialect())?,
@@ -166,9 +202,20 @@ impl KeyedDiffer {
             let detail =
                 row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
             *queries += detail.queries;
+            let exp_l = lmap.get(&b).map(|t| t.count).unwrap_or(0);
+            let exp_r = rmap.get(&b).map(|t| t.count).unwrap_or(0);
+            if let Some(w) = fetch_count_mismatch_warning(
+                &format!("bucket {b}"),
+                exp_l,
+                detail.left_count,
+                exp_r,
+                detail.right_count,
+            ) {
+                extra.push(w);
+            }
             rows.extend(detail.rows);
         }
-        Ok((rows, left_total, right_total))
+        Ok((rows, left_total, right_total, extra))
     }
 }
 
@@ -219,6 +266,23 @@ fn render_count_sql(
         Some(f) => format!("SELECT COUNT(*) AS cnt FROM {table} WHERE ({f})"),
         None => format!("SELECT COUNT(*) AS cnt FROM {table}"),
     }
+}
+
+fn fetch_count_mismatch_warning(
+    scope: &str,
+    expected_left: u64,
+    fetched_left: u64,
+    expected_right: u64,
+    fetched_right: u64,
+) -> Option<String> {
+    if expected_left == fetched_left && expected_right == fetched_right {
+        return None;
+    }
+    Some(format!(
+        "keyset fetch count mismatch {scope}: left checksum={expected_left} fetched={fetched_left}, \
+         right checksum={expected_right} fetched={fetched_right}; \
+         NULL-key pagination or concurrent writes may have dropped rows"
+    ))
 }
 
 fn parse_count(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
@@ -365,6 +429,7 @@ fn assemble(
     left_total: u64,
     right_total: u64,
     sample_limit: usize,
+    extra_warnings: Vec<String>,
 ) -> DiffReport {
     let mut summary = DiffSummary {
         left_total,
@@ -392,6 +457,7 @@ fn assemble(
         .chain(ctx.right.plan.warnings.iter())
         .chain(ctx.route_warnings.iter())
         .cloned()
+        .chain(extra_warnings)
         .collect();
     let sample: Vec<DiffRow> = diff_rows.into_iter().take(sample_limit).collect();
     let diff_count = summary.missing_left + summary.missing_right + summary.modified;
@@ -436,6 +502,19 @@ mod tests {
     use super::*;
     use crate::delta_diff::report::DiffStatus;
     use serde_json::json;
+
+    #[test]
+    fn fetch_count_mismatch_warning_none_when_equal() {
+        assert!(fetch_count_mismatch_warning("bucket 1", 5, 5, 3, 3).is_none());
+    }
+
+    #[test]
+    fn fetch_count_mismatch_warning_when_fetched_short() {
+        let w = fetch_count_mismatch_warning("bucket 2", 10, 8, 10, 10).unwrap();
+        assert!(w.contains("bucket 2"), "{w}");
+        assert!(w.contains("left checksum=10 fetched=8"), "{w}");
+        assert!(w.contains("NULL-key"), "{w}");
+    }
 
     #[test]
     fn parse_count_rejects_garbage() {
