@@ -10,76 +10,100 @@ use crate::delta_diff::report::{DiffRow, DiffStatus};
 
 const PAGE_SIZE: usize = 8192;
 
-/// 一个分片范围内的行级差异（key 为单列整型，MVP 约束见 §6.4）
+/// 一个分片范围内的行级差异。
 pub(crate) struct RangeDiff {
     pub(crate) rows: Vec<DiffRow>,
     pub(crate) left_count: u64,
     pub(crate) right_count: u64,
+    pub(crate) queries: u64,
 }
 
 /// 双侧 keyset 分页归并。两侧各自持有分页 spec（表名/schema 可不同）。
+/// `key_arity` 是每行前缀中的键列数（单列=1，复合>1）。
 pub(crate) async fn row_level_diff(
     left: &mut (dyn DbConn + Send),
     right: &mut (dyn DbConn + Send),
     left_spec: &KeysetPageSpec,
     right_spec: &KeysetPageSpec,
-    range: (i64, i64),
+    range: Option<(i64, i64)>,
+    key_arity: usize,
     verbose: bool,
 ) -> Result<RangeDiff, DbError> {
-    let mut left_page = PageCursor::new(left, left_spec, range, verbose);
-    let mut right_page = PageCursor::new(right, right_spec, range, verbose);
+    let arity = key_arity.max(1);
+    let mut left_page = PageCursor::new(left, left_spec, range, arity, verbose);
+    let mut right_page = PageCursor::new(right, right_spec, range, arity, verbose);
+    let mut queries = 0u64;
     let mut out = RangeDiff {
         rows: Vec::new(),
         left_count: 0,
         right_count: 0,
+        queries: 0,
     };
 
-    let mut lbuf = left_page.next_page().await?;
-    let mut rbuf = right_page.next_page().await?;
+    let mut lbuf = fetch_page(&mut left_page, &mut queries).await?;
+    let mut rbuf = fetch_page(&mut right_page, &mut queries).await?;
     let (mut li, mut ri) = (0usize, 0usize);
 
     loop {
         if li >= lbuf.len() {
             if left_page.exhausted {
                 // 左尽：右侧剩余全部 MissingLeft
-                drain(&mut rbuf, &mut ri, &mut right_page, &mut out, Side::Right).await?;
+                drain(
+                    &mut rbuf,
+                    &mut ri,
+                    &mut right_page,
+                    &mut out,
+                    Side::Right,
+                    arity,
+                    &mut queries,
+                )
+                .await?;
                 break;
             }
-            lbuf = left_page.next_page().await?;
+            lbuf = fetch_page(&mut left_page, &mut queries).await?;
             li = 0;
             continue;
         }
         if ri >= rbuf.len() {
             if right_page.exhausted {
-                drain(&mut lbuf, &mut li, &mut left_page, &mut out, Side::Left).await?;
+                drain(
+                    &mut lbuf,
+                    &mut li,
+                    &mut left_page,
+                    &mut out,
+                    Side::Left,
+                    arity,
+                    &mut queries,
+                )
+                .await?;
                 break;
             }
-            rbuf = right_page.next_page().await?;
+            rbuf = fetch_page(&mut right_page, &mut queries).await?;
             ri = 0;
             continue;
         }
 
-        let lk = row_key(&lbuf[li]);
-        let rk = row_key(&rbuf[ri]);
-        match lk.cmp(&rk) {
+        let lk = row_key_tuple(&lbuf[li], arity);
+        let rk = row_key_tuple(&rbuf[ri], arity);
+        match cmp_key(&lk, &rk) {
             std::cmp::Ordering::Less => {
                 out.rows
-                    .push(diff_row(&lbuf[li], true, DiffStatus::MissingRight));
+                    .push(diff_row_n(&lbuf[li], arity, true, DiffStatus::MissingRight));
                 out.left_count += 1;
                 li += 1;
             }
             std::cmp::Ordering::Greater => {
                 out.rows
-                    .push(diff_row(&rbuf[ri], false, DiffStatus::MissingLeft));
+                    .push(diff_row_n(&rbuf[ri], arity, false, DiffStatus::MissingLeft));
                 out.right_count += 1;
                 ri += 1;
             }
             std::cmp::Ordering::Equal => {
                 out.left_count += 1;
                 out.right_count += 1;
-                if lbuf[li][1..] != rbuf[ri][1..] {
+                if lbuf[li].get(arity..) != rbuf[ri].get(arity..) {
                     out.rows.push(DiffRow {
-                        key: lbuf[li][0].clone(),
+                        key: diff_key(&lbuf[li], arity),
                         left: Some(lbuf[li].clone()),
                         right: Some(rbuf[ri].clone()),
                         status: DiffStatus::Modified,
@@ -91,6 +115,7 @@ pub(crate) async fn row_level_diff(
             }
         }
     }
+    out.queries = queries;
     Ok(out)
 }
 
@@ -99,12 +124,23 @@ enum Side {
     Right,
 }
 
+async fn fetch_page(
+    cursor: &mut PageCursor<'_>,
+    queries: &mut u64,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    let rows = cursor.next_page().await?;
+    *queries += 1;
+    Ok(rows)
+}
+
 async fn drain(
     buf: &mut Vec<Vec<Value>>,
     idx: &mut usize,
     cursor: &mut PageCursor<'_>,
     out: &mut RangeDiff,
     side: Side,
+    arity: usize,
+    queries: &mut u64,
 ) -> Result<(), DbError> {
     loop {
         while *idx < buf.len() {
@@ -113,7 +149,7 @@ async fn drain(
                 Side::Left => (DiffStatus::MissingRight, true),
                 Side::Right => (DiffStatus::MissingLeft, false),
             };
-            out.rows.push(diff_row(row, is_left, status));
+            out.rows.push(diff_row_n(row, arity, is_left, status));
             match side {
                 Side::Left => out.left_count += 1,
                 Side::Right => out.right_count += 1,
@@ -123,22 +159,79 @@ async fn drain(
         if cursor.exhausted {
             return Ok(());
         }
-        *buf = cursor.next_page().await?;
+        *buf = fetch_page(cursor, queries).await?;
         *idx = 0;
     }
 }
 
-fn row_key(row: &[Value]) -> i64 {
-    match row.first() {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(i64::MIN),
-        Some(Value::String(s)) => s.trim().parse().unwrap_or(i64::MIN),
-        _ => i64::MIN,
+fn row_key_tuple(row: &[Value], arity: usize) -> Vec<Value> {
+    let n = arity.min(row.len());
+    row[..n].to_vec()
+}
+
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
     }
 }
 
-fn diff_row(row: &[Value], is_left: bool, status: DiffStatus) -> DiffRow {
+fn as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn cmp_value(l: &Value, r: &Value) -> std::cmp::Ordering {
+    if matches!(l, Value::Number(_)) || matches!(r, Value::Number(_)) {
+        if let (Some(li), Some(ri)) = (as_i64(l), as_i64(r)) {
+            return li.cmp(&ri);
+        }
+        if let (Some(lu), Some(ru)) = (as_u64(l), as_u64(r)) {
+            return lu.cmp(&ru);
+        }
+        if let (Some(ln), Some(rn)) = (as_f64(l), as_f64(r)) {
+            return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
+        }
+    }
+    match (l.as_str(), r.as_str()) {
+        (Some(ls), Some(rs)) => ls.cmp(rs),
+        _ => l.to_string().cmp(&r.to_string()),
+    }
+}
+
+fn cmp_key(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (l, r) in a.iter().zip(b.iter()) {
+        match cmp_value(l, r) {
+            std::cmp::Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn diff_key(row: &[Value], arity: usize) -> Value {
+    if arity <= 1 {
+        row.first().cloned().unwrap_or(Value::Null)
+    } else {
+        Value::Array(row_key_tuple(row, arity))
+    }
+}
+
+fn diff_row_n(row: &[Value], arity: usize, is_left: bool, status: DiffStatus) -> DiffRow {
     DiffRow {
-        key: row[0].clone(),
+        key: diff_key(row, arity),
         left: if is_left { Some(row.to_vec()) } else { None },
         right: if is_left { None } else { Some(row.to_vec()) },
         status,
@@ -150,8 +243,9 @@ fn diff_row(row: &[Value], is_left: bool, status: DiffStatus) -> DiffRow {
 struct PageCursor<'a> {
     conn: &'a mut (dyn DbConn + Send),
     base: &'a KeysetPageSpec,
-    range: (i64, i64),
-    last_key: Option<i64>,
+    range: Option<(i64, i64)>,
+    last_key: Option<Vec<Value>>,
+    key_arity: usize,
     exhausted: bool,
     verbose: bool,
 }
@@ -160,7 +254,8 @@ impl<'a> PageCursor<'a> {
     fn new(
         conn: &'a mut (dyn DbConn + Send),
         base: &'a KeysetPageSpec,
-        range: (i64, i64),
+        range: Option<(i64, i64)>,
+        key_arity: usize,
         verbose: bool,
     ) -> Self {
         Self {
@@ -168,6 +263,7 @@ impl<'a> PageCursor<'a> {
             base,
             range,
             last_key: None,
+            key_arity,
             exhausted: false,
             verbose,
         }
@@ -179,9 +275,10 @@ impl<'a> PageCursor<'a> {
             table: self.base.table.clone(),
             columns: self.base.columns.clone(),
             raw_exprs: self.base.raw_exprs,
-            key_column: self.base.key_column.clone(),
-            range: Some(self.range),
-            last_key: self.last_key,
+            key_columns: self.base.key_columns.clone(),
+            string_key: self.base.string_key.clone(),
+            range: self.range,
+            last_key: self.last_key.clone(),
             page_size: PAGE_SIZE,
             filter: self.base.filter.clone(),
             scn: self.base.scn,
@@ -195,7 +292,7 @@ impl<'a> PageCursor<'a> {
             self.exhausted = true;
         }
         if let Some(last) = result.rows.last() {
-            self.last_key = Some(row_key(last));
+            self.last_key = Some(row_key_tuple(last, self.key_arity));
         }
         Ok(result.rows)
     }
@@ -207,6 +304,7 @@ mod tests {
     use crate::backend::mysql::dialect::MySqlDialect;
     use crate::backend::{Dialect, QueryResult};
     use async_trait::async_trait;
+    use serde_json::json;
     use std::collections::VecDeque;
 
     /// 按页供给预置行集的 mock 连接
@@ -248,13 +346,53 @@ mod tests {
             table: "t".into(),
             columns: vec!["id".into(), "v".into()],
             raw_exprs: false,
-            key_column: "id".into(),
+            key_columns: vec!["id".into()],
+            string_key: vec![false],
             range: None,
             last_key: None,
             page_size: PAGE_SIZE,
             filter: None,
             scn: None,
         }
+    }
+
+    #[test]
+    fn cmp_key_tuple_numeric_coercion() {
+        let a = vec![json!(1), json!("x")];
+        let b = vec![json!("1"), json!("x")];
+        assert_eq!(cmp_key(&a, &b), std::cmp::Ordering::Equal);
+        let c = vec![json!(1), json!("y")];
+        assert_eq!(cmp_key(&a, &c), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_key_two_numeric_strings_stay_lexical() {
+        assert_eq!(
+            cmp_key(&[json!("10")], &[json!("2")]),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_value_i64_beyond_f64_mantissa_is_exact() {
+        let a = json!(9007199254740993i64);
+        let b = json!(9007199254740992i64);
+        assert_ne!(cmp_key(&[a], &[b]), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_value_number_vs_numeric_string_still_equal() {
+        assert_eq!(
+            cmp_key(&[json!(1)], &[json!("1")]),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn diff_row_composite_key_is_array() {
+        let row = vec![json!(1), json!("t"), json!("payload")];
+        let d = diff_row_n(&row, 2, true, DiffStatus::MissingRight);
+        assert_eq!(d.key, json!([1, "t"]));
     }
 
     #[tokio::test]
@@ -267,9 +405,18 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "B"), (4, "d"), (5, "e")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diff.queries, 2);
         assert_eq!(diff.rows.len(), 3);
         assert_eq!(diff.rows[0].status, DiffStatus::Modified);
         assert_eq!(diff.rows[0].key, Value::from(2));
@@ -289,9 +436,18 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diff.queries, 2);
         assert!(diff.rows.is_empty());
         assert_eq!(diff.left_count, 2);
         assert_eq!(diff.right_count, 2);
@@ -307,9 +463,18 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
-        let diff = row_level_diff(&mut left, &mut right, &spec(), &spec(), (0, 100), false)
-            .await
-            .unwrap();
+        let diff = row_level_diff(
+            &mut left,
+            &mut right,
+            &spec(),
+            &spec(),
+            Some((0, 100)),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diff.queries, 2);
         assert_eq!(diff.rows.len(), 2);
         assert!(diff
             .rows

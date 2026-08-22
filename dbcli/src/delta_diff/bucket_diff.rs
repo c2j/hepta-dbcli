@@ -10,13 +10,13 @@ use std::time::Instant;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
-use crate::delta_diff::checksum::{run_checksum, ChecksumTuple};
+use crate::backend::{quote_ident, ChecksumSqlSpec, DbConn, DbError};
+use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
 use crate::delta_diff::report::{
     DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, ShardResult, ShardStatus, TableRef,
 };
-use crate::delta_diff::strategy::{ConsistencyMode, DiffContext, DiffStrategy};
+use crate::delta_diff::strategy::{side_filter, ConsistencyMode, DiffContext, DiffStrategy};
 
 const MAX_BUCKETS: u64 = 1024;
 
@@ -79,38 +79,28 @@ impl BucketDiffer {
         queries: &mut u64,
     ) -> Result<(Vec<ShardResult>, Vec<DiffRow>, u64), DbError> {
         let n = self.bucket_count(left, right, ctx, queries).await?;
+        let t0 = Instant::now();
+        let lspec = bucket_checksum_spec(ctx, true, n, 0, left.dialect())?;
+        let rspec = bucket_checksum_spec(ctx, false, n, 0, right.dialect())?;
+        let (lmap, rmap) = tokio::join!(
+            run_batch_checksum(left, &lspec, ctx.verbose),
+            run_batch_checksum(right, &rspec, ctx.verbose)
+        );
+        let (lmap, rmap) = (lmap?, rmap?);
+        *queries += 2;
 
-        let mut diff_buckets = Vec::new();
         let mut shards = Vec::new();
         for b in 0..n {
-            let t0 = Instant::now();
-            let lspec = bucket_checksum_spec(ctx, true, n, b, left.dialect())?;
-            let rspec = bucket_checksum_spec(ctx, false, n, b, right.dialect())?;
-            let (l, r) = tokio::join!(
-                run_checksum(left, &lspec, ctx.verbose),
-                run_checksum(right, &rspec, ctx.verbose)
-            );
-            let (l, r) = (l?, r?);
-            *queries += 2;
-            if l != r {
-                diff_buckets.push(b);
-                shards.push(shard_of_bucket(n, b, l, r, ShardStatus::Diff, t0));
-                ctx.vlog(format!(
-                    "[shard] bucket-{b}/{n} diff left={} right={} diff=1 ({}ms)",
-                    l.count,
-                    r.count,
-                    t0.elapsed().as_millis()
-                ));
+            let l = lmap.get(&b).copied().unwrap_or_else(ChecksumTuple::zero);
+            let r = rmap.get(&b).copied().unwrap_or_else(ChecksumTuple::zero);
+            let status = if l == r {
+                ShardStatus::Match
             } else {
-                shards.push(shard_of_bucket(n, b, l, r, ShardStatus::Match, t0));
-                ctx.vlog(format!(
-                    "[shard] bucket-{b}/{n} match left={} right={} diff=0 ({}ms)",
-                    l.count,
-                    r.count,
-                    t0.elapsed().as_millis()
-                ));
-            }
+                ShardStatus::Diff
+            };
+            shards.push(shard_of_bucket(n, b, l, r, status, t0));
         }
+        let diff_buckets = maps_to_diff_buckets(&lmap, &rmap, n);
 
         let mut rows = Vec::new();
         for b in &diff_buckets {
@@ -149,12 +139,86 @@ impl BucketDiffer {
         ctx: &DiffContext,
         queries: &mut u64,
     ) -> Result<u64, DbError> {
-        let le = estimate_rows(left, ctx, true).await?;
-        let re = estimate_rows(right, ctx, false).await?;
+        let lf = side_filter(ctx, left.dialect().url_scheme());
+        let rf = side_filter(ctx, right.dialect().url_scheme());
+        let (le, re) = if lf.is_some() || rf.is_some() {
+            let lsql = filtered_count_sql(
+                left.dialect().identifier_quote(),
+                ctx.left.schema.as_deref(),
+                &ctx.left.table,
+                lf.as_deref(),
+            );
+            let rsql = filtered_count_sql(
+                right.dialect().identifier_quote(),
+                ctx.right.schema.as_deref(),
+                &ctx.right.table,
+                rf.as_deref(),
+            );
+            ctx.vlog(format!("[sql:left] {lsql}"));
+            ctx.vlog(format!("[sql:right] {rsql}"));
+            let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
+            (parse_count_cell(&lr?)?, parse_count_cell(&rr?)?)
+        } else {
+            (
+                estimate_rows(left, ctx, true).await?,
+                estimate_rows(right, ctx, false).await?,
+            )
+        };
         *queries += 2;
         let rows = le.max(re).max(1);
         let per = ctx.bisection_threshold.max(1);
         Ok((rows.div_ceil(per)).clamp(1, MAX_BUCKETS))
+    }
+}
+
+fn maps_to_diff_buckets(
+    left: &std::collections::BTreeMap<u64, ChecksumTuple>,
+    right: &std::collections::BTreeMap<u64, ChecksumTuple>,
+    n: u64,
+) -> Vec<u64> {
+    (0..n)
+        .filter(|b| {
+            left.get(b).copied().unwrap_or_else(ChecksumTuple::zero)
+                != right.get(b).copied().unwrap_or_else(ChecksumTuple::zero)
+        })
+        .collect()
+}
+
+fn expected_queries(diff_buckets: u64) -> u64 {
+    2 + 2 + 2 * diff_buckets
+}
+
+fn filtered_count_sql(
+    quote: char,
+    schema: Option<&str>,
+    table: &str,
+    filter: Option<&str>,
+) -> String {
+    let table = match schema {
+        Some(s) => format!("{}.{}", quote_ident(quote, s), quote_ident(quote, table)),
+        None => quote_ident(quote, table),
+    };
+    match filter {
+        Some(f) => format!("SELECT COUNT(*) AS cnt FROM {table} WHERE ({f})"),
+        None => format!("SELECT COUNT(*) AS cnt FROM {table}"),
+    }
+}
+
+fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
+    match result.rows.first().and_then(|r| r.first()) {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
+            .ok_or_else(|| DbError::query(format!("unparseable COUNT: {n}"))),
+        Some(Value::String(s)) => s
+            .trim()
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| DbError::query(format!("unparseable COUNT: {s}"))),
+        Some(other) => Err(DbError::query(format!("unparseable COUNT: {other}"))),
     }
 }
 
@@ -214,9 +278,10 @@ fn bucket_checksum_spec(
         key_column: None,
         range: None,
         bucket: Some((modulus, bucket)),
-        filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
+        filter: side_filter(ctx, dialect.url_scheme()),
         scn: ctx.scn_of(is_left),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
+        key_hash_exprs: vec![],
     })
 }
 
@@ -357,6 +422,39 @@ fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_to_diff_buckets_treats_missing_as_zero() {
+        let mut l = std::collections::BTreeMap::new();
+        l.insert(
+            1,
+            ChecksumTuple {
+                count: 5,
+                s: [1, 0, 0, 0],
+            },
+        );
+        let mut r = std::collections::BTreeMap::new();
+        r.insert(
+            1,
+            ChecksumTuple {
+                count: 5,
+                s: [1, 0, 0, 0],
+            },
+        );
+        r.insert(
+            2,
+            ChecksumTuple {
+                count: 3,
+                s: [9, 0, 0, 0],
+            },
+        );
+        assert_eq!(maps_to_diff_buckets(&l, &r, 4), vec![2]);
+    }
+
+    #[test]
+    fn batch_query_count_formula() {
+        assert_eq!(expected_queries(5), 2 + 2 + 10);
+    }
 
     #[test]
     fn multiset_diff_counts_direction() {

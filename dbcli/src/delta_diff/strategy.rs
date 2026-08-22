@@ -23,6 +23,7 @@ pub(crate) struct DiffContext {
     pub(crate) left_pool: Arc<dyn DbPool>,
     pub(crate) right_pool: Arc<dyn DbPool>,
     pub(crate) key_column: String,
+    pub(crate) key_columns: Vec<String>,
     pub(crate) filter: Option<String>,
     /// 增量比对（--update-column/--update-since）：(列, 窗口表达式)，
     /// 谓词由 side_filter 按方言渲染
@@ -41,6 +42,7 @@ pub(crate) struct DiffContext {
         Option<std::sync::Arc<tokio::sync::Mutex<crate::delta_diff::progress::CheckpointManager>>>,
     /// IBLT 预期差异容量 d（k=3d 桶，Addendum §2.4）
     pub(crate) iblt_capacity: u64,
+    pub(crate) fetch_all_threshold: u64,
     /// IBLT 解码失败时报错（exit 2）而非透明回退
     pub(crate) strict: bool,
     /// Oracle AS OF SCN 锚点（左, 右），快照开启后由策略捕获（§8.2）
@@ -140,6 +142,7 @@ mod filter_tests {
             left_pool: dummy_pool(),
             right_pool: dummy_pool(),
             key_column: "id".into(),
+            key_columns: vec!["id".into()],
             filter: filter.map(str::to_string),
             incremental: inc.map(|(a, b)| (a.to_string(), b.to_string())),
             bisection_factor: 32,
@@ -151,6 +154,7 @@ mod filter_tests {
             route_warnings: vec![],
             checkpoint: None,
             iblt_capacity: 65536,
+            fetch_all_threshold: 4096,
             strict: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,

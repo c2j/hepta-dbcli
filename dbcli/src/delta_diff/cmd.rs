@@ -18,6 +18,7 @@ pub(crate) enum Strategy {
     Joindiff,
     Bucketdiff,
     Iblt,
+    Keyeddiff,
 }
 
 impl std::fmt::Display for Strategy {
@@ -28,6 +29,7 @@ impl std::fmt::Display for Strategy {
             Strategy::Joindiff => "joindiff",
             Strategy::Bucketdiff => "bucketdiff",
             Strategy::Iblt => "iblt",
+            Strategy::Keyeddiff => "keyeddiff",
         };
         write!(f, "{s}")
     }
@@ -110,7 +112,7 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub update_since: Option<String>,
 
-    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt
+    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: Strategy,
 
@@ -173,6 +175,10 @@ pub(crate) struct DeltaDiffArgs {
     /// 与 --strategy iblt 联用：解码失败时报错（exit 2）而非回退
     #[arg(long)]
     pub strict: bool,
+
+    /// Keyeddiff: pull all filtered rows when max(COUNT) is at most this (default 4096)
+    #[arg(long, default_value_t = 4096)]
+    pub fetch_all_threshold: u64,
 }
 
 // ─── Helpers & validation ──────────────────────────────────────────────
@@ -266,6 +272,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.strategy, Strategy::Auto);
+        assert_eq!(args.fetch_all_threshold, 4096);
         assert_eq!(args.bisection_factor, 32);
         assert_eq!(args.bisection_threshold, 16384);
         assert_eq!(args.consistency, ConsistencyMode::Snapshot);
@@ -280,6 +287,24 @@ mod tests {
         assert_eq!(args.left_table_name(), Some("orders"));
         assert_eq!(args.right_table_name(), Some("orders"));
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn strategy_keyeddiff_parses() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--strategy",
+            "keyeddiff",
+        ])
+        .expect("parse");
+        assert_eq!(args.strategy, Strategy::Keyeddiff);
+        assert_eq!(args.strategy.to_string(), "keyeddiff");
     }
 
     #[test]

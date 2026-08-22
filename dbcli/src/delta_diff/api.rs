@@ -23,6 +23,7 @@ pub(crate) struct SideInput {
 pub(crate) struct DiffOptions {
     pub(crate) strategy: Option<crate::delta_diff::cmd::Strategy>,
     pub(crate) iblt_capacity: u64,
+    pub(crate) fetch_all_threshold: u64,
     pub(crate) strict: bool,
     pub(crate) key: Vec<String>,
     pub(crate) columns: Vec<String>,
@@ -120,6 +121,7 @@ pub(crate) async fn run_diff(
         left_pool: Arc::clone(&left.pool),
         right_pool: Arc::clone(&right.pool),
         key_column: routed.key_column,
+        key_columns: routed.key_columns,
         filter: opts.filter.clone(),
         incremental: opts.incremental.clone(),
         bisection_factor: opts.bisection_factor.max(2),
@@ -139,6 +141,11 @@ pub(crate) async fn run_diff(
         },
         checkpoint,
         iblt_capacity: opts.iblt_capacity.max(16),
+        fetch_all_threshold: if opts.fetch_all_threshold == 0 {
+            4096
+        } else {
+            opts.fetch_all_threshold
+        },
         strict: opts.strict,
         scns: std::sync::OnceLock::new(),
         verbose: opts.verbose,

@@ -178,6 +178,14 @@ pub trait Dialect: Send + Sync {
     /// Render the order-independent bit-slice checksum SQL (v2.1 §十).
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
 
+    /// Scan-once checksum: one row per `MOD(hash, N)` bucket.
+    /// `spec.bucket = Some((modulus, _))`; the per-bucket equality predicate is omitted.
+    /// GROUP BY the `MOD(...)` expression, never a select alias.
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String;
+
+    /// Bucket membership predicate using the same hash template as checksum.
+    fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String;
+
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 
@@ -255,6 +263,9 @@ pub struct ChecksumSqlSpec {
     pub scn: Option<u64>,
     /// Normalized per-column expressions (from normalize_expr), select order.
     pub normalized_exprs: Vec<String>,
+    /// If nonempty, `MOD(hash(key_hash_exprs), N)` assigns buckets; slices still use `normalized_exprs`.
+    /// Empty means bucket by `normalized_exprs` (bucketdiff / content hash).
+    pub key_hash_exprs: Vec<String>,
 }
 
 /// Specification for one keyset pagination fetch (v2.1 §6.2.2).
@@ -262,19 +273,141 @@ pub struct ChecksumSqlSpec {
 pub struct KeysetPageSpec {
     pub schema: Option<String>,
     pub table: String,
-    /// Columns to select, key column first.
+    /// Columns to select, key columns first.
     pub columns: Vec<String>,
     /// true: `columns` 为 SQL 表达式（规范化表达式），渲染时不加引号；
     /// false: 列名，按 identifier_quote 加引号。
     /// 行级跨库比较统一用规范化表达式（§九-2：两侧文本表示字节级一致）。
     pub raw_exprs: bool,
-    pub key_column: String,
+    /// Key columns in PK order. First column is used for optional i64 `range`.
+    pub key_columns: Vec<String>,
+    /// Parallel to `key_columns`: true if that key is a string type (needs binary collation).
+    pub string_key: Vec<bool>,
     pub range: Option<(i64, i64)>,
-    pub last_key: Option<i64>,
+    /// Exclusive lower bound of the last seen key tuple (JSON numbers/strings).
+    pub last_key: Option<Vec<Value>>,
     pub page_size: usize,
     pub filter: Option<String>,
     /// Oracle AS OF SCN anchor (snapshot mode).
     pub scn: Option<u64>,
+}
+
+pub(crate) fn quote_ident(quote: char, name: &str) -> String {
+    let doubled = name.replace(quote, &format!("{quote}{quote}"));
+    format!("{quote}{doubled}{quote}")
+}
+
+fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
+    let s = if backslash_escape {
+        s.replace('\\', "\\\\")
+    } else {
+        s.to_string()
+    };
+    s.replace('\'', "''")
+}
+
+pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => {
+            if *b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", escape_sql_string(s, backslash_escape)),
+        other => format!(
+            "'{}'",
+            escape_sql_string(&other.to_string(), backslash_escape)
+        ),
+    }
+}
+
+pub(crate) fn key_sort_expr(quote: char, name: &str, is_string: bool, scheme: &str) -> String {
+    let q = quote_ident(quote, name);
+    if !is_string {
+        return q;
+    }
+    match scheme {
+        "mysql" => format!("{q} COLLATE utf8mb4_bin"),
+        "gaussdb" => format!("{q} COLLATE \"C\""),
+        "oracle" => format!("NLSSORT({q},'NLS_SORT=BINARY')"),
+        _ => q,
+    }
+}
+
+fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool) -> String {
+    let lit = sql_literal(v, backslash_escape);
+    if is_string && scheme == "oracle" {
+        format!("NLSSORT({lit},'NLS_SORT=BINARY')")
+    } else {
+        lit
+    }
+}
+
+fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
+    spec.string_key.get(i).copied().unwrap_or(false)
+}
+
+pub(crate) fn render_tuple_gt(
+    quote: char,
+    spec: &KeysetPageSpec,
+    last: &[Value],
+    backslash_escape: bool,
+    scheme: &str,
+) -> String {
+    let keys = &spec.key_columns;
+    let mut parts = Vec::new();
+    for i in 0..keys.len().min(last.len()) {
+        let mut ands = Vec::new();
+        for j in 0..i {
+            ands.push(format!(
+                "{} = {}",
+                key_sort_expr(quote, &keys[j], is_string_key(spec, j), scheme),
+                key_cmp_rhs(&last[j], is_string_key(spec, j), scheme, backslash_escape)
+            ));
+        }
+        ands.push(format!(
+            "{} > {}",
+            key_sort_expr(quote, &keys[i], is_string_key(spec, i), scheme),
+            key_cmp_rhs(&last[i], is_string_key(spec, i), scheme, backslash_escape)
+        ));
+        parts.push(format!("({})", ands.join(" AND ")));
+    }
+    parts.join(" OR ")
+}
+
+pub(crate) fn keyset_key_conds(
+    quote: char,
+    spec: &KeysetPageSpec,
+    backslash_escape: bool,
+    scheme: &str,
+) -> Vec<String> {
+    let mut conds = Vec::new();
+    if let (Some(k), Some((lo, hi))) = (spec.key_columns.first(), spec.range) {
+        let qk = quote_ident(quote, k);
+        conds.push(format!("{qk} >= {lo} AND {qk} < {hi}"));
+    }
+    if let Some(last) = &spec.last_key {
+        if !spec.key_columns.is_empty() && !last.is_empty() {
+            conds.push(format!(
+                "({})",
+                render_tuple_gt(quote, spec, last, backslash_escape, scheme)
+            ));
+        }
+    }
+    conds
+}
+
+pub(crate) fn keyset_order_by(quote: char, spec: &KeysetPageSpec, scheme: &str) -> String {
+    spec.key_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| key_sort_expr(quote, c, is_string_key(spec, i), scheme))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ─── BackendFactory — Creates Backends from Configuration ───────────
@@ -379,5 +512,17 @@ mod tests {
     #[test]
     fn test_ssl_url_param_gaussdb() {
         assert_eq!(ssl_url_param_for_scheme("gaussdb"), "?sslmode=require");
+    }
+
+    #[test]
+    fn sql_literal_mysql_escapes_backslash() {
+        let v = Value::String("abc\\".into());
+        assert_eq!(sql_literal(&v, true), "'abc\\\\'");
+    }
+
+    #[test]
+    fn sql_literal_pg_does_not_escape_backslash() {
+        let v = Value::String("abc\\".into());
+        assert_eq!(sql_literal(&v, false), "'abc\\'");
     }
 }

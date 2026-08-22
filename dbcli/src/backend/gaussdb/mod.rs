@@ -201,29 +201,71 @@ impl Dialect for GaussdbDialect {
         )
     }
 
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
+        let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
+            (format!("SELECT {row_hash} AS h"), "h".to_string())
+        } else {
+            let key_hash = format!("MD5(concat_ws('#', {}))", spec.key_hash_exprs.join(", "));
+            (
+                format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
+                "kh".to_string(),
+            )
+        };
+        let bkt = format!("MOD(('x' || SUBSTR({bkt_src}, 1, 8))::bit(32)::bigint, {modulus})");
+        let slice = |i: u32| {
+            format!(
+                "MOD(SUM(('x' || SUBSTR(h, {:2}, 8))::bit(32)::bigint), 18446744073709551616) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT {bkt} AS bkt,\n  COUNT(*) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  {inner_select}\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
+    fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String {
+        let concat = exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        format!("MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) = {bucket}")
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
         } else {
             spec.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
         let table = match &spec.schema {
             Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
             None => format!("\"{}\"", spec.table),
         };
-        let mut conds: Vec<String> = Vec::new();
-        if let Some((lo, hi)) = spec.range {
-            conds.push(format!(
-                "\"{}\" >= {lo} AND \"{}\" < {hi}",
-                spec.key_column, spec.key_column
-            ));
-        }
-        if let Some(last) = spec.last_key {
-            conds.push(format!("\"{}\" > {last}", spec.key_column));
-        }
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false, "gaussdb");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -233,9 +275,9 @@ impl Dialect for GaussdbDialect {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
         format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nLIMIT {}",
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nLIMIT {}",
             cols.join(", "),
-            spec.key_column,
+            crate::backend::keyset_order_by('"', spec, "gaussdb"),
             spec.page_size
         )
     }
@@ -387,6 +429,7 @@ mod tests {
             filter: None,
             scn: None,
             normalized_exprs: vec!["\"id\"::text".into()],
+            key_hash_exprs: vec![],
         };
         let sql = d.render_checksum_sql(&spec);
         assert!(sql.contains("('x' || SUBSTR(h,  1, 8))::bit(32)::bigint"));
@@ -394,6 +437,55 @@ mod tests {
         assert!(sql.contains("18446744073709551616"));
         assert!(sql.contains("\"id\" >= 0 AND \"id\" < 1000"));
         assert!(sql.contains("MD5(concat_ws('#', \"id\"::text))"));
+    }
+
+    #[test]
+    fn keyset_page_sql_composite_next_page() {
+        let d = GaussdbDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["k1".into(), "k2".into()],
+            raw_exprs: false,
+            key_columns: vec!["k1".into(), "k2".into()],
+            string_key: vec![false, false],
+            range: None,
+            last_key: Some(vec![serde_json::json!(10), serde_json::json!("ab")]),
+            page_size: 50,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("(\"k1\" > 10) OR (\"k1\" = 10 AND \"k2\" > 'ab')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("ORDER BY \"k1\", \"k2\""));
+        assert!(!sql.contains("(k1,k2) >"));
+    }
+
+    #[test]
+    fn batch_checksum_sql_groups_by_mod_expression() {
+        let d = GaussdbDialect;
+        let spec = ChecksumSqlSpec {
+            schema: None,
+            table: "orders".into(),
+            key_column: None,
+            range: None,
+            bucket: Some((8, 0)),
+            filter: Some("x=1".into()),
+            scn: None,
+            normalized_exprs: vec!["\"id\"::text".into()],
+            key_hash_exprs: vec![],
+        };
+        let sql = d.render_batch_checksum_sql(&spec);
+        assert!(
+            sql.contains("GROUP BY MOD(('x' || SUBSTR(h, 1, 8))::bit(32)::bigint, 8)"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("GROUP BY bkt"));
+        assert!(sql.contains("(x=1)"));
+        assert!(sql.contains("COUNT(*) AS cnt"));
     }
 }
 

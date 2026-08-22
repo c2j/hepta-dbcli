@@ -15,6 +15,7 @@ pub(crate) mod engine;
 pub(crate) mod hash_diff;
 pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
+pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
 pub(crate) mod output;
 pub(crate) mod progress;
@@ -131,19 +132,20 @@ async fn dry_run_inner(
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
 
-    let (lminmax, rminmax) =
-        if routed.strategy.name() != "bucketdiff" && !routed.key_column.is_empty() {
-            (
-                min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
-                    .await
-                    .ok(),
-                min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
-                    .await
-                    .ok(),
-            )
-        } else {
-            (None, None)
-        };
+    let (lminmax, rminmax) = if routed.key_columns.len() == 1
+        && matches!(routed.strategy.name(), "hashdiff" | "iblt" | "joindiff")
+    {
+        (
+            min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
+                .await
+                .ok(),
+            min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
+                .await
+                .ok(),
+        )
+    } else {
+        (None, None)
+    };
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -160,8 +162,11 @@ async fn dry_run_inner(
         "\n  left             : {}.{} ({})\n  right            : {}.{} ({})",
         lschema, ltable, left.name, rschema, rtable, right.name
     ));
-    if !routed.key_column.is_empty() {
-        out.push_str(&format!("\n  key              : {}", routed.key_column));
+    if !routed.key_columns.is_empty() {
+        out.push_str(&format!(
+            "\n  key              : {}",
+            format_dry_run_key(&routed.key_columns)
+        ));
     }
     out.push_str(&format!(
         "\n  compare columns  : {} (left) / {} (right)",
@@ -180,19 +185,19 @@ async fn dry_run_inner(
                 .join("; ")
         ));
     }
-    match (lminmax, rminmax) {
-        (Some(l), Some(r)) => {
-            let lo = l.0.min(r.0);
-            let hi = l.1.max(r.1);
-            let segments = args.threads * 8;
-            out.push_str(&format!(
-                "\n  key domain       : [{}, {}]\n  first-pass segs  : {} (threads×8)\n  est. queries     : ≈{} (checksum) + bisect on diff segs",
-                lo, hi, segments, segments * 2
-            ));
-        }
-        _ => {
-            out.push_str("\n  key domain       : (not applicable — bucketdiff)");
-        }
+    let strategy = routed.strategy.name();
+    let minmax = match (lminmax, rminmax) {
+        (Some(l), Some(r)) => Some((l.0.min(r.0), l.1.max(r.1))),
+        _ => None,
+    };
+    out.push('\n');
+    out.push_str(&format_key_domain_line(strategy, minmax));
+    if matches!(strategy, "hashdiff" | "iblt" | "joindiff") && minmax.is_some() {
+        let segments = args.threads * 8;
+        out.push_str(&format!(
+            "\n  first-pass segs  : {segments} (threads×8)\n  est. queries     : ≈{} (checksum) + bisect on diff segs",
+            segments * 2
+        ));
     }
     out.push_str(&format!(
         "\n  consistency      : {}\n  recheck          : {}\n  statement timeout: {}s\n  threads          : {}",
@@ -330,6 +335,7 @@ async fn execute_diff_inner(
         left_pool: lpool,
         right_pool: rpool,
         key_column: routed.key_column,
+        key_columns: routed.key_columns,
         filter,
         incremental,
         bisection_factor: args.bisection_factor,
@@ -344,6 +350,7 @@ async fn execute_diff_inner(
         route_warnings: routed.warnings,
         checkpoint,
         iblt_capacity: args.iblt_capacity,
+        fetch_all_threshold: args.fetch_all_threshold,
         strict: args.strict,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,
@@ -534,5 +541,38 @@ fn format_name(fmt: crate::cli::OutputFormat) -> &'static str {
         crate::cli::OutputFormat::Json => "json",
         crate::cli::OutputFormat::Vertical => "vertical",
         crate::cli::OutputFormat::Csv => "csv",
+    }
+}
+
+fn format_dry_run_key(key_columns: &[String]) -> String {
+    key_columns.join(",")
+}
+
+fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String {
+    match strategy {
+        "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
+        "bucketdiff" => "  key domain       : (not applicable — bucketdiff)".to_string(),
+        _ => match minmax {
+            Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
+            None => "  key domain       : (unavailable)".to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod dry_run_format_tests {
+    use super::{format_dry_run_key, format_key_domain_line};
+
+    #[test]
+    fn composite_keys_join_with_comma() {
+        assert_eq!(format_dry_run_key(&["k1".into(), "k2".into()]), "k1,k2");
+    }
+
+    #[test]
+    fn dry_run_keyeddiff_key_domain_label() {
+        assert_eq!(
+            format_key_domain_line("keyeddiff", None),
+            "  key domain       : (not applicable — keyeddiff)"
+        );
     }
 }

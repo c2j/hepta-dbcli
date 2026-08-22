@@ -133,4 +133,12 @@ mod tests {
         assert_eq!(qr.row_count, 1);
         assert_eq!(qr.rows[0][1], Value::from("MissingRight"));
     }
+
+    #[test]
+    fn diffs_projection_preserves_composite_key_array() {
+        let mut report = report_with_diff();
+        report.sample_diffs[0].key = serde_json::json!([1, "t"]);
+        let qr = diffs_to_query_result(&report);
+        assert_eq!(qr.rows[0][0], serde_json::json!([1, "t"]));
+    }
 }

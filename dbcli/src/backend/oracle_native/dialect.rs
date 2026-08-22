@@ -237,13 +237,73 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
+        let concat = spec.normalized_exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let mut table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let mut conds: Vec<String> = Vec::new();
+        if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
+            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+        }
+        if let Some(f) = &spec.filter {
+            conds.push(format!("({f})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("\n  WHERE {}", conds.join("\n    AND "))
+        };
+        let modulus = spec.bucket.map(|(m, _)| m).unwrap_or(1);
+        let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
+            (format!("SELECT {row_hash} AS h"), "h".to_string())
+        } else {
+            let key_hash = format!(
+                "STANDARD_HASH({}, 'MD5')",
+                spec.key_hash_exprs.join(" || '#' || ")
+            );
+            (
+                format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
+                "kh".to_string(),
+            )
+        };
+        let bkt =
+            format!("MOD(TO_NUMBER(SUBSTR(RAWTOHEX({bkt_src}), 1, 8), 'XXXXXXXX'), {modulus})");
+        let slice = |i: u32| {
+            format!(
+                "TO_CHAR(MOD(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(h), {:2}, 8), 'XXXXXXXX')), POWER(2,64))) AS s{i}",
+                (i - 1) * 8 + 1
+            )
+        };
+        format!(
+            "SELECT {bkt} AS bkt,\n  TO_CHAR(COUNT(*)) AS cnt,\n  {},\n  {},\n  {},\n  {}\nFROM (\n  {inner_select}\n  FROM {table}{where_clause}\n) t\nGROUP BY {bkt}",
+            slice(1),
+            slice(2),
+            slice(3),
+            slice(4)
+        )
+    }
+
+    fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String {
+        let concat = exprs.join(" || '#' || ");
+        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        format!(
+            "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), {modulus}) = {bucket}"
+        )
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
         } else {
             spec.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
         let mut table = match &spec.schema {
@@ -253,16 +313,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds: Vec<String> = Vec::new();
-        if let Some((lo, hi)) = spec.range {
-            conds.push(format!(
-                "\"{}\" >= {lo} AND \"{}\" < {hi}",
-                spec.key_column, spec.key_column
-            ));
-        }
-        if let Some(last) = spec.last_key {
-            conds.push(format!("\"{}\" > {last}", spec.key_column));
-        }
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false, "oracle");
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
@@ -272,9 +323,9 @@ impl Dialect for OracleDialect {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
         format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY \"{}\"\nFETCH FIRST {} ROWS ONLY",
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
             cols.join(", "),
-            spec.key_column,
+            crate::backend::keyset_order_by('"', spec, "oracle"),
             spec.page_size
         )
     }
