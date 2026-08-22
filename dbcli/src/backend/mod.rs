@@ -338,6 +338,15 @@ pub(crate) fn key_sort_expr(quote: char, name: &str, is_string: bool, scheme: &s
     }
 }
 
+fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool) -> String {
+    let lit = sql_literal(v, backslash_escape);
+    if is_string && scheme == "oracle" {
+        format!("NLSSORT({lit},'NLS_SORT=BINARY')")
+    } else {
+        lit
+    }
+}
+
 fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
     spec.string_key.get(i).copied().unwrap_or(false)
 }
@@ -357,13 +366,13 @@ pub(crate) fn render_tuple_gt(
             ands.push(format!(
                 "{} = {}",
                 key_sort_expr(quote, &keys[j], is_string_key(spec, j), scheme),
-                sql_literal(&last[j], backslash_escape)
+                key_cmp_rhs(&last[j], is_string_key(spec, j), scheme, backslash_escape)
             ));
         }
         ands.push(format!(
             "{} > {}",
             key_sort_expr(quote, &keys[i], is_string_key(spec, i), scheme),
-            sql_literal(&last[i], backslash_escape)
+            key_cmp_rhs(&last[i], is_string_key(spec, i), scheme, backslash_escape)
         ));
         parts.push(format!("({})", ands.join(" AND ")));
     }

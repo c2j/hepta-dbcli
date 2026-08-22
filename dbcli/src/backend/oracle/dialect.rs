@@ -624,6 +624,34 @@ mod tests {
     }
 
     #[test]
+    fn keyset_oracle_string_key_wraps_literal_in_nlssort() {
+        let d = OracleDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "T".into(),
+            columns: vec!["CODE".into()],
+            raw_exprs: false,
+            key_columns: vec!["CODE".into()],
+            string_key: vec![true],
+            range: None,
+            last_key: Some(vec![serde_json::json!("abc")]),
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("NLSSORT(\"CODE\",'NLS_SORT=BINARY') > NLSSORT('abc','NLS_SORT=BINARY')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("ORDER BY NLSSORT(\"CODE\",'NLS_SORT=BINARY')"));
+        assert!(
+            !sql.contains("NLSSORT(\"CODE\",'NLS_SORT=BINARY') > 'abc'"),
+            "bare VARCHAR2 literal on RHS is ORA-00932: sql={sql}"
+        );
+    }
+
+    #[test]
     fn keyset_page_sql_composite_next_page() {
         let d = OracleDialect;
         let spec = crate::backend::KeysetPageSpec {
