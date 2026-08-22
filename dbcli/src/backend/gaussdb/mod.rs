@@ -577,7 +577,6 @@ mod integration_tests {
             table: "iblt_probe".to_string(),
             key_expr: "\"id\"".to_string(),
             normalized_exprs: vec![
-            key_hash_exprs: vec![],
                 "\"id\"::text".to_string(),
                 "COALESCE(\"v\"::text, '\\N')".to_string(),
             ],
