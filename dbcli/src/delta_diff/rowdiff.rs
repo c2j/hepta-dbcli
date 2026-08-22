@@ -153,6 +153,22 @@ fn row_key_tuple(row: &[Value], arity: usize) -> Vec<Value> {
     row[..n].to_vec()
 }
 
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
@@ -162,14 +178,16 @@ fn as_f64(v: &Value) -> Option<f64> {
 }
 
 fn cmp_value(l: &Value, r: &Value) -> std::cmp::Ordering {
-    match (l, r) {
-        (Value::Number(_), _) | (_, Value::Number(_)) => match (as_f64(l), as_f64(r)) {
-            (Some(ln), Some(rn)) => {
-                return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
-            }
-            _ => {}
-        },
-        _ => {}
+    if matches!(l, Value::Number(_)) || matches!(r, Value::Number(_)) {
+        if let (Some(li), Some(ri)) = (as_i64(l), as_i64(r)) {
+            return li.cmp(&ri);
+        }
+        if let (Some(lu), Some(ru)) = (as_u64(l), as_u64(r)) {
+            return lu.cmp(&ru);
+        }
+        if let (Some(ln), Some(rn)) = (as_f64(l), as_f64(r)) {
+            return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
+        }
     }
     match (l.as_str(), r.as_str()) {
         (Some(ls), Some(rs)) => ls.cmp(rs),
@@ -334,6 +352,21 @@ mod tests {
         assert_eq!(
             cmp_key(&[json!("10")], &[json!("2")]),
             std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_value_i64_beyond_f64_mantissa_is_exact() {
+        let a = json!(9007199254740993i64);
+        let b = json!(9007199254740992i64);
+        assert_ne!(cmp_key(&[a], &[b]), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_value_number_vs_numeric_string_still_equal() {
+        assert_eq!(
+            cmp_key(&[json!(1)], &[json!("1")]),
+            std::cmp::Ordering::Equal
         );
     }
 
