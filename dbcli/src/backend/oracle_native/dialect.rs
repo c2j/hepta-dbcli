@@ -300,7 +300,7 @@ impl Dialect for OracleDialect {
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
-        let mut conds = crate::backend::keyset_key_conds('"', spec);
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }

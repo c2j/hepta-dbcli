@@ -249,7 +249,7 @@ impl Dialect for MySqlDialect {
             Some(s) => format!("`{}`.`{}`", s, spec.table),
             None => format!("`{}`", spec.table),
         };
-        let mut conds = crate::backend::keyset_key_conds('`', spec);
+        let mut conds = crate::backend::keyset_key_conds('`', spec, true);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }

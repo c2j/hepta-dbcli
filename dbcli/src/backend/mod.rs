@@ -292,7 +292,16 @@ pub(crate) fn quote_ident(quote: char, name: &str) -> String {
     format!("{quote}{doubled}{quote}")
 }
 
-pub(crate) fn sql_literal(v: &Value) -> String {
+fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
+    let s = if backslash_escape {
+        s.replace('\\', "\\\\")
+    } else {
+        s.to_string()
+    };
+    s.replace('\'', "''")
+}
+
+pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => {
@@ -303,12 +312,20 @@ pub(crate) fn sql_literal(v: &Value) -> String {
             }
         }
         Value::Number(n) => n.to_string(),
-        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-        other => format!("'{}'", other.to_string().replace('\'', "''")),
+        Value::String(s) => format!("'{}'", escape_sql_string(s, backslash_escape)),
+        other => format!(
+            "'{}'",
+            escape_sql_string(&other.to_string(), backslash_escape)
+        ),
     }
 }
 
-pub(crate) fn render_tuple_gt(quote: char, keys: &[String], last: &[Value]) -> String {
+pub(crate) fn render_tuple_gt(
+    quote: char,
+    keys: &[String],
+    last: &[Value],
+    backslash_escape: bool,
+) -> String {
     let mut parts = Vec::new();
     for i in 0..keys.len().min(last.len()) {
         let mut ands = Vec::new();
@@ -316,20 +333,24 @@ pub(crate) fn render_tuple_gt(quote: char, keys: &[String], last: &[Value]) -> S
             ands.push(format!(
                 "{} = {}",
                 quote_ident(quote, key),
-                sql_literal(val)
+                sql_literal(val, backslash_escape)
             ));
         }
         ands.push(format!(
             "{} > {}",
             quote_ident(quote, &keys[i]),
-            sql_literal(&last[i])
+            sql_literal(&last[i], backslash_escape)
         ));
         parts.push(format!("({})", ands.join(" AND ")));
     }
     parts.join(" OR ")
 }
 
-pub(crate) fn keyset_key_conds(quote: char, spec: &KeysetPageSpec) -> Vec<String> {
+pub(crate) fn keyset_key_conds(
+    quote: char,
+    spec: &KeysetPageSpec,
+    backslash_escape: bool,
+) -> Vec<String> {
     let mut conds = Vec::new();
     if let (Some(k), Some((lo, hi))) = (spec.key_columns.first(), spec.range) {
         let qk = quote_ident(quote, k);
@@ -339,7 +360,7 @@ pub(crate) fn keyset_key_conds(quote: char, spec: &KeysetPageSpec) -> Vec<String
         if !spec.key_columns.is_empty() && !last.is_empty() {
             conds.push(format!(
                 "({})",
-                render_tuple_gt(quote, &spec.key_columns, last)
+                render_tuple_gt(quote, &spec.key_columns, last, backslash_escape)
             ));
         }
     }
@@ -456,5 +477,17 @@ mod tests {
     #[test]
     fn test_ssl_url_param_gaussdb() {
         assert_eq!(ssl_url_param_for_scheme("gaussdb"), "?sslmode=require");
+    }
+
+    #[test]
+    fn sql_literal_mysql_escapes_backslash() {
+        let v = Value::String("abc\\".into());
+        assert_eq!(sql_literal(&v, true), "'abc\\\\'");
+    }
+
+    #[test]
+    fn sql_literal_pg_does_not_escape_backslash() {
+        let v = Value::String("abc\\".into());
+        assert_eq!(sql_literal(&v, false), "'abc\\'");
     }
 }

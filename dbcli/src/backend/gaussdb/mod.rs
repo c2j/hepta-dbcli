@@ -256,7 +256,7 @@ impl Dialect for GaussdbDialect {
             Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
             None => format!("\"{}\"", spec.table),
         };
-        let mut conds = crate::backend::keyset_key_conds('"', spec);
+        let mut conds = crate::backend::keyset_key_conds('"', spec, false);
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
         }
