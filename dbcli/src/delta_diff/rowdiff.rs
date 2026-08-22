@@ -27,6 +27,7 @@ pub(crate) async fn row_level_diff(
     range: Option<(i64, i64)>,
     key_arity: usize,
     verbose: bool,
+    queries: &mut u64,
 ) -> Result<RangeDiff, DbError> {
     let arity = key_arity.max(1);
     let mut left_page = PageCursor::new(left, left_spec, range, arity, verbose);
@@ -37,8 +38,8 @@ pub(crate) async fn row_level_diff(
         right_count: 0,
     };
 
-    let mut lbuf = left_page.next_page().await?;
-    let mut rbuf = right_page.next_page().await?;
+    let mut lbuf = fetch_page(&mut left_page, queries).await?;
+    let mut rbuf = fetch_page(&mut right_page, queries).await?;
     let (mut li, mut ri) = (0usize, 0usize);
 
     loop {
@@ -52,11 +53,12 @@ pub(crate) async fn row_level_diff(
                     &mut out,
                     Side::Right,
                     arity,
+                    queries,
                 )
                 .await?;
                 break;
             }
-            lbuf = left_page.next_page().await?;
+            lbuf = fetch_page(&mut left_page, queries).await?;
             li = 0;
             continue;
         }
@@ -69,11 +71,12 @@ pub(crate) async fn row_level_diff(
                     &mut out,
                     Side::Left,
                     arity,
+                    queries,
                 )
                 .await?;
                 break;
             }
-            rbuf = right_page.next_page().await?;
+            rbuf = fetch_page(&mut right_page, queries).await?;
             ri = 0;
             continue;
         }
@@ -118,6 +121,15 @@ enum Side {
     Right,
 }
 
+async fn fetch_page(
+    cursor: &mut PageCursor<'_>,
+    queries: &mut u64,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    let rows = cursor.next_page().await?;
+    *queries += 1;
+    Ok(rows)
+}
+
 async fn drain(
     buf: &mut Vec<Vec<Value>>,
     idx: &mut usize,
@@ -125,6 +137,7 @@ async fn drain(
     out: &mut RangeDiff,
     side: Side,
     arity: usize,
+    queries: &mut u64,
 ) -> Result<(), DbError> {
     loop {
         while *idx < buf.len() {
@@ -143,7 +156,7 @@ async fn drain(
         if cursor.exhausted {
             return Ok(());
         }
-        *buf = cursor.next_page().await?;
+        *buf = fetch_page(cursor, queries).await?;
         *idx = 0;
     }
 }
@@ -389,6 +402,7 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "B"), (4, "d"), (5, "e")])]),
             dialect: MySqlDialect,
         };
+        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -397,9 +411,11 @@ mod tests {
             Some((0, 100)),
             1,
             false,
+            &mut queries,
         )
         .await
         .unwrap();
+        assert_eq!(queries, 2);
         assert_eq!(diff.rows.len(), 3);
         assert_eq!(diff.rows[0].status, DiffStatus::Modified);
         assert_eq!(diff.rows[0].key, Value::from(2));
@@ -419,6 +435,7 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
+        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -427,9 +444,11 @@ mod tests {
             Some((0, 100)),
             1,
             false,
+            &mut queries,
         )
         .await
         .unwrap();
+        assert_eq!(queries, 2);
         assert!(diff.rows.is_empty());
         assert_eq!(diff.left_count, 2);
         assert_eq!(diff.right_count, 2);
@@ -445,6 +464,7 @@ mod tests {
             pages: VecDeque::from(vec![rows(&[(1, "a"), (2, "b")])]),
             dialect: MySqlDialect,
         };
+        let mut queries = 0u64;
         let diff = row_level_diff(
             &mut left,
             &mut right,
@@ -453,9 +473,11 @@ mod tests {
             Some((0, 100)),
             1,
             false,
+            &mut queries,
         )
         .await
         .unwrap();
+        assert_eq!(queries, 2);
         assert_eq!(diff.rows.len(), 2);
         assert!(diff
             .rows

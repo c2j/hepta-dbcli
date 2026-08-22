@@ -300,9 +300,17 @@ impl HashDiffer {
             let t0 = Instant::now();
             let lspec = keyset_spec(ctx, true, left.dialect())?;
             let rspec = keyset_spec(ctx, false, right.dialect())?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, Some(range), 1, ctx.verbose).await?;
-            counters.queries += 2 * (1 + detail.left_count.max(detail.right_count) / 8192);
+            let detail = row_level_diff(
+                left,
+                right,
+                &lspec,
+                &rspec,
+                Some(range),
+                1,
+                ctx.verbose,
+                &mut counters.queries,
+            )
+            .await?;
             let n = detail.rows.len() as u64;
             diffs.extend(detail.rows);
             let total_ms = elapsed_ms + t0.elapsed().as_millis() as u64;

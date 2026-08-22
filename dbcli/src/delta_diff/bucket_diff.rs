@@ -205,19 +205,20 @@ fn filtered_count_sql(
 }
 
 fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
-    let Some(row) = result.rows.first() else {
-        return Ok(0);
-    };
-    match row.first() {
-        Some(Value::Number(n)) => Ok(n.as_u64().unwrap_or(0)),
-        Some(Value::String(s)) => Ok(s
+    match result.rows.first().and_then(|r| r.first()) {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
+            .ok_or_else(|| DbError::query(format!("unparseable COUNT: {n}"))),
+        Some(Value::String(s)) => s
             .trim()
             .split('.')
             .next()
-            .unwrap_or("0")
+            .unwrap_or("")
             .parse()
-            .unwrap_or(0)),
-        _ => Ok(0),
+            .map_err(|_| DbError::query(format!("unparseable COUNT: {s}"))),
+        Some(other) => Err(DbError::query(format!("unparseable COUNT: {other}"))),
     }
 }
 

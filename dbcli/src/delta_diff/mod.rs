@@ -185,19 +185,19 @@ async fn dry_run_inner(
                 .join("; ")
         ));
     }
-    match (lminmax, rminmax) {
-        (Some(l), Some(r)) => {
-            let lo = l.0.min(r.0);
-            let hi = l.1.max(r.1);
-            let segments = args.threads * 8;
-            out.push_str(&format!(
-                "\n  key domain       : [{}, {}]\n  first-pass segs  : {} (threads×8)\n  est. queries     : ≈{} (checksum) + bisect on diff segs",
-                lo, hi, segments, segments * 2
-            ));
-        }
-        _ => {
-            out.push_str("\n  key domain       : (not applicable — bucketdiff)");
-        }
+    let strategy = routed.strategy.name();
+    let minmax = match (lminmax, rminmax) {
+        (Some(l), Some(r)) => Some((l.0.min(r.0), l.1.max(r.1))),
+        _ => None,
+    };
+    out.push('\n');
+    out.push_str(&format_key_domain_line(strategy, minmax));
+    if matches!(strategy, "hashdiff" | "iblt" | "joindiff") && minmax.is_some() {
+        let segments = args.threads * 8;
+        out.push_str(&format!(
+            "\n  first-pass segs  : {segments} (threads×8)\n  est. queries     : ≈{} (checksum) + bisect on diff segs",
+            segments * 2
+        ));
     }
     out.push_str(&format!(
         "\n  consistency      : {}\n  recheck          : {}\n  statement timeout: {}s\n  threads          : {}",
@@ -548,12 +548,31 @@ fn format_dry_run_key(key_columns: &[String]) -> String {
     key_columns.join(",")
 }
 
+fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String {
+    match strategy {
+        "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
+        "bucketdiff" => "  key domain       : (not applicable — bucketdiff)".to_string(),
+        _ => match minmax {
+            Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
+            None => "  key domain       : (unavailable)".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod dry_run_format_tests {
-    use super::format_dry_run_key;
+    use super::{format_dry_run_key, format_key_domain_line};
 
     #[test]
     fn composite_keys_join_with_comma() {
         assert_eq!(format_dry_run_key(&["k1".into(), "k2".into()]), "k1,k2");
+    }
+
+    #[test]
+    fn dry_run_keyeddiff_key_domain_label() {
+        assert_eq!(
+            format_key_domain_line("keyeddiff", None),
+            "  key domain       : (not applicable — keyeddiff)"
+        );
     }
 }

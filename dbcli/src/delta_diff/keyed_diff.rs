@@ -125,9 +125,17 @@ impl KeyedDiffer {
         if left_total.max(right_total) <= ctx.fetch_all_threshold {
             let lspec = full_row_spec(ctx, true, left.dialect(), None)?;
             let rspec = full_row_spec(ctx, false, right.dialect(), None)?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
-            *queries += estimate_page_queries(left_total, right_total);
+            let detail = row_level_diff(
+                left,
+                right,
+                &lspec,
+                &rspec,
+                None,
+                arity,
+                ctx.verbose,
+                queries,
+            )
+            .await?;
             return Ok((detail.rows, left_total, right_total));
         }
 
@@ -163,9 +171,17 @@ impl KeyedDiffer {
             );
             let lspec = full_row_spec(ctx, true, left.dialect(), Some(&lpred))?;
             let rspec = full_row_spec(ctx, false, right.dialect(), Some(&rpred))?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
-            *queries += 2;
+            let detail = row_level_diff(
+                left,
+                right,
+                &lspec,
+                &rspec,
+                None,
+                arity,
+                ctx.verbose,
+                queries,
+            )
+            .await?;
             rows.extend(detail.rows);
         }
         Ok((rows, left_total, right_total))
@@ -205,11 +221,6 @@ fn batch_spec(
     })
 }
 
-fn estimate_page_queries(left_total: u64, right_total: u64) -> u64 {
-    let pages = |n: u64| n.div_ceil(PAGE_SIZE as u64).max(1);
-    pages(left_total) + pages(right_total)
-}
-
 fn render_count_sql(
     quote: char,
     schema: Option<&str>,
@@ -227,19 +238,24 @@ fn render_count_sql(
 }
 
 fn parse_count(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
-    let Some(row) = result.rows.first() else {
-        return Ok(0);
-    };
-    match row.first() {
-        Some(Value::Number(n)) => Ok(n.as_u64().unwrap_or(0)),
-        Some(Value::String(s)) => Ok(s
+    parse_count_value(result.rows.first().and_then(|r| r.first()))
+}
+
+fn parse_count_value(cell: Option<&Value>) -> Result<u64, DbError> {
+    match cell {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
+            .ok_or_else(|| DbError::query(format!("unparseable COUNT: {n}"))),
+        Some(Value::String(s)) => s
             .trim()
             .split('.')
             .next()
-            .unwrap_or("0")
+            .unwrap_or("")
             .parse()
-            .unwrap_or(0)),
-        _ => Ok(0),
+            .map_err(|_| DbError::query(format!("unparseable COUNT: {s}"))),
+        Some(other) => Err(DbError::query(format!("unparseable COUNT: {other}"))),
     }
 }
 
@@ -436,6 +452,16 @@ mod tests {
     use super::*;
     use crate::delta_diff::report::DiffStatus;
     use serde_json::json;
+
+    #[test]
+    fn parse_count_rejects_garbage() {
+        let r = crate::backend::QueryResult {
+            columns: vec!["cnt".into()],
+            rows: vec![vec![json!("nope")]],
+            row_count: 1,
+        };
+        assert!(parse_count(&r).is_err());
+    }
 
     #[test]
     fn count_sql_includes_filter_and_quotes() {
