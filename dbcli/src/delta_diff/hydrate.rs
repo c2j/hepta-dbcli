@@ -25,6 +25,9 @@ pub(crate) fn attach_keyless_rows(
         let Some(cells) = fetched.get(&hash) else {
             continue;
         };
+        let lc = cell_u64(row.left.as_deref(), 1);
+        let rc = cell_u64(row.right.as_deref(), 1);
+        row.key = serde_json::json!({ "hash": hash, "left": lc, "right": rc });
         match row.status {
             DiffStatus::MissingLeft => row.right = Some(cells.clone()),
             DiffStatus::MissingRight => row.left = Some(cells.clone()),
@@ -37,6 +40,14 @@ pub(crate) fn attach_keyless_rows(
                 }
             }
         }
+    }
+}
+
+fn cell_u64(row: Option<&[Value]>, idx: usize) -> u64 {
+    match row.and_then(|r| r.get(idx)) {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -368,6 +379,9 @@ mod tests {
             vec![Value::from("59267"), Value::from(100)],
         );
         attach_keyless_rows(&mut report, &fetched, vec!["xwdm".into(), "cjsl".into()]);
+        assert_eq!(report.sample_diffs[0].key["hash"], "abc123");
+        assert_eq!(report.sample_diffs[0].key["left"], 0);
+        assert_eq!(report.sample_diffs[0].key["right"], 1);
         assert_eq!(report.value_columns, vec!["xwdm", "cjsl"]);
         assert_eq!(
             report.sample_diffs[0].right,

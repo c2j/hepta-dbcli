@@ -20,6 +20,28 @@ pub(crate) fn render_export(
     }
 }
 
+fn keyless_hash(row: &DiffRow) -> Value {
+    if let Value::Object(o) = &row.key {
+        return o.get("hash").cloned().unwrap_or(Value::Null);
+    }
+    row.left
+        .as_ref()
+        .or(row.right.as_ref())
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or_else(|| row.key.clone())
+}
+
+fn keyless_counts(row: &DiffRow) -> (Option<Value>, Option<Value>) {
+    if let Value::Object(o) = &row.key {
+        return (o.get("left").cloned(), o.get("right").cloned());
+    }
+    (
+        row.left.as_ref().and_then(|r| r.get(1)).cloned(),
+        row.right.as_ref().and_then(|r| r.get(1)).cloned(),
+    )
+}
+
 fn status_export(s: DiffStatus) -> &'static str {
     match s {
         DiffStatus::MissingLeft => "missing_left",
@@ -30,14 +52,7 @@ fn status_export(s: DiffStatus) -> &'static str {
 
 fn key_map(row: &DiffRow, report: &DiffReport) -> Value {
     if report.key_columns.is_empty() {
-        let hash = row
-            .left
-            .as_ref()
-            .or(row.right.as_ref())
-            .and_then(|r| r.first())
-            .cloned()
-            .unwrap_or_else(|| row.key.clone());
-        return json!({ "hash": hash });
+        return json!({ "hash": keyless_hash(row) });
     }
     let src = row.left.as_ref().or(row.right.as_ref());
     let mut obj = serde_json::Map::new();
@@ -185,19 +200,14 @@ fn render_csv(report: &DiffReport, export_rows: bool) -> String {
 fn render_keyless_csv(report: &DiffReport) -> String {
     let mut lines = vec!["status,hash,left_count,right_count".to_string()];
     for row in &report.sample_diffs {
-        let hash = row
-            .left
-            .as_ref()
-            .or(row.right.as_ref())
-            .and_then(|r| r.first());
-        let lc = row.left.as_ref().and_then(|r| r.get(1));
-        let rc = row.right.as_ref().and_then(|r| r.get(1));
+        let hash = keyless_hash(row);
+        let (lc, rc) = keyless_counts(row);
         lines.push(format!(
             "{},{},{},{}",
             status_export(row.status),
-            csv_cell(hash),
-            csv_cell(lc),
-            csv_cell(rc)
+            csv_cell(Some(&hash)),
+            csv_cell(lc.as_ref()),
+            csv_cell(rc.as_ref())
         ));
     }
     lines.join("\n") + "\n"
@@ -359,6 +369,24 @@ mod tests {
             "{csv}"
         );
         assert!(csv.contains("missing_left,abc,0,1"), "{csv}");
+    }
+
+    #[test]
+    fn jsonl_keyless_hash_survives_hydrate() {
+        let mut r = report();
+        r.key_columns.clear();
+        r.value_columns = vec!["xwdm".into(), "cjsl".into()];
+        r.sample_diffs = vec![DiffRow {
+            key: json!({"hash":"abc123def456","left":0,"right":1}),
+            left: None,
+            right: Some(vec![Value::from("59267"), Value::from(100)]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        }];
+        let line: Value =
+            serde_json::from_str(render_jsonl(&r, false).lines().next().unwrap()).unwrap();
+        assert_eq!(line["key"]["hash"], "abc123def456");
+        assert_eq!(line["right"]["xwdm"], "59267");
     }
 
     #[test]
