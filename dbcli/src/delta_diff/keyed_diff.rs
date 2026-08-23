@@ -428,7 +428,7 @@ fn assemble(
     diff_rows: Vec<DiffRow>,
     left_total: u64,
     right_total: u64,
-    sample_limit: usize,
+    _sample_limit: usize,
     extra_warnings: Vec<String>,
 ) -> DiffReport {
     let mut summary = DiffSummary {
@@ -459,9 +459,9 @@ fn assemble(
         .cloned()
         .chain(extra_warnings)
         .collect();
-    let sample: Vec<DiffRow> = diff_rows.into_iter().take(sample_limit).collect();
+    let sample: Vec<DiffRow> = diff_rows;
     let diff_count = summary.missing_left + summary.missing_right + summary.modified;
-    DiffReport {
+    let mut report = DiffReport {
         started_at: Utc::now(),
         finished_at: Utc::now(),
         left: TableRef {
@@ -494,7 +494,13 @@ fn assemble(
         }],
         sample_diffs: sample,
         warnings,
-    }
+        key_columns: vec![],
+        value_columns: vec![],
+        ident_quote: '"',
+        backslash_escape: false,
+    };
+    crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
+    report
 }
 
 #[cfg(test)]

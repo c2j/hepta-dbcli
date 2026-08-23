@@ -12,7 +12,9 @@ pub(crate) mod bucket_diff;
 pub(crate) mod checksum;
 pub(crate) mod cmd;
 pub(crate) mod engine;
+pub(crate) mod export;
 pub(crate) mod hash_diff;
+pub(crate) mod hydrate;
 pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
@@ -22,6 +24,7 @@ pub(crate) mod progress;
 pub(crate) mod recheck;
 pub(crate) mod report;
 pub(crate) mod rowdiff;
+pub(crate) mod sql_patch;
 pub(crate) mod strategy;
 
 // ─── Exit codes (CI/CD contract, §2.3) ─────────────────────────────────
@@ -356,18 +359,35 @@ async fn execute_diff_inner(
         verbose: args.verbose,
     };
 
-    let result = routed
+    let mut report = routed
         .strategy
         .diff(&mut *lconn, &mut *rconn, &ctx)
         .await
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())?;
 
-    if result.is_ok() {
-        if let Some(path) = &args.checkpoint {
-            progress::finalize_path(path).map_err(|e| e.to_string())?;
-        }
+    if let Some(path) = &args.checkpoint {
+        progress::finalize_path(path).map_err(|e| e.to_string())?;
     }
-    result
+
+    let apply_right = matches!(args.apply_to, Some(cmd::ApplyTo::Right));
+    let qconn = if apply_right { &rconn } else { &lconn };
+    report.ident_quote = qconn.dialect().identifier_quote();
+    report.backslash_escape = qconn.dialect().url_scheme() == "mysql";
+
+    let did_fetch =
+        hydrate::post_diff_fetch(args, &mut report, &mut *lconn, &mut *rconn, &ctx).await?;
+    if did_fetch && matches!(args.consistency, cmd::ConsistencyMode::Snapshot) {
+        report
+            .warnings
+            .push("sample/export row fetch ran after snapshot commit".into());
+    }
+    if report.sample_diffs.len() > 100_000 {
+        report.warnings.push(format!(
+            "diff row count {} exceeds 100000; memory and export may be large",
+            report.sample_diffs.len()
+        ));
+    }
+    Ok(report)
 }
 
 async fn connect_side(
@@ -461,12 +481,85 @@ fn default_schema_from_url(url: &str) -> Option<String> {
 }
 
 fn emit_report(args: &cmd::DeltaDiffArgs, report: &report::DiffReport) -> Result<(), String> {
+    let buf = render_stdout(args, report)?;
+    match &args.output {
+        Some(path) => std::fs::write(path, &buf).map_err(|e| e.to_string())?,
+        None => {
+            print!("{}", String::from_utf8_lossy(&buf));
+        }
+    }
+    write_export(args, report)
+}
+
+fn write_export(args: &cmd::DeltaDiffArgs, report: &report::DiffReport) -> Result<(), String> {
+    let Some(path) = &args.export else {
+        return Ok(());
+    };
+    let fmt = cmd::infer_export_format(Some(path), args.export_format)?;
+    let body = match fmt {
+        cmd::ExportFormat::Sql => {
+            let apply_to = args
+                .apply_to
+                .ok_or_else(|| "--export .sql requires --apply-to left|right".to_string())?;
+            let (conn, schema, table) = match apply_to {
+                cmd::ApplyTo::Left => (
+                    report.left.connection.as_str(),
+                    report.left.schema.as_deref(),
+                    report.left.table.as_str(),
+                ),
+                cmd::ApplyTo::Right => (
+                    report.right.connection.as_str(),
+                    report.right.schema.as_deref(),
+                    report.right.table.as_str(),
+                ),
+            };
+            sql_patch::render_sql_patch(
+                report,
+                &sql_patch::SqlPatchOpts {
+                    apply_to,
+                    quote: if report.ident_quote == '\0' {
+                        '"'
+                    } else {
+                        report.ident_quote
+                    },
+                    backslash_escape: report.backslash_escape,
+                    target_conn: conn,
+                    target_schema: schema,
+                    target_table: table,
+                },
+            )?
+        }
+        other => export::render_export(report, other, args.export_rows_effective())?,
+    };
+    std::fs::write(path, body).map_err(|e| e.to_string())
+}
+
+fn render_stdout(
+    args: &cmd::DeltaDiffArgs,
+    report: &report::DiffReport,
+) -> Result<Vec<u8>, String> {
     let mut buf: Vec<u8> = Vec::new();
     match args.format {
         crate::cli::OutputFormat::Json => {
             let s = serde_json::to_string_pretty(report)
                 .map_err(|e| format!("json serialize: {}", e))?;
             buf.extend_from_slice(s.as_bytes());
+        }
+        crate::cli::OutputFormat::Table => {
+            let summary = output::summary_to_query_result(report);
+            crate::cli::render_result(&summary, &mut buf, crate::cli::OutputFormat::Table)
+                .map_err(|e| e.to_string())?;
+            if !report.warnings.is_empty() {
+                buf.extend_from_slice(
+                    format!("warnings: {}\n", report.warnings.join("; ")).as_bytes(),
+                );
+            }
+            if !args.summary_only && !report.sample_diffs.is_empty() {
+                buf.push(b'\n');
+                buf.extend_from_slice(
+                    output::render_compact_sample(report, args.sample, args.wide).as_bytes(),
+                );
+            }
         }
         fmt => {
             let summary = output::summary_to_query_result(report);
@@ -478,18 +571,16 @@ fn emit_report(args: &cmd::DeltaDiffArgs, report: &report::DiffReport) -> Result
             }
             if !args.summary_only && !report.sample_diffs.is_empty() {
                 buf.extend_from_slice(b"\nsample diffs:\n");
-                let diffs = output::diffs_to_query_result(report);
+                let mut sampled = report.clone();
+                if args.sample > 0 && sampled.sample_diffs.len() > args.sample {
+                    sampled.sample_diffs.truncate(args.sample);
+                }
+                let diffs = output::diffs_to_query_result(&sampled);
                 crate::cli::render_result(&diffs, &mut buf, fmt).map_err(|e| e.to_string())?;
             }
         }
     }
-    match &args.output {
-        Some(path) => std::fs::write(path, &buf).map_err(|e| e.to_string()),
-        None => {
-            print!("{}", String::from_utf8_lossy(&buf));
-            Ok(())
-        }
-    }
+    Ok(buf)
 }
 
 /// 按名解析连接（风格对齐 main.rs handle_check_connection_cmd）；
@@ -574,5 +665,195 @@ mod dry_run_format_tests {
             format_key_domain_line("keyeddiff", None),
             "  key domain       : (not applicable — keyeddiff)"
         );
+    }
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::*;
+    use crate::delta_diff::report::*;
+    use chrono::Utc;
+    use clap::Parser;
+    use serde_json::Value;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: cmd::DeltaDiffArgs,
+    }
+
+    fn parse(argv: &[&str]) -> cmd::DeltaDiffArgs {
+        TestCli::try_parse_from(argv).unwrap().args
+    }
+
+    fn report_with_n_diffs(n: usize) -> DiffReport {
+        let diffs = (0..n)
+            .map(|i| DiffRow {
+                key: Value::from(i as i64),
+                left: Some(vec![Value::from(i as i64), Value::from("x")]),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            })
+            .collect();
+        DiffReport {
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            left: TableRef {
+                connection: "l".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            right: TableRef {
+                connection: "r".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            strategy: "keyeddiff".into(),
+            consistency: "none".into(),
+            hash_algorithm: "md5".into(),
+            summary: DiffSummary {
+                left_total: n as u64,
+                right_total: 0,
+                missing_left: 0,
+                missing_right: n as u64,
+                modified: 0,
+                diff_rate: 1.0,
+            },
+            perf: PerfMetrics::default(),
+            shards: vec![],
+            sample_diffs: diffs,
+            warnings: vec![],
+            key_columns: vec!["id".into()],
+            value_columns: vec!["name".into()],
+            ident_quote: '"',
+            backslash_escape: false,
+        }
+    }
+
+    #[test]
+    fn json_stdout_includes_all_diffs_even_if_sample_is_2() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--format",
+            "json",
+            "--sample",
+            "2",
+        ]);
+        let buf = render_stdout(&args, &report_with_n_diffs(5)).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["sample_diffs"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn table_stdout_respects_sample() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--sample",
+            "2",
+        ]);
+        let text =
+            String::from_utf8(render_stdout(&args, &report_with_n_diffs(5)).unwrap()).unwrap();
+        assert!(text.contains("sample diffs (2 of 5)"), "{text}");
+        assert!(!text.contains("String("), "{text}");
+    }
+
+    #[test]
+    fn summary_only_omits_terminal_details_but_json_still_full() {
+        let table = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--summary-only",
+        ]);
+        let text =
+            String::from_utf8(render_stdout(&table, &report_with_n_diffs(5)).unwrap()).unwrap();
+        assert!(!text.contains("sample diffs"), "{text}");
+
+        let json = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--format",
+            "json",
+            "--summary-only",
+            "--sample",
+            "1",
+        ]);
+        let buf = render_stdout(&json, &report_with_n_diffs(5)).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["sample_diffs"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn csv_stdout_respects_sample() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--format",
+            "csv",
+            "--sample",
+            "2",
+        ]);
+        let text =
+            String::from_utf8(render_stdout(&args, &report_with_n_diffs(5)).unwrap()).unwrap();
+        let sample = text.split("sample diffs:\n").nth(1).unwrap_or("");
+        let data_lines = sample
+            .lines()
+            .filter(|l| l.contains("MissingRight"))
+            .count();
+        assert_eq!(
+            data_lines, 2,
+            "csv stdout should honor --sample, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn export_csv_writes_all_rows_when_summary_only() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hepta-dd-export-{}.csv", std::process::id()));
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--summary-only",
+            "--sample",
+            "1",
+            "--export",
+            path.to_str().unwrap(),
+        ]);
+        write_export(&args, &report_with_n_diffs(5)).unwrap();
+        let csv = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(csv.lines().count(), 6);
     }
 }

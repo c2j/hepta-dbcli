@@ -52,6 +52,20 @@ impl std::fmt::Display for ConsistencyMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ExportFormat {
+    Csv,
+    Jsonl,
+    Json,
+    Sql,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ApplyTo {
+    Left,
+    Right,
+}
+
 // ─── CLI Arguments ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Args)]
@@ -132,8 +146,8 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub recheck: bool,
 
-    /// 差异行采样上限
-    #[arg(long, default_value_t = 1000)]
+    /// 终端差异明细行数上限（只裁终端；0 = 终端也打全量）
+    #[arg(long, default_value_t = 20)]
     pub sample: usize,
 
     /// 仅输出统计，不输出差异明细
@@ -179,6 +193,30 @@ pub(crate) struct DeltaDiffArgs {
     /// Keyeddiff: pull all filtered rows when max(COUNT) is at most this (default 4096)
     #[arg(long, default_value_t = 4096)]
     pub fetch_all_threshold: u64,
+
+    /// 终端显示全部比对列，不只变化列
+    #[arg(long)]
+    pub wide: bool,
+
+    /// 写出全部差异（后缀推断 csv/jsonl/json/sql）
+    #[arg(long)]
+    pub export: Option<String>,
+
+    /// 覆盖 --export 后缀推断
+    #[arg(long, value_enum)]
+    pub export_format: Option<ExportFormat>,
+
+    /// 文件带完整左右行值（.sql 自动打开）
+    #[arg(long)]
+    pub export_rows: bool,
+
+    /// 写 .sql 时必填：让哪一侧变成另一侧
+    #[arg(long, value_enum)]
+    pub apply_to: Option<ApplyTo>,
+
+    /// keyless 不要回查真实行
+    #[arg(long)]
+    pub no_fetch_sample: bool,
 }
 
 // ─── Helpers & validation ──────────────────────────────────────────────
@@ -226,7 +264,49 @@ impl DeltaDiffArgs {
             );
         }
 
+        if self.export.is_some() || self.export_format.is_some() || self.apply_to.is_some() {
+            let fmt = infer_export_format(self.export.as_deref(), self.export_format)?;
+            if fmt == ExportFormat::Sql {
+                if self.apply_to.is_none() {
+                    return Err("--export .sql requires --apply-to left|right".to_string());
+                }
+            } else if self.apply_to.is_some() {
+                return Err("--apply-to is only valid with --export-format sql / *.sql".to_string());
+            }
+        }
+
         Ok(())
+    }
+
+    pub(crate) fn export_rows_effective(&self) -> bool {
+        self.export_rows
+            || infer_export_format(self.export.as_deref(), self.export_format)
+                .map(|f| f == ExportFormat::Sql)
+                .unwrap_or(false)
+    }
+}
+
+pub(crate) fn infer_export_format(
+    path: Option<&str>,
+    override_fmt: Option<ExportFormat>,
+) -> Result<ExportFormat, String> {
+    if let Some(fmt) = override_fmt {
+        return Ok(fmt);
+    }
+    let path = path.ok_or_else(|| {
+        "cannot infer --export format from PATH; pass --export-format".to_string()
+    })?;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "csv" => Ok(ExportFormat::Csv),
+        "jsonl" => Ok(ExportFormat::Jsonl),
+        "json" => Ok(ExportFormat::Json),
+        "sql" => Ok(ExportFormat::Sql),
+        _ => Err("cannot infer --export format from PATH; pass --export-format".to_string()),
     }
 }
 
@@ -276,7 +356,7 @@ mod tests {
         assert_eq!(args.bisection_factor, 32);
         assert_eq!(args.bisection_threshold, 16384);
         assert_eq!(args.consistency, ConsistencyMode::Snapshot);
-        assert_eq!(args.sample, 1000);
+        assert_eq!(args.sample, 20);
         assert_eq!(args.format, OutputFormat::Table);
         assert_eq!(args.threads, 4);
         assert_eq!(args.statement_timeout, 300);
@@ -284,6 +364,12 @@ mod tests {
         assert!(!args.dry_run);
         assert!(!args.summary_only);
         assert!(!args.verbose);
+        assert!(!args.wide);
+        assert!(args.export.is_none());
+        assert!(args.export_format.is_none());
+        assert!(!args.export_rows);
+        assert!(args.apply_to.is_none());
+        assert!(!args.no_fetch_sample);
         assert_eq!(args.left_table_name(), Some("orders"));
         assert_eq!(args.right_table_name(), Some("orders"));
         assert!(args.validate().is_ok());
@@ -566,5 +652,113 @@ mod tests {
         ])
         .unwrap();
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn sample_zero_allowed() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--sample",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(args.sample, 0);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn export_sql_requires_apply_to() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--export",
+            "patch.sql",
+        ])
+        .unwrap();
+        let err = args.validate().unwrap_err();
+        assert!(err.contains("--apply-to"), "{err}");
+    }
+
+    #[test]
+    fn apply_to_rejected_unless_sql() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--export",
+            "out.csv",
+            "--apply-to",
+            "left",
+        ])
+        .unwrap();
+        let err = args.validate().unwrap_err();
+        assert!(err.contains("--apply-to"), "{err}");
+    }
+
+    #[test]
+    fn export_unknown_suffix_requires_format() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--export",
+            "out.bin",
+        ])
+        .unwrap();
+        let err = args.validate().unwrap_err();
+        assert!(err.contains("--export-format"), "{err}");
+    }
+
+    #[test]
+    fn export_format_overrides_suffix() {
+        assert_eq!(
+            infer_export_format(Some("out.csv"), Some(ExportFormat::Jsonl)).unwrap(),
+            ExportFormat::Jsonl
+        );
+        assert_eq!(
+            infer_export_format(Some("patch.sql"), None).unwrap(),
+            ExportFormat::Sql
+        );
+        assert!(infer_export_format(Some("out.bin"), None).is_err());
+    }
+
+    #[test]
+    fn export_sql_with_apply_to_ok() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--export",
+            "patch.sql",
+            "--apply-to",
+            "left",
+        ])
+        .unwrap();
+        assert_eq!(args.apply_to, Some(ApplyTo::Left));
+        assert!(args.validate().is_ok());
+        assert!(args.export_rows_effective());
     }
 }

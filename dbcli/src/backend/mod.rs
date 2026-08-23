@@ -194,6 +194,9 @@ pub trait Dialect: Send + Sync {
     /// spec.bucket 必须存在；返回 (row_hash, count) 行集，客户端做多重集合比对。
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String;
 
+    /// Same row-hash SQL fragment used inside `render_bucket_multiset_sql`.
+    fn row_hash_expr(&self, exprs: &[String]) -> String;
+
     /// Render an IBLT summary SQL（Addendum A v1.1 §三，j=4 哈希子表）。
     /// 返回行集 (grp, cell, cnt, key_xor, val_xor_1..4)；桶位 j 取 val_xor 第 j 切片
     /// （对齐约束 §1.4）。GaussDB 无 bit_xor 聚合 → 逐位奇偶 SUM（宽列）；

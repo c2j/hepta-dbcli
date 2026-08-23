@@ -508,7 +508,7 @@ fn assemble(
         note
     ));
 
-    DiffReport {
+    let mut report = DiffReport {
         started_at: Utc::now(),
         finished_at: Utc::now(),
         left: TableRef {
@@ -531,7 +531,13 @@ fn assemble(
             shard_duration_p99_ms: 0,
         },
         shards: vec![shard],
-        sample_diffs: diffs.into_iter().take(ctx.sample_limit).collect(),
+        sample_diffs: diffs,
         warnings,
-    }
+        key_columns: vec![],
+        value_columns: vec![],
+        ident_quote: '"',
+        backslash_escape: false,
+    };
+    crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
+    report
 }
