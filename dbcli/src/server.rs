@@ -768,7 +768,12 @@ impl DbMcp {
         };
 
         match crate::delta_diff::api::run_diff(left, right, opts).await {
-            Ok(report) => {
+            Ok(mut report) => {
+                // Engine keeps full diffs for CLI --export; MCP payload stays capped.
+                crate::delta_diff::report::cap_sample_diffs(
+                    &mut report,
+                    params.sample_limit.unwrap_or(1000),
+                );
                 let text = serde_json::to_string_pretty(&report)
                     .unwrap_or_else(|e| format!("{{\"error\":\"json serialize: {e}\"}}"));
                 Ok(CallToolResult::success(vec![Content::text(text)]))
