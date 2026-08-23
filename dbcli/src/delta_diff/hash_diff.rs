@@ -598,7 +598,7 @@ fn assemble_report(
     ctx: &DiffContext,
     shards: Vec<ShardResult>,
     diffs: Vec<DiffRow>,
-    sample_limit: usize,
+    _sample_limit: usize,
 ) -> DiffReport {
     let mut summary = DiffSummary {
         left_total: shards.iter().map(|s| s.left_count).sum(),
@@ -621,8 +621,8 @@ fn assemble_report(
     } else {
         0.0
     };
-    let sample_diffs = diffs.into_iter().take(sample_limit).collect();
-    DiffReport {
+    let sample_diffs = diffs;
+    let mut report = DiffReport {
         started_at: started_now(),
         finished_at: started_now(),
         left: TableRef {
@@ -651,7 +651,13 @@ fn assemble_report(
             .chain(ctx.route_warnings.iter())
             .cloned()
             .collect(),
-    }
+        key_columns: vec![],
+        value_columns: vec![],
+        ident_quote: '"',
+        backslash_escape: false,
+    };
+    crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
+    report
 }
 
 #[cfg(test)]
