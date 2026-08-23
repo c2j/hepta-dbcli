@@ -330,12 +330,15 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn row_hash_expr(&self, exprs: &[String]) -> String {
+        format!("STANDARD_HASH({}, 'MD5')", exprs.join(" || '#' || "))
+    }
+
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let Some((modulus, bucket)) = spec.bucket else {
             return String::from("-- error: bucket spec required for multiset query");
         };
-        let concat = spec.normalized_exprs.join(" || '#' || ");
-        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let row_hash = self.row_hash_expr(&spec.normalized_exprs);
         let mut table = match &spec.schema {
             Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
             None => format!("\"{}\"", spec.table),

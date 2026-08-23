@@ -275,12 +275,15 @@ impl Dialect for MySqlDialect {
         )
     }
 
+    fn row_hash_expr(&self, exprs: &[String]) -> String {
+        format!("MD5(CONCAT_WS('#', {}))", exprs.join(", "))
+    }
+
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let Some((modulus, bucket)) = spec.bucket else {
             return String::from("-- error: bucket spec required for multiset query");
         };
-        let concat = spec.normalized_exprs.join(", ");
-        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let row_hash = self.row_hash_expr(&spec.normalized_exprs);
         let table = match &spec.schema {
             Some(s) => format!("`{}`.`{}`", s, spec.table),
             None => format!("`{}`", spec.table),
