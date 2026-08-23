@@ -141,6 +141,11 @@ fn insert_copies(report: &DiffReport, row: &DiffRow) -> usize {
     if !report.key_columns.is_empty() {
         return 1;
     }
+    if let Value::Object(o) = &row.key {
+        let lc = o.get("left").and_then(Value::as_u64).unwrap_or(0);
+        let rc = o.get("right").and_then(Value::as_u64).unwrap_or(0);
+        return lc.abs_diff(rc).max(1) as usize;
+    }
     parse_multiset_gap(&row.key).max(1)
 }
 
@@ -235,6 +240,15 @@ fn render_update(
     ))
 }
 
+fn key_eq(name: &str, v: &Value, opts: &SqlPatchOpts<'_>) -> String {
+    let col = quote_ident(opts.quote, name);
+    if v.is_null() {
+        format!("{col} IS NULL")
+    } else {
+        format!("{col} = {}", sql_literal(v, opts.backslash_escape))
+    }
+}
+
 fn key_predicate(report: &DiffReport, row: &DiffRow, opts: &SqlPatchOpts<'_>) -> String {
     let src = row.left.as_ref().or(row.right.as_ref());
     report
@@ -250,11 +264,7 @@ fn key_predicate(report: &DiffReport, row: &DiffRow, opts: &SqlPatchOpts<'_>) ->
                     _ => None,
                 })
                 .unwrap_or(&Value::Null);
-            format!(
-                "{} = {}",
-                quote_ident(opts.quote, name),
-                sql_literal(v, opts.backslash_escape)
-            )
+            key_eq(name, v, opts)
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -363,6 +373,50 @@ mod tests {
     }
 
     #[test]
+    fn key_predicate_uses_is_null_for_null_key() {
+        let mut r = report_keyed();
+        r.sample_diffs = vec![DiffRow {
+            key: json!(["59267", Value::Null]),
+            left: Some(vec![Value::from("59267"), Value::Null, Value::from(8)]),
+            right: None,
+            status: DiffStatus::MissingRight,
+            confirmed: true,
+        }];
+        r.summary.missing_right = 1;
+        r.summary.missing_left = 0;
+        r.summary.modified = 0;
+        let sql = render_sql_patch(&r, &opts_left()).unwrap();
+        assert!(sql.contains("\"security_id\" IS NULL"), "{sql}");
+        assert!(!sql.contains("\"security_id\" = NULL"), "{sql}");
+        assert!(sql.contains("\"xwdm\" = '59267'"), "{sql}");
+    }
+
+    #[test]
+    fn update_set_still_assigns_null_with_eq() {
+        let mut r = report_keyed();
+        r.sample_diffs = vec![DiffRow {
+            key: json!(["59267", "600001"]),
+            left: Some(vec![
+                Value::from("59267"),
+                Value::from("600001"),
+                Value::from(10),
+            ]),
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("600001"),
+                Value::Null,
+            ]),
+            status: DiffStatus::Modified,
+            confirmed: true,
+        }];
+        r.summary.modified = 1;
+        r.summary.missing_left = 0;
+        let sql = render_sql_patch(&r, &opts_left()).unwrap();
+        assert!(sql.contains("\"cjsl\" = NULL"), "{sql}");
+        assert!(!sql.contains("SET \"cjsl\" IS NULL"), "{sql}");
+    }
+
+    #[test]
     fn apply_to_left_deletes_from_left() {
         let mut r = report_keyed();
         r.sample_diffs = vec![DiffRow {
@@ -443,6 +497,27 @@ mod tests {
         let sql = render_sql_patch(&r, &opts_left()).unwrap();
         let inserts = sql.matches("INSERT INTO").count();
         assert_eq!(inserts, 2, "{sql}");
+    }
+
+    #[test]
+    fn sql_keyless_insert_repeats_from_key_object_counts() {
+        let mut r = report_keyed();
+        r.key_columns.clear();
+        r.value_columns = vec!["xwdm".into(), "security_id".into(), "cjsl".into()];
+        r.sample_diffs = vec![DiffRow {
+            key: json!({"hash":"abc123def456","left":1,"right":3}),
+            left: None,
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("600000"),
+                Value::from(100),
+            ]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        }];
+        r.summary.modified = 0;
+        let sql = render_sql_patch(&r, &opts_left()).unwrap();
+        assert_eq!(sql.matches("INSERT INTO").count(), 2, "{sql}");
     }
 
     #[test]
