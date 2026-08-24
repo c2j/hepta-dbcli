@@ -174,7 +174,7 @@ pub(crate) async fn preflight(
     columns: &[String],
     key: &[String],
     strategy_hint: Option<crate::delta_diff::cmd::Strategy>,
-    consistency_none: bool,
+    _consistency_none: bool,
     rtrim_char_columns: bool,
 ) -> Result<Preflight, String> {
     pin_session(left.conn, "left").await?;
@@ -214,13 +214,6 @@ pub(crate) async fn preflight(
         &paired,
         rtrim_char_columns,
     ));
-    if consistency_none
-        && [left.connection_url, right.connection_url]
-            .iter()
-            .any(|url| matches!(url.split("://").next().unwrap_or("mysql"), "oracle"))
-    {
-        warnings.push("session pins apply to primary connections only".to_string());
-    }
     Ok(Preflight {
         lplan,
         rplan,
@@ -281,7 +274,6 @@ pub(crate) fn cross_db_column_type_warnings(
     ];
     let fixed_char = ["char", "nchar", "character", "bpchar"];
     let variable_char = ["varchar", "varchar2", "nvarchar2", "character varying"];
-    let numeric = ["number", "decimal", "numeric", "money"];
     let mut out = Vec::new();
 
     for (left_index, right_index) in pairing.right_of_left.iter().enumerate() {
@@ -323,7 +315,9 @@ pub(crate) fn cross_db_column_type_warnings(
                  content hashes will show false positives for values shorter than the declared width",
                 left.name, left.data_type, right.data_type
             ));
-        } else if numeric.contains(&left_base.as_str()) && numeric.contains(&right_base.as_str()) {
+        } else if metadata::TablePlan::is_numeric_type(&left.data_type)
+            && metadata::TablePlan::is_numeric_type(&right.data_type)
+        {
             let left_scale = declared_scale(&left.data_type);
             let right_scale = declared_scale(&right.data_type);
             let differs = match (left_scale, right_scale) {

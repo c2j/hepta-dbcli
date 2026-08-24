@@ -220,6 +220,7 @@ pub(crate) struct DeltaDiffArgs {
 
     /// Trim trailing blanks of fixed-width char columns on both sides before
     /// hashing/comparison (CHAR/NCHAR on Oracle, character/bpchar on GaussDB).
+    /// While active, all-blank fixed-width values are indistinguishable from NULL.
     #[arg(long)]
     pub rtrim_char_columns: bool,
 }

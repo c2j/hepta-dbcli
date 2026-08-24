@@ -470,10 +470,16 @@ mod tests {
     #[test]
     fn fixed_char_rtrim_is_opt_in() {
         let d = OracleDialect::new();
-        let mut spec = col("CODE", "CHAR(12)", false);
-        assert!(!d.normalize_expr(&spec).unwrap().contains("RTRIM("));
+        let mut spec = col("CODE", "CHAR(12)", true);
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(\"CODE\", '{NULL_SENTINEL}')")
+        );
         spec.rtrim_fixed_char = true;
-        assert!(d.normalize_expr(&spec).unwrap().contains("RTRIM("));
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(RTRIM(\"CODE\"), '{NULL_SENTINEL}')")
+        );
     }
 
     #[test]

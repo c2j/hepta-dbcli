@@ -30,6 +30,43 @@ pub(crate) struct TablePlan {
 }
 
 impl TablePlan {
+    pub(crate) fn is_numeric_type(data_type: &str) -> bool {
+        let base = data_type
+            .split('(')
+            .next()
+            .unwrap_or(data_type)
+            .trim()
+            .to_ascii_lowercase();
+        matches!(
+            base.as_str(),
+            "tinyint"
+                | "smallint"
+                | "mediumint"
+                | "int"
+                | "integer"
+                | "bigint"
+                | "int2"
+                | "int4"
+                | "int8"
+                | "oid"
+                | "number"
+                | "decimal"
+                | "numeric"
+                | "money"
+        )
+    }
+
+    pub(crate) fn numeric_value_flags_for(&self, columns: &[String]) -> Vec<bool> {
+        columns
+            .iter()
+            .map(|column| {
+                find_unique_ci(&self.norm_specs, column, |spec| &spec.name)
+                    .map(|spec| Self::is_numeric_type(&spec.data_type))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     /// Render §九 normalized expressions in compare order.
     pub(crate) fn normalized_exprs(&self, dialect: &dyn Dialect) -> Result<Vec<String>, DbError> {
         self.norm_specs
@@ -68,12 +105,13 @@ impl TablePlan {
     }
 
     pub(crate) fn string_key_flags(&self) -> Vec<bool> {
-        self.key_columns
-            .iter()
+        self.string_key_flags_for(&self.key_columns)
+    }
+
+    pub(crate) fn string_key_flags_for(&self, keys: &[String]) -> Vec<bool> {
+        keys.iter()
             .map(|k| {
-                self.norm_specs
-                    .iter()
-                    .find(|s| &s.name == k)
+                find_unique_ci(&self.norm_specs, k, |spec| &spec.name)
                     .map(|s| Self::key_is_string(&s.data_type))
                     .unwrap_or(false)
             })
@@ -479,6 +517,35 @@ mod tests {
         );
         let key = plan.key_hash_exprs(&MySqlDialect).unwrap();
         assert_eq!(&exprs[..key.len()], &key[..]);
+    }
+
+    #[test]
+    fn string_key_flags_follow_requested_key_order() {
+        let plan = TablePlan {
+            url_scheme: "oracle".into(),
+            key_columns: vec!["A".into(), "B".into()],
+            compare_columns: vec!["A".into(), "B".into()],
+            norm_specs: vec![
+                ColumnNormSpec {
+                    name: "A".into(),
+                    data_type: "NUMBER".into(),
+                    nullable: false,
+                    rtrim_fixed_char: false,
+                },
+                ColumnNormSpec {
+                    name: "B".into(),
+                    data_type: "VARCHAR2".into(),
+                    nullable: false,
+                    rtrim_fixed_char: false,
+                },
+            ],
+            warnings: vec![],
+        };
+
+        assert_eq!(
+            plan.string_key_flags_for(&["B".into(), "A".into()]),
+            vec![true, false]
+        );
     }
 
     // ── Mock connection serving canned metadata results ──

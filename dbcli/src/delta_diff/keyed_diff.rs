@@ -154,8 +154,18 @@ impl KeyedDiffer {
         if left_total.max(right_total) <= ctx.fetch_all_threshold {
             let lspec = full_row_spec(ctx, true, left.dialect(), None)?;
             let rspec = full_row_spec(ctx, false, right.dialect(), None)?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            let left_numeric = full_row_numeric_flags(ctx, true);
+            let right_numeric = full_row_numeric_flags(ctx, false);
+            let detail = row_level_diff(
+                left,
+                right,
+                (&lspec, &rspec),
+                None,
+                arity,
+                (&left_numeric, &right_numeric),
+                ctx.verbose,
+            )
+            .await?;
             *queries += detail.queries;
             let mut extra = Vec::new();
             if let Some(w) = fetch_count_mismatch_warning(
@@ -203,8 +213,18 @@ impl KeyedDiffer {
             );
             let lspec = full_row_spec(ctx, true, left.dialect(), Some(&lpred))?;
             let rspec = full_row_spec(ctx, false, right.dialect(), Some(&rpred))?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            let left_numeric = full_row_numeric_flags(ctx, true);
+            let right_numeric = full_row_numeric_flags(ctx, false);
+            let detail = row_level_diff(
+                left,
+                right,
+                (&lspec, &rspec),
+                None,
+                arity,
+                (&left_numeric, &right_numeric),
+                ctx.verbose,
+            )
+            .await?;
             *queries += detail.queries;
             let exp_l = lmap.get(&b).map(|t| t.count).unwrap_or(0);
             let exp_r = rmap.get(&b).map(|t| t.count).unwrap_or(0);
@@ -346,7 +366,7 @@ fn keys_only_spec(
         columns: side_keys.to_vec(),
         raw_exprs: false,
         key_columns: side_keys.to_vec(),
-        string_key: side.plan.string_key_flags(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: PAGE_SIZE,
@@ -378,7 +398,7 @@ fn full_row_spec(
         columns,
         raw_exprs: true,
         key_columns: side_keys.to_vec(),
-        string_key: side.plan.string_key_flags(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: PAGE_SIZE,
@@ -393,6 +413,20 @@ fn full_row_spec(
         },
         scn: ctx.scn_of(is_left),
     })
+}
+
+fn full_row_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_keys = ctx.side_key_columns(is_left);
+    let mut columns = side_keys.to_vec();
+    columns.extend(
+        side.plan
+            .norm_specs
+            .iter()
+            .filter(|spec| !side_keys.iter().any(|key| key == &spec.name))
+            .map(|spec| spec.name.clone()),
+    );
+    side.plan.numeric_value_flags_for(&columns)
 }
 
 async fn fetch_all_pages(

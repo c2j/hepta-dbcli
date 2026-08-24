@@ -28,33 +28,37 @@ impl CheckpointManager {
         if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| DbError::query(format!("checkpoint read: {e}")))?;
-            let mut lines = content.lines();
-            let found = lines
-                .find(|line| !line.trim().is_empty())
-                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .and_then(|value| {
-                    value
-                        .get("checkpoint_format_version")
-                        .and_then(|version| version.as_u64())
-                });
-            if found != Some(u64::from(CHECKPOINT_FORMAT_VERSION)) {
-                return Err(incompatible_version_error(&path, found));
-            }
-            for line in lines {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+            if content.trim().is_empty() {
+                // A pre-created zero-length checkpoint is equivalent to a fresh path.
+            } else {
+                let mut lines = content.lines();
+                let found = lines
+                    .find(|line| !line.trim().is_empty())
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|value| {
+                        value
+                            .get("checkpoint_format_version")
+                            .and_then(|version| version.as_u64())
+                    });
+                if found != Some(u64::from(CHECKPOINT_FORMAT_VERSION)) {
+                    return Err(incompatible_version_error(&path, found));
                 }
-                match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(v) => {
-                        if let Some(id) = v.get("shard").and_then(|s| s.as_str()) {
-                            let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                            completed.insert(id.to_string(), (get("lc"), get("rc"), get("dc")));
-                        } else {
-                            corrupted_lines += 1;
-                        }
+                for line in lines {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
-                    Err(_) => corrupted_lines += 1,
+                    match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(v) => {
+                            if let Some(id) = v.get("shard").and_then(|s| s.as_str()) {
+                                let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                                completed.insert(id.to_string(), (get("lc"), get("rc"), get("dc")));
+                            } else {
+                                corrupted_lines += 1;
+                            }
+                        }
+                        Err(_) => corrupted_lines += 1,
+                    }
                 }
             }
         }
@@ -231,6 +235,22 @@ mod tests {
         };
         assert!(err.contains("found: none"), "{err}");
         assert!(err.contains("expected: 2"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_checkpoint_is_initialized_as_new() {
+        let dir = std::env::temp_dir().join(format!("ddcp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let checkpoint = CheckpointManager::open(&path).unwrap();
+        drop(checkpoint);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&format!(
+            "\"checkpoint_format_version\":{CHECKPOINT_FORMAT_VERSION}"
+        )));
         std::fs::remove_dir_all(&dir).ok();
     }
 

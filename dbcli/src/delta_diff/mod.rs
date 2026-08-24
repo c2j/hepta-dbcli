@@ -158,6 +158,13 @@ async fn dry_run_inner(
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
     let paired = pairing::pair_plans(&lplan, &rplan);
+    let mut dry_run_warnings = routed.warnings.clone();
+    dry_run_warnings.extend(api::cross_db_column_type_warnings(
+        &lplan,
+        &rplan,
+        &paired,
+        args.rtrim_char_columns,
+    ));
     let (left_key_columns, right_key_columns) = paired_side_keys(
         &routed.key_columns,
         &lplan.key_columns,
@@ -186,12 +193,7 @@ async fn dry_run_inner(
         "dry-run plan\n  strategy         : {}",
         routed.strategy.name()
     ));
-    if !routed.warnings.is_empty() {
-        out.push_str(&format!(
-            "\n  route warnings   : {}",
-            routed.warnings.join("; ")
-        ));
-    }
+    append_dry_run_warnings(&mut out, &dry_run_warnings);
     out.push_str(&format!(
         "\n  left             : {}.{} ({})\n  right            : {}.{} ({})",
         lschema, ltable, left.name, rschema, rtable, right.name
@@ -692,6 +694,12 @@ fn format_dry_run_key(key_columns: &[String]) -> String {
     key_columns.join(",")
 }
 
+fn append_dry_run_warnings(out: &mut String, warnings: &[String]) {
+    if !warnings.is_empty() {
+        out.push_str(&format!("\n  route warnings   : {}", warnings.join("; ")));
+    }
+}
+
 fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String {
     match strategy {
         "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
@@ -705,11 +713,23 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
 
 #[cfg(test)]
 mod dry_run_format_tests {
-    use super::{format_dry_run_key, format_key_domain_line, paired_side_keys};
+    use super::{
+        append_dry_run_warnings, format_dry_run_key, format_key_domain_line, paired_side_keys,
+    };
 
     #[test]
     fn composite_keys_join_with_comma() {
         assert_eq!(format_dry_run_key(&["k1".into(), "k2".into()]), "k1,k2");
+    }
+
+    #[test]
+    fn dry_run_output_includes_scale_skew_warning() {
+        let mut out = "dry-run plan".to_string();
+        append_dry_run_warnings(
+            &mut out,
+            &["column 'amount': NUMBER(16,2) (left) vs numeric (right) — declared numeric scale differs".into()],
+        );
+        assert!(out.contains("declared numeric scale differs"), "{out}");
     }
 
     #[test]

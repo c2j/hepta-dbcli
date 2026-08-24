@@ -16,10 +16,15 @@ pub(crate) fn attach_keyless_rows(
     fetched: &HashMap<String, Vec<Value>>,
     value_columns: Vec<String>,
 ) {
-    if fetched.is_empty() {
+    if fetched.is_empty()
+        || !report.sample_diffs.iter().all(|row| {
+            row_hash(row)
+                .as_ref()
+                .is_some_and(|hash| fetched.contains_key(hash))
+        })
+    {
         return;
     }
-    let mut attached = false;
     for row in &mut report.sample_diffs {
         let Some(hash) = row_hash(row) else {
             continue;
@@ -27,7 +32,6 @@ pub(crate) fn attach_keyless_rows(
         let Some(cells) = fetched.get(&hash) else {
             continue;
         };
-        attached = true;
         let lc = cell_u64(row.left.as_deref(), 1);
         let rc = cell_u64(row.right.as_deref(), 1);
         row.key = serde_json::json!({ "hash": hash, "left": lc, "right": rc });
@@ -44,10 +48,12 @@ pub(crate) fn attach_keyless_rows(
             }
         }
     }
-    if attached {
-        report.value_columns = value_columns;
-        report.row_payload = RowPayload::Columns;
-    }
+    report.value_columns = value_columns;
+    report.row_payload = RowPayload::Columns;
+    debug_assert!(report
+        .sample_diffs
+        .iter()
+        .all(|row| row.key.get("hash").is_some()));
 }
 
 fn cell_u64(row: Option<&[Value]>, idx: usize) -> u64 {
@@ -185,14 +191,11 @@ async fn fetch_and_attach_keyless(
     left: &mut (dyn crate::backend::DbConn + Send),
     right: &mut (dyn crate::backend::DbConn + Send),
     ctx: &crate::delta_diff::strategy::DiffContext,
-    sample: usize,
+    _sample: usize,
 ) -> Result<(), String> {
     let mut hashes: Vec<String> = report.sample_diffs.iter().filter_map(row_hash).collect();
     hashes.sort();
     hashes.dedup();
-    if sample > 0 && hashes.len() > sample {
-        hashes.truncate(sample);
-    }
     if hashes.len() > 1000 {
         report.warnings.push(format!(
             "keyless row fetch of {} hashes (warning threshold 1000)",
@@ -217,8 +220,8 @@ async fn fetch_and_attach_keyless(
     }
     let display_columns = ctx.left.plan.compare_columns.clone();
     let mut map = std::collections::HashMap::new();
-    pull_hash_rows(left, ctx, true, &hashes, &mut map).await?;
-    pull_hash_rows(right, ctx, false, &hashes, &mut map).await?;
+    pull_hash_rows(left, ctx, &pairing, true, &hashes, &mut map).await?;
+    pull_hash_rows(right, ctx, &pairing, false, &hashes, &mut map).await?;
     attach_keyless_rows(report, &map, display_columns);
     Ok(())
 }
@@ -226,6 +229,7 @@ async fn fetch_and_attach_keyless(
 async fn pull_hash_rows(
     conn: &mut (dyn crate::backend::DbConn + Send),
     ctx: &crate::delta_diff::strategy::DiffContext,
+    pairing: &crate::delta_diff::pairing::Pairing,
     is_left: bool,
     hashes: &[String],
     out: &mut std::collections::HashMap<String, Vec<Value>>,
@@ -246,7 +250,6 @@ async fn pull_hash_rows(
     let projection = if is_left {
         side.plan.compare_columns.clone()
     } else {
-        let pairing = pair_plans(&ctx.left.plan, &ctx.right.plan);
         pairing
             .right_of_left
             .iter()
@@ -352,7 +355,7 @@ async fn pull_raw_side(
         columns,
         raw_exprs: true,
         key_columns: side_keys.to_vec(),
-        string_key: side.plan.string_key_flags(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: 4096,
@@ -509,6 +512,30 @@ mod tests {
             report.sample_diffs[0].right,
             Some(vec![Value::from("abc123"), Value::from(1)])
         );
+    }
+
+    #[test]
+    fn keyless_attach_is_all_or_nothing() {
+        let mut report = empty_report();
+        for hash in ["found", "missing"] {
+            report.sample_diffs.push(DiffRow {
+                key: Value::from(hash),
+                left: Some(vec![Value::from(hash), Value::from(1)]),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            });
+        }
+        let fetched = HashMap::from([("found".into(), vec![Value::from("payload")])]);
+
+        attach_keyless_rows(&mut report, &fetched, vec!["value".into()]);
+
+        assert_eq!(report.row_payload, RowPayload::HashCount);
+        assert!(report.value_columns.is_empty());
+        assert!(report
+            .sample_diffs
+            .iter()
+            .all(|row| row.left.as_ref().is_none_or(|cells| cells.len() == 2)));
     }
 
     #[test]

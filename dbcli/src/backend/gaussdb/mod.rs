@@ -163,11 +163,18 @@ impl Dialect for GaussdbDialect {
                 )));
             }
         };
-        Ok(if col.nullable {
-            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
-        } else {
-            inner
-        })
+        Ok(
+            if col.nullable
+                && col.rtrim_fixed_char
+                && matches!(base.as_str(), "character" | "bpchar")
+            {
+                format!("COALESCE(NULLIF({inner}, ''), '{NULL_SENTINEL}')")
+            } else if col.nullable {
+                format!("COALESCE({inner}, '{NULL_SENTINEL}')")
+            } else {
+                inner
+            },
+        )
     }
 
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
@@ -407,10 +414,16 @@ mod tests {
     #[test]
     fn fixed_character_rtrim_is_opt_in() {
         let d = GaussdbDialect;
-        let mut spec = col("code", "character(12)", false);
-        assert!(!d.normalize_expr(&spec).unwrap().contains("rtrim("));
+        let mut spec = col("code", "character(12)", true);
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(\"code\", '{NULL_SENTINEL}')")
+        );
         spec.rtrim_fixed_char = true;
-        assert!(d.normalize_expr(&spec).unwrap().contains("rtrim("));
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(NULLIF(rtrim(\"code\"), ''), '{NULL_SENTINEL}')")
+        );
     }
 
     #[test]

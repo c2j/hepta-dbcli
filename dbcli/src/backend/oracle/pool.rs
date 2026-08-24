@@ -2,9 +2,14 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::backend::error::DbError;
-use crate::backend::{DbConn, DbPool};
+use crate::backend::{DbConn, DbPool, Dialect};
 
 use super::conn::OracleConn;
+use super::dialect::OracleDialect;
+
+fn pool_init_sql() -> Vec<String> {
+    OracleDialect::new().session_pin_sql()
+}
 
 pub(crate) struct OraclePool;
 
@@ -47,6 +52,9 @@ impl DbPool for OracleRsPool {
             .map_err(|e| DbError::connection_with_source("Oracle connection failed", e))?;
         let mut conn = OracleConn::new(conn);
         conn.probe_capabilities().await?;
+        for sql in pool_init_sql() {
+            conn.query_drop(&sql).await?;
+        }
         Ok(Box::new(conn))
     }
 }
