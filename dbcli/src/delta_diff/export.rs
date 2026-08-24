@@ -328,6 +328,7 @@ mod tests {
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into(), "yhs".into()],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         }
     }

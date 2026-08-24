@@ -108,22 +108,18 @@ impl DiffStrategy for JoinDiffer {
 /// 输出 (key, in_left, in_right)；Modified 由哈希不等判定。
 fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbError> {
     let dialect = conn.dialect();
-    let q = dialect.identifier_quote();
     let side_sql = |side: &crate::delta_diff::strategy::SideCtx| -> Result<String, DbError> {
         let exprs = side.plan.normalized_exprs(dialect)?;
-        let table = match &side.schema {
-            Some(s) => format!("{q}{s}{q}.{q}{}{q}", side.table),
-            None => format!("{q}{}{q}", side.table),
-        };
+        let table = dialect.quote_table(side.schema.as_deref(), &side.table);
+        let key = dialect.quote_ident(&ctx.key_column);
         let where_clause = ctx
             .filter
             .as_ref()
             .map(|f| format!(" WHERE ({f})"))
             .unwrap_or_default();
         Ok(format!(
-            "SELECT {q}{key}{q} AS k, MD5(CONCAT_WS('#', {})) AS h FROM {table}{where_clause}",
-            exprs.join(", "),
-            key = ctx.key_column
+            "SELECT {key} AS k, MD5(CONCAT_WS('#', {})) AS h FROM {table}{where_clause}",
+            exprs.join(", ")
         ))
     };
     let l = side_sql(&ctx.left)?;
@@ -148,7 +144,6 @@ async fn fetch_diff_rows(
     ctx: &DiffContext,
     diffs: &mut [DiffRow],
 ) -> Result<(), DbError> {
-    let q = conn.dialect().identifier_quote();
     for d in diffs.iter_mut() {
         let key = match &d.key {
             Value::Number(n) => n.as_i64(),
@@ -156,8 +151,8 @@ async fn fetch_diff_rows(
             _ => None,
         };
         let Some(k) = key else { continue };
-        let lspec = point_spec(ctx, true, k, q, conn.dialect())?;
-        let rspec = point_spec(ctx, false, k, q, conn.dialect())?;
+        let lspec = point_spec(ctx, true, k, conn.dialect())?;
+        let rspec = point_spec(ctx, false, k, conn.dialect())?;
         let lsql = conn.dialect().render_keyset_page_sql(&lspec);
         let rsql = conn.dialect().render_keyset_page_sql(&rspec);
         ctx.vlog(format!("[sql:left] {lsql}"));
@@ -174,11 +169,10 @@ fn point_spec(
     ctx: &DiffContext,
     is_left: bool,
     key: i64,
-    quote: char,
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let mut columns = vec![format!("{quote}{key}{quote}", key = ctx.key_column)];
+    let mut columns = vec![dialect.quote_ident(&ctx.key_column)];
     for spec in side
         .plan
         .norm_specs
@@ -209,11 +203,9 @@ async fn count_rows(
     is_left: bool,
 ) -> Result<u64, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let q = conn.dialect().identifier_quote();
-    let table = match &side.schema {
-        Some(s) => format!("{q}{s}{q}.{q}{}{q}", side.table),
-        None => format!("{q}{}{q}", side.table),
-    };
+    let table = conn
+        .dialect()
+        .quote_table(side.schema.as_deref(), &side.table);
     let where_clause = ctx
         .filter
         .as_ref()
@@ -297,6 +289,7 @@ fn assemble(
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
+        ident_scheme: String::new(),
         backslash_escape: false,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);

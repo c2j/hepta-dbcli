@@ -61,6 +61,7 @@ pub(crate) fn row_hash(row: &crate::delta_diff::report::DiffRow) -> Option<Strin
 }
 
 pub(crate) struct HashInSql<'a> {
+    pub scheme: &'a str,
     pub quote: char,
     pub schema: Option<&'a str>,
     pub table: &'a str,
@@ -72,14 +73,7 @@ pub(crate) struct HashInSql<'a> {
 }
 
 pub(crate) fn render_hash_in_sql(p: &HashInSql<'_>) -> String {
-    let table = match p.schema {
-        Some(s) => format!(
-            "{}.{}",
-            crate::backend::quote_ident(p.quote, s),
-            crate::backend::quote_ident(p.quote, p.table)
-        ),
-        None => crate::backend::quote_ident(p.quote, p.table),
-    };
+    let table = crate::backend::quote_table_scheme(p.scheme, p.quote, p.schema, p.table);
     let cols = if p.columns.is_empty() {
         "*".to_string()
     } else {
@@ -192,18 +186,23 @@ async fn pull_hash_rows(
     hashes: &[String],
     out: &mut std::collections::HashMap<String, Vec<Value>>,
 ) -> Result<(), String> {
-    let dialect = conn.dialect();
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let exprs = side
-        .plan
-        .normalized_exprs(dialect)
-        .map_err(|e| e.to_string())?;
-    let hash_expr = dialect.row_hash_expr(&exprs);
-    let quote = dialect.identifier_quote();
-    let bs = dialect.url_scheme() == "mysql";
-    let filter = crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme());
+    let (hash_expr, quote, scheme, filter) = {
+        let dialect = conn.dialect();
+        let exprs = side
+            .plan
+            .normalized_exprs(dialect)
+            .map_err(|e| e.to_string())?;
+        let hash_expr = dialect.row_hash_expr(&exprs);
+        let quote = dialect.identifier_quote();
+        let scheme = dialect.url_scheme().to_string();
+        let filter = crate::delta_diff::strategy::side_filter(ctx, &scheme);
+        (hash_expr, quote, scheme, filter)
+    };
+    let bs = scheme == "mysql";
     for chunk in chunk_hashes(hashes) {
         let inner = render_hash_in_sql(&HashInSql {
+            scheme: &scheme,
             quote,
             schema: side.schema.as_deref(),
             table: &side.table,
@@ -359,6 +358,7 @@ mod tests {
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         }
     }
@@ -412,6 +412,7 @@ mod tests {
         let cols = ["a".into(), "b".into()];
         let hashes = ["aa".into(), "bb".into()];
         let sql = render_hash_in_sql(&HashInSql {
+            scheme: "gaussdb",
             quote: '"',
             schema: Some("s"),
             table: "t",

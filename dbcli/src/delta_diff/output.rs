@@ -309,6 +309,7 @@ mod tests {
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         }
     }

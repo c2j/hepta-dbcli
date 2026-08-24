@@ -10,7 +10,7 @@ use std::time::Instant;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::backend::{quote_ident, ChecksumSqlSpec, DbConn, DbError};
+use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
 use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
 use crate::delta_diff::report::{
@@ -143,12 +143,14 @@ impl BucketDiffer {
         let rf = side_filter(ctx, right.dialect().url_scheme());
         let (le, re) = if lf.is_some() || rf.is_some() {
             let lsql = filtered_count_sql(
+                left.dialect().url_scheme(),
                 left.dialect().identifier_quote(),
                 ctx.left.schema.as_deref(),
                 &ctx.left.table,
                 lf.as_deref(),
             );
             let rsql = filtered_count_sql(
+                right.dialect().url_scheme(),
                 right.dialect().identifier_quote(),
                 ctx.right.schema.as_deref(),
                 &ctx.right.table,
@@ -189,15 +191,13 @@ fn expected_queries(diff_buckets: u64) -> u64 {
 }
 
 fn filtered_count_sql(
+    scheme: &str,
     quote: char,
     schema: Option<&str>,
     table: &str,
     filter: Option<&str>,
 ) -> String {
-    let table = match schema {
-        Some(s) => format!("{}.{}", quote_ident(quote, s), quote_ident(quote, table)),
-        None => quote_ident(quote, table),
-    };
+    let table = crate::backend::quote_table_scheme(scheme, quote, schema, table);
     match filter {
         Some(f) => format!("SELECT COUNT(*) AS cnt FROM {table} WHERE ({f})"),
         None => format!("SELECT COUNT(*) AS cnt FROM {table}"),
@@ -419,6 +419,7 @@ fn assemble(
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
+        ident_scheme: String::new(),
         backslash_escape: false,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);

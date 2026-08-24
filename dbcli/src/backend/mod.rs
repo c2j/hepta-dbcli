@@ -140,6 +140,17 @@ pub trait Dialect: Send + Sync {
     /// Character used to quote identifiers (backtick ` for MySQL, double-quote " for Oracle).
     fn identifier_quote(&self) -> char;
 
+    /// Quote an identifier, applying dialect folding (Oracle uppercases
+    /// unquoted names so CLI `dat_fund_cjqs` matches `DAT_FUND_CJQS`).
+    fn quote_ident(&self, name: &str) -> String {
+        quote_ident_scheme(self.url_scheme(), self.identifier_quote(), name)
+    }
+
+    /// Quote `schema.table` (or just `table` when schema is None).
+    fn quote_table(&self, schema: Option<&str>, table: &str) -> String {
+        quote_table_scheme(self.url_scheme(), self.identifier_quote(), schema, table)
+    }
+
     /// Whether this database supports # as a line-comment token (MySQL yes, Oracle no).
     fn supports_hash_comment(&self) -> bool;
 
@@ -298,6 +309,31 @@ pub struct KeysetPageSpec {
 pub(crate) fn quote_ident(quote: char, name: &str) -> String {
     let doubled = name.replace(quote, &format!("{quote}{quote}"));
     format!("{quote}{doubled}{quote}")
+}
+
+/// Quote an identifier with Oracle unquoted-name folding (ASCII uppercase).
+pub(crate) fn quote_ident_scheme(scheme: &str, quote: char, name: &str) -> String {
+    if scheme == "oracle" {
+        quote_ident(quote, &name.to_ascii_uppercase())
+    } else {
+        quote_ident(quote, name)
+    }
+}
+
+pub(crate) fn quote_table_scheme(
+    scheme: &str,
+    quote: char,
+    schema: Option<&str>,
+    table: &str,
+) -> String {
+    match schema {
+        Some(s) => format!(
+            "{}.{}",
+            quote_ident_scheme(scheme, quote, s),
+            quote_ident_scheme(scheme, quote, table)
+        ),
+        None => quote_ident_scheme(scheme, quote, table),
+    }
 }
 
 fn escape_sql_string(s: &str, backslash_escape: bool) -> String {

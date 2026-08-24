@@ -220,11 +220,10 @@ fn render_iblt(
 ) -> Result<String, DbError> {
     let dialect = conn.dialect();
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let q = dialect.identifier_quote();
     let spec = IbltSqlSpec {
         schema: side.schema.clone(),
         table: side.table.clone(),
-        key_expr: format!("{q}{}{q}", ctx.key_column),
+        key_expr: dialect.quote_ident(&ctx.key_column),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
         cells_per_subtable: m,
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
@@ -536,6 +535,7 @@ fn assemble(
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
+        ident_scheme: String::new(),
         backslash_escape: false,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);

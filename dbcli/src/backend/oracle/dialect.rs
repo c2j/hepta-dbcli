@@ -5,38 +5,38 @@ pub(crate) struct OracleDialect;
 
 impl Dialect for OracleDialect {
     fn database_info(&self) -> &str {
+        // COMMENT/DATABASE are reserved; unquoted `AS comment` raises ORA-00923.
         "SELECT \
-         (SELECT banner FROM v$version WHERE banner LIKE 'Oracle%' AND ROWNUM = 1) AS version, \
-         SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS database, \
-         SYS_CONTEXT('USERENV','SESSION_USER') AS current_user, \
-         SYS_CONTEXT('USERENV','HOST') AS hostname, \
-         CAST(NULL AS VARCHAR2(1)) AS port, \
-         CAST(NULL AS VARCHAR2(1)) AS os, \
-         (SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET') AS charset, \
-         (SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_SORT') AS collation, \
-         (SELECT banner FROM v$version WHERE banner LIKE 'Oracle%' AND ROWNUM = 1) AS version_comment \
+         (SELECT banner FROM v$version WHERE banner LIKE 'Oracle%' AND ROWNUM = 1) AS \"version\", \
+         SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS \"database\", \
+         SYS_CONTEXT('USERENV','SESSION_USER') AS \"current_user\", \
+         SYS_CONTEXT('USERENV','HOST') AS \"hostname\", \
+         CAST(NULL AS VARCHAR2(1)) AS \"port\", \
+         CAST(NULL AS VARCHAR2(1)) AS \"os\", \
+         (SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET') AS \"charset\", \
+         (SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_SORT') AS \"collation\", \
+         (SELECT banner FROM v$version WHERE banner LIKE 'Oracle%' AND ROWNUM = 1) AS \"version_comment\" \
          FROM dual"
     }
 
     fn list_tables(&self) -> &str {
         "SELECT \
-         t.OWNER AS schema_name, \
-         t.TABLE_NAME AS table_name, \
-         t.TABLE_TYPE AS table_type, \
-         NULL AS engine, \
-         t.NUM_ROWS AS row_count, \
-         s.BYTES AS total_size, \
-         c.COMMENTS AS comment \
+         t.OWNER AS \"schema_name\", \
+         t.TABLE_NAME AS \"table_name\", \
+         'TABLE' AS \"table_type\", \
+         NULL AS \"engine\", \
+         t.NUM_ROWS AS \"row_count\", \
+         CAST(NULL AS NUMBER) AS \"total_size\", \
+         c.COMMENTS AS \"comment\" \
          FROM all_tables t \
          LEFT JOIN all_tab_comments c ON c.OWNER = t.OWNER AND c.TABLE_NAME = t.TABLE_NAME \
-         LEFT JOIN dba_segments s ON s.OWNER = t.OWNER AND s.SEGMENT_NAME = t.TABLE_NAME \
          WHERE t.OWNER NOT IN ('SYS','SYSTEM','OUTLN','DBSNMP','XDB','CTXSYS','MDSYS','ORDSYS') \
          ORDER BY t.OWNER, t.TABLE_NAME"
     }
 
     fn table_columns(&self) -> &str {
         "SELECT \
-         c.COLUMN_NAME AS column_name, \
+         c.COLUMN_NAME AS \"column_name\", \
          c.DATA_TYPE || \
            CASE \
              WHEN c.DATA_TYPE IN ('VARCHAR2','NVARCHAR2','CHAR','NCHAR','RAW') \
@@ -44,11 +44,11 @@ impl Dialect for OracleDialect {
              WHEN c.DATA_TYPE = 'NUMBER' \
                THEN '(' || NVL(TO_CHAR(c.DATA_PRECISION),'*') || ',' || NVL(TO_CHAR(c.DATA_SCALE),'*') || ')' \
              ELSE '' \
-           END AS data_type, \
-         CASE WHEN c.NULLABLE = 'Y' THEN 1 ELSE 0 END AS nullable, \
-         c.DATA_DEFAULT AS default_value, \
-         c.COLUMN_ID AS ordinal_position, \
-         com.COMMENTS AS comment, \
+           END AS \"data_type\", \
+         CASE WHEN c.NULLABLE = 'Y' THEN 1 ELSE 0 END AS \"nullable\", \
+         CAST(NULL AS VARCHAR2(1)) AS \"default_value\", \
+         c.COLUMN_ID AS \"ordinal_position\", \
+         com.COMMENTS AS \"comment\", \
          (SELECT LISTAGG(cc.CONSTRAINT_TYPE, ',') WITHIN GROUP (ORDER BY cc.CONSTRAINT_TYPE) \
           FROM all_cons_columns acc \
           JOIN all_constraints cc ON cc.CONSTRAINT_NAME = acc.CONSTRAINT_NAME \
@@ -56,7 +56,7 @@ impl Dialect for OracleDialect {
           WHERE acc.OWNER = c.OWNER \
             AND acc.TABLE_NAME = c.TABLE_NAME \
             AND acc.COLUMN_NAME = c.COLUMN_NAME \
-            AND cc.CONSTRAINT_TYPE IN ('P','U','R')) AS column_key \
+            AND cc.CONSTRAINT_TYPE IN ('P','U','R')) AS \"column_key\" \
          FROM all_tab_columns c \
          LEFT JOIN all_col_comments com \
            ON com.OWNER = c.OWNER AND com.TABLE_NAME = c.TABLE_NAME AND com.COLUMN_NAME = c.COLUMN_NAME \
@@ -66,13 +66,13 @@ impl Dialect for OracleDialect {
 
     fn table_indexes(&self) -> &str {
         "SELECT \
-         i.INDEX_NAME AS index_name, \
-         CASE WHEN i.UNIQUENESS = 'UNIQUE' THEN 1 ELSE 0 END AS is_unique, \
-         CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS is_primary, \
+         i.INDEX_NAME AS \"index_name\", \
+         CASE WHEN i.UNIQUENESS = 'UNIQUE' THEN 1 ELSE 0 END AS \"is_unique\", \
+         CASE WHEN c.CONSTRAINT_TYPE = 'P' THEN 1 ELSE 0 END AS \"is_primary\", \
          (SELECT LISTAGG(ic.COLUMN_NAME, ', ') WITHIN GROUP (ORDER BY ic.COLUMN_POSITION) \
           FROM all_ind_columns ic \
-          WHERE ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME) AS columns, \
-         i.INDEX_TYPE AS index_type \
+          WHERE ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME) AS \"columns\", \
+         i.INDEX_TYPE AS \"index_type\" \
          FROM all_indexes i \
          LEFT JOIN all_constraints c \
            ON c.OWNER = i.OWNER \
@@ -135,6 +135,10 @@ impl Dialect for OracleDialect {
         '"'
     }
 
+    fn quote_ident(&self, name: &str) -> String {
+        oracle_ident(name)
+    }
+
     fn supports_hash_comment(&self) -> bool {
         false
     }
@@ -148,14 +152,15 @@ impl Dialect for OracleDialect {
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
-        let q = format!("\"{}\"", col.name.replace('"', "\"\""));
+        let q = oracle_ident(&col.name);
         let base = col.data_type.trim().to_uppercase();
-        let inner = match base.as_str() {
+        let type_name = base.split('(').next().unwrap_or(&base).trim();
+        let inner = match type_name {
             s if s.starts_with("TIMESTAMP") => {
                 format!("TO_CHAR({q}, 'YYYY-MM-DD HH24:MI:SS.FF6')")
             }
             "DATE" => format!("TO_CHAR({q}, 'YYYY-MM-DD')"),
-            "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" => q.clone(),
+            "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" | "VARCHAR" => q.clone(),
             "RAW" | "LONG RAW" => format!("RAWTOHEX({q})"),
             "CLOB" | "NCLOB" | "BLOB" | "LONG" | "BFILE" => {
                 return Err(DbError::unsupported(format!(
@@ -164,10 +169,7 @@ impl Dialect for OracleDialect {
                     col.name, col.data_type
                 )));
             }
-            s if s.starts_with("NUMBER")
-                || s.starts_with("DECIMAL")
-                || s.starts_with("NUMERIC") =>
-            {
+            "NUMBER" | "DECIMAL" | "NUMERIC" => {
                 // 标度保留掩码（§九 + 评审）：TO_CHAR 默认丢前导零/尾零，
                 // NUMBER(p,s) 须按声明标度补齐以与 MySQL CAST(DECIMAL) 对齐
                 match oracle_number_scale(&base) {
@@ -198,16 +200,14 @@ impl Dialect for OracleDialect {
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let concat = spec.normalized_exprs.join(" || '#' || ");
         let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
-        let mut table = match &spec.schema {
-            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
-            None => format!("\"{}\"", spec.table),
-        };
+        let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+            let k = oracle_ident(key);
+            conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some((modulus, bucket)) = spec.bucket {
             conds.push(format!(
@@ -240,16 +240,14 @@ impl Dialect for OracleDialect {
     fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let concat = spec.normalized_exprs.join(" || '#' || ");
         let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
-        let mut table = match &spec.schema {
-            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
-            None => format!("\"{}\"", spec.table),
-        };
+        let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            conds.push(format!("\"{key}\" >= {lo} AND \"{key}\" < {hi}"));
+            let k = oracle_ident(key);
+            conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some(f) = &spec.filter {
             conds.push(format!("({f})"));
@@ -306,10 +304,7 @@ impl Dialect for OracleDialect {
                 .map(|c| crate::backend::quote_ident('"', c))
                 .collect()
         };
-        let mut table = match &spec.schema {
-            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
-            None => format!("\"{}\"", spec.table),
-        };
+        let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
@@ -339,10 +334,7 @@ impl Dialect for OracleDialect {
             return String::from("-- error: bucket spec required for multiset query");
         };
         let row_hash = self.row_hash_expr(&spec.normalized_exprs);
-        let mut table = match &spec.schema {
-            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
-            None => format!("\"{}\"", spec.table),
-        };
+        let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
@@ -364,10 +356,7 @@ impl Dialect for OracleDialect {
         let m = spec.cells_per_subtable;
         let concat = spec.normalized_exprs.join(" || '#' || ");
         let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
-        let mut table = match &spec.schema {
-            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
-            None => format!("\"{}\"", spec.table),
-        };
+        let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
         }
@@ -390,6 +379,17 @@ impl Dialect for OracleDialect {
             val_xor(4),
             key = spec.key_expr
         ))
+    }
+}
+
+fn oracle_ident(name: &str) -> String {
+    crate::backend::quote_ident('"', &name.to_ascii_uppercase())
+}
+
+fn quoted_table(schema: &Option<String>, table: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", oracle_ident(s), oracle_ident(table)),
+        None => oracle_ident(table),
     }
 }
 
@@ -460,6 +460,30 @@ mod tests {
         let sql = d.table_indexes();
         assert!(sql.contains("UPPER(i.OWNER) = UPPER(:1)"));
         assert!(sql.contains("UPPER(i.TABLE_NAME) = UPPER(:2)"));
+    }
+
+    #[test]
+    fn test_introspection_quotes_reserved_aliases() {
+        let d = OracleDialect;
+        assert!(d.database_info().contains("AS \"database\""));
+        assert!(d.list_tables().contains("AS \"comment\""));
+        assert!(d.table_columns().contains("AS \"comment\""));
+        assert!(d.table_indexes().contains("AS \"columns\""));
+        assert!(!d.list_tables().contains("TABLE_TYPE"));
+        assert!(!d.list_tables().contains("dba_segments"));
+    }
+
+    #[test]
+    fn test_quote_ident_folds_cli_table_names() {
+        assert_eq!(oracle_ident("dat_fund_cjqs"), "\"DAT_FUND_CJQS\"");
+        assert_eq!(
+            quoted_table(&Some("scott".into()), "orders"),
+            "\"SCOTT\".\"ORDERS\""
+        );
+        assert_eq!(
+            OracleDialect.quote_table(Some("system"), "dd_int_l"),
+            "\"SYSTEM\".\"DD_INT_L\""
+        );
     }
 
     #[test]
@@ -575,6 +599,11 @@ mod tests {
         assert_eq!(
             d.normalize_expr(&col("DATA", "RAW", true)).unwrap(),
             "COALESCE(RAWTOHEX(\"DATA\"), '\u{1f}NULL\u{1f}')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("XWDM", "VARCHAR2(32)", false))
+                .unwrap(),
+            "\"XWDM\""
         );
         assert!(d.normalize_expr(&col("DOC", "CLOB", true)).is_err());
     }

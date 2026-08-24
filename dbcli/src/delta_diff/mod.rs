@@ -218,9 +218,10 @@ async fn min_max(
     table: &str,
     key: &str,
 ) -> Result<(i64, i64), String> {
-    let q = conn.dialect().identifier_quote();
-    let sql =
-        format!("SELECT MIN({q}{key}{q}), MAX({q}{key}{q}) FROM {q}{schema}{q}.{q}{table}{q}");
+    let d = conn.dialect();
+    let k = d.quote_ident(key);
+    let t = d.quote_table(Some(schema), table);
+    let sql = format!("SELECT MIN({k}), MAX({k}) FROM {t}");
     let r = conn.query(&sql).await.map_err(|e| e.to_string())?;
     let row = r.rows.first().ok_or("no rows")?;
     let lo = row.first().and_then(|v| v.as_i64()).ok_or("no min")?;
@@ -372,6 +373,7 @@ async fn execute_diff_inner(
     let apply_right = matches!(args.apply_to, Some(cmd::ApplyTo::Right));
     let qconn = if apply_right { &rconn } else { &lconn };
     report.ident_quote = qconn.dialect().identifier_quote();
+    report.ident_scheme = qconn.dialect().url_scheme().to_string();
     report.backslash_escape = qconn.dialect().url_scheme() == "mysql";
 
     let did_fetch =
@@ -517,6 +519,11 @@ fn write_export(args: &cmd::DeltaDiffArgs, report: &report::DiffReport) -> Resul
                 report,
                 &sql_patch::SqlPatchOpts {
                     apply_to,
+                    scheme: if report.ident_scheme.is_empty() {
+                        "gaussdb"
+                    } else {
+                        report.ident_scheme.as_str()
+                    },
                     quote: if report.ident_quote == '\0' {
                         '"'
                     } else {
@@ -727,6 +734,7 @@ mod emit_tests {
             key_columns: vec!["id".into()],
             value_columns: vec!["name".into()],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         }
     }

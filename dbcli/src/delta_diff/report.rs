@@ -89,6 +89,8 @@ pub(crate) struct DiffReport {
     #[serde(skip)]
     pub(crate) ident_quote: char,
     #[serde(skip)]
+    pub(crate) ident_scheme: String,
+    #[serde(skip)]
     pub(crate) backslash_escape: bool,
 }
 
@@ -178,6 +180,7 @@ mod tests {
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         };
         let s = serde_json::to_string(&report).unwrap();
@@ -213,6 +216,7 @@ mod tests {
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
+                ident_scheme: String::new(),
                 backslash_escape: false,
             })
             .unwrap(),
@@ -257,6 +261,7 @@ mod tests {
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
+                ident_scheme: String::new(),
                 backslash_escape: false,
             })
             .unwrap(),
@@ -298,6 +303,7 @@ mod tests {
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
+                ident_scheme: String::new(),
                 backslash_escape: false,
             })
             .unwrap(),
@@ -347,6 +353,7 @@ mod tests {
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
+                ident_scheme: String::new(),
                 backslash_escape: false,
             })
             .unwrap(),
