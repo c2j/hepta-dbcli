@@ -24,6 +24,8 @@ pub(crate) struct DiffContext {
     pub(crate) right_pool: Arc<dyn DbPool>,
     pub(crate) key_column: String,
     pub(crate) key_columns: Vec<String>,
+    pub(crate) left_key_columns: Vec<String>,
+    pub(crate) right_key_columns: Vec<String>,
     pub(crate) filter: Option<String>,
     /// 增量比对（--update-column/--update-since）：(列, 窗口表达式)，
     /// 谓词由 side_filter 按方言渲染
@@ -52,6 +54,15 @@ pub(crate) struct DiffContext {
 }
 
 impl DiffContext {
+    /// 本侧物理键名，顺序与逻辑键 `key_columns` 一致。
+    pub(crate) fn side_key_columns(&self, is_left: bool) -> &[String] {
+        if is_left {
+            &self.left_key_columns
+        } else {
+            &self.right_key_columns
+        }
+    }
+
     /// 本侧 SCN（若已捕获且为 Oracle 快照模式）
     pub(crate) fn scn_of(&self, is_left: bool) -> Option<u64> {
         self.scns
@@ -143,6 +154,8 @@ mod filter_tests {
             right_pool: dummy_pool(),
             key_column: "id".into(),
             key_columns: vec!["id".into()],
+            left_key_columns: vec!["id".into()],
+            right_key_columns: vec!["id".into()],
             filter: filter.map(str::to_string),
             incremental: inc.map(|(a, b)| (a.to_string(), b.to_string())),
             bisection_factor: 32,

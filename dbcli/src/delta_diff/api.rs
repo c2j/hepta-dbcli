@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::backend::{DbConn, DbPool};
 use crate::delta_diff::report::DiffReport;
-use crate::delta_diff::{engine, metadata, strategy};
+use crate::delta_diff::{engine, metadata, pairing, strategy};
 use crate::delta_diff::{progress, side_schema_from_conn};
 
 pub(crate) struct SideInput {
@@ -97,6 +97,14 @@ pub(crate) async fn run_diff(
         &right.connection_url,
         opts.strategy,
     )?;
+    let paired = pairing::pair_plans(&lplan, &rplan);
+    let (left_key_columns, right_key_columns) = super::paired_side_keys(
+        &routed.key_columns,
+        &lplan.key_columns,
+        &rplan.key_columns,
+        paired.left_key_columns,
+        paired.right_key_columns,
+    )?;
 
     let checkpoint = match &opts.checkpoint {
         Some(path) => Some(Arc::new(tokio::sync::Mutex::new(
@@ -122,6 +130,8 @@ pub(crate) async fn run_diff(
         right_pool: Arc::clone(&right.pool),
         key_column: routed.key_column,
         key_columns: routed.key_columns,
+        left_key_columns,
+        right_key_columns,
         filter: opts.filter.clone(),
         incremental: opts.incremental.clone(),
         bisection_factor: opts.bisection_factor.max(2),

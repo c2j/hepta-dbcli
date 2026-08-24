@@ -101,7 +101,7 @@ pub(crate) async fn row_level_diff(
             std::cmp::Ordering::Equal => {
                 out.left_count += 1;
                 out.right_count += 1;
-                if lbuf[li].get(arity..) != rbuf[ri].get(arity..) {
+                if !row_values_equal(&lbuf[li][arity..], &rbuf[ri][arity..]) {
                     out.rows.push(DiffRow {
                         key: diff_key(&lbuf[li], arity),
                         left: Some(lbuf[li].clone()),
@@ -219,6 +219,14 @@ fn cmp_key(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
         }
     }
     a.len().cmp(&b.len())
+}
+
+fn row_values_equal(left: &[Value], right: &[Value]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| cmp_value(left, right) == std::cmp::Ordering::Equal)
 }
 
 fn diff_key(row: &[Value], arity: usize) -> Value {
@@ -386,6 +394,14 @@ mod tests {
             cmp_key(&[json!(1)], &[json!("1")]),
             std::cmp::Ordering::Equal
         );
+    }
+
+    #[test]
+    fn normalized_numeric_rows_compare_by_value_across_driver_json_types() {
+        let left = vec![json!(3248703.0), json!(4.9), json!(0.0)];
+        let right = vec![json!("3248703.00"), json!("4.90"), json!("0.00")];
+
+        assert!(row_values_equal(&left, &right));
     }
 
     #[test]

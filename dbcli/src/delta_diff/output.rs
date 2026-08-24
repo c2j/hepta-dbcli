@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use crate::backend::QueryResult;
-use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus};
+use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
 
 /// 差异样本投影：列 [key, status, left, right]
 pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
@@ -85,16 +85,19 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
         sample.min(total)
     };
     let rows = &report.sample_diffs[..n];
+    let hash_count = report.row_payload == RowPayload::HashCount;
     let key_len = report.key_columns.len();
     let value_len = report.value_columns.len();
-    let val_idxs: Vec<usize> = if wide {
+    let val_idxs: Vec<usize> = if hash_count {
+        Vec::new()
+    } else if wide {
         (0..value_len).collect()
     } else {
         visible_value_indices(rows, key_len, value_len)
     };
 
     let mut headers = vec!["status".to_string()];
-    if report.key_columns.is_empty() {
+    if hash_count || report.key_columns.is_empty() {
         headers.push("key".into());
     } else {
         headers.extend(report.key_columns.iter().cloned());
@@ -106,7 +109,11 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
     let mut table: Vec<Vec<String>> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells = vec![status_terminal(row.status).to_string()];
-        cells.extend(key_cells(row, &report.key_columns));
+        if hash_count {
+            cells.push(trunc32(&keyless_label(row)));
+        } else {
+            cells.extend(key_cells(row, &report.key_columns));
+        }
         for i in &val_idxs {
             cells.push(value_cell(row, key_len, *i, wide));
         }
@@ -306,6 +313,7 @@ mod tests {
                 confirmed: true,
             }],
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
@@ -398,6 +406,25 @@ mod tests {
         assert!(out.contains("10 → 12"), "{out}");
         assert!(!out.contains("String("), "{out}");
         assert!(!out.contains("Number("), "{out}");
+    }
+
+    #[test]
+    fn compact_hash_count_ignores_stale_named_column_schema() {
+        let mut report = report_with_diff();
+        report.row_payload = RowPayload::HashCount;
+        report.key_columns = (0..14).map(|i| format!("key_{i}")).collect();
+        report.value_columns = (0..20).map(|i| format!("value_{i}")).collect();
+        report.sample_diffs[0].left = Some(vec![Value::from("abc"), Value::from(1)]);
+
+        let out = render_compact_sample(&report, 20, false);
+        let header = out.lines().nth(1).expect("header row");
+
+        assert_eq!(
+            header.split_whitespace().collect::<Vec<_>>(),
+            ["status", "key"]
+        );
+        assert!(!out.contains("key_0"), "{out}");
+        assert!(!out.contains("value_19"), "{out}");
     }
 
     #[test]

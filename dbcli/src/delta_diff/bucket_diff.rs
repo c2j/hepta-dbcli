@@ -14,7 +14,8 @@ use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
 use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
 use crate::delta_diff::report::{
-    DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, ShardResult, ShardStatus, TableRef,
+    DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, RowPayload, ShardResult,
+    ShardStatus, TableRef,
 };
 use crate::delta_diff::strategy::{side_filter, ConsistencyMode, DiffContext, DiffStrategy};
 
@@ -395,7 +396,7 @@ fn assemble(
     {
         warnings.push(note);
     }
-    let mut report = DiffReport {
+    DiffReport {
         started_at: Utc::now(),
         finished_at: Utc::now(),
         left: TableRef {
@@ -416,19 +417,86 @@ fn assemble(
         shards,
         sample_diffs: diff_rows,
         warnings,
+        row_payload: RowPayload::HashCount,
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
         ident_scheme: String::new(),
         backslash_escape: false,
-    };
-    crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
-    report
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dummy_pool() -> std::sync::Arc<dyn crate::backend::DbPool> {
+        struct Pool;
+        #[async_trait::async_trait]
+        impl crate::backend::DbPool for Pool {
+            async fn acquire(
+                &self,
+            ) -> Result<Box<dyn crate::backend::DbConn + Send>, crate::backend::DbError>
+            {
+                Err(crate::backend::DbError::unsupported("dummy"))
+            }
+        }
+        std::sync::Arc::new(Pool)
+    }
+
+    #[test]
+    fn assemble_keeps_hash_count_payload_despite_plan_columns() {
+        let plan = crate::delta_diff::metadata::TablePlan {
+            key_columns: vec!["id".into()],
+            compare_columns: vec!["id".into(), "name".into()],
+            norm_specs: vec![],
+            warnings: vec![],
+        };
+        let ctx = DiffContext {
+            left: crate::delta_diff::strategy::SideCtx {
+                connection_name: "left".into(),
+                schema: None,
+                table: "t".into(),
+                plan: plan.clone(),
+            },
+            right: crate::delta_diff::strategy::SideCtx {
+                connection_name: "right".into(),
+                schema: None,
+                table: "t".into(),
+                plan,
+            },
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column: String::new(),
+            key_columns: vec![],
+            left_key_columns: vec![],
+            right_key_columns: vec![],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 4,
+            consistency: ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            strict: false,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        };
+
+        let report = assemble(&ctx, vec![], vec![], 1, 20);
+
+        assert!(report.key_columns.is_empty());
+        assert!(report.value_columns.is_empty());
+        assert_eq!(
+            report.row_payload,
+            crate::delta_diff::report::RowPayload::HashCount
+        );
+    }
 
     #[test]
     fn maps_to_diff_buckets_treats_missing_as_zero() {

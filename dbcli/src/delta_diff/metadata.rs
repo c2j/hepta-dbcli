@@ -9,6 +9,7 @@
 use serde_json::Value;
 
 use crate::backend::{ColumnNormSpec, DbConn, DbError, Dialect, QueryResult};
+use crate::delta_diff::pairing::find_unique_ci;
 
 // ─── TablePlan ─────────────────────────────────────────────────────────
 
@@ -336,14 +337,7 @@ fn parse_column_row(row: &[Value]) -> ColumnRow {
 }
 
 fn find_column_ci<'a>(columns: &'a [ColumnRow], name: &str) -> Option<&'a ColumnRow> {
-    if let Some(c) = columns.iter().find(|c| c.name == name) {
-        return Some(c);
-    }
-    let mut ci = columns.iter().filter(|c| c.name.eq_ignore_ascii_case(name));
-    match (ci.next(), ci.next()) {
-        (Some(c), None) => Some(c),
-        _ => None,
-    }
+    find_unique_ci(columns, name, |column| &column.name)
 }
 
 /// Extract primary key columns from a table_indexes result: the

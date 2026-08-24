@@ -108,22 +108,23 @@ impl DiffStrategy for JoinDiffer {
 /// 输出 (key, in_left, in_right)；Modified 由哈希不等判定。
 fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbError> {
     let dialect = conn.dialect();
-    let side_sql = |side: &crate::delta_diff::strategy::SideCtx| -> Result<String, DbError> {
-        let exprs = side.plan.normalized_exprs(dialect)?;
-        let table = dialect.quote_table(side.schema.as_deref(), &side.table);
-        let key = dialect.quote_ident(&ctx.key_column);
-        let where_clause = ctx
-            .filter
-            .as_ref()
-            .map(|f| format!(" WHERE ({f})"))
-            .unwrap_or_default();
-        Ok(format!(
-            "SELECT {key} AS k, MD5(CONCAT_WS('#', {})) AS h FROM {table}{where_clause}",
-            exprs.join(", ")
-        ))
-    };
-    let l = side_sql(&ctx.left)?;
-    let r = side_sql(&ctx.right)?;
+    let side_sql =
+        |side: &crate::delta_diff::strategy::SideCtx, is_left: bool| -> Result<String, DbError> {
+            let exprs = side.plan.normalized_exprs(dialect)?;
+            let table = dialect.quote_table(side.schema.as_deref(), &side.table);
+            let key = dialect.quote_ident(&ctx.side_key_columns(is_left)[0]);
+            let where_clause = ctx
+                .filter
+                .as_ref()
+                .map(|f| format!(" WHERE ({f})"))
+                .unwrap_or_default();
+            Ok(format!(
+                "SELECT {key} AS k, MD5(CONCAT_WS('#', {})) AS h FROM {table}{where_clause}",
+                exprs.join(", ")
+            ))
+        };
+    let l = side_sql(&ctx.left, true)?;
+    let r = side_sql(&ctx.right, false)?;
     Ok(format!(
         "SELECT k, in_l, in_r FROM (\n\
            SELECT l.k AS k, 1 AS in_l, (r.k IS NOT NULL) AS in_r, l.h AS lh, r.h AS rh\n\
@@ -172,13 +173,9 @@ fn point_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let mut columns = vec![dialect.quote_ident(&ctx.key_column)];
-    for spec in side
-        .plan
-        .norm_specs
-        .iter()
-        .filter(|s| s.name != ctx.key_column)
-    {
+    let side_key = &ctx.side_key_columns(is_left)[0];
+    let mut columns = vec![dialect.quote_ident(side_key)];
+    for spec in side.plan.norm_specs.iter().filter(|s| &s.name != side_key) {
         columns.push(dialect.normalize_expr(spec)?);
     }
     Ok(KeysetPageSpec {
@@ -186,7 +183,7 @@ fn point_spec(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_columns: vec![ctx.key_column.clone()],
+        key_columns: vec![side_key.clone()],
         string_key: vec![false],
         range: Some((key, key + 1)),
         last_key: None,
@@ -286,6 +283,7 @@ fn assemble(
             .chain(ctx.route_warnings.iter())
             .cloned()
             .collect(),
+        row_payload: crate::delta_diff::report::RowPayload::Columns,
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',

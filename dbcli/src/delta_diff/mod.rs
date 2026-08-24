@@ -20,6 +20,7 @@ pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
 pub(crate) mod output;
+pub(crate) mod pairing;
 pub(crate) mod progress;
 pub(crate) mod recheck;
 pub(crate) mod report;
@@ -32,6 +33,26 @@ pub(crate) mod strategy;
 pub(crate) const EXIT_IDENTICAL: i32 = 0;
 pub(crate) const EXIT_DIFF: i32 = 1;
 pub(crate) const EXIT_ERROR: i32 = 2;
+
+fn paired_side_keys(
+    logical_keys: &[String],
+    catalog_left_keys: &[String],
+    catalog_right_keys: &[String],
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    if logical_keys.is_empty() && catalog_left_keys.is_empty() && catalog_right_keys.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if left_keys.len() == logical_keys.len() && right_keys.len() == logical_keys.len() {
+        return Ok((left_keys, right_keys));
+    }
+    Err(format!(
+        "cannot establish 1:1 key correspondence; left key [{}], right key [{}]",
+        catalog_left_keys.join(", "),
+        catalog_right_keys.join(", ")
+    ))
+}
 
 // ─── Entry Point ───────────────────────────────────────────────────────
 
@@ -134,15 +155,23 @@ async fn dry_run_inner(
     .map_err(|e| format!("right plan: {}", e))?;
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
+    let paired = pairing::pair_plans(&lplan, &rplan);
+    let (left_key_columns, right_key_columns) = paired_side_keys(
+        &routed.key_columns,
+        &lplan.key_columns,
+        &rplan.key_columns,
+        paired.left_key_columns,
+        paired.right_key_columns,
+    )?;
 
     let (lminmax, rminmax) = if routed.key_columns.len() == 1
         && matches!(routed.strategy.name(), "hashdiff" | "iblt" | "joindiff")
     {
         (
-            min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
+            min_max(&mut *lconn, &lschema, ltable, &left_key_columns[0])
                 .await
                 .ok(),
-            min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
+            min_max(&mut *rconn, &rschema, rtable, &right_key_columns[0])
                 .await
                 .ok(),
         )
@@ -307,6 +336,14 @@ async fn execute_diff_inner(
     .map_err(|e| format!("right plan: {}", e))?;
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
+    let paired = pairing::pair_plans(&lplan, &rplan);
+    let (left_key_columns, right_key_columns) = paired_side_keys(
+        &routed.key_columns,
+        &lplan.key_columns,
+        &rplan.key_columns,
+        paired.left_key_columns,
+        paired.right_key_columns,
+    )?;
 
     let (filter, incremental) = effective_filter(args);
     let checkpoint = match &args.checkpoint {
@@ -340,6 +377,8 @@ async fn execute_diff_inner(
         right_pool: rpool,
         key_column: routed.key_column,
         key_columns: routed.key_columns,
+        left_key_columns,
+        right_key_columns,
         filter,
         incremental,
         bisection_factor: args.bisection_factor,
@@ -659,7 +698,7 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
 
 #[cfg(test)]
 mod dry_run_format_tests {
-    use super::{format_dry_run_key, format_key_domain_line};
+    use super::{format_dry_run_key, format_key_domain_line, paired_side_keys};
 
     #[test]
     fn composite_keys_join_with_comma() {
@@ -672,6 +711,21 @@ mod dry_run_format_tests {
             format_key_domain_line("keyeddiff", None),
             "  key domain       : (not applicable — keyeddiff)"
         );
+    }
+
+    #[test]
+    fn paired_side_keys_rejects_unresolved_correspondence() {
+        let error = paired_side_keys(
+            &["K_XWDM".into(), "SECURITY_ID".into()],
+            &["K_XWDM".into(), "SECURITY_ID".into()],
+            &["k_xwdm".into()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("left key [K_XWDM, SECURITY_ID]"), "{error}");
+        assert!(error.contains("right key [k_xwdm]"), "{error}");
     }
 }
 
@@ -731,6 +785,7 @@ mod emit_tests {
             shards: vec![],
             sample_diffs: diffs,
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec!["id".into()],
             value_columns: vec!["name".into()],
             ident_quote: '"',
