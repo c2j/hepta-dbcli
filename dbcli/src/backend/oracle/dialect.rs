@@ -1,7 +1,44 @@
 use crate::backend::error::DbError;
 use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, NULL_SENTINEL};
 
-pub(crate) struct OracleDialect;
+/// MD5 SQL: `STANDARD_HASH` is 12c+; 11g uses `DBMS_CRYPTO.HASH` (same RAW MD5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OracleMd5 {
+    StandardHash,
+    DbmsCrypto,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OracleDialect {
+    md5: OracleMd5,
+    /// 12c+ `FETCH FIRST`; 11g wraps with `ROWNUM`.
+    fetch_first: bool,
+}
+
+impl OracleDialect {
+    pub(crate) const fn new() -> Self {
+        Self {
+            md5: OracleMd5::StandardHash,
+            fetch_first: true,
+        }
+    }
+
+    pub(crate) const fn oracle11() -> Self {
+        Self {
+            md5: OracleMd5::DbmsCrypto,
+            fetch_first: false,
+        }
+    }
+
+    fn md5_hash(&self, concat: &str) -> String {
+        match self.md5 {
+            OracleMd5::StandardHash => format!("STANDARD_HASH({concat}, 'MD5')"),
+            OracleMd5::DbmsCrypto => {
+                format!("DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW({concat}), 2)")
+            }
+        }
+    }
+}
 
 impl Dialect for OracleDialect {
     fn database_info(&self) -> &str {
@@ -90,8 +127,10 @@ impl Dialect for OracleDialect {
         let upper = sql.trim().to_uppercase();
         if upper.contains("FETCH FIRST") || upper.contains("ROWNUM") {
             sql.trim().to_string()
-        } else {
+        } else if self.fetch_first {
             format!("{} FETCH FIRST {} ROWS ONLY", sql.trim(), n)
+        } else {
+            format!("SELECT * FROM ({}) t WHERE ROWNUM <= {}", sql.trim(), n)
         }
     }
 
@@ -199,7 +238,7 @@ impl Dialect for OracleDialect {
 
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let concat = spec.normalized_exprs.join(" || '#' || ");
-        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let row_hash = self.md5_hash(&concat);
         let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
@@ -239,7 +278,7 @@ impl Dialect for OracleDialect {
 
     fn render_batch_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let concat = spec.normalized_exprs.join(" || '#' || ");
-        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let row_hash = self.md5_hash(&concat);
         let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
@@ -261,10 +300,7 @@ impl Dialect for OracleDialect {
         let (inner_select, bkt_src) = if spec.key_hash_exprs.is_empty() {
             (format!("SELECT {row_hash} AS h"), "h".to_string())
         } else {
-            let key_hash = format!(
-                "STANDARD_HASH({}, 'MD5')",
-                spec.key_hash_exprs.join(" || '#' || ")
-            );
+            let key_hash = self.md5_hash(&spec.key_hash_exprs.join(" || '#' || "));
             (
                 format!("SELECT {key_hash} AS kh, {row_hash} AS h"),
                 "kh".to_string(),
@@ -289,7 +325,7 @@ impl Dialect for OracleDialect {
 
     fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String {
         let concat = exprs.join(" || '#' || ");
-        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let row_hash = self.md5_hash(&concat);
         format!(
             "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), {modulus}) = {bucket}"
         )
@@ -317,16 +353,23 @@ impl Dialect for OracleDialect {
         } else {
             format!("\nWHERE {}", conds.join("\n  AND "))
         };
-        format!(
-            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}\nFETCH FIRST {} ROWS ONLY",
+        let inner = format!(
+            "SELECT {}\nFROM {table}{where_clause}\nORDER BY {}",
             cols.join(", "),
             crate::backend::keyset_order_by('"', spec, "oracle"),
-            spec.page_size
-        )
+        );
+        if self.fetch_first {
+            format!("{inner}\nFETCH FIRST {} ROWS ONLY", spec.page_size)
+        } else {
+            format!(
+                "SELECT * FROM (\n{inner}\n) t WHERE ROWNUM <= {}",
+                spec.page_size
+            )
+        }
     }
 
     fn row_hash_expr(&self, exprs: &[String]) -> String {
-        format!("STANDARD_HASH({}, 'MD5')", exprs.join(" || '#' || "))
+        self.md5_hash(&exprs.join(" || '#' || "))
     }
 
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
@@ -355,7 +398,7 @@ impl Dialect for OracleDialect {
         // 路由层在版本探测后降级 hashdiff，不在此生成奇偶模板。
         let m = spec.cells_per_subtable;
         let concat = spec.normalized_exprs.join(" || '#' || ");
-        let row_hash = format!("STANDARD_HASH({concat}, 'MD5')");
+        let row_hash = self.md5_hash(&concat);
         let mut table = quoted_table(&spec.schema, &spec.table);
         if let Some(scn) = spec.scn {
             table.push_str(&format!(" AS OF SCN {scn}"));
@@ -412,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_database_info_contains_keywords() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.database_info();
         assert!(sql.contains("v$version"));
         assert!(sql.contains("SYS_CONTEXT"));
@@ -421,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_list_tables_contains_all_tables() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.list_tables();
         assert!(sql.contains("all_tables"));
         assert!(sql.contains("SYS"));
@@ -430,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_table_columns_uses_bind_params() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.table_columns();
         assert!(sql.contains(":1"));
         assert!(sql.contains(":2"));
@@ -439,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_table_indexes_uses_listagg() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.table_indexes();
         assert!(sql.contains("LISTAGG"));
         assert!(sql.contains("all_indexes"));
@@ -448,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_table_columns_case_insensitive_owner_table() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.table_columns();
         assert!(sql.contains("UPPER(c.OWNER) = UPPER(:1)"));
         assert!(sql.contains("UPPER(c.TABLE_NAME) = UPPER(:2)"));
@@ -456,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_table_indexes_case_insensitive_owner_table() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.table_indexes();
         assert!(sql.contains("UPPER(i.OWNER) = UPPER(:1)"));
         assert!(sql.contains("UPPER(i.TABLE_NAME) = UPPER(:2)"));
@@ -464,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_introspection_quotes_reserved_aliases() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         assert!(d.database_info().contains("AS \"database\""));
         assert!(d.list_tables().contains("AS \"comment\""));
         assert!(d.table_columns().contains("AS \"comment\""));
@@ -481,14 +524,14 @@ mod tests {
             "\"SCOTT\".\"ORDERS\""
         );
         assert_eq!(
-            OracleDialect.quote_table(Some("system"), "dd_int_l"),
+            OracleDialect::new().quote_table(Some("system"), "dd_int_l"),
             "\"SYSTEM\".\"DD_INT_L\""
         );
     }
 
     #[test]
     fn test_read_only_prefixes_no_show_describe() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let prefixes = d.read_only_prefixes();
         assert!(prefixes.contains(&"SELECT"));
         assert!(prefixes.contains(&"EXPLAIN"));
@@ -498,21 +541,21 @@ mod tests {
 
     #[test]
     fn test_add_limit_fetch_first() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let result = d.add_limit("SELECT * FROM dual", 10);
         assert!(result.contains("FETCH FIRST 10 ROWS ONLY"));
     }
 
     #[test]
     fn test_add_limit_no_double_limit() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let result = d.add_limit("SELECT * FROM dual FETCH FIRST 5 ROWS ONLY", 10);
         assert_eq!(result, "SELECT * FROM dual FETCH FIRST 5 ROWS ONLY");
     }
 
     #[test]
     fn test_build_explain_contains_dbms_xplan() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.build_explain("SELECT * FROM dual", false, "TYPICAL");
         assert!(sql.contains("EXPLAIN PLAN"));
         assert!(sql.contains("DBMS_XPLAN.DISPLAY"));
@@ -521,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_build_explain_analyze() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let sql = d.build_explain("SELECT * FROM dual", true, "TEXT");
         assert!(sql.contains("EXPLAIN PLAN"));
         assert!(sql.contains("ALL"));
@@ -529,34 +572,34 @@ mod tests {
 
     #[test]
     fn test_no_statement_timeout() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         assert!(d.set_statement_timeout_sql(1000).is_none());
     }
 
     #[test]
     fn test_no_kill_own_connection() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         assert!(d.kill_own_connection_sql().is_none());
     }
 
     #[test]
     fn test_default_port() {
-        assert_eq!(OracleDialect.default_port(), 1521);
+        assert_eq!(OracleDialect::new().default_port(), 1521);
     }
 
     #[test]
     fn test_url_scheme() {
-        assert_eq!(OracleDialect.url_scheme(), "oracle");
+        assert_eq!(OracleDialect::new().url_scheme(), "oracle");
     }
 
     #[test]
     fn test_identifier_quote_is_double_quote() {
-        assert_eq!(OracleDialect.identifier_quote(), '"');
+        assert_eq!(OracleDialect::new().identifier_quote(), '"');
     }
 
     #[test]
     fn test_no_hash_comment() {
-        assert!(!OracleDialect.supports_hash_comment());
+        assert!(!OracleDialect::new().supports_hash_comment());
     }
 
     fn col(name: &str, ty: &str, nullable: bool) -> crate::backend::ColumnNormSpec {
@@ -569,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_sql_and_scn() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         assert_eq!(d.begin_snapshot_sql(), "SET TRANSACTION READ ONLY");
         assert_eq!(
             d.snapshot_scn_sql(),
@@ -579,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_normalize_expr_matrix() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         assert_eq!(
             d.normalize_expr(&col("ID", "NUMBER", false)).unwrap(),
             "TO_CHAR(\"ID\")"
@@ -610,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_checksum_sql_with_scn_and_bucket() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let spec = crate::backend::ChecksumSqlSpec {
             schema: Some("SCOTT".into()),
             table: "ORDERS".into(),
@@ -635,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_keyset_page_sql() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let spec = crate::backend::KeysetPageSpec {
             schema: None,
             table: "ORDERS".into(),
@@ -657,7 +700,7 @@ mod tests {
 
     #[test]
     fn keyset_oracle_string_key_wraps_literal_in_nlssort() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let spec = crate::backend::KeysetPageSpec {
             schema: None,
             table: "T".into(),
@@ -685,7 +728,7 @@ mod tests {
 
     #[test]
     fn keyset_page_sql_composite_next_page() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let spec = crate::backend::KeysetPageSpec {
             schema: None,
             table: "T".into(),
@@ -711,7 +754,7 @@ mod tests {
 
     #[test]
     fn batch_checksum_sql_groups_by_mod_expression() {
-        let d = OracleDialect;
+        let d = OracleDialect::new();
         let spec = crate::backend::ChecksumSqlSpec {
             schema: None,
             table: "ORDERS".into(),
@@ -731,5 +774,48 @@ mod tests {
         assert!(!sql.contains("GROUP BY bkt"));
         assert!(sql.contains("(x=1)"));
         assert!(sql.contains("TO_CHAR(COUNT(*)) AS cnt"));
+    }
+
+    #[test]
+    fn oracle11_uses_dbms_crypto_and_rownum() {
+        let d = OracleDialect::oracle11();
+        assert!(d
+            .row_hash_expr(&["TO_CHAR(\"ID\")".into()])
+            .contains("DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW(TO_CHAR(\"ID\")), 2)"));
+        assert!(!d
+            .row_hash_expr(&["TO_CHAR(\"ID\")".into()])
+            .contains("STANDARD_HASH"));
+        let spec = crate::backend::ChecksumSqlSpec {
+            schema: None,
+            table: "T".into(),
+            key_column: None,
+            range: None,
+            bucket: None,
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["TO_CHAR(\"ID\")".into()],
+            key_hash_exprs: vec![],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(sql.contains("DBMS_CRYPTO.HASH"), "{sql}");
+        let limited = d.add_limit("SELECT * FROM dual", 5);
+        assert!(limited.contains("ROWNUM <= 5"), "{limited}");
+        assert!(!limited.contains("FETCH FIRST"));
+        let page = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "T".into(),
+            columns: vec!["ID".into()],
+            raw_exprs: false,
+            key_columns: vec!["ID".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: None,
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let ksql = d.render_keyset_page_sql(&page);
+        assert!(ksql.contains("ROWNUM <= 10"), "{ksql}");
+        assert!(!ksql.contains("FETCH FIRST"));
     }
 }

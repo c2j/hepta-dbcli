@@ -45,7 +45,9 @@ impl DbPool for OracleRsPool {
         let conn = oracle_rs::Connection::connect_with_config(self.config.clone())
             .await
             .map_err(|e| DbError::connection_with_source("Oracle connection failed", e))?;
-        Ok(Box::new(OracleConn::new(conn)))
+        let mut conn = OracleConn::new(conn);
+        conn.probe_capabilities().await?;
+        Ok(Box::new(conn))
     }
 }
 

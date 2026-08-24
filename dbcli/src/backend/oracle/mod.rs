@@ -25,7 +25,7 @@ impl BackendFactory for OracleFactory {
     }
 
     fn create_dialect(&self) -> Box<dyn Dialect> {
-        Box::new(OracleDialect)
+        Box::new(OracleDialect::new())
     }
 
     async fn connect(
