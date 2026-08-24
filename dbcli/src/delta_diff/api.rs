@@ -19,6 +19,21 @@ pub(crate) struct SideInput {
     pub(crate) connection_url: String,
 }
 
+pub(crate) struct Preflight {
+    pub(crate) lplan: metadata::TablePlan,
+    pub(crate) rplan: metadata::TablePlan,
+    pub(crate) routed: engine::Route,
+    pub(crate) paired: crate::delta_diff::pairing::Pairing,
+    pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) struct PreflightSide<'a> {
+    pub(crate) conn: &'a mut (dyn DbConn + Send),
+    pub(crate) schema: &'a str,
+    pub(crate) table: &'a str,
+    pub(crate) connection_url: &'a str,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DiffOptions {
     pub(crate) strategy: Option<crate::delta_diff::cmd::Strategy>,
@@ -37,6 +52,7 @@ pub(crate) struct DiffOptions {
     pub(crate) recheck: bool,
     pub(crate) checkpoint: Option<String>,
     pub(crate) verbose: bool,
+    pub(crate) rtrim_char_columns: bool,
 }
 
 pub(crate) async fn run_diff(
@@ -59,43 +75,32 @@ pub(crate) async fn run_diff(
     )
     .await?;
 
-    let lplan = metadata::build_table_plan(
-        &mut *left.conn,
-        &lschema,
-        &left.table,
+    let Preflight {
+        lplan,
+        rplan,
+        routed,
+        paired,
+        warnings,
+    } = preflight(
+        PreflightSide {
+            conn: &mut *left.conn,
+            schema: &lschema,
+            table: &left.table,
+            connection_url: &left.connection_url,
+        },
+        PreflightSide {
+            conn: &mut *right.conn,
+            schema: &rschema,
+            table: &right.table,
+            connection_url: &right.connection_url,
+        },
         &opts.columns,
         &opts.key,
-    )
-    .await
-    .map_err(|e| format!("left plan: {}", e))?;
-    let rplan = metadata::build_table_plan(
-        &mut *right.conn,
-        &rschema,
-        &right.table,
-        &opts.columns,
-        &opts.key,
-    )
-    .await
-    .map_err(|e| format!("right plan: {}", e))?;
-
-    // MySQL 会话时区固定为 UTC（§九 TIMESTAMP 规范化前提；评审修复）
-    for conn in [&mut *left.conn, &mut *right.conn] {
-        if conn.dialect().url_scheme() == "mysql" {
-            conn.query_drop("SET time_zone = '+00:00'")
-                .await
-                .map_err(|e| format!("session time_zone pin failed: {}", e))?;
-        }
-    }
-
-    let routed = engine::route_plan(
-        &lplan,
-        &rplan,
-        &left.connection_url,
-        &right.connection_url,
         opts.strategy,
-    )?;
-    let paired = pairing::pair_plans(&lplan, &rplan);
-    let cross_warnings = cross_db_column_type_warnings(&lplan, &rplan, &paired);
+        !opts.snapshot,
+        opts.rtrim_char_columns,
+    )
+    .await?;
     let (left_key_columns, right_key_columns) = super::paired_side_keys(
         &routed.key_columns,
         &lplan.key_columns,
@@ -142,18 +147,10 @@ pub(crate) async fn run_diff(
             strategy::ConsistencyMode::None
         },
         recheck: opts.recheck,
-        route_warnings: {
-            let mut w = routed.warnings;
-            w.extend(cross_warnings);
-            w
-        },
+        route_warnings: warnings,
         checkpoint,
         iblt_capacity: opts.iblt_capacity.max(16),
-        fetch_all_threshold: if opts.fetch_all_threshold == 0 {
-            4096
-        } else {
-            opts.fetch_all_threshold
-        },
+        fetch_all_threshold: opts.fetch_all_threshold,
         strict: opts.strict,
         scns: std::sync::OnceLock::new(),
         verbose: opts.verbose,
@@ -169,6 +166,77 @@ pub(crate) async fn run_diff(
         progress::finalize_path(path).map_err(|e| e.to_string())?;
     }
     Ok(report)
+}
+
+pub(crate) async fn preflight(
+    left: PreflightSide<'_>,
+    right: PreflightSide<'_>,
+    columns: &[String],
+    key: &[String],
+    strategy_hint: Option<crate::delta_diff::cmd::Strategy>,
+    consistency_none: bool,
+    rtrim_char_columns: bool,
+) -> Result<Preflight, String> {
+    pin_session(left.conn, "left").await?;
+    pin_session(right.conn, "right").await?;
+    let lplan = metadata::build_table_plan(
+        left.conn,
+        left.schema,
+        left.table,
+        columns,
+        key,
+        rtrim_char_columns,
+    )
+    .await
+    .map_err(|e| format!("left plan: {}", e))?;
+    let rplan = metadata::build_table_plan(
+        right.conn,
+        right.schema,
+        right.table,
+        columns,
+        key,
+        rtrim_char_columns,
+    )
+    .await
+    .map_err(|e| format!("right plan: {}", e))?;
+    let routed = engine::route_plan(
+        &lplan,
+        &rplan,
+        left.connection_url,
+        right.connection_url,
+        strategy_hint,
+    )?;
+    let paired = pairing::pair_plans(&lplan, &rplan);
+    let mut warnings = routed.warnings.clone();
+    warnings.extend(cross_db_column_type_warnings(
+        &lplan,
+        &rplan,
+        &paired,
+        rtrim_char_columns,
+    ));
+    if consistency_none
+        && [left.connection_url, right.connection_url]
+            .iter()
+            .any(|url| matches!(url.split("://").next().unwrap_or("mysql"), "oracle"))
+    {
+        warnings.push("session pins apply to primary connections only".to_string());
+    }
+    Ok(Preflight {
+        lplan,
+        rplan,
+        routed,
+        paired,
+        warnings,
+    })
+}
+
+async fn pin_session(conn: &mut (dyn DbConn + Send), side: &str) -> Result<(), String> {
+    for sql in conn.dialect().session_pin_sql() {
+        conn.query_drop(&sql)
+            .await
+            .map_err(|e| format!("{side} session pin failed: {e}"))?;
+    }
+    Ok(())
 }
 
 async fn resolve_schema(
@@ -188,6 +256,7 @@ pub(crate) fn cross_db_column_type_warnings(
     lplan: &metadata::TablePlan,
     rplan: &metadata::TablePlan,
     pairing: &crate::delta_diff::pairing::Pairing,
+    rtrim_char_columns: bool,
 ) -> Vec<String> {
     if lplan.url_scheme == rplan.url_scheme {
         return Vec::new();
@@ -243,10 +312,11 @@ pub(crate) fn cross_db_column_type_warnings(
                  this guarantees a mismatch for every non-null value, even at midnight",
                 left.name, left.data_type, right.data_type
             ));
-        } else if (fixed_char.contains(&left_base.as_str())
-            && variable_char.contains(&right_base.as_str()))
-            || (variable_char.contains(&left_base.as_str())
-                && fixed_char.contains(&right_base.as_str()))
+        } else if !rtrim_char_columns
+            && ((fixed_char.contains(&left_base.as_str())
+                && variable_char.contains(&right_base.as_str()))
+                || (variable_char.contains(&left_base.as_str())
+                    && fixed_char.contains(&right_base.as_str())))
         {
             out.push(format!(
                 "column '{}': {} (left) vs {} (right) — blank-padding differs across engines; \
@@ -308,6 +378,7 @@ mod tests {
                     name: (*name).to_string(),
                     data_type: (*data_type).to_string(),
                     nullable: true,
+                    rtrim_fixed_char: false,
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -316,7 +387,7 @@ mod tests {
 
     fn warnings(left: metadata::TablePlan, right: metadata::TablePlan) -> Vec<String> {
         let paired = pairing::pair_plans(&left, &right);
-        cross_db_column_type_warnings(&left, &right, &paired)
+        cross_db_column_type_warnings(&left, &right, &paired, false)
     }
 
     #[test]
@@ -363,6 +434,23 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("V_GDDM"));
         assert!(warnings[0].contains("blank-padding differs"));
+    }
+
+    #[test]
+    fn rtrim_suppresses_only_padding_warning() {
+        let left = plan(
+            "oracle",
+            &[("V_GDDM", "CHAR(12)"), ("V_GHF", "NUMBER(16,2)")],
+        );
+        let right = plan(
+            "gaussdb",
+            &[("v_gddm", "character varying(12)"), ("v_ghf", "numeric")],
+        );
+        let paired = pairing::pair_plans(&left, &right);
+        let warnings = cross_db_column_type_warnings(&left, &right, &paired, true);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("numeric scale differs"));
     }
 
     #[test]

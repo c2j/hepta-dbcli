@@ -118,6 +118,7 @@ pub(crate) async fn build_table_plan(
     table: &str,
     explicit_columns: &[String],
     explicit_key: &[String],
+    rtrim_char_columns: bool,
 ) -> Result<TablePlan, DbError> {
     let (col_sql, idx_sql) = {
         let d = conn.dialect();
@@ -159,7 +160,7 @@ pub(crate) async fn build_table_plan(
     let mut warnings = Vec::new();
     if explicit_columns.is_empty() {
         for col in &columns {
-            let spec = col.norm_spec();
+            let spec = col.norm_spec(rtrim_char_columns);
             match conn.dialect().normalize_expr(&spec) {
                 Ok(_) => {
                     compare_columns.push(col.name.clone());
@@ -178,7 +179,7 @@ pub(crate) async fn build_table_plan(
                     "delta-diff: --columns column '{name}' not found in '{schema}.{table}'"
                 ))
             })?;
-            let spec = col.norm_spec();
+            let spec = col.norm_spec(rtrim_char_columns);
             // Explicitly requested columns must be comparable — propagate Err.
             conn.dialect().normalize_expr(&spec)?;
             compare_columns.push(col.name.clone());
@@ -322,11 +323,12 @@ struct ColumnRow {
 }
 
 impl ColumnRow {
-    fn norm_spec(&self) -> ColumnNormSpec {
+    fn norm_spec(&self, rtrim_fixed_char: bool) -> ColumnNormSpec {
         ColumnNormSpec {
             name: self.name.clone(),
             data_type: self.data_type.clone(),
             nullable: self.nullable,
+            rtrim_fixed_char,
         }
     }
 }
@@ -460,6 +462,7 @@ mod tests {
                 name: "c_int".into(),
                 data_type: "int".into(),
                 nullable: false,
+                rtrim_fixed_char: false,
             }],
             warnings: vec![],
         };
@@ -567,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn plan_from_mysql_metadata() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -586,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn composite_primary_key_csv_parsed() {
         let mut conn = mock(verify_columns(), primary_index("id, c_int"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id", "c_int"]);
@@ -604,7 +607,7 @@ mod tests {
         ]);
         idx.row_count += 1;
         let mut conn = mock(verify_columns(), idx);
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -613,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn no_primary_index_yields_empty_key() {
         let mut conn = mock(verify_columns(), as_result(vec![]));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(plan.key_columns.is_empty());
@@ -625,7 +628,7 @@ mod tests {
         cols.rows.push(col_row("doc", "text", true, ""));
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(!plan.compare_columns.contains(&"doc".to_string()));
@@ -641,7 +644,7 @@ mod tests {
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
         let explicit = vec!["id".to_string(), "doc".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("doc"), "{err}");
@@ -651,7 +654,7 @@ mod tests {
     async fn explicit_columns_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["id".to_string(), "nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -660,9 +663,16 @@ mod tests {
     #[tokio::test]
     async fn nullable_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_int".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_int".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("nullable")),
             "{:?}",
@@ -673,9 +683,16 @@ mod tests {
     #[tokio::test]
     async fn date_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_dt".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_dt".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("temporal")),
             "{:?}",
@@ -686,9 +703,16 @@ mod tests {
     #[tokio::test]
     async fn non_unique_explicit_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_vc".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_vc".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings
                 .iter()
@@ -701,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn primary_key_has_no_uniqueness_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(
@@ -717,7 +741,7 @@ mod tests {
     async fn explicit_key_overrides_discovery() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["c_int".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["c_int"]);
@@ -727,7 +751,7 @@ mod tests {
     async fn explicit_key_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -739,7 +763,7 @@ mod tests {
         // to the catalog's case, since downstream SQL double-quotes the key.
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -749,7 +773,7 @@ mod tests {
     async fn explicit_columns_case_insensitive_matches() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["ID".to_string(), "C_INT".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap();
         assert_eq!(plan.compare_columns, vec!["id", "c_int"]);
@@ -763,7 +787,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["ID"]);
@@ -777,7 +801,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("ID"));
         let key = vec!["id".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("id"), "{err}");
@@ -786,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn missing_table_errors() {
         let mut conn = mock(as_result(vec![]), as_result(vec![]));
-        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[])
+        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");

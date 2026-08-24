@@ -295,6 +295,7 @@ mod tests {
                     name: k.to_string(),
                     data_type: key_ty.to_string(),
                     nullable: false,
+                    rtrim_fixed_char: false,
                 })
                 .collect(),
             warnings: vec![],
@@ -550,6 +551,7 @@ mod tests {
                 name: "c1".to_string(),
                 data_type: "int".to_string(),
                 nullable: false,
+                rtrim_fixed_char: false,
             }],
             warnings: vec![],
         };

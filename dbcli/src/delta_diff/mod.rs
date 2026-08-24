@@ -141,6 +141,7 @@ async fn dry_run_inner(
         ltable,
         &args.columns_list(),
         &args.key_list(),
+        args.rtrim_char_columns,
     )
     .await
     .map_err(|e| format!("left plan: {}", e))?;
@@ -150,6 +151,7 @@ async fn dry_run_inner(
         rtable,
         &args.columns_list(),
         &args.key_list(),
+        args.rtrim_char_columns,
     )
     .await
     .map_err(|e| format!("right plan: {}", e))?;
@@ -316,28 +318,32 @@ async fn execute_diff_inner(
     let ltable = args.left_table_name().ok_or("missing --table")?;
     let rtable = args.right_table_name().ok_or("missing --table")?;
 
-    let lplan = metadata::build_table_plan(
-        &mut *lconn,
-        &lschema,
-        ltable,
+    let api::Preflight {
+        lplan,
+        rplan,
+        routed,
+        paired,
+        warnings,
+    } = api::preflight(
+        api::PreflightSide {
+            conn: &mut *lconn,
+            schema: &lschema,
+            table: ltable,
+            connection_url: &left.connection_url,
+        },
+        api::PreflightSide {
+            conn: &mut *rconn,
+            schema: &rschema,
+            table: rtable,
+            connection_url: &right.connection_url,
+        },
         &args.columns_list(),
         &args.key_list(),
+        Some(args.strategy),
+        matches!(args.consistency, cmd::ConsistencyMode::None),
+        args.rtrim_char_columns,
     )
-    .await
-    .map_err(|e| format!("left plan: {}", e))?;
-    let rplan = metadata::build_table_plan(
-        &mut *rconn,
-        &rschema,
-        rtable,
-        &args.columns_list(),
-        &args.key_list(),
-    )
-    .await
-    .map_err(|e| format!("right plan: {}", e))?;
-
-    let routed = engine::route(args, left, right, &lplan, &rplan)?;
-    let paired = pairing::pair_plans(&lplan, &rplan);
-    let type_warnings = api::cross_db_column_type_warnings(&lplan, &rplan, &paired);
+    .await?;
     let (left_key_columns, right_key_columns) = paired_side_keys(
         &routed.key_columns,
         &lplan.key_columns,
@@ -391,11 +397,7 @@ async fn execute_diff_inner(
             cmd::ConsistencyMode::None => strategy::ConsistencyMode::None,
         },
         recheck: args.recheck_effective(),
-        route_warnings: {
-            let mut warnings = routed.warnings;
-            warnings.extend(type_warnings);
-            warnings
-        },
+        route_warnings: warnings,
         checkpoint,
         iblt_capacity: args.iblt_capacity,
         fetch_all_threshold: args.fetch_all_threshold,

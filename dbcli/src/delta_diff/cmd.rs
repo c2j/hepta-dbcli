@@ -217,6 +217,11 @@ pub(crate) struct DeltaDiffArgs {
     /// keyless 不要回查真实行
     #[arg(long)]
     pub no_fetch_sample: bool,
+
+    /// Trim trailing blanks of fixed-width char columns on both sides before
+    /// hashing/comparison (CHAR/NCHAR on Oracle, character/bpchar on GaussDB).
+    #[arg(long)]
+    pub rtrim_char_columns: bool,
 }
 
 // ─── Helpers & validation ──────────────────────────────────────────────
@@ -370,6 +375,7 @@ mod tests {
         assert!(!args.export_rows);
         assert!(args.apply_to.is_none());
         assert!(!args.no_fetch_sample);
+        assert!(!args.rtrim_char_columns);
         assert_eq!(args.left_table_name(), Some("orders"));
         assert_eq!(args.right_table_name(), Some("orders"));
         assert!(args.validate().is_ok());

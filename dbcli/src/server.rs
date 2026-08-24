@@ -765,6 +765,7 @@ impl DbMcp {
             recheck,
             checkpoint: None,
             verbose: false,
+            rtrim_char_columns: false,
         };
 
         match crate::delta_diff::api::run_diff(left, right, opts).await {
