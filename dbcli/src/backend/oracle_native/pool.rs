@@ -28,13 +28,15 @@ impl DbPool for OraclePool {
         let user = self.user.clone();
         let password = self.password.clone();
         let conn_str = self.conn_str.clone();
-        tokio::task::spawn_blocking(move || {
+        let raw = tokio::task::spawn_blocking(move || {
             oracle::Connection::connect(&user, &password, &conn_str)
                 .map_err(|e| DbError::connection_with_source("Oracle connection failed", e))
         })
         .await
-        .map_err(|e| DbError::connection(format!("Oracle connect task panicked: {}", e)))?
-        .map(|conn| Box::new(OracleConn::new(conn)) as Box<dyn DbConn + Send>)
+        .map_err(|e| DbError::connection(format!("Oracle connect task panicked: {}", e)))??;
+        let mut conn = OracleConn::new(raw);
+        conn.probe_capabilities().await?;
+        Ok(Box::new(conn) as Box<dyn DbConn + Send>)
     }
 }
 

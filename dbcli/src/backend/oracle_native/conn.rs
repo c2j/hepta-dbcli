@@ -6,16 +6,39 @@ use crate::backend::{DbConn, Dialect, QueryResult};
 
 use super::dialect::OracleDialect;
 
-static ORACLE_DIALECT: OracleDialect = OracleDialect;
-
 pub(crate) struct OracleConn {
     conn: oracle::Connection,
+    dialect: OracleDialect,
 }
 
 impl OracleConn {
     pub(crate) fn new(conn: oracle::Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            dialect: OracleDialect::new(),
+        }
     }
+
+    pub(crate) async fn probe_capabilities(&mut self) -> Result<(), DbError> {
+        self.dialect = probe_oracle_dialect(self).await?;
+        Ok(())
+    }
+}
+
+const PROBE_STANDARD_HASH: &str = "SELECT STANDARD_HASH('a','MD5') FROM dual";
+const PROBE_DBMS_CRYPTO: &str = "SELECT DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW('a'), 2) FROM dual";
+
+async fn probe_oracle_dialect(conn: &mut OracleConn) -> Result<OracleDialect, DbError> {
+    if conn.query(PROBE_STANDARD_HASH).await.is_ok() {
+        return Ok(OracleDialect::new());
+    }
+    if conn.query(PROBE_DBMS_CRYPTO).await.is_ok() {
+        return Ok(OracleDialect::oracle11());
+    }
+    Err(DbError::unsupported(
+        "this Oracle has no STANDARD_HASH (12c+) and DBMS_CRYPTO.HASH failed; \
+         on 11g grant EXECUTE ON SYS.DBMS_CRYPTO to the connected user",
+    ))
 }
 
 fn result_set_to_query_result(
@@ -101,6 +124,6 @@ impl DbConn for OracleConn {
     }
 
     fn dialect(&self) -> &dyn Dialect {
-        &ORACLE_DIALECT
+        &self.dialect
     }
 }
