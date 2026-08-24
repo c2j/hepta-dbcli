@@ -337,6 +337,7 @@ async fn execute_diff_inner(
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
     let paired = pairing::pair_plans(&lplan, &rplan);
+    let type_warnings = api::cross_db_column_type_warnings(&lplan, &rplan, &paired);
     let (left_key_columns, right_key_columns) = paired_side_keys(
         &routed.key_columns,
         &lplan.key_columns,
@@ -390,7 +391,11 @@ async fn execute_diff_inner(
             cmd::ConsistencyMode::None => strategy::ConsistencyMode::None,
         },
         recheck: args.recheck_effective(),
-        route_warnings: routed.warnings,
+        route_warnings: {
+            let mut warnings = routed.warnings;
+            warnings.extend(type_warnings);
+            warnings
+        },
         checkpoint,
         iblt_capacity: args.iblt_capacity,
         fetch_all_threshold: args.fetch_all_threshold,

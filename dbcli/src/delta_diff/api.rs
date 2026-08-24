@@ -87,9 +87,6 @@ pub(crate) async fn run_diff(
         }
     }
 
-    // 跨库规范化告警（评审修复）
-    let cross_warnings = cross_db_warnings(&left, &right, &lplan, &rplan);
-
     let routed = engine::route_plan(
         &lplan,
         &rplan,
@@ -98,6 +95,7 @@ pub(crate) async fn run_diff(
         opts.strategy,
     )?;
     let paired = pairing::pair_plans(&lplan, &rplan);
+    let cross_warnings = cross_db_column_type_warnings(&lplan, &rplan, &paired);
     let (left_key_columns, right_key_columns) = super::paired_side_keys(
         &routed.key_columns,
         &lplan.key_columns,
@@ -185,30 +183,16 @@ async fn resolve_schema(
     side_schema_from_conn(conn, url, name).await
 }
 
-/// 跨库规范化告警（评审修复）：
-/// - 浮点列跨库文本表示不可移植（MySQL `1e30` vs PG `1e+30`）；
-/// - DATE ↔ DATETIME/TIMESTAMP 同名配对会静默截断时间分量（假阴性）。
-fn cross_db_warnings(
-    left: &SideInput,
-    right: &SideInput,
+/// Warn when paired cross-database columns have incompatible text normalization.
+pub(crate) fn cross_db_column_type_warnings(
     lplan: &metadata::TablePlan,
     rplan: &metadata::TablePlan,
+    pairing: &crate::delta_diff::pairing::Pairing,
 ) -> Vec<String> {
-    let mut out = Vec::new();
-    let lscheme = left.conn.dialect().url_scheme();
-    let rscheme = right.conn.dialect().url_scheme();
-    if lscheme == rscheme {
-        return out;
+    if lplan.url_scheme == rplan.url_scheme {
+        return Vec::new();
     }
 
-    let type_base = |t: &str| {
-        t.split('(')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase()
-            .to_string()
-    };
     let float_types = [
         "float",
         "double",
@@ -226,41 +210,207 @@ fn cross_db_warnings(
         "timestamp with time zone",
         "timestamptz",
     ];
+    let fixed_char = ["char", "nchar", "character", "bpchar"];
+    let variable_char = ["varchar", "varchar2", "nvarchar2", "character varying"];
+    let numeric = ["number", "decimal", "numeric", "money"];
+    let mut out = Vec::new();
 
-    let ltypes: std::collections::HashMap<&str, &str> = lplan
-        .norm_specs
-        .iter()
-        .map(|s| (s.name.as_str(), s.data_type.as_str()))
-        .collect();
-    for spec in &rplan.norm_specs {
-        let base = type_base(&spec.data_type);
-        let lty = ltypes.get(spec.name.as_str()).map(|t| type_base(t));
-        if float_types.contains(&base.as_str())
-            || lty
-                .as_deref()
-                .map(|t| float_types.contains(&t))
-                .unwrap_or(false)
+    for (left_index, right_index) in pairing.right_of_left.iter().enumerate() {
+        let Some(right_index) = right_index else {
+            continue;
+        };
+        let Some(left) = lplan.norm_specs.get(left_index) else {
+            continue;
+        };
+        let Some(right) = rplan.norm_specs.get(*right_index) else {
+            continue;
+        };
+        let left_base = type_base(&left.data_type);
+        let right_base = type_base(&right.data_type);
+
+        if float_types.contains(&left_base.as_str()) || float_types.contains(&right_base.as_str()) {
+            out.push(format!(
+                "column '{}': {} (left) vs {} (right) — cross-database float text representation \
+                 is not portable; results may show false differences (v2.1 §九)",
+                left.name, left.data_type, right.data_type
+            ));
+        } else if (date_only.contains(&left_base.as_str())
+            && date_time.contains(&right_base.as_str()))
+            || (date_time.contains(&left_base.as_str()) && date_only.contains(&right_base.as_str()))
         {
             out.push(format!(
-                "column '{}' is float-typed; cross-database text representation is not portable — \
-                 results may show false differences (v2.1 §九)",
-                spec.name
+                "column '{}': {} (left) vs {} (right) — date-only and time-bearing formats differ; \
+                 this guarantees a mismatch for every non-null value, even at midnight",
+                left.name, left.data_type, right.data_type
             ));
-        }
-        let date_mismatch = lty
-            .map(|lt| {
-                (date_only.contains(&lt.as_str()) && date_time.contains(&base.as_str()))
-                    || (date_time.contains(&lt.as_str()) && date_only.contains(&base.as_str()))
-            })
-            .unwrap_or(false);
-        if date_mismatch {
+        } else if (fixed_char.contains(&left_base.as_str())
+            && variable_char.contains(&right_base.as_str()))
+            || (variable_char.contains(&left_base.as_str())
+                && fixed_char.contains(&right_base.as_str()))
+        {
             out.push(format!(
-                "column '{}' pairs DATE with DATETIME/TIMESTAMP across sides — \
-                 time-of-day is truncated on the DATE side; time-only differences are invisible",
-                spec.name
+                "column '{}': {} (left) vs {} (right) — blank-padding differs across engines; \
+                 content hashes will show false positives for values shorter than the declared width",
+                left.name, left.data_type, right.data_type
             ));
+        } else if numeric.contains(&left_base.as_str()) && numeric.contains(&right_base.as_str()) {
+            let left_scale = declared_scale(&left.data_type);
+            let right_scale = declared_scale(&right.data_type);
+            let differs = match (left_scale, right_scale) {
+                (Some(left), Some(right)) => left != right,
+                (Some(scale), None) | (None, Some(scale)) => scale > 0,
+                (None, None) => false,
+            };
+            if differs {
+                out.push(format!(
+                    "column '{}': {} (left) vs {} (right) — declared numeric scale differs; \
+                     content hashes will mismatch on values needing trailing zeros",
+                    left.name, left.data_type, right.data_type
+                ));
+            }
         }
     }
-    out.dedup();
     out
+}
+
+fn type_base(data_type: &str) -> String {
+    data_type
+        .split('(')
+        .next()
+        .unwrap_or(data_type)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn declared_scale(data_type: &str) -> Option<i32> {
+    let (_, args) = data_type.split_once('(')?;
+    let args = args.split_once(')').map_or(args, |(inside, _)| inside);
+    args.split_once(',')?.1.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::ColumnNormSpec;
+
+    use super::*;
+
+    fn plan(scheme: &str, columns: &[(&str, &str)]) -> metadata::TablePlan {
+        metadata::TablePlan {
+            url_scheme: scheme.to_string(),
+            key_columns: Vec::new(),
+            compare_columns: columns
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+            norm_specs: columns
+                .iter()
+                .map(|(name, data_type)| ColumnNormSpec {
+                    name: (*name).to_string(),
+                    data_type: (*data_type).to_string(),
+                    nullable: true,
+                })
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn warnings(left: metadata::TablePlan, right: metadata::TablePlan) -> Vec<String> {
+        let paired = pairing::pair_plans(&left, &right);
+        cross_db_column_type_warnings(&left, &right, &paired)
+    }
+
+    #[test]
+    fn warns_when_only_one_numeric_side_declares_positive_scale() {
+        let warnings = warnings(
+            plan("oracle", &[("V_GHF", "NUMBER(16,2)")]),
+            plan("gaussdb", &[("v_ghf", "numeric")]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("V_GHF"));
+        assert!(warnings[0].contains("NUMBER(16,2)"));
+        assert!(warnings[0].contains("numeric"));
+        assert!(warnings[0].contains("declared numeric scale differs"));
+    }
+
+    #[test]
+    fn equal_declared_numeric_scales_are_silent() {
+        assert!(warnings(
+            plan("oracle", &[("V_GHF", "NUMBER(16,2)")]),
+            plan("gaussdb", &[("v_ghf", "numeric(16,2)")]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn warns_when_declared_numeric_scales_differ() {
+        let warnings = warnings(
+            plan("oracle", &[("V_GHF", "NUMBER(16,2)")]),
+            plan("gaussdb", &[("v_ghf", "numeric(16,4)")]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("declared numeric scale differs"));
+    }
+
+    #[test]
+    fn warns_for_fixed_and_variable_width_character_pair() {
+        let warnings = warnings(
+            plan("oracle", &[("V_GDDM", "CHAR(12)")]),
+            plan("gaussdb", &[("v_gddm", "character varying(12)")]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("V_GDDM"));
+        assert!(warnings[0].contains("blank-padding differs"));
+    }
+
+    #[test]
+    fn fixed_width_character_pair_is_silent() {
+        assert!(warnings(
+            plan("oracle", &[("V_GDDM", "CHAR(12)")]),
+            plan("gaussdb", &[("v_gddm", "character(12)")]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn warns_for_date_and_timestamp_pair() {
+        let warnings = warnings(
+            plan("oracle", &[("CREATED_AT", "DATE")]),
+            plan("gaussdb", &[("created_at", "timestamp without time zone")]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("guarantees a mismatch for every non-null value"));
+    }
+
+    #[test]
+    fn case_differing_names_use_pairing_for_type_warning() {
+        let warnings = warnings(
+            plan("oracle", &[("V_GHF", "NUMBER(16,2)")]),
+            plan("gaussdb", &[("v_ghf", "numeric")]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("column 'V_GHF'"));
+    }
+
+    #[test]
+    fn unpaired_column_has_no_type_warning() {
+        assert!(warnings(
+            plan("oracle", &[("LEFT_ONLY", "NUMBER(16,2)")]),
+            plan("gaussdb", &[("right_only", "numeric")]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn identical_schemes_suppress_type_warnings() {
+        assert!(warnings(
+            plan("oracle", &[("V_GHF", "NUMBER(16,2)")]),
+            plan("oracle", &[("v_ghf", "numeric")]),
+        )
+        .is_empty());
+    }
 }

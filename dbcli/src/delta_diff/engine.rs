@@ -286,6 +286,7 @@ mod tests {
 
     fn plan(keys: Vec<&str>, key_ty: &str) -> TablePlan {
         TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: keys.iter().map(|k| k.to_string()).collect(),
             compare_columns: vec![],
             norm_specs: keys
@@ -542,6 +543,7 @@ mod tests {
     fn non_bisectable_reason_for_excluded_key_column() {
         // --columns excludes the integer PK, so is_int_key cannot see its type.
         let excluded = TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: vec!["id".to_string()],
             compare_columns: vec!["c1".to_string()],
             norm_specs: vec![ColumnNormSpec {

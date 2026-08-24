@@ -535,6 +535,7 @@ mod tests {
             schema: Some("s".into()),
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                url_scheme: "mysql".into(),
                 key_columns: key_columns.iter().map(|name| (*name).into()).collect(),
                 compare_columns: key_columns.iter().map(|name| (*name).into()).collect(),
                 norm_specs: vec![],

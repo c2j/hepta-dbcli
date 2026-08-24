@@ -180,6 +180,7 @@ mod filter_tests {
             schema: None,
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                url_scheme: "mysql".into(),
                 key_columns: vec![],
                 compare_columns: vec![],
                 norm_specs: vec![],

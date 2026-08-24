@@ -447,6 +447,7 @@ mod tests {
     #[test]
     fn assemble_keeps_hash_count_payload_despite_plan_columns() {
         let plan = crate::delta_diff::metadata::TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["id".into(), "name".into()],
             norm_specs: vec![],

@@ -17,6 +17,8 @@ use crate::delta_diff::pairing::find_unique_ci;
 /// which participate in the checksum, and their normalization specs.
 #[derive(Debug, Clone)]
 pub(crate) struct TablePlan {
+    /// Backend URL scheme used to select cross-database normalization checks.
+    pub(crate) url_scheme: String,
     /// Primary/compare key columns (PRIMARY index or --key override).
     pub key_columns: Vec<String>,
     /// Columns participating in the checksum, ordinal order.
@@ -193,6 +195,7 @@ pub(crate) async fn build_table_plan(
     );
 
     Ok(TablePlan {
+        url_scheme: conn.dialect().url_scheme().to_string(),
         key_columns,
         compare_columns,
         norm_specs,
@@ -450,6 +453,7 @@ mod tests {
     #[test]
     fn identity_hash_exprs_includes_key_excluded_from_columns() {
         let plan = TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["c_int".into()],
             norm_specs: vec![ColumnNormSpec {
