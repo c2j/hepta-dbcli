@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::backend::{quote_ident, sql_literal};
+use crate::backend::{quote_ident_scheme, quote_table_scheme, sql_literal};
 use crate::delta_diff::cmd::ApplyTo;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus};
 
@@ -10,6 +10,7 @@ pub(crate) const SQL_ROW_CAP: usize = 100_000;
 
 pub(crate) struct SqlPatchOpts<'a> {
     pub apply_to: ApplyTo,
+    pub scheme: &'a str,
     pub quote: char,
     pub backslash_escape: bool,
     pub target_conn: &'a str,
@@ -82,14 +83,12 @@ pub(crate) fn render_sql_patch(
 }
 
 fn qualified_table(opts: &SqlPatchOpts<'_>) -> String {
-    match opts.target_schema {
-        Some(s) => format!(
-            "{}.{}",
-            quote_ident(opts.quote, s),
-            quote_ident(opts.quote, opts.target_table)
-        ),
-        None => quote_ident(opts.quote, opts.target_table),
-    }
+    quote_table_scheme(
+        opts.scheme,
+        opts.quote,
+        opts.target_schema,
+        opts.target_table,
+    )
 }
 
 fn row_hydrated(row: &DiffRow, report: &DiffReport) -> bool {
@@ -181,7 +180,7 @@ fn render_insert(
     let names = all_col_names(report);
     let cols = names
         .iter()
-        .map(|n| quote_ident(opts.quote, n))
+        .map(|n| quote_ident_scheme(opts.scheme, opts.quote, n))
         .collect::<Vec<_>>()
         .join(", ");
     let vals = names
@@ -223,7 +222,7 @@ fn render_update(
         let new_v = if src_is_right { r } else { l }.unwrap_or(&Value::Null);
         sets.push(format!(
             "{} = {}",
-            quote_ident(opts.quote, name),
+            quote_ident_scheme(opts.scheme, opts.quote, name),
             sql_literal(new_v, opts.backslash_escape)
         ));
     }
@@ -241,7 +240,7 @@ fn render_update(
 }
 
 fn key_eq(name: &str, v: &Value, opts: &SqlPatchOpts<'_>) -> String {
-    let col = quote_ident(opts.quote, name);
+    let col = quote_ident_scheme(opts.scheme, opts.quote, name);
     if v.is_null() {
         format!("{col} IS NULL")
     } else {
@@ -336,6 +335,7 @@ mod tests {
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into()],
             ident_quote: '"',
+            ident_scheme: String::new(),
             backslash_escape: false,
         }
     }
@@ -343,6 +343,7 @@ mod tests {
     fn opts_left<'a>() -> SqlPatchOpts<'a> {
         SqlPatchOpts {
             apply_to: ApplyTo::Left,
+            scheme: "gaussdb",
             quote: '"',
             backslash_escape: false,
             target_conn: "touchigh",

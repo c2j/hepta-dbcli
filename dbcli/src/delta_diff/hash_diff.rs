@@ -437,20 +437,15 @@ async fn key_range(
     is_left: bool,
 ) -> Result<(Option<i64>, Option<i64>), DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let q = conn.dialect().identifier_quote();
-    let table = match &side.schema {
-        Some(s) => format!("{q}{s}{q}.{q}{}{q}", side.table),
-        None => format!("{q}{}{q}", side.table),
-    };
+    let d = conn.dialect();
+    let table = d.quote_table(side.schema.as_deref(), &side.table);
+    let key = d.quote_ident(&ctx.key_column);
     let where_clause = ctx
         .filter
         .as_ref()
         .map(|f| format!(" WHERE ({f})"))
         .unwrap_or_default();
-    let sql = format!(
-        "SELECT MIN({q}{key}{q}), MAX({q}{key}{q}) FROM {table}{where_clause}",
-        key = ctx.key_column
-    );
+    let sql = format!("SELECT MIN({key}), MAX({key}) FROM {table}{where_clause}");
     ctx.vlog(format!("[sql] {sql}"));
     let r = conn.query(&sql).await?;
     let Some(row) = r.rows.first() else {
@@ -534,11 +529,7 @@ pub(crate) fn keyset_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let mut columns = vec![format!(
-        "{q}{key}{q}",
-        q = dialect.identifier_quote(),
-        key = ctx.key_column
-    )];
+    let mut columns = vec![dialect.quote_ident(&ctx.key_column)];
     for spec in side
         .plan
         .norm_specs
@@ -654,6 +645,7 @@ fn assemble_report(
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
+        ident_scheme: String::new(),
         backslash_escape: false,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);

@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use std::collections::BTreeMap;
 
-use crate::backend::{quote_ident, ChecksumSqlSpec, DbConn, DbError, KeysetPageSpec};
+use crate::backend::{ChecksumSqlSpec, DbConn, DbError, KeysetPageSpec};
 use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
 use crate::delta_diff::report::{
@@ -87,15 +87,19 @@ impl KeyedDiffer {
     ) -> Result<(Vec<DiffRow>, u64, u64, Vec<String>), DbError> {
         let lq = left.dialect().identifier_quote();
         let rq = right.dialect().identifier_quote();
-        let lfilter = side_filter(ctx, left.dialect().url_scheme());
-        let rfilter = side_filter(ctx, right.dialect().url_scheme());
+        let lscheme = left.dialect().url_scheme();
+        let rscheme = right.dialect().url_scheme();
+        let lfilter = side_filter(ctx, lscheme);
+        let rfilter = side_filter(ctx, rscheme);
         let lsql = render_count_sql(
+            lscheme,
             lq,
             ctx.left.schema.as_deref(),
             &ctx.left.table,
             lfilter.as_deref(),
         );
         let rsql = render_count_sql(
+            rscheme,
             rq,
             ctx.right.schema.as_deref(),
             &ctx.right.table,
@@ -253,15 +257,13 @@ fn batch_spec(
 }
 
 fn render_count_sql(
+    scheme: &str,
     quote: char,
     schema: Option<&str>,
     table: &str,
     filter: Option<&str>,
 ) -> String {
-    let table = match schema {
-        Some(s) => format!("{}.{}", quote_ident(quote, s), quote_ident(quote, table)),
-        None => quote_ident(quote, table),
-    };
+    let table = crate::backend::quote_table_scheme(scheme, quote, schema, table);
     match filter {
         Some(f) => format!("SELECT COUNT(*) AS cnt FROM {table} WHERE ({f})"),
         None => format!("SELECT COUNT(*) AS cnt FROM {table}"),
@@ -359,8 +361,11 @@ fn full_row_spec(
     extra_pred: Option<&str>,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let q = dialect.identifier_quote();
-    let mut columns: Vec<String> = ctx.key_columns.iter().map(|c| quote_ident(q, c)).collect();
+    let mut columns: Vec<String> = ctx
+        .key_columns
+        .iter()
+        .map(|c| dialect.quote_ident(c))
+        .collect();
     for spec in side
         .plan
         .norm_specs
@@ -497,6 +502,7 @@ fn assemble(
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
+        ident_scheme: String::new(),
         backslash_escape: false,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
@@ -534,7 +540,7 @@ mod tests {
 
     #[test]
     fn count_sql_includes_filter_and_quotes() {
-        let sql = render_count_sql('`', Some("s"), "t", Some("bcrq='20260114'"));
+        let sql = render_count_sql("mysql", '`', Some("s"), "t", Some("bcrq='20260114'"));
         assert_eq!(
             sql,
             "SELECT COUNT(*) AS cnt FROM `s`.`t` WHERE (bcrq='20260114')"
