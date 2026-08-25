@@ -557,6 +557,29 @@ mod tests {
     }
 
     #[test]
+    fn keyset_string_key_quotes_numeric_json_last_key() {
+        let spec = KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["code".into()],
+            raw_exprs: false,
+            key_columns: vec!["code".into()],
+            string_key: vec![true],
+            range: None,
+            last_key: Some(vec![serde_json::json!(55958)]),
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let sql = MySqlDialect.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("`code` COLLATE utf8mb4_bin > '55958'"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("> 55958"), "sql={sql}");
+    }
+
+    #[test]
     fn keyset_order_by_int_key_has_no_collate() {
         let spec = KeysetPageSpec {
             schema: None,

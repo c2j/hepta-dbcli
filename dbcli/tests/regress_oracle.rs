@@ -7,6 +7,7 @@ mod common;
 #[cfg(all(feature = "integration", feature = "oracle"))]
 mod tests {
     use polar_mysql::backend::oracle::OracleFactory;
+    use polar_mysql::backend::{DbConn, KeysetPageSpec};
     use serde_json::Value;
 
     fn oracle_url() -> Option<String> {
@@ -17,6 +18,19 @@ mod tests {
         let url = oracle_url()?;
         let pool = crate::common::connect_pool(OracleFactory, &url).await;
         Some(pool.acquire().await.expect("acquire"))
+    }
+
+    async fn try_connect_native() -> Option<Box<dyn polar_mysql::backend::DbConn + Send>> {
+        let url = oracle_url()?;
+        let factory: std::sync::Arc<dyn polar_mysql::backend::BackendFactory> =
+            std::sync::Arc::new(polar_mysql::backend::oracle_native::OracleFactory);
+        let mut registry = polar_mysql::backend::factory::BackendRegistry::new();
+        registry.register(factory);
+        let pool = registry
+            .connect_with_fallback("oracle", &url, None)
+            .await
+            .ok()?;
+        pool.acquire().await.ok()
     }
 
     const TABLE: &str = "REGRESS_TEST";
@@ -203,5 +217,203 @@ mod tests {
         let result =
             polar_mysql::backend::DbConn::query(&mut *conn, "SELECT * FROM nonexistent_xyz").await;
         assert!(result.is_err());
+    }
+
+    async fn drop_table_named(conn: &mut dyn DbConn, table: &str) {
+        let _ = conn
+            .query_drop(&format!(
+                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; EXCEPTION WHEN OTHERS THEN NULL; END;"
+            ))
+            .await;
+    }
+
+    async fn create_varchar_key_table(conn: &mut dyn DbConn, table: &str) {
+        drop_table_named(conn, table).await;
+        conn.query_drop(&format!(
+            "CREATE TABLE {table} (
+               xwdm VARCHAR2(20) NOT NULL,
+               bs   VARCHAR2(8)  NOT NULL,
+               gddm VARCHAR2(20) NOT NULL,
+               CONSTRAINT pk_{table} PRIMARY KEY (xwdm, bs, gddm)
+             )"
+        ))
+        .await
+        .expect("create varchar-key table");
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (xwdm, bs, gddm) VALUES ('47872','-1','D890523805')"
+        ))
+        .await
+        .expect("insert 47872");
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (xwdm, bs, gddm) VALUES ('55958','-1','D890216050')"
+        ))
+        .await
+        .expect("insert 55958");
+        conn.query_drop(&format!(
+            "INSERT INTO {table} (xwdm, bs, gddm) VALUES ('A100','-1','D890000001')"
+        ))
+        .await
+        .expect("insert A100");
+    }
+
+    /// Digit-only VARCHAR2 must stay a JSON string. `serde_json::from_str("55958")`
+    /// used to yield a Number, and keyset SQL then emitted `NLSSORT(55958)` (ORA-01722).
+    #[tokio::test]
+    async fn oracle_varchar_digit_stays_json_string() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        const TABLE: &str = "DD_KEYSET_STR";
+        create_varchar_key_table(&mut *conn, TABLE).await;
+        let result = DbConn::query(
+            &mut *conn,
+            &format!("SELECT xwdm FROM {TABLE} WHERE xwdm = '55958'"),
+        )
+        .await
+        .expect("select xwdm");
+        assert_eq!(result.row_count, 1);
+        match &result.rows[0][0] {
+            Value::String(s) => assert_eq!(s, "55958"),
+            other => panic!("VARCHAR2 '55958' became {other}, expected JSON string"),
+        }
+        drop_table_named(&mut *conn, TABLE).await;
+    }
+
+    /// Live Oracle: NLS_SORT=BINARY rewrites `NLSSORT(col) > NLSSORT(55958)` into
+    /// `col > 55958`. A non-numeric VARCHAR2 value then raises ORA-01722.
+    #[tokio::test]
+    async fn oracle_nlssort_unquoted_number_is_ora_01722() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        const TABLE: &str = "DD_KEYSET_ORA01722";
+        create_varchar_key_table(&mut *conn, TABLE).await;
+        let err = DbConn::query(
+            &mut *conn,
+            &format!(
+                "SELECT COUNT(*) FROM {TABLE}
+                 WHERE NLSSORT(\"XWDM\",'NLS_SORT=BINARY') > NLSSORT(55958,'NLS_SORT=BINARY')"
+            ),
+        )
+        .await
+        .expect_err("unquoted NLSSORT(55958) must fail when XWDM has 'A100'");
+        let msg = err.to_string();
+        // oracle-rs sometimes drops the session instead of surfacing ORA-01722.
+        assert!(
+            msg.contains("01722")
+                || msg.to_lowercase().contains("invalid number")
+                || msg.to_lowercase().contains("closed the connection"),
+            "expected ORA-01722 or a dropped session, got {msg}"
+        );
+        drop_table_named(&mut *conn, TABLE).await;
+    }
+
+    /// Dialect keyset SQL must quote JSON-number last-keys for VARCHAR2 columns
+    /// so pagination does not ORA-01722 on mixed alphanumeric PK values.
+    #[tokio::test]
+    async fn oracle_keyset_quotes_numeric_json_last_key() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        const TABLE: &str = "DD_KEYSET_PAGE";
+        create_varchar_key_table(&mut *conn, TABLE).await;
+        let spec = KeysetPageSpec {
+            schema: None,
+            table: TABLE.into(),
+            columns: vec!["XWDM".into(), "BS".into(), "GDDM".into()],
+            raw_exprs: false,
+            key_columns: vec!["XWDM".into(), "BS".into(), "GDDM".into()],
+            string_key: vec![true, true, true],
+            range: None,
+            last_key: Some(vec![
+                serde_json::json!(55958),
+                serde_json::json!(-1),
+                serde_json::json!("D890216050"),
+            ]),
+            page_size: 8192,
+            filter: None,
+            scn: None,
+        };
+        let sql = conn.dialect().render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("NLSSORT('55958','NLS_SORT=BINARY')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("NLSSORT('-1','NLS_SORT=BINARY')"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT(55958,"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT(-1,"), "sql={sql}");
+        let result = DbConn::query(&mut *conn, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("quoted keyset SQL failed: {e}; sql={sql}"));
+        assert!(
+            result.row_count >= 1,
+            "expected rows after last_key, got {result:?}"
+        );
+        drop_table_named(&mut *conn, TABLE).await;
+    }
+
+    /// Drive a real page-to-page cursor: last_key comes from the driver row,
+    /// not a hand-built JSON number.
+    #[tokio::test]
+    async fn oracle_keyset_pages_with_driver_last_key() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        const TABLE: &str = "DD_KEYSET_CURSOR";
+        create_varchar_key_table(&mut *conn, TABLE).await;
+        let mut spec = KeysetPageSpec {
+            schema: None,
+            table: TABLE.into(),
+            columns: vec!["XWDM".into(), "BS".into(), "GDDM".into()],
+            raw_exprs: false,
+            key_columns: vec!["XWDM".into(), "BS".into(), "GDDM".into()],
+            string_key: vec![true, true, true],
+            range: None,
+            last_key: None,
+            page_size: 1,
+            filter: None,
+            scn: None,
+        };
+        let first_sql = conn.dialect().render_keyset_page_sql(&spec);
+        let first = DbConn::query(&mut *conn, &first_sql)
+            .await
+            .expect("first page");
+        assert_eq!(first.row_count, 1);
+        spec.last_key = Some(first.rows[0][..3].to_vec());
+        let sql = conn.dialect().render_keyset_page_sql(&spec);
+        assert!(
+            !sql.contains("NLSSORT(47872,") && !sql.contains("NLSSORT(55958,"),
+            "driver last_key must stay quoted: sql={sql}"
+        );
+        let second = DbConn::query(&mut *conn, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("second page failed: {e}; sql={sql}"));
+        assert_eq!(second.row_count, 1);
+        match &second.rows[0][0] {
+            Value::String(s) => assert_ne!(s, first.rows[0][0].as_str().unwrap_or("")),
+            other => panic!("second-page XWDM should be a string, got {other}"),
+        }
+        drop_table_named(&mut *conn, TABLE).await;
+    }
+
+    #[tokio::test]
+    async fn oracle_native_varchar_digit_stays_json_string() {
+        let Some(mut conn) = try_connect_native().await else {
+            return;
+        };
+        const TABLE: &str = "DD_KEYSET_NATIVE";
+        create_varchar_key_table(&mut *conn, TABLE).await;
+        let result = DbConn::query(
+            &mut *conn,
+            &format!("SELECT xwdm FROM {TABLE} WHERE xwdm = '55958'"),
+        )
+        .await
+        .expect("select xwdm via oracle_native");
+        assert_eq!(result.row_count, 1);
+        match &result.rows[0][0] {
+            Value::String(s) => assert_eq!(s, "55958"),
+            other => panic!("native VARCHAR2 '55958' became {other}, expected JSON string"),
+        }
+        drop_table_named(&mut *conn, TABLE).await;
     }
 }

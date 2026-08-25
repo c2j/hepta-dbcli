@@ -5,6 +5,7 @@ use crate::backend::error::DbError;
 use crate::backend::{DbConn, Dialect, QueryResult};
 
 use super::dialect::OracleDialect;
+use super::types;
 
 pub(crate) struct OracleConn {
     conn: oracle::Connection,
@@ -52,11 +53,7 @@ fn result_set_to_query_result(
     for row_result in result {
         let row =
             row_result.map_err(|e| DbError::query_with_source("Oracle row fetch failed", e))?;
-        let mut values = Vec::with_capacity(col_count);
-        for i in 0..col_count {
-            values.push(oracle_value_to_json(&row, i));
-        }
-        rows.push(values);
+        rows.push(types::format_oracle_row(&row, col_count));
     }
 
     let row_count = rows.len();
@@ -65,25 +62,6 @@ fn result_set_to_query_result(
         rows,
         row_count,
     })
-}
-
-fn oracle_value_to_json(row: &oracle::Row, idx: usize) -> Value {
-    // String first (most common for introspection)
-    if let Ok(v) = row.get::<_, String>(idx) {
-        if let Ok(json_val) = serde_json::from_str(&v) {
-            return json_val;
-        }
-        return Value::String(v);
-    }
-    if let Ok(v) = row.get::<_, i64>(idx) {
-        return Value::Number(serde_json::Number::from(v));
-    }
-    if let Ok(v) = row.get::<_, f64>(idx) {
-        if let Some(n) = serde_json::Number::from_f64(v) {
-            return Value::Number(n);
-        }
-    }
-    Value::Null
 }
 
 #[async_trait]

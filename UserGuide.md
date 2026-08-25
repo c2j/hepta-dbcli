@@ -38,7 +38,7 @@ cargo build --release -p polar-mysql
 
 ```bash
 $ hepta_dbcli --version
-hepta_dbcli 0.2.5
+hepta_dbcli 0.4.4
 ```
 
 ---
