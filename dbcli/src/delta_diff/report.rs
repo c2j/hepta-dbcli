@@ -98,6 +98,9 @@ pub(crate) struct DiffReport {
     /// Non-key compare columns, in row-tail order. Empty until keyless hydrate.
     #[serde(default)]
     pub(crate) value_columns: Vec<String>,
+    /// Declared types aligned with `row_columns()` (left-plan names).
+    #[serde(default)]
+    pub(crate) column_data_types: Vec<String>,
     #[serde(skip)]
     pub(crate) ident_quote: char,
     #[serde(skip)]
@@ -141,6 +144,17 @@ pub(crate) fn stamp_columns_from_plan(
     plan: &crate::delta_diff::metadata::TablePlan,
 ) {
     stamp_columns(report, &plan.key_columns, &plan.compare_columns);
+    report.column_data_types = report
+        .row_columns()
+        .iter()
+        .map(|name| {
+            plan.norm_specs
+                .iter()
+                .find(|spec| spec.name.eq_ignore_ascii_case(name))
+                .map(|spec| spec.data_type.clone())
+                .unwrap_or_default()
+        })
+        .collect();
 }
 
 pub(crate) fn cap_sample_diffs(report: &mut DiffReport, limit: usize) {
@@ -192,6 +206,7 @@ mod tests {
             row_payload: RowPayload::Columns,
             key_columns: vec![],
             value_columns: vec![],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
@@ -228,6 +243,7 @@ mod tests {
             row_payload: RowPayload::HashCount,
             key_columns: vec![],
             value_columns: vec![],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
@@ -270,6 +286,7 @@ mod tests {
                 row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
+                column_data_types: vec![],
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
@@ -316,6 +333,7 @@ mod tests {
                 row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
+                column_data_types: vec![],
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
@@ -359,6 +377,7 @@ mod tests {
                 row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
+                column_data_types: vec![],
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
@@ -410,6 +429,7 @@ mod tests {
                 row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
+                column_data_types: vec![],
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,

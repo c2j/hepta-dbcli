@@ -223,6 +223,21 @@ async fn fetch_and_attach_keyless(
     pull_hash_rows(left, ctx, &pairing, true, &hashes, &mut map).await?;
     pull_hash_rows(right, ctx, &pairing, false, &hashes, &mut map).await?;
     attach_keyless_rows(report, &map, display_columns);
+    if report.row_payload == RowPayload::Columns {
+        report.column_data_types = report
+            .row_columns()
+            .iter()
+            .map(|name| {
+                ctx.left
+                    .plan
+                    .norm_specs
+                    .iter()
+                    .find(|spec| spec.name.eq_ignore_ascii_case(name))
+                    .map(|spec| spec.data_type.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+    }
     Ok(())
 }
 
@@ -451,6 +466,7 @@ mod tests {
             row_payload: RowPayload::HashCount,
             key_columns: vec![],
             value_columns: vec![],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,

@@ -815,6 +815,7 @@ mod emit_tests {
             row_payload: RowPayload::Columns,
             key_columns: vec!["id".into()],
             value_columns: vec!["name".into()],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,

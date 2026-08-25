@@ -316,6 +316,7 @@ mod tests {
             row_payload: RowPayload::Columns,
             key_columns: vec![],
             value_columns: vec![],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,

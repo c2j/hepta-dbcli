@@ -338,6 +338,7 @@ mod tests {
             row_payload: RowPayload::Columns,
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into()],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
