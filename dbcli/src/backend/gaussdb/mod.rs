@@ -91,6 +91,13 @@ impl Dialect for GaussdbDialect {
         None
     }
 
+    fn session_pin_sql(&self) -> Vec<String> {
+        vec![
+            "SET TimeZone = 'UTC'".to_string(),
+            "SET extra_float_digits = 3".to_string(),
+        ]
+    }
+
     fn default_port(&self) -> u16 {
         5432
     }
@@ -139,6 +146,7 @@ impl Dialect for GaussdbDialect {
             }
             "date" => format!("to_char({q}, 'YYYY-MM-DD')"),
             "time without time zone" | "time" => format!("{q}::text"),
+            "character" | "bpchar" if col.rtrim_fixed_char => format!("rtrim({q})"),
             "character" | "character varying" | "char" | "varchar" | "name" | "bpchar" => q.clone(),
             "bytea" => format!("encode({q}, 'hex')"),
             "text" | "json" | "jsonb" | "xml" | "clob" => {
@@ -155,11 +163,18 @@ impl Dialect for GaussdbDialect {
                 )));
             }
         };
-        Ok(if col.nullable {
-            format!("COALESCE({inner}, '{NULL_SENTINEL}')")
-        } else {
-            inner
-        })
+        Ok(
+            if col.nullable
+                && col.rtrim_fixed_char
+                && matches!(base.as_str(), "character" | "bpchar")
+            {
+                format!("COALESCE(NULLIF({inner}, ''), '{NULL_SENTINEL}')")
+            } else if col.nullable {
+                format!("COALESCE({inner}, '{NULL_SENTINEL}')")
+            } else {
+                inner
+            },
+        )
     }
 
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
@@ -352,6 +367,7 @@ mod tests {
             name: name.to_string(),
             data_type: ty.to_string(),
             nullable,
+            rtrim_fixed_char: false,
         }
     }
 
@@ -385,6 +401,29 @@ mod tests {
         );
         assert!(d.snapshot_scn_sql().is_none());
         assert!(d.begin_snapshot_sql_polardbx().is_none());
+    }
+
+    #[test]
+    fn session_pins_timezone_and_float_rendering() {
+        assert_eq!(
+            GaussdbDialect.session_pin_sql(),
+            vec!["SET TimeZone = 'UTC'", "SET extra_float_digits = 3"]
+        );
+    }
+
+    #[test]
+    fn fixed_character_rtrim_is_opt_in() {
+        let d = GaussdbDialect;
+        let mut spec = col("code", "character(12)", true);
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(\"code\", '{NULL_SENTINEL}')")
+        );
+        spec.rtrim_fixed_char = true;
+        assert_eq!(
+            d.normalize_expr(&spec).unwrap(),
+            format!("COALESCE(NULLIF(rtrim(\"code\"), ''), '{NULL_SENTINEL}')")
+        );
     }
 
     #[test]

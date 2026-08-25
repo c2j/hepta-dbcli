@@ -97,14 +97,42 @@ impl DbConn for OracleConn {
     }
 
     async fn query_drop(&mut self, sql: &str) -> Result<(), DbError> {
-        self.conn
-            .execute(sql, &[])
-            .await
-            .map_err(|e| DbError::query_with_source("Oracle query_drop failed", e))?;
-        Ok(())
+        match self.conn.execute(sql, &[]).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_alter_session_decode_error(sql, &e.to_string()) => Ok(()),
+            Err(e) => Err(DbError::query_with_source("Oracle query_drop failed", e)),
+        }
     }
 
     fn dialect(&self) -> &dyn Dialect {
         &self.dialect
+    }
+}
+
+fn is_alter_session_decode_error(sql: &str, error: &str) -> bool {
+    sql.trim_start()
+        .to_ascii_uppercase()
+        .starts_with("ALTER SESSION")
+        && error.starts_with("invalid length indicator:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_alter_session_decode_error;
+
+    #[test]
+    fn alter_session_tolerates_oracle_rs_post_execute_decode_bug() {
+        assert!(is_alter_session_decode_error(
+            "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'",
+            "invalid length indicator: 8"
+        ));
+        assert!(!is_alter_session_decode_error(
+            "COMMIT",
+            "invalid length indicator: 8"
+        ));
+        assert!(!is_alter_session_decode_error(
+            "ALTER SESSION SET NLS_SORT = BINARY",
+            "ORA-00922: missing or invalid option"
+        ));
     }
 }

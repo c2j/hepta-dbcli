@@ -127,6 +127,12 @@ pub trait Dialect: Send + Sync {
     /// Used for timeout_action=disconnect to force pool recycling.
     fn kill_own_connection_sql(&self) -> Option<String>;
 
+    /// Idempotent session statements that make normalization deterministic
+    /// (executed via exec-drop on every delta-diff connection; empty = none).
+    fn session_pin_sql(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     // ── Connection Metadata ──
 
     /// Default TCP port for this database.
@@ -258,6 +264,7 @@ pub struct ColumnNormSpec {
     /// GaussDB format_type e.g. "numeric(20,6)"; Oracle DATA_TYPE e.g. "NUMBER").
     pub data_type: String,
     pub nullable: bool,
+    pub rtrim_fixed_char: bool,
 }
 
 /// Specification for one bit-slice checksum query (v2.1 §十).

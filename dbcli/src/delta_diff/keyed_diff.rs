@@ -154,8 +154,18 @@ impl KeyedDiffer {
         if left_total.max(right_total) <= ctx.fetch_all_threshold {
             let lspec = full_row_spec(ctx, true, left.dialect(), None)?;
             let rspec = full_row_spec(ctx, false, right.dialect(), None)?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            let left_numeric = full_row_numeric_flags(ctx, true);
+            let right_numeric = full_row_numeric_flags(ctx, false);
+            let detail = row_level_diff(
+                left,
+                right,
+                (&lspec, &rspec),
+                None,
+                arity,
+                (&left_numeric, &right_numeric),
+                ctx.verbose,
+            )
+            .await?;
             *queries += detail.queries;
             let mut extra = Vec::new();
             if let Some(w) = fetch_count_mismatch_warning(
@@ -203,8 +213,18 @@ impl KeyedDiffer {
             );
             let lspec = full_row_spec(ctx, true, left.dialect(), Some(&lpred))?;
             let rspec = full_row_spec(ctx, false, right.dialect(), Some(&rpred))?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, None, arity, ctx.verbose).await?;
+            let left_numeric = full_row_numeric_flags(ctx, true);
+            let right_numeric = full_row_numeric_flags(ctx, false);
+            let detail = row_level_diff(
+                left,
+                right,
+                (&lspec, &rspec),
+                None,
+                arity,
+                (&left_numeric, &right_numeric),
+                ctx.verbose,
+            )
+            .await?;
             *queries += detail.queries;
             let exp_l = lmap.get(&b).map(|t| t.count).unwrap_or(0);
             let exp_r = rmap.get(&b).map(|t| t.count).unwrap_or(0);
@@ -339,13 +359,14 @@ fn keys_only_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_keys = ctx.side_key_columns(is_left);
     Ok(KeysetPageSpec {
         schema: side.schema.clone(),
         table: side.table.clone(),
-        columns: ctx.key_columns.clone(),
+        columns: side_keys.to_vec(),
         raw_exprs: false,
-        key_columns: ctx.key_columns.clone(),
-        string_key: side.plan.string_key_flags(),
+        key_columns: side_keys.to_vec(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: PAGE_SIZE,
@@ -361,16 +382,13 @@ fn full_row_spec(
     extra_pred: Option<&str>,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let mut columns: Vec<String> = ctx
-        .key_columns
-        .iter()
-        .map(|c| dialect.quote_ident(c))
-        .collect();
+    let side_keys = ctx.side_key_columns(is_left);
+    let mut columns: Vec<String> = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
     for spec in side
         .plan
         .norm_specs
         .iter()
-        .filter(|s| !ctx.key_columns.iter().any(|k| k == &s.name))
+        .filter(|s| !side_keys.iter().any(|k| k == &s.name))
     {
         columns.push(dialect.normalize_expr(spec)?);
     }
@@ -379,8 +397,8 @@ fn full_row_spec(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_columns: ctx.key_columns.clone(),
-        string_key: side.plan.string_key_flags(),
+        key_columns: side_keys.to_vec(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: PAGE_SIZE,
@@ -395,6 +413,20 @@ fn full_row_spec(
         },
         scn: ctx.scn_of(is_left),
     })
+}
+
+fn full_row_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_keys = ctx.side_key_columns(is_left);
+    let mut columns = side_keys.to_vec();
+    columns.extend(
+        side.plan
+            .norm_specs
+            .iter()
+            .filter(|spec| !side_keys.iter().any(|key| key == &spec.name))
+            .map(|spec| spec.name.clone()),
+    );
+    side.plan.numeric_value_flags_for(&columns)
 }
 
 async fn fetch_all_pages(
@@ -499,6 +531,7 @@ fn assemble(
         }],
         sample_diffs: sample,
         warnings,
+        row_payload: crate::delta_diff::report::RowPayload::Columns,
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',
@@ -512,8 +545,73 @@ fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendFactory;
     use crate::delta_diff::report::DiffStatus;
     use serde_json::json;
+
+    fn dummy_pool() -> std::sync::Arc<dyn crate::backend::DbPool> {
+        struct Pool;
+        #[async_trait::async_trait]
+        impl crate::backend::DbPool for Pool {
+            async fn acquire(
+                &self,
+            ) -> Result<Box<dyn crate::backend::DbConn + Send>, crate::backend::DbError>
+            {
+                Err(crate::backend::DbError::unsupported("dummy"))
+            }
+        }
+        std::sync::Arc::new(Pool)
+    }
+
+    fn side(key_columns: &[&str]) -> crate::delta_diff::strategy::SideCtx {
+        crate::delta_diff::strategy::SideCtx {
+            connection_name: "x".into(),
+            schema: Some("s".into()),
+            table: "t".into(),
+            plan: crate::delta_diff::metadata::TablePlan {
+                url_scheme: "mysql".into(),
+                key_columns: key_columns.iter().map(|name| (*name).into()).collect(),
+                compare_columns: key_columns.iter().map(|name| (*name).into()).collect(),
+                norm_specs: vec![],
+                warnings: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn right_keyset_sql_uses_right_side_key_casing() {
+        let ctx = DiffContext {
+            left: side(&["K_XWDM", "SECURITY_ID"]),
+            right: side(&["k_xwdm", "security_id"]),
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column: "K_XWDM".into(),
+            key_columns: vec!["K_XWDM".into(), "SECURITY_ID".into()],
+            left_key_columns: vec!["K_XWDM".into(), "SECURITY_ID".into()],
+            right_key_columns: vec!["k_xwdm".into(), "security_id".into()],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 4,
+            consistency: crate::delta_diff::strategy::ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            strict: false,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        };
+        let dialect = crate::backend::gaussdb::GaussdbFactory.create_dialect();
+        let spec = keys_only_spec(&ctx, false, dialect.as_ref()).unwrap();
+        let sql = dialect.render_keyset_page_sql(&spec);
+
+        assert!(sql.contains("\"k_xwdm\", \"security_id\""), "{sql}");
+        assert!(!sql.contains("\"K_XWDM\""), "{sql}");
+    }
 
     #[test]
     fn fetch_count_mismatch_warning_none_when_equal() {

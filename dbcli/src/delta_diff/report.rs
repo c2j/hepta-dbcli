@@ -22,6 +22,16 @@ pub(crate) enum DiffStatus {
     Modified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RowPayload {
+    /// cells are [key…, value…], aligned to key_columns ++ value_columns
+    #[default]
+    Columns,
+    /// cells are [row_hash, multiset_count] — NOT column-aligned
+    HashCount,
+}
+
 /// 分片比对结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShardResult {
@@ -80,6 +90,8 @@ pub(crate) struct DiffReport {
     pub(crate) shards: Vec<ShardResult>,
     pub(crate) sample_diffs: Vec<DiffRow>,
     pub(crate) warnings: Vec<String>,
+    #[serde(default)]
+    pub(crate) row_payload: RowPayload,
     /// Compare-key column names, in key order. Empty for keyless reports.
     #[serde(default)]
     pub(crate) key_columns: Vec<String>,
@@ -177,6 +189,7 @@ mod tests {
                 confirmed: true,
             }],
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
@@ -187,6 +200,47 @@ mod tests {
         let back: DiffReport = serde_json::from_str(&s).unwrap();
         assert!(back.has_diff());
         assert_eq!(back.summary.missing_right, 1);
+    }
+
+    #[test]
+    fn legacy_report_without_row_payload_defaults_to_columns() {
+        let report = DiffReport {
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            left: TableRef {
+                connection: "a".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            right: TableRef {
+                connection: "b".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            strategy: "hashdiff".into(),
+            consistency: "none".into(),
+            hash_algorithm: "md5".into(),
+            summary: DiffSummary::default(),
+            perf: PerfMetrics::default(),
+            shards: vec![],
+            sample_diffs: vec![],
+            warnings: vec![],
+            row_payload: RowPayload::HashCount,
+            key_columns: vec![],
+            value_columns: vec![],
+            ident_quote: '"',
+            ident_scheme: String::new(),
+            backslash_escape: false,
+        };
+        let mut json = serde_json::to_value(report).expect("report should serialize");
+        json.as_object_mut()
+            .expect("report JSON should be an object")
+            .remove("row_payload");
+
+        let legacy: DiffReport =
+            serde_json::from_value(json).expect("legacy report should deserialize");
+
+        assert_eq!(legacy.row_payload, RowPayload::Columns);
     }
 
     #[test]
@@ -213,6 +267,7 @@ mod tests {
                 shards: vec![],
                 sample_diffs: vec![],
                 warnings: vec![],
+                row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
@@ -258,6 +313,7 @@ mod tests {
                 shards: vec![],
                 sample_diffs: vec![],
                 warnings: vec![],
+                row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
@@ -300,6 +356,7 @@ mod tests {
                 shards: vec![],
                 sample_diffs: vec![],
                 warnings: vec![],
+                row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',
@@ -350,6 +407,7 @@ mod tests {
                     })
                     .collect(),
                 warnings: vec![],
+                row_payload: RowPayload::Columns,
                 key_columns: vec![],
                 value_columns: vec![],
                 ident_quote: '"',

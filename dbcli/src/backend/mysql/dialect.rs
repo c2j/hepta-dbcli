@@ -80,6 +80,10 @@ impl Dialect for MySqlDialect {
         Some("KILL CONNECTION CONNECTION_ID()".to_string())
     }
 
+    fn session_pin_sql(&self) -> Vec<String> {
+        vec!["SET time_zone = '+00:00'".to_string()]
+    }
+
     fn default_port(&self) -> u16 {
         3306
     }
@@ -340,6 +344,8 @@ mod tests {
             name: name.to_string(),
             data_type: ty.to_string(),
             nullable,
+            // MySQL returns CHAR values without storage padding; no RTRIM rewrite is needed.
+            rtrim_fixed_char: false,
         }
     }
 
@@ -354,6 +360,14 @@ mod tests {
         assert_eq!(pdx[0], "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
         assert_eq!(pdx[1], "START TRANSACTION READ ONLY");
         assert!(d.snapshot_scn_sql().is_none());
+    }
+
+    #[test]
+    fn session_pin_sets_utc_time_zone() {
+        assert_eq!(
+            MySqlDialect.session_pin_sql(),
+            vec!["SET time_zone = '+00:00'"]
+        );
     }
 
     #[test]

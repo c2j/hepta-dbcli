@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::DbError;
 
+pub(crate) const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+
 /// 已完成分片记录：(left_count, right_count, diff_count)——恢复时还原统计。
 pub(crate) struct CheckpointManager {
     path: PathBuf,
@@ -26,21 +28,37 @@ impl CheckpointManager {
         if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| DbError::query(format!("checkpoint read: {e}")))?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+            if content.trim().is_empty() {
+                // A pre-created zero-length checkpoint is equivalent to a fresh path.
+            } else {
+                let mut lines = content.lines();
+                let found = lines
+                    .find(|line| !line.trim().is_empty())
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .and_then(|value| {
+                        value
+                            .get("checkpoint_format_version")
+                            .and_then(|version| version.as_u64())
+                    });
+                if found != Some(u64::from(CHECKPOINT_FORMAT_VERSION)) {
+                    return Err(incompatible_version_error(&path, found));
                 }
-                match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(v) => {
-                        if let Some(id) = v.get("shard").and_then(|s| s.as_str()) {
-                            let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                            completed.insert(id.to_string(), (get("lc"), get("rc"), get("dc")));
-                        } else {
-                            corrupted_lines += 1;
-                        }
+                for line in lines {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
-                    Err(_) => corrupted_lines += 1,
+                    match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(v) => {
+                            if let Some(id) = v.get("shard").and_then(|s| s.as_str()) {
+                                let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                                completed.insert(id.to_string(), (get("lc"), get("rc"), get("dc")));
+                            } else {
+                                corrupted_lines += 1;
+                            }
+                        }
+                        Err(_) => corrupted_lines += 1,
+                    }
                 }
             }
         }
@@ -49,10 +67,27 @@ impl CheckpointManager {
             .append(true)
             .open(&path)
             .map_err(|e| DbError::query(format!("checkpoint open: {e}")))?;
+        let is_new = file
+            .metadata()
+            .map_err(|e| DbError::query(format!("checkpoint metadata: {e}")))?
+            .len()
+            == 0;
+        let mut writer = std::io::BufWriter::new(file);
+        if is_new {
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({"checkpoint_format_version": CHECKPOINT_FORMAT_VERSION})
+            )
+            .map_err(|e| DbError::query(format!("checkpoint write: {e}")))?;
+            writer
+                .flush()
+                .map_err(|e| DbError::query(format!("checkpoint flush: {e}")))?;
+        }
         Ok(Self {
             path,
             completed,
-            writer: std::io::BufWriter::new(file),
+            writer,
             corrupted_lines,
         })
     }
@@ -95,6 +130,15 @@ impl CheckpointManager {
     }
 }
 
+fn incompatible_version_error(path: &Path, found: Option<u64>) -> DbError {
+    let found = found.map_or_else(|| "none".to_string(), |version| version.to_string());
+    DbError::query(format!(
+        "checkpoint file {} was written by an incompatible version (found: {found}, expected: \
+         {CHECKPOINT_FORMAT_VERSION}); delete it or choose a new --checkpoint path",
+        path.display()
+    ))
+}
+
 /// 完成后将断点文件原子 rename 为 <path>.done（POSIX 允许 rename 打开中的文件）。
 pub(crate) fn finalize_path(path: impl AsRef<Path>) -> Result<(), DbError> {
     let path = path.as_ref();
@@ -118,7 +162,11 @@ mod tests {
         let path = dir.join("cp.jsonl");
         std::fs::write(
             &path,
-            "{\"shard\":\"0-100\",\"status\":\"Match\"}\nNOT-JSON\n{\"shard\":\"100-200\"}\n",
+            format!(
+                "{{\"checkpoint_format_version\":{CHECKPOINT_FORMAT_VERSION}}}\n\
+                 {{\"shard\":\"0-100\",\"status\":\"Match\"}}\nNOT-JSON\n\
+                 {{\"shard\":\"100-200\"}}\n"
+            ),
         )
         .unwrap();
 
@@ -132,7 +180,77 @@ mod tests {
         assert_eq!(cp.completed("200-300"), Some((10, 20, 3)));
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.lines().count() == 4);
+        assert!(content.lines().count() == 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_checkpoint_roundtrips_with_format_version() {
+        let dir = std::env::temp_dir().join(format!("ddcp-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.jsonl");
+
+        let mut cp = CheckpointManager::open(&path).unwrap();
+        cp.record("0-100", "Match", 10, 10, 0).unwrap();
+        drop(cp);
+        let reopened = CheckpointManager::open(&path).unwrap();
+        assert_eq!(reopened.completed("0-100"), Some((10, 10, 0)));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.lines().next().unwrap().contains(&format!(
+            "\"checkpoint_format_version\":{CHECKPOINT_FORMAT_VERSION}"
+        )));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn foreign_checkpoint_version_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ddcp-foreign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.jsonl");
+        std::fs::write(&path, "{\"checkpoint_format_version\":999}\n").unwrap();
+
+        let err = match CheckpointManager::open(&path) {
+            Ok(_) => panic!("foreign checkpoint version accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("found: 999"), "{err}");
+        assert!(err.contains("expected: 2"), "{err}");
+        assert!(
+            err.contains("delete it or choose a new --checkpoint path"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_version_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ddcp-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.jsonl");
+        std::fs::write(&path, "{\"shard\":\"0-100\",\"status\":\"Match\"}\n").unwrap();
+
+        let err = match CheckpointManager::open(&path) {
+            Ok(_) => panic!("legacy checkpoint accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("found: none"), "{err}");
+        assert!(err.contains("expected: 2"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_checkpoint_is_initialized_as_new() {
+        let dir = std::env::temp_dir().join(format!("ddcp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cp.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let checkpoint = CheckpointManager::open(&path).unwrap();
+        drop(checkpoint);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&format!(
+            "\"checkpoint_format_version\":{CHECKPOINT_FORMAT_VERSION}"
+        )));
         std::fs::remove_dir_all(&dir).ok();
     }
 

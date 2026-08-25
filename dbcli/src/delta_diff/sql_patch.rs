@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::backend::{quote_ident_scheme, quote_table_scheme, sql_literal};
 use crate::delta_diff::cmd::ApplyTo;
-use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus};
+use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
 
 pub(crate) const SQL_ROW_CAP: usize = 100_000;
 
@@ -28,7 +28,7 @@ pub(crate) fn render_sql_patch(
             report.sample_diffs.len()
         ));
     }
-    if report.key_columns.is_empty() {
+    if report.row_payload == RowPayload::HashCount || report.strategy == "bucketdiff" {
         for row in &report.sample_diffs {
             match row.status {
                 DiffStatus::Modified => {
@@ -92,6 +92,9 @@ fn qualified_table(opts: &SqlPatchOpts<'_>) -> String {
 }
 
 fn row_hydrated(row: &DiffRow, report: &DiffReport) -> bool {
+    if report.row_payload != RowPayload::Columns {
+        return false;
+    }
     let need = report.key_columns.len() + report.value_columns.len();
     if need == 0 {
         return false;
@@ -137,7 +140,7 @@ fn render_row_sql(
 }
 
 fn insert_copies(report: &DiffReport, row: &DiffRow) -> usize {
-    if !report.key_columns.is_empty() {
+    if report.strategy != "bucketdiff" {
         return 1;
     }
     if let Value::Object(o) = &row.key {
@@ -332,6 +335,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into()],
             ident_quote: '"',
@@ -472,8 +476,10 @@ mod tests {
     #[test]
     fn sql_keyless_modified_errors() {
         let mut r = report_keyed();
+        r.strategy = "bucketdiff".into();
+        r.row_payload = RowPayload::HashCount;
         r.key_columns.clear();
-        r.sample_diffs[1].status = DiffStatus::Modified;
+        r.sample_diffs = vec![r.sample_diffs[1].clone()];
         let err = render_sql_patch(&r, &opts_left()).unwrap_err();
         assert!(err.contains("UPDATE"), "{err}");
     }
@@ -481,6 +487,7 @@ mod tests {
     #[test]
     fn sql_keyless_insert_repeats_for_multiset_gap() {
         let mut r = report_keyed();
+        r.strategy = "bucketdiff".into();
         r.key_columns.clear();
         r.value_columns = vec!["xwdm".into(), "security_id".into(), "cjsl".into()];
         r.sample_diffs = vec![DiffRow {
@@ -503,6 +510,7 @@ mod tests {
     #[test]
     fn sql_keyless_insert_repeats_from_key_object_counts() {
         let mut r = report_keyed();
+        r.strategy = "bucketdiff".into();
         r.key_columns.clear();
         r.value_columns = vec!["xwdm".into(), "security_id".into(), "cjsl".into()];
         r.sample_diffs = vec![DiffRow {
@@ -524,6 +532,7 @@ mod tests {
     #[test]
     fn sql_keyless_insert_ok_when_hydrated() {
         let mut r = report_keyed();
+        r.strategy = "bucketdiff".into();
         r.key_columns.clear();
         r.value_columns = vec!["xwdm".into(), "security_id".into(), "cjsl".into()];
         r.sample_diffs = vec![DiffRow {

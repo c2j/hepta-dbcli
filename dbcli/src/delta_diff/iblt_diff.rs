@@ -223,7 +223,7 @@ fn render_iblt(
     let spec = IbltSqlSpec {
         schema: side.schema.clone(),
         table: side.table.clone(),
-        key_expr: dialect.quote_ident(&ctx.key_column),
+        key_expr: dialect.quote_ident(&ctx.side_key_columns(is_left)[0]),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
         cells_per_subtable: m,
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
@@ -532,6 +532,7 @@ fn assemble(
         shards: vec![shard],
         sample_diffs: diffs,
         warnings,
+        row_payload: crate::delta_diff::report::RowPayload::Columns,
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',

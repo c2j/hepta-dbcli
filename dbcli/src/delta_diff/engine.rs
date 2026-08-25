@@ -9,6 +9,7 @@
 use crate::config::ResolvedConnection;
 use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
 use crate::delta_diff::metadata::TablePlan;
+use crate::delta_diff::pairing::{find_unique_ci, pair_plans};
 use crate::delta_diff::strategy::DiffStrategy;
 use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff};
 
@@ -127,10 +128,20 @@ fn route_impl(
         }
         Strategy::Auto => match (key_columns.is_empty(), bisectable) {
             (true, _) => {
-                warnings.push(
-                    "note: keyless table diff reports row-content multiset differences only"
-                        .to_string(),
-                );
+                if lplan.key_columns.is_empty() && rplan.key_columns.is_empty() {
+                    warnings.push(
+                        "note: keyless table diff reports row-content multiset differences only"
+                            .to_string(),
+                    );
+                } else {
+                    warnings.push(format!(
+                        "keyed diff unavailable: {reason}; left key [{}] does not correspond to \
+                         right key [{}] — degraded to keyless multiset comparison; \
+                         row-content differences only",
+                        lplan.key_columns.join(", "),
+                        rplan.key_columns.join(", ")
+                    ));
+                }
                 Box::new(bucket_diff::BucketDiffer)
             }
             (false, false) => Box::new(keyed_diff::KeyedDiffer),
@@ -154,6 +165,14 @@ fn route_impl(
         }
         Strategy::Keyeddiff => {
             if key_columns.is_empty() {
+                if !lplan.key_columns.is_empty() && !rplan.key_columns.is_empty() {
+                    return Err(format!(
+                        "keyed diff unavailable: {reason}; left key [{}] does not correspond to \
+                         right key [{}]",
+                        lplan.key_columns.join(", "),
+                        rplan.key_columns.join(", ")
+                    ));
+                }
                 return Ok(keyed_or_bucket_fallback(
                     key_columns,
                     warnings,
@@ -173,17 +192,11 @@ fn route_impl(
 }
 
 fn resolve_key(lplan: &TablePlan, rplan: &TablePlan) -> Vec<String> {
-    if !lplan.key_columns.is_empty() && lplan.key_columns == rplan.key_columns {
-        return lplan.key_columns.clone();
-    }
-    Vec::new()
+    pair_plans(lplan, rplan).key_columns
 }
 
 fn is_int_key(plan: &TablePlan, key: &str) -> bool {
-    let ty = plan
-        .norm_specs
-        .iter()
-        .find(|s| s.name == key)
+    let ty = find_unique_ci(&plan.norm_specs, key, |spec| &spec.name)
         .map(|s| s.data_type.as_str())
         .unwrap_or("");
     let base = ty.split('(').next().unwrap_or("").trim().to_lowercase();
@@ -214,14 +227,15 @@ fn non_bisectable_reason(lplan: &TablePlan, rplan: &TablePlan, key_columns: &[St
                 "table has no key".to_string()
             } else if ln == 0 || rn == 0 {
                 "key is missing on one side".to_string()
-            } else if lplan.key_columns != rplan.key_columns {
+            } else if pair_plans(lplan, rplan).key_columns.is_empty() {
                 "key columns differ between the two sides".to_string()
             } else {
                 format!("composite key ({ln} columns)")
             }
         }
         [k] => {
-            let compared = |p: &TablePlan| p.norm_specs.iter().any(|s| &s.name == k);
+            let compared =
+                |p: &TablePlan| find_unique_ci(&p.norm_specs, k, |spec| &spec.name).is_some();
             if !compared(lplan) || !compared(rplan) {
                 format!("key column '{k}' is not among the compared columns")
             } else {
@@ -272,6 +286,7 @@ mod tests {
 
     fn plan(keys: Vec<&str>, key_ty: &str) -> TablePlan {
         TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: keys.iter().map(|k| k.to_string()).collect(),
             compare_columns: vec![],
             norm_specs: keys
@@ -280,6 +295,7 @@ mod tests {
                     name: k.to_string(),
                     data_type: key_ty.to_string(),
                     nullable: false,
+                    rtrim_fixed_char: false,
                 })
                 .collect(),
             warnings: vec![],
@@ -528,12 +544,14 @@ mod tests {
     fn non_bisectable_reason_for_excluded_key_column() {
         // --columns excludes the integer PK, so is_int_key cannot see its type.
         let excluded = TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: vec!["id".to_string()],
             compare_columns: vec!["c1".to_string()],
             norm_specs: vec![ColumnNormSpec {
                 name: "c1".to_string(),
                 data_type: "int".to_string(),
                 nullable: false,
+                rtrim_fixed_char: false,
             }],
             warnings: vec![],
         };
@@ -574,6 +592,83 @@ mod tests {
             "composite PK must not be reported as keyless: {:?}",
             r.warnings
         );
+    }
+
+    #[test]
+    fn cross_dialect_composite_key_casing_routes_keyeddiff_without_keyless_warning() {
+        let left = plan(vec!["XWDM", "SECURITY_ID"], "varchar(32)");
+        let right = plan(vec!["xwdm", "security_id"], "varchar(32)");
+        assert_eq!(resolve_key(&left, &right), vec!["XWDM", "SECURITY_ID"]);
+
+        let routed = route(
+            &args(Strategy::Auto),
+            &conn("oracle://a/t"),
+            &conn("gaussdb://b/t"),
+            &left,
+            &right,
+        )
+        .unwrap();
+        assert_eq!(routed.strategy.name(), "keyeddiff");
+        assert!(routed.warnings.iter().all(|w| !w.contains("keyless")));
+    }
+
+    #[test]
+    fn explicit_keyeddiff_errors_for_unpairable_nonempty_keys() {
+        let result = route(
+            &args(Strategy::Keyeddiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["other_id"], "int"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_keyeddiff_still_falls_back_for_genuinely_keyless_tables() {
+        let routed = route(
+            &args(Strategy::Keyeddiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+        )
+        .unwrap();
+        assert_eq!(routed.strategy.name(), "bucketdiff");
+    }
+
+    #[test]
+    fn auto_keyless_keeps_original_note_verbatim() {
+        let routed = route(
+            &args(Strategy::Auto),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+        )
+        .unwrap();
+        assert!(routed.warnings.iter().any(|warning| {
+            warning == "note: keyless table diff reports row-content multiset differences only"
+        }));
+    }
+
+    #[test]
+    fn auto_unpairable_keys_degrades_with_loud_warning() {
+        let routed = route(
+            &args(Strategy::Auto),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["other_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(routed.strategy.name(), "bucketdiff");
+        assert!(routed.warnings.iter().any(|warning| {
+            warning.contains("key columns differ between the two sides")
+                && warning.contains("left key [id]")
+                && warning.contains("right key [other_id]")
+                && warning.contains("degraded to keyless multiset comparison")
+        }));
     }
 
     #[test]

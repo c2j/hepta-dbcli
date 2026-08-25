@@ -5,11 +5,15 @@ use gaussdb::NoTls;
 use native_tls::TlsConnector;
 
 use crate::backend::error::DbError;
-use crate::backend::{DbConn, DbPool};
+use crate::backend::{DbConn, DbPool, Dialect};
 
 use super::conn::GaussdbConn;
 use super::error;
 use super::GaussdbDialect;
+
+fn pool_init_sql() -> Vec<String> {
+    GaussdbDialect.session_pin_sql()
+}
 
 /// 真多连接池（delta-diff Phase 2 重构）：每次 acquire() 建立独立 TCP 连接，
 /// 使每连接可持有独立快照事务（v2.1 §8.2 前置项；此前为单连接 Arc<Client>
@@ -74,6 +78,12 @@ impl GaussdbPool {
         // 变化时服务端回落到库默认编码，误读本驱动按 UTF-8 发送的字面量。
         if let Err(e) = client.simple_query("SET client_encoding = 'UTF8'").await {
             tracing::warn!("failed to set client_encoding=UTF8: {e}");
+        }
+        for sql in pool_init_sql() {
+            client
+                .simple_query(&sql)
+                .await
+                .map_err(|e| DbError::query_with_source("GaussDB session pin failed", e))?;
         }
         Ok(client)
     }
@@ -195,6 +205,16 @@ mod tests {
         assert_eq!(
             redact_password("postgres://myuser:s3cret@db.example.com:8000/mydb"),
             "postgres://myuser:****@db.example.com:8000/mydb"
+        );
+    }
+
+    #[test]
+    fn pooled_connection_init_includes_dialect_pins() {
+        let sql = pool_init_sql();
+        assert!(sql.iter().any(|stmt| stmt.contains("TimeZone")), "{sql:?}");
+        assert!(
+            sql.iter().any(|stmt| stmt.contains("extra_float_digits")),
+            "{sql:?}"
         );
     }
 }

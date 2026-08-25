@@ -20,6 +20,7 @@ pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
 pub(crate) mod output;
+pub(crate) mod pairing;
 pub(crate) mod progress;
 pub(crate) mod recheck;
 pub(crate) mod report;
@@ -32,6 +33,26 @@ pub(crate) mod strategy;
 pub(crate) const EXIT_IDENTICAL: i32 = 0;
 pub(crate) const EXIT_DIFF: i32 = 1;
 pub(crate) const EXIT_ERROR: i32 = 2;
+
+fn paired_side_keys(
+    logical_keys: &[String],
+    catalog_left_keys: &[String],
+    catalog_right_keys: &[String],
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    if logical_keys.is_empty() && catalog_left_keys.is_empty() && catalog_right_keys.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if left_keys.len() == logical_keys.len() && right_keys.len() == logical_keys.len() {
+        return Ok((left_keys, right_keys));
+    }
+    Err(format!(
+        "cannot establish 1:1 key correspondence; left key [{}], right key [{}]",
+        catalog_left_keys.join(", "),
+        catalog_right_keys.join(", ")
+    ))
+}
 
 // ─── Entry Point ───────────────────────────────────────────────────────
 
@@ -120,6 +141,7 @@ async fn dry_run_inner(
         ltable,
         &args.columns_list(),
         &args.key_list(),
+        args.rtrim_char_columns,
     )
     .await
     .map_err(|e| format!("left plan: {}", e))?;
@@ -129,20 +151,36 @@ async fn dry_run_inner(
         rtable,
         &args.columns_list(),
         &args.key_list(),
+        args.rtrim_char_columns,
     )
     .await
     .map_err(|e| format!("right plan: {}", e))?;
 
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
+    let paired = pairing::pair_plans(&lplan, &rplan);
+    let mut dry_run_warnings = routed.warnings.clone();
+    dry_run_warnings.extend(api::cross_db_column_type_warnings(
+        &lplan,
+        &rplan,
+        &paired,
+        args.rtrim_char_columns,
+    ));
+    let (left_key_columns, right_key_columns) = paired_side_keys(
+        &routed.key_columns,
+        &lplan.key_columns,
+        &rplan.key_columns,
+        paired.left_key_columns,
+        paired.right_key_columns,
+    )?;
 
     let (lminmax, rminmax) = if routed.key_columns.len() == 1
         && matches!(routed.strategy.name(), "hashdiff" | "iblt" | "joindiff")
     {
         (
-            min_max(&mut *lconn, &lschema, ltable, &routed.key_column)
+            min_max(&mut *lconn, &lschema, ltable, &left_key_columns[0])
                 .await
                 .ok(),
-            min_max(&mut *rconn, &rschema, rtable, &routed.key_column)
+            min_max(&mut *rconn, &rschema, rtable, &right_key_columns[0])
                 .await
                 .ok(),
         )
@@ -155,12 +193,7 @@ async fn dry_run_inner(
         "dry-run plan\n  strategy         : {}",
         routed.strategy.name()
     ));
-    if !routed.warnings.is_empty() {
-        out.push_str(&format!(
-            "\n  route warnings   : {}",
-            routed.warnings.join("; ")
-        ));
-    }
+    append_dry_run_warnings(&mut out, &dry_run_warnings);
     out.push_str(&format!(
         "\n  left             : {}.{} ({})\n  right            : {}.{} ({})",
         lschema, ltable, left.name, rschema, rtable, right.name
@@ -287,26 +320,39 @@ async fn execute_diff_inner(
     let ltable = args.left_table_name().ok_or("missing --table")?;
     let rtable = args.right_table_name().ok_or("missing --table")?;
 
-    let lplan = metadata::build_table_plan(
-        &mut *lconn,
-        &lschema,
-        ltable,
+    let api::Preflight {
+        lplan,
+        rplan,
+        routed,
+        paired,
+        warnings,
+    } = api::preflight(
+        api::PreflightSide {
+            conn: &mut *lconn,
+            schema: &lschema,
+            table: ltable,
+            connection_url: &left.connection_url,
+        },
+        api::PreflightSide {
+            conn: &mut *rconn,
+            schema: &rschema,
+            table: rtable,
+            connection_url: &right.connection_url,
+        },
         &args.columns_list(),
         &args.key_list(),
+        Some(args.strategy),
+        matches!(args.consistency, cmd::ConsistencyMode::None),
+        args.rtrim_char_columns,
     )
-    .await
-    .map_err(|e| format!("left plan: {}", e))?;
-    let rplan = metadata::build_table_plan(
-        &mut *rconn,
-        &rschema,
-        rtable,
-        &args.columns_list(),
-        &args.key_list(),
-    )
-    .await
-    .map_err(|e| format!("right plan: {}", e))?;
-
-    let routed = engine::route(args, left, right, &lplan, &rplan)?;
+    .await?;
+    let (left_key_columns, right_key_columns) = paired_side_keys(
+        &routed.key_columns,
+        &lplan.key_columns,
+        &rplan.key_columns,
+        paired.left_key_columns,
+        paired.right_key_columns,
+    )?;
 
     let (filter, incremental) = effective_filter(args);
     let checkpoint = match &args.checkpoint {
@@ -340,6 +386,8 @@ async fn execute_diff_inner(
         right_pool: rpool,
         key_column: routed.key_column,
         key_columns: routed.key_columns,
+        left_key_columns,
+        right_key_columns,
         filter,
         incremental,
         bisection_factor: args.bisection_factor,
@@ -351,7 +399,7 @@ async fn execute_diff_inner(
             cmd::ConsistencyMode::None => strategy::ConsistencyMode::None,
         },
         recheck: args.recheck_effective(),
-        route_warnings: routed.warnings,
+        route_warnings: warnings,
         checkpoint,
         iblt_capacity: args.iblt_capacity,
         fetch_all_threshold: args.fetch_all_threshold,
@@ -646,6 +694,12 @@ fn format_dry_run_key(key_columns: &[String]) -> String {
     key_columns.join(",")
 }
 
+fn append_dry_run_warnings(out: &mut String, warnings: &[String]) {
+    if !warnings.is_empty() {
+        out.push_str(&format!("\n  route warnings   : {}", warnings.join("; ")));
+    }
+}
+
 fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String {
     match strategy {
         "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
@@ -659,11 +713,23 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
 
 #[cfg(test)]
 mod dry_run_format_tests {
-    use super::{format_dry_run_key, format_key_domain_line};
+    use super::{
+        append_dry_run_warnings, format_dry_run_key, format_key_domain_line, paired_side_keys,
+    };
 
     #[test]
     fn composite_keys_join_with_comma() {
         assert_eq!(format_dry_run_key(&["k1".into(), "k2".into()]), "k1,k2");
+    }
+
+    #[test]
+    fn dry_run_output_includes_scale_skew_warning() {
+        let mut out = "dry-run plan".to_string();
+        append_dry_run_warnings(
+            &mut out,
+            &["column 'amount': NUMBER(16,2) (left) vs numeric (right) — declared numeric scale differs".into()],
+        );
+        assert!(out.contains("declared numeric scale differs"), "{out}");
     }
 
     #[test]
@@ -672,6 +738,21 @@ mod dry_run_format_tests {
             format_key_domain_line("keyeddiff", None),
             "  key domain       : (not applicable — keyeddiff)"
         );
+    }
+
+    #[test]
+    fn paired_side_keys_rejects_unresolved_correspondence() {
+        let error = paired_side_keys(
+            &["K_XWDM".into(), "SECURITY_ID".into()],
+            &["K_XWDM".into(), "SECURITY_ID".into()],
+            &["k_xwdm".into()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("left key [K_XWDM, SECURITY_ID]"), "{error}");
+        assert!(error.contains("right key [k_xwdm]"), "{error}");
     }
 }
 
@@ -731,6 +812,7 @@ mod emit_tests {
             shards: vec![],
             sample_diffs: diffs,
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec!["id".into()],
             value_columns: vec!["name".into()],
             ident_quote: '"',

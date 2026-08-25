@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::backend::sql_literal;
-use crate::delta_diff::report::{DiffReport, DiffStatus};
+use crate::delta_diff::cmd::DeltaDiffArgs;
+use crate::delta_diff::pairing::pair_plans;
+use crate::delta_diff::report::{DiffReport, DiffStatus, RowPayload};
 
 pub(crate) const HASH_IN_CHUNK: usize = 500;
 
@@ -14,10 +16,15 @@ pub(crate) fn attach_keyless_rows(
     fetched: &HashMap<String, Vec<Value>>,
     value_columns: Vec<String>,
 ) {
-    if fetched.is_empty() {
+    if fetched.is_empty()
+        || !report.sample_diffs.iter().all(|row| {
+            row_hash(row)
+                .as_ref()
+                .is_some_and(|hash| fetched.contains_key(hash))
+        })
+    {
         return;
     }
-    report.value_columns = value_columns;
     for row in &mut report.sample_diffs {
         let Some(hash) = row_hash(row) else {
             continue;
@@ -41,6 +48,12 @@ pub(crate) fn attach_keyless_rows(
             }
         }
     }
+    report.value_columns = value_columns;
+    report.row_payload = RowPayload::Columns;
+    debug_assert!(report
+        .sample_diffs
+        .iter()
+        .all(|row| row.key.get("hash").is_some()));
 }
 
 fn cell_u64(row: Option<&[Value]>, idx: usize) -> u64 {
@@ -97,6 +110,27 @@ pub(crate) fn render_hash_in_sql(p: &HashInSql<'_>) -> String {
     format!("SELECT {cols} FROM {table} WHERE {}", conds.join(" AND "))
 }
 
+fn render_side_hash_sql(
+    side: &crate::delta_diff::strategy::SideCtx,
+    scheme: &str,
+    quote: char,
+    filter: Option<&str>,
+    row_hash_expr: &str,
+    hashes: &[String],
+) -> String {
+    render_hash_in_sql(&HashInSql {
+        scheme,
+        quote,
+        schema: side.schema.as_deref(),
+        table: &side.table,
+        columns: &side.plan.compare_columns,
+        filter,
+        row_hash_expr,
+        hashes,
+        backslash_escape: scheme == "mysql",
+    })
+}
+
 pub(crate) fn chunk_hashes(hashes: &[String]) -> Vec<&[String]> {
     hashes.chunks(HASH_IN_CHUNK).collect()
 }
@@ -125,6 +159,10 @@ pub(crate) fn sides_to_refill(report: &DiffReport) -> (bool, bool) {
     (left, right)
 }
 
+pub(crate) fn wants_keyless_fetch(report: &DiffReport, args: &DeltaDiffArgs) -> bool {
+    report.row_payload == RowPayload::HashCount && !args.no_fetch_sample
+}
+
 pub(crate) async fn post_diff_fetch(
     args: &crate::delta_diff::cmd::DeltaDiffArgs,
     report: &mut DiffReport,
@@ -133,7 +171,7 @@ pub(crate) async fn post_diff_fetch(
     ctx: &crate::delta_diff::strategy::DiffContext,
 ) -> Result<bool, String> {
     let mut fetched = false;
-    if report.key_columns.is_empty() && !args.no_fetch_sample {
+    if wants_keyless_fetch(report, args) {
         let cap = keyless_fetch_cap(
             args.export.is_some(),
             args.export_rows_effective(),
@@ -153,14 +191,11 @@ async fn fetch_and_attach_keyless(
     left: &mut (dyn crate::backend::DbConn + Send),
     right: &mut (dyn crate::backend::DbConn + Send),
     ctx: &crate::delta_diff::strategy::DiffContext,
-    sample: usize,
+    _sample: usize,
 ) -> Result<(), String> {
     let mut hashes: Vec<String> = report.sample_diffs.iter().filter_map(row_hash).collect();
     hashes.sort();
     hashes.dedup();
-    if sample > 0 && hashes.len() > sample {
-        hashes.truncate(sample);
-    }
     if hashes.len() > 1000 {
         report.warnings.push(format!(
             "keyless row fetch of {} hashes (warning threshold 1000)",
@@ -170,19 +205,32 @@ async fn fetch_and_attach_keyless(
     if hashes.is_empty() {
         return Ok(());
     }
-    let cols = ctx.left.plan.compare_columns.clone();
+    let pairing = pair_plans(&ctx.left.plan, &ctx.right.plan);
+    if !pairing.ambiguous.is_empty()
+        || !pairing.unmatched_left.is_empty()
+        || !pairing.unmatched_right.is_empty()
+    {
+        return Err(format!(
+            "cannot align keyless row columns: unmatched left [{}], unmatched right [{}], \
+             ambiguous [{}]",
+            pairing.unmatched_left.join(", "),
+            pairing.unmatched_right.join(", "),
+            pairing.ambiguous.join(", ")
+        ));
+    }
+    let display_columns = ctx.left.plan.compare_columns.clone();
     let mut map = std::collections::HashMap::new();
-    pull_hash_rows(left, ctx, true, &cols, &hashes, &mut map).await?;
-    pull_hash_rows(right, ctx, false, &cols, &hashes, &mut map).await?;
-    attach_keyless_rows(report, &map, cols);
+    pull_hash_rows(left, ctx, &pairing, true, &hashes, &mut map).await?;
+    pull_hash_rows(right, ctx, &pairing, false, &hashes, &mut map).await?;
+    attach_keyless_rows(report, &map, display_columns);
     Ok(())
 }
 
 async fn pull_hash_rows(
     conn: &mut (dyn crate::backend::DbConn + Send),
     ctx: &crate::delta_diff::strategy::DiffContext,
+    pairing: &crate::delta_diff::pairing::Pairing,
     is_left: bool,
-    cols: &[String],
     hashes: &[String],
     out: &mut std::collections::HashMap<String, Vec<Value>>,
 ) -> Result<(), String> {
@@ -199,19 +247,31 @@ async fn pull_hash_rows(
         let filter = crate::delta_diff::strategy::side_filter(ctx, &scheme);
         (hash_expr, quote, scheme, filter)
     };
-    let bs = scheme == "mysql";
+    let projection = if is_left {
+        side.plan.compare_columns.clone()
+    } else {
+        pairing
+            .right_of_left
+            .iter()
+            .map(|right_index| {
+                right_index
+                    .and_then(|index| side.plan.compare_columns.get(index))
+                    .cloned()
+                    .ok_or_else(|| "cannot align keyless row columns".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     for chunk in chunk_hashes(hashes) {
-        let inner = render_hash_in_sql(&HashInSql {
-            scheme: &scheme,
+        let mut projected_side = side.clone();
+        projected_side.plan.compare_columns = projection.clone();
+        let inner = render_side_hash_sql(
+            &projected_side,
+            &scheme,
             quote,
-            schema: side.schema.as_deref(),
-            table: &side.table,
-            columns: cols,
-            filter: filter.as_deref(),
-            row_hash_expr: &hash_expr,
-            hashes: chunk,
-            backslash_escape: bs,
-        });
+            filter.as_deref(),
+            &hash_expr,
+            chunk,
+        );
         let sql = inner.replacen("SELECT ", &format!("SELECT {hash_expr} AS h, "), 1);
         if ctx.verbose {
             eprintln!("[sql] {sql}");
@@ -276,8 +336,8 @@ async fn pull_raw_side(
     let dialect = conn.dialect();
     let side = if is_left { &ctx.left } else { &ctx.right };
     let q = dialect.identifier_quote();
-    let mut columns: Vec<String> = ctx
-        .key_columns
+    let side_keys = ctx.side_key_columns(is_left);
+    let mut columns: Vec<String> = side_keys
         .iter()
         .map(|c| crate::backend::quote_ident(q, c))
         .collect();
@@ -285,7 +345,7 @@ async fn pull_raw_side(
         .plan
         .norm_specs
         .iter()
-        .filter(|s| !ctx.key_columns.iter().any(|k| k == &s.name))
+        .filter(|s| !side_keys.iter().any(|k| k == &s.name))
     {
         columns.push(crate::backend::quote_ident(q, &spec.name));
     }
@@ -294,8 +354,8 @@ async fn pull_raw_side(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_columns: ctx.key_columns.clone(),
-        string_key: side.plan.string_key_flags(),
+        key_columns: side_keys.to_vec(),
+        string_key: side.plan.string_key_flags_for(side_keys),
         range: None,
         last_key: None,
         page_size: 4096,
@@ -332,6 +392,39 @@ mod tests {
     use crate::backend::BackendFactory;
     use crate::delta_diff::report::*;
     use chrono::Utc;
+    use clap::Parser;
+
+    fn side(compare_columns: &[&str]) -> crate::delta_diff::strategy::SideCtx {
+        crate::delta_diff::strategy::SideCtx {
+            connection_name: "x".into(),
+            schema: Some("s".into()),
+            table: "t".into(),
+            plan: crate::delta_diff::metadata::TablePlan {
+                url_scheme: "mysql".into(),
+                key_columns: vec![],
+                compare_columns: compare_columns
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect(),
+                norm_specs: vec![],
+                warnings: vec![],
+            },
+        }
+    }
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: crate::delta_diff::cmd::DeltaDiffArgs,
+    }
+
+    fn args(extra: &[&str]) -> crate::delta_diff::cmd::DeltaDiffArgs {
+        let mut argv = vec!["test", "--left", "l", "--right", "r", "--table", "t"];
+        argv.extend_from_slice(extra);
+        TestCli::try_parse_from(argv)
+            .expect("test arguments should parse")
+            .args
+    }
 
     fn empty_report() -> DiffReport {
         DiffReport {
@@ -355,6 +448,7 @@ mod tests {
             shards: vec![],
             sample_diffs: vec![],
             warnings: vec![],
+            row_payload: RowPayload::HashCount,
             key_columns: vec![],
             value_columns: vec![],
             ident_quote: '"',
@@ -383,10 +477,22 @@ mod tests {
         assert_eq!(report.sample_diffs[0].key["left"], 0);
         assert_eq!(report.sample_diffs[0].key["right"], 1);
         assert_eq!(report.value_columns, vec!["xwdm", "cjsl"]);
+        assert_eq!(report.row_payload, RowPayload::Columns);
         assert_eq!(
             report.sample_diffs[0].right,
             Some(vec![Value::from("59267"), Value::from(100)])
         );
+    }
+
+    #[test]
+    fn wants_keyless_fetch_uses_payload_tag_not_column_names() {
+        let mut report = empty_report();
+        report.row_payload = RowPayload::HashCount;
+        report.key_columns = vec!["wrongly_stamped".into()];
+        assert!(wants_keyless_fetch(&report, &args(&[])));
+        assert!(!wants_keyless_fetch(&report, &args(&["--no-fetch-sample"])));
+        report.row_payload = RowPayload::Columns;
+        assert!(!wants_keyless_fetch(&report, &args(&[])));
     }
 
     #[test]
@@ -401,10 +507,35 @@ mod tests {
         });
         attach_keyless_rows(&mut report, &HashMap::new(), vec!["xwdm".into()]);
         assert!(report.value_columns.is_empty());
+        assert_eq!(report.row_payload, RowPayload::HashCount);
         assert_eq!(
             report.sample_diffs[0].right,
             Some(vec![Value::from("abc123"), Value::from(1)])
         );
+    }
+
+    #[test]
+    fn keyless_attach_is_all_or_nothing() {
+        let mut report = empty_report();
+        for hash in ["found", "missing"] {
+            report.sample_diffs.push(DiffRow {
+                key: Value::from(hash),
+                left: Some(vec![Value::from(hash), Value::from(1)]),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            });
+        }
+        let fetched = HashMap::from([("found".into(), vec![Value::from("payload")])]);
+
+        attach_keyless_rows(&mut report, &fetched, vec!["value".into()]);
+
+        assert_eq!(report.row_payload, RowPayload::HashCount);
+        assert!(report.value_columns.is_empty());
+        assert!(report
+            .sample_diffs
+            .iter()
+            .all(|row| row.left.as_ref().is_none_or(|cells| cells.len() == 2)));
     }
 
     #[test]
@@ -426,6 +557,21 @@ mod tests {
         assert!(sql.contains("(bcrq='20260114')"), "{sql}");
         assert!(sql.contains("\"s\".\"t\""), "{sql}");
         assert!(sql.contains("\"a\", \"b\""), "{sql}");
+    }
+
+    #[test]
+    fn right_side_projection_uses_right_side_column_names() {
+        let hashes = vec!["abc".into()];
+        let sql = render_side_hash_sql(
+            &side(&["k_xwdm", "security_id"]),
+            "gaussdb",
+            '"',
+            None,
+            "MD5(row_expr)",
+            &hashes,
+        );
+        assert!(sql.contains("\"k_xwdm\", \"security_id\""), "{sql}");
+        assert!(!sql.contains("\"K_XWDM\""), "{sql}");
     }
 
     #[test]

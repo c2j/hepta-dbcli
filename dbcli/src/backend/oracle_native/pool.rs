@@ -2,9 +2,14 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::backend::error::DbError;
-use crate::backend::{DbConn, DbPool};
+use crate::backend::{DbConn, DbPool, Dialect};
 
 use super::conn::OracleConn;
+use super::dialect::OracleDialect;
+
+fn pool_init_sql() -> Vec<String> {
+    OracleDialect::new().session_pin_sql()
+}
 
 pub(crate) struct OraclePool {
     user: String,
@@ -36,6 +41,9 @@ impl DbPool for OraclePool {
         .map_err(|e| DbError::connection(format!("Oracle connect task panicked: {}", e)))??;
         let mut conn = OracleConn::new(raw);
         conn.probe_capabilities().await?;
+        for sql in pool_init_sql() {
+            conn.query_drop(&sql).await?;
+        }
         Ok(Box::new(conn) as Box<dyn DbConn + Send>)
     }
 }
@@ -134,6 +142,17 @@ mod tests {
         assert_eq!(user, "scott");
         assert_eq!(password, "p@ss:word");
         assert_eq!(conn_str, "//localhost:1521/ORCL");
+    }
+
+    #[test]
+    fn pooled_connection_init_includes_dialect_pins() {
+        let sql = pool_init_sql();
+        assert!(
+            sql.iter()
+                .any(|stmt| stmt.contains("NLS_NUMERIC_CHARACTERS")),
+            "{sql:?}"
+        );
+        assert!(sql.iter().any(|stmt| stmt.contains("NLS_SORT")), "{sql:?}");
     }
 }
 

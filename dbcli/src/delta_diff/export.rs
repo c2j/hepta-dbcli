@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::delta_diff::cmd::ExportFormat;
-use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus};
+use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
 
 pub(crate) fn render_export(
     report: &DiffReport,
@@ -51,7 +51,7 @@ fn status_export(s: DiffStatus) -> &'static str {
 }
 
 fn key_map(row: &DiffRow, report: &DiffReport) -> Value {
-    if report.key_columns.is_empty() {
+    if report.row_payload == RowPayload::HashCount || report.strategy == "bucketdiff" {
         return json!({ "hash": keyless_hash(row) });
     }
     let src = row.left.as_ref().or(row.right.as_ref());
@@ -156,7 +156,7 @@ fn csv_cell(v: Option<&Value>) -> String {
 }
 
 fn render_csv(report: &DiffReport, export_rows: bool) -> String {
-    if report.key_columns.is_empty() && report.value_columns.is_empty() {
+    if report.row_payload == RowPayload::HashCount {
         return render_keyless_csv(report);
     }
     let changed = union_changed_value_names(report, export_rows);
@@ -216,6 +216,19 @@ fn render_keyless_csv(report: &DiffReport) -> String {
 fn render_jsonl(report: &DiffReport, export_rows: bool) -> String {
     let mut lines = Vec::with_capacity(report.sample_diffs.len());
     for row in &report.sample_diffs {
+        if report.row_payload == RowPayload::HashCount {
+            let (left_count, right_count) = keyless_counts(row);
+            lines.push(
+                json!({
+                    "status": status_export(row.status),
+                    "hash": keyless_hash(row),
+                    "left_count": left_count,
+                    "right_count": right_count,
+                })
+                .to_string(),
+            );
+            continue;
+        }
         let mut obj = serde_json::Map::new();
         obj.insert("status".into(), Value::from(status_export(row.status)));
         obj.insert("key".into(), key_map(row, report));
@@ -325,6 +338,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
+            row_payload: RowPayload::Columns,
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into(), "yhs".into()],
             ident_quote: '"',
@@ -355,6 +369,7 @@ mod tests {
     #[test]
     fn csv_keyless_default_is_hash_and_counts() {
         let mut r = report();
+        r.row_payload = RowPayload::HashCount;
         r.key_columns.clear();
         r.value_columns.clear();
         r.sample_diffs = vec![DiffRow {
@@ -373,8 +388,33 @@ mod tests {
     }
 
     #[test]
+    fn csv_hash_count_ignores_stale_named_column_schema() {
+        let mut r = report();
+        r.row_payload = RowPayload::HashCount;
+        r.key_columns = (0..14).map(|i| format!("key_{i}")).collect();
+        r.value_columns = (0..20).map(|i| format!("value_{i}")).collect();
+        r.sample_diffs = vec![DiffRow {
+            key: Value::from("h"),
+            left: Some(vec![Value::from("abc"), Value::from(0)]),
+            right: Some(vec![Value::from("abc"), Value::from(1)]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        }];
+
+        let csv = render_csv(&r, false);
+
+        assert_eq!(
+            csv.lines().next(),
+            Some("status,hash,left_count,right_count")
+        );
+        assert!(!csv.contains("key_0"), "{csv}");
+        assert!(!csv.contains("value_19"), "{csv}");
+    }
+
+    #[test]
     fn jsonl_keyless_hash_survives_hydrate() {
         let mut r = report();
+        r.strategy = "bucketdiff".into();
         r.key_columns.clear();
         r.value_columns = vec!["xwdm".into(), "cjsl".into()];
         r.sample_diffs = vec![DiffRow {

@@ -3,9 +3,14 @@ use mysql_async::prelude::Queryable;
 use std::sync::Arc;
 
 use crate::backend::error::DbError;
-use crate::backend::DbPool;
+use crate::backend::{DbPool, Dialect};
 
 use super::conn::MySqlConn;
+use super::dialect::MySqlDialect;
+
+fn pool_init_sql() -> Vec<String> {
+    MySqlDialect.session_pin_sql()
+}
 
 pub(crate) struct MySqlPool {
     pool: mysql_async::Pool,
@@ -30,6 +35,11 @@ impl DbPool for MySqlPool {
         if let Some(ms) = self.timeout_ms {
             let set_sql = format!("SET max_execution_time = {}", ms);
             let _ = conn.query_drop(&set_sql).await;
+        }
+        for sql in pool_init_sql() {
+            conn.query_drop(&sql)
+                .await
+                .map_err(|e| DbError::query_with_source("MySQL session pin failed", e))?;
         }
 
         Ok(Box::new(MySqlConn::new(conn)))

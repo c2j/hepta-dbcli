@@ -9,6 +9,7 @@
 use serde_json::Value;
 
 use crate::backend::{ColumnNormSpec, DbConn, DbError, Dialect, QueryResult};
+use crate::delta_diff::pairing::find_unique_ci;
 
 // ─── TablePlan ─────────────────────────────────────────────────────────
 
@@ -16,6 +17,8 @@ use crate::backend::{ColumnNormSpec, DbConn, DbError, Dialect, QueryResult};
 /// which participate in the checksum, and their normalization specs.
 #[derive(Debug, Clone)]
 pub(crate) struct TablePlan {
+    /// Backend URL scheme used to select cross-database normalization checks.
+    pub(crate) url_scheme: String,
     /// Primary/compare key columns (PRIMARY index or --key override).
     pub key_columns: Vec<String>,
     /// Columns participating in the checksum, ordinal order.
@@ -27,6 +30,43 @@ pub(crate) struct TablePlan {
 }
 
 impl TablePlan {
+    pub(crate) fn is_numeric_type(data_type: &str) -> bool {
+        let base = data_type
+            .split('(')
+            .next()
+            .unwrap_or(data_type)
+            .trim()
+            .to_ascii_lowercase();
+        matches!(
+            base.as_str(),
+            "tinyint"
+                | "smallint"
+                | "mediumint"
+                | "int"
+                | "integer"
+                | "bigint"
+                | "int2"
+                | "int4"
+                | "int8"
+                | "oid"
+                | "number"
+                | "decimal"
+                | "numeric"
+                | "money"
+        )
+    }
+
+    pub(crate) fn numeric_value_flags_for(&self, columns: &[String]) -> Vec<bool> {
+        columns
+            .iter()
+            .map(|column| {
+                find_unique_ci(&self.norm_specs, column, |spec| &spec.name)
+                    .map(|spec| Self::is_numeric_type(&spec.data_type))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     /// Render §九 normalized expressions in compare order.
     pub(crate) fn normalized_exprs(&self, dialect: &dyn Dialect) -> Result<Vec<String>, DbError> {
         self.norm_specs
@@ -65,12 +105,13 @@ impl TablePlan {
     }
 
     pub(crate) fn string_key_flags(&self) -> Vec<bool> {
-        self.key_columns
-            .iter()
+        self.string_key_flags_for(&self.key_columns)
+    }
+
+    pub(crate) fn string_key_flags_for(&self, keys: &[String]) -> Vec<bool> {
+        keys.iter()
             .map(|k| {
-                self.norm_specs
-                    .iter()
-                    .find(|s| &s.name == k)
+                find_unique_ci(&self.norm_specs, k, |spec| &spec.name)
                     .map(|s| Self::key_is_string(&s.data_type))
                     .unwrap_or(false)
             })
@@ -115,6 +156,7 @@ pub(crate) async fn build_table_plan(
     table: &str,
     explicit_columns: &[String],
     explicit_key: &[String],
+    rtrim_char_columns: bool,
 ) -> Result<TablePlan, DbError> {
     let (col_sql, idx_sql) = {
         let d = conn.dialect();
@@ -156,7 +198,7 @@ pub(crate) async fn build_table_plan(
     let mut warnings = Vec::new();
     if explicit_columns.is_empty() {
         for col in &columns {
-            let spec = col.norm_spec();
+            let spec = col.norm_spec(rtrim_char_columns);
             match conn.dialect().normalize_expr(&spec) {
                 Ok(_) => {
                     compare_columns.push(col.name.clone());
@@ -175,7 +217,7 @@ pub(crate) async fn build_table_plan(
                     "delta-diff: --columns column '{name}' not found in '{schema}.{table}'"
                 ))
             })?;
-            let spec = col.norm_spec();
+            let spec = col.norm_spec(rtrim_char_columns);
             // Explicitly requested columns must be comparable — propagate Err.
             conn.dialect().normalize_expr(&spec)?;
             compare_columns.push(col.name.clone());
@@ -192,6 +234,7 @@ pub(crate) async fn build_table_plan(
     );
 
     Ok(TablePlan {
+        url_scheme: conn.dialect().url_scheme().to_string(),
         key_columns,
         compare_columns,
         norm_specs,
@@ -318,11 +361,12 @@ struct ColumnRow {
 }
 
 impl ColumnRow {
-    fn norm_spec(&self) -> ColumnNormSpec {
+    fn norm_spec(&self, rtrim_fixed_char: bool) -> ColumnNormSpec {
         ColumnNormSpec {
             name: self.name.clone(),
             data_type: self.data_type.clone(),
             nullable: self.nullable,
+            rtrim_fixed_char,
         }
     }
 }
@@ -336,14 +380,7 @@ fn parse_column_row(row: &[Value]) -> ColumnRow {
 }
 
 fn find_column_ci<'a>(columns: &'a [ColumnRow], name: &str) -> Option<&'a ColumnRow> {
-    if let Some(c) = columns.iter().find(|c| c.name == name) {
-        return Some(c);
-    }
-    let mut ci = columns.iter().filter(|c| c.name.eq_ignore_ascii_case(name));
-    match (ci.next(), ci.next()) {
-        (Some(c), None) => Some(c),
-        _ => None,
-    }
+    find_unique_ci(columns, name, |column| &column.name)
 }
 
 /// Extract primary key columns from a table_indexes result: the
@@ -456,12 +493,14 @@ mod tests {
     #[test]
     fn identity_hash_exprs_includes_key_excluded_from_columns() {
         let plan = TablePlan {
+            url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["c_int".into()],
             norm_specs: vec![ColumnNormSpec {
                 name: "c_int".into(),
                 data_type: "int".into(),
                 nullable: false,
+                rtrim_fixed_char: false,
             }],
             warnings: vec![],
         };
@@ -478,6 +517,35 @@ mod tests {
         );
         let key = plan.key_hash_exprs(&MySqlDialect).unwrap();
         assert_eq!(&exprs[..key.len()], &key[..]);
+    }
+
+    #[test]
+    fn string_key_flags_follow_requested_key_order() {
+        let plan = TablePlan {
+            url_scheme: "oracle".into(),
+            key_columns: vec!["A".into(), "B".into()],
+            compare_columns: vec!["A".into(), "B".into()],
+            norm_specs: vec![
+                ColumnNormSpec {
+                    name: "A".into(),
+                    data_type: "NUMBER".into(),
+                    nullable: false,
+                    rtrim_fixed_char: false,
+                },
+                ColumnNormSpec {
+                    name: "B".into(),
+                    data_type: "VARCHAR2".into(),
+                    nullable: false,
+                    rtrim_fixed_char: false,
+                },
+            ],
+            warnings: vec![],
+        };
+
+        assert_eq!(
+            plan.string_key_flags_for(&["B".into(), "A".into()]),
+            vec![true, false]
+        );
     }
 
     // ── Mock connection serving canned metadata results ──
@@ -569,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn plan_from_mysql_metadata() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -588,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn composite_primary_key_csv_parsed() {
         let mut conn = mock(verify_columns(), primary_index("id, c_int"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id", "c_int"]);
@@ -606,7 +674,7 @@ mod tests {
         ]);
         idx.row_count += 1;
         let mut conn = mock(verify_columns(), idx);
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -615,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn no_primary_index_yields_empty_key() {
         let mut conn = mock(verify_columns(), as_result(vec![]));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(plan.key_columns.is_empty());
@@ -627,7 +695,7 @@ mod tests {
         cols.rows.push(col_row("doc", "text", true, ""));
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(!plan.compare_columns.contains(&"doc".to_string()));
@@ -643,7 +711,7 @@ mod tests {
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
         let explicit = vec!["id".to_string(), "doc".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("doc"), "{err}");
@@ -653,7 +721,7 @@ mod tests {
     async fn explicit_columns_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["id".to_string(), "nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -662,9 +730,16 @@ mod tests {
     #[tokio::test]
     async fn nullable_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_int".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_int".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("nullable")),
             "{:?}",
@@ -675,9 +750,16 @@ mod tests {
     #[tokio::test]
     async fn date_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_dt".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_dt".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("temporal")),
             "{:?}",
@@ -688,9 +770,16 @@ mod tests {
     #[tokio::test]
     async fn non_unique_explicit_key_adds_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &["c_vc".into()])
-            .await
-            .unwrap();
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_vc".into()],
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             plan.warnings
                 .iter()
@@ -703,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn primary_key_has_no_uniqueness_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
             .await
             .unwrap();
         assert!(
@@ -719,7 +808,7 @@ mod tests {
     async fn explicit_key_overrides_discovery() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["c_int".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["c_int"]);
@@ -729,7 +818,7 @@ mod tests {
     async fn explicit_key_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -741,7 +830,7 @@ mod tests {
         // to the catalog's case, since downstream SQL double-quotes the key.
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -751,7 +840,7 @@ mod tests {
     async fn explicit_columns_case_insensitive_matches() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["ID".to_string(), "C_INT".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[])
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
             .await
             .unwrap();
         assert_eq!(plan.compare_columns, vec!["id", "c_int"]);
@@ -765,7 +854,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["ID"]);
@@ -779,7 +868,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("ID"));
         let key = vec!["id".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("id"), "{err}");
@@ -788,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn missing_table_errors() {
         let mut conn = mock(as_result(vec![]), as_result(vec![]));
-        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[])
+        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");

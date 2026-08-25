@@ -300,8 +300,18 @@ impl HashDiffer {
             let t0 = Instant::now();
             let lspec = keyset_spec(ctx, true, left.dialect())?;
             let rspec = keyset_spec(ctx, false, right.dialect())?;
-            let detail =
-                row_level_diff(left, right, &lspec, &rspec, Some(range), 1, ctx.verbose).await?;
+            let left_numeric = keyset_numeric_flags(ctx, true);
+            let right_numeric = keyset_numeric_flags(ctx, false);
+            let detail = row_level_diff(
+                left,
+                right,
+                (&lspec, &rspec),
+                Some(range),
+                1,
+                (&left_numeric, &right_numeric),
+                ctx.verbose,
+            )
+            .await?;
             counters.queries += detail.queries;
             let n = detail.rows.len() as u64;
             diffs.extend(detail.rows);
@@ -439,7 +449,7 @@ async fn key_range(
     let side = if is_left { &ctx.left } else { &ctx.right };
     let d = conn.dialect();
     let table = d.quote_table(side.schema.as_deref(), &side.table);
-    let key = d.quote_ident(&ctx.key_column);
+    let key = d.quote_ident(&ctx.side_key_columns(is_left)[0]);
     let where_clause = ctx
         .filter
         .as_ref()
@@ -507,10 +517,11 @@ fn checksum_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<ChecksumSqlSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_key = ctx.side_key_columns(is_left)[0].clone();
     Ok(ChecksumSqlSpec {
         schema: side.schema.clone(),
         table: side.table.clone(),
-        key_column: Some(ctx.key_column.clone()),
+        key_column: Some(side_key),
         range: Some(range),
         bucket: None,
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
@@ -529,13 +540,9 @@ pub(crate) fn keyset_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let mut columns = vec![dialect.quote_ident(&ctx.key_column)];
-    for spec in side
-        .plan
-        .norm_specs
-        .iter()
-        .filter(|s| s.name != ctx.key_column)
-    {
+    let side_key = &ctx.side_key_columns(is_left)[0];
+    let mut columns = vec![dialect.quote_ident(side_key)];
+    for spec in side.plan.norm_specs.iter().filter(|s| &s.name != side_key) {
         columns.push(dialect.normalize_expr(spec)?);
     }
     Ok(KeysetPageSpec {
@@ -543,7 +550,7 @@ pub(crate) fn keyset_spec(
         table: side.table.clone(),
         columns,
         raw_exprs: true,
-        key_columns: vec![ctx.key_column.clone()],
+        key_columns: vec![side_key.clone()],
         string_key: vec![false],
         range: None,
         last_key: None,
@@ -551,6 +558,20 @@ pub(crate) fn keyset_spec(
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
         scn: ctx.scn_of(is_left),
     })
+}
+
+fn keyset_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_key = &ctx.side_key_columns(is_left)[0];
+    let mut columns = vec![side_key.clone()];
+    columns.extend(
+        side.plan
+            .norm_specs
+            .iter()
+            .filter(|spec| &spec.name != side_key)
+            .map(|spec| spec.name.clone()),
+    );
+    side.plan.numeric_value_flags_for(&columns)
 }
 
 fn shard_result(
@@ -642,6 +663,7 @@ fn assemble_report(
             .chain(ctx.route_warnings.iter())
             .cloned()
             .collect(),
+        row_payload: crate::delta_diff::report::RowPayload::Columns,
         key_columns: vec![],
         value_columns: vec![],
         ident_quote: '"',

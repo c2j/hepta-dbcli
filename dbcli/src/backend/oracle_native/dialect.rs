@@ -123,6 +123,10 @@ impl Dialect for OracleDialect {
         &["SELECT", "EXPLAIN", "WITH"]
     }
 
+    fn session_pin_sql(&self) -> Vec<String> {
+        vec!["ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,' NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS' NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6' NLS_SORT = BINARY NLS_COMP = BINARY".to_string()]
+    }
+
     fn add_limit(&self, sql: &str, n: usize) -> String {
         let upper = sql.trim().to_uppercase();
         if upper.contains("FETCH FIRST") || upper.contains("ROWNUM") {
@@ -199,6 +203,7 @@ impl Dialect for OracleDialect {
                 format!("TO_CHAR({q}, 'YYYY-MM-DD HH24:MI:SS.FF6')")
             }
             "DATE" => format!("TO_CHAR({q}, 'YYYY-MM-DD')"),
+            "CHAR" | "NCHAR" if col.rtrim_fixed_char => format!("RTRIM({q})"),
             "VARCHAR2" | "NVARCHAR2" | "CHAR" | "NCHAR" | "VARCHAR" => q.clone(),
             "RAW" | "LONG RAW" => format!("RAWTOHEX({q})"),
             "CLOB" | "NCLOB" | "BLOB" | "LONG" | "BFILE" => {
@@ -453,6 +458,24 @@ mod tests {
     use crate::backend::Dialect;
 
     #[test]
+    fn test_session_pin_sets_deterministic_nls() {
+        let pins = OracleDialect::new().session_pin_sql();
+        assert_eq!(pins.len(), 1);
+        assert!(pins[0].contains("NLS_NUMERIC_CHARACTERS = '.,'"));
+        assert!(pins[0].contains("NLS_SORT = BINARY"));
+        assert!(pins[0].contains("NLS_COMP = BINARY"));
+    }
+
+    #[test]
+    fn fixed_char_rtrim_is_opt_in() {
+        let d = OracleDialect::new();
+        let mut spec = col("CODE", "CHAR(12)", false);
+        assert!(!d.normalize_expr(&spec).unwrap().contains("RTRIM("));
+        spec.rtrim_fixed_char = true;
+        assert!(d.normalize_expr(&spec).unwrap().contains("RTRIM("));
+    }
+
+    #[test]
     fn test_database_info_contains_keywords() {
         let d = OracleDialect::new();
         let sql = d.database_info();
@@ -592,6 +615,7 @@ mod tests {
             name: name.to_string(),
             data_type: ty.to_string(),
             nullable,
+            rtrim_fixed_char: false,
         }
     }
 

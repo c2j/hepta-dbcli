@@ -3,7 +3,10 @@
 // 双侧按 key 升序分页拉取（render_keyset_page_sql），客户端页式归并，
 // 内存 O(页大小)。行值比较为 serde_json::Value 逐列相等（§九-2 客户端路径）。
 
+use rust_decimal::Decimal;
 use serde_json::Value;
+
+use std::str::FromStr;
 
 use crate::backend::{DbConn, DbError, KeysetPageSpec};
 use crate::delta_diff::report::{DiffRow, DiffStatus};
@@ -23,13 +26,28 @@ pub(crate) struct RangeDiff {
 pub(crate) async fn row_level_diff(
     left: &mut (dyn DbConn + Send),
     right: &mut (dyn DbConn + Send),
-    left_spec: &KeysetPageSpec,
-    right_spec: &KeysetPageSpec,
+    specs: (&KeysetPageSpec, &KeysetPageSpec),
     range: Option<(i64, i64)>,
     key_arity: usize,
+    numeric_values: (&[bool], &[bool]),
     verbose: bool,
 ) -> Result<RangeDiff, DbError> {
+    let (left_spec, right_spec) = specs;
+    let (left_numeric_value, right_numeric_value) = numeric_values;
     let arity = key_arity.max(1);
+    if left_numeric_value.len() != left_spec.columns.len()
+        || right_numeric_value.len() != right_spec.columns.len()
+        || left_numeric_value.len() != right_numeric_value.len()
+    {
+        return Err(DbError::config(
+            "delta-diff: row comparison type flags do not align with selected columns",
+        ));
+    }
+    let numeric_value: Vec<bool> = left_numeric_value
+        .iter()
+        .zip(right_numeric_value)
+        .map(|(left, right)| *left && *right)
+        .collect();
     let mut left_page = PageCursor::new(left, left_spec, range, arity, verbose);
     let mut right_page = PageCursor::new(right, right_spec, range, arity, verbose);
     let mut queries = 0u64;
@@ -85,7 +103,7 @@ pub(crate) async fn row_level_diff(
 
         let lk = row_key_tuple(&lbuf[li], arity);
         let rk = row_key_tuple(&rbuf[ri], arity);
-        match cmp_key(&lk, &rk) {
+        match cmp_key(&lk, &rk, &numeric_value[..arity]) {
             std::cmp::Ordering::Less => {
                 out.rows
                     .push(diff_row_n(&lbuf[li], arity, true, DiffStatus::MissingRight));
@@ -101,7 +119,11 @@ pub(crate) async fn row_level_diff(
             std::cmp::Ordering::Equal => {
                 out.left_count += 1;
                 out.right_count += 1;
-                if lbuf[li].get(arity..) != rbuf[ri].get(arity..) {
+                if !row_values_equal(
+                    &lbuf[li][arity..],
+                    &rbuf[ri][arity..],
+                    &numeric_value[arity..],
+                ) {
                     out.rows.push(DiffRow {
                         key: diff_key(&lbuf[li], arity),
                         left: Some(lbuf[li].clone()),
@@ -185,40 +207,57 @@ fn as_u64(v: &Value) -> Option<u64> {
     }
 }
 
-fn as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
-    }
+fn value_text(v: &Value) -> String {
+    v.as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| v.to_string())
 }
 
-fn cmp_value(l: &Value, r: &Value) -> std::cmp::Ordering {
-    if matches!(l, Value::Number(_)) || matches!(r, Value::Number(_)) {
+fn cmp_value(l: &Value, r: &Value, numeric: bool) -> std::cmp::Ordering {
+    if numeric {
         if let (Some(li), Some(ri)) = (as_i64(l), as_i64(r)) {
             return li.cmp(&ri);
         }
         if let (Some(lu), Some(ru)) = (as_u64(l), as_u64(r)) {
             return lu.cmp(&ru);
         }
-        if let (Some(ln), Some(rn)) = (as_f64(l), as_f64(r)) {
-            return ln.partial_cmp(&rn).unwrap_or(std::cmp::Ordering::Equal);
+        let (left, right) = (value_text(l), value_text(r));
+        if [left.as_str(), right.as_str()]
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case("nan"))
+        {
+            return std::cmp::Ordering::Less;
+        }
+        if let (Ok(left), Ok(right)) = (
+            Decimal::from_str(left.trim()),
+            Decimal::from_str(right.trim()),
+        ) {
+            return left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Less);
         }
     }
-    match (l.as_str(), r.as_str()) {
-        (Some(ls), Some(rs)) => ls.cmp(rs),
-        _ => l.to_string().cmp(&r.to_string()),
-    }
+    value_text(l).cmp(&value_text(r))
 }
 
-fn cmp_key(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
-    for (l, r) in a.iter().zip(b.iter()) {
-        match cmp_value(l, r) {
+fn cmp_key(a: &[Value], b: &[Value], numeric_value: &[bool]) -> std::cmp::Ordering {
+    for (index, (l, r)) in a.iter().zip(b.iter()).enumerate() {
+        match cmp_value(l, r, numeric_value.get(index).copied().unwrap_or(false)) {
             std::cmp::Ordering::Equal => continue,
             o => return o,
         }
     }
     a.len().cmp(&b.len())
+}
+
+fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> bool {
+    left.len() == right.len()
+        && left.len() == numeric_value.len()
+        && left
+            .iter()
+            .zip(right)
+            .zip(numeric_value)
+            .all(|((left, right), numeric)| {
+                cmp_value(left, right, *numeric) == std::cmp::Ordering::Equal
+            })
 }
 
 fn diff_key(row: &[Value], arity: usize) -> Value {
@@ -360,15 +399,15 @@ mod tests {
     fn cmp_key_tuple_numeric_coercion() {
         let a = vec![json!(1), json!("x")];
         let b = vec![json!("1"), json!("x")];
-        assert_eq!(cmp_key(&a, &b), std::cmp::Ordering::Equal);
+        assert_eq!(cmp_key(&a, &b, &[true, false]), std::cmp::Ordering::Equal);
         let c = vec![json!(1), json!("y")];
-        assert_eq!(cmp_key(&a, &c), std::cmp::Ordering::Less);
+        assert_eq!(cmp_key(&a, &c, &[true, false]), std::cmp::Ordering::Less);
     }
 
     #[test]
     fn cmp_key_two_numeric_strings_stay_lexical() {
         assert_eq!(
-            cmp_key(&[json!("10")], &[json!("2")]),
+            cmp_key(&[json!("10")], &[json!("2")], &[false]),
             std::cmp::Ordering::Less
         );
     }
@@ -377,13 +416,69 @@ mod tests {
     fn cmp_value_i64_beyond_f64_mantissa_is_exact() {
         let a = json!(9007199254740993i64);
         let b = json!(9007199254740992i64);
-        assert_ne!(cmp_key(&[a], &[b]), std::cmp::Ordering::Equal);
+        assert_ne!(cmp_key(&[a], &[b], &[true]), std::cmp::Ordering::Equal);
     }
 
     #[test]
     fn cmp_value_number_vs_numeric_string_still_equal() {
         assert_eq!(
-            cmp_key(&[json!(1)], &[json!("1")]),
+            cmp_key(&[json!(1)], &[json!("1")], &[true]),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn normalized_numeric_rows_compare_by_value_across_driver_json_types() {
+        let left = vec![json!(3248703.0), json!(4.9), json!(0.0)];
+        let right = vec![json!("3248703.00"), json!("4.90"), json!("0.00")];
+
+        assert!(row_values_equal(&left, &right, &[true, true, true]));
+    }
+
+    #[test]
+    fn exact_decimal_comparison_preserves_all_digits() {
+        assert_ne!(
+            cmp_value(
+                &json!("12345678901234567890.11"),
+                &json!("12345678901234567890.12"),
+                true,
+            ),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn numeric_column_compares_decimal_semantics() {
+        assert_eq!(
+            cmp_value(&json!("1.50"), &json!("1.5"), true),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn varchar_column_compares_exact_text() {
+        assert_ne!(
+            cmp_value(&json!("1.50"), &json!("1.5"), false),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn non_parseable_numeric_text_falls_back_to_exact_text() {
+        assert_eq!(
+            cmp_value(&json!("not-a-number"), &json!("not-a-number"), true),
+            std::cmp::Ordering::Equal
+        );
+        assert_ne!(
+            cmp_value(&json!("not-a-number"), &json!("NOT-A-NUMBER"), true),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn nanish_numeric_input_is_never_equal() {
+        assert_ne!(
+            cmp_value(&json!("NaN"), &json!("NaN"), true),
             std::cmp::Ordering::Equal
         );
     }
@@ -408,10 +503,10 @@ mod tests {
         let diff = row_level_diff(
             &mut left,
             &mut right,
-            &spec(),
-            &spec(),
+            (&spec(), &spec()),
             Some((0, 100)),
             1,
+            (&[true, false], &[true, false]),
             false,
         )
         .await
@@ -439,10 +534,10 @@ mod tests {
         let diff = row_level_diff(
             &mut left,
             &mut right,
-            &spec(),
-            &spec(),
+            (&spec(), &spec()),
             Some((0, 100)),
             1,
+            (&[true, false], &[true, false]),
             false,
         )
         .await
@@ -466,10 +561,10 @@ mod tests {
         let diff = row_level_diff(
             &mut left,
             &mut right,
-            &spec(),
-            &spec(),
+            (&spec(), &spec()),
             Some((0, 100)),
             1,
+            (&[true, false], &[true, false]),
             false,
         )
         .await
