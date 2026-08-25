@@ -1,6 +1,8 @@
 // ─── delta-diff full-diff file export (csv / jsonl / json) ─────────────
 
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use std::str::FromStr;
 
 use crate::delta_diff::cmd::ExportFormat;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
@@ -124,17 +126,70 @@ fn csv_cell(v: Option<&Value>) -> String {
     }
 }
 
+fn declared_scale(data_type: &str) -> Option<u32> {
+    let trimmed = data_type.trim();
+    let base = trimmed
+        .split('(')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(base.as_str(), "number" | "numeric" | "decimal" | "dec") {
+        return None;
+    }
+    let inner = trimmed.split_once('(')?.1.strip_suffix(')')?;
+    let scale = inner.split(',').nth(1)?.trim();
+    if scale == "*" {
+        return None;
+    }
+    scale.parse().ok()
+}
+
+fn format_fixed_scale(d: Decimal, scale: u32) -> String {
+    let rounded = d.round_dp(scale);
+    if scale == 0 {
+        return rounded.trunc().to_string();
+    }
+    let mut text = rounded.to_string();
+    if let Some(dot) = text.find('.') {
+        let frac = text.len() - dot - 1;
+        if frac < scale as usize {
+            text.push_str(&"0".repeat(scale as usize - frac));
+        }
+        text
+    } else {
+        format!("{text}.{}", "0".repeat(scale as usize))
+    }
+}
+
+fn csv_cell_typed(v: Option<&Value>, data_type: &str) -> String {
+    let Some(scale) = declared_scale(data_type) else {
+        return csv_cell(v);
+    };
+    let text = match v {
+        None | Some(Value::Null) => return String::new(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => return csv_escape(&other.to_string()),
+    };
+    match Decimal::from_str(text.trim()) {
+        Ok(d) => format_fixed_scale(d, scale),
+        Err(_) => csv_escape(&text),
+    }
+}
+
 fn table_column_names(report: &DiffReport) -> Vec<String> {
     let mut names = report.key_columns.clone();
     names.extend(report.value_columns.iter().cloned());
     names
 }
 
-fn csv_side_row(kind: &str, cells: Option<&[Value]>, ncols: usize) -> String {
+fn csv_side_row(kind: &str, cells: Option<&[Value]>, types: &[String], ncols: usize) -> String {
     let mut out = Vec::with_capacity(ncols + 1);
     out.push(kind.to_string());
     for i in 0..ncols {
-        out.push(csv_cell(cells.and_then(|c| c.get(i))));
+        let ty = types.get(i).map(String::as_str).unwrap_or("");
+        out.push(csv_cell_typed(cells.and_then(|c| c.get(i)), ty));
     }
     out.join(",")
 }
@@ -151,14 +206,34 @@ fn render_csv(report: &DiffReport, _export_rows: bool) -> String {
     for row in &report.sample_diffs {
         match row.status {
             DiffStatus::MissingRight => {
-                lines.push(csv_side_row("only_left", row.left.as_deref(), ncols));
+                lines.push(csv_side_row(
+                    "only_left",
+                    row.left.as_deref(),
+                    &report.column_data_types,
+                    ncols,
+                ));
             }
             DiffStatus::MissingLeft => {
-                lines.push(csv_side_row("only_right", row.right.as_deref(), ncols));
+                lines.push(csv_side_row(
+                    "only_right",
+                    row.right.as_deref(),
+                    &report.column_data_types,
+                    ncols,
+                ));
             }
             DiffStatus::Modified => {
-                lines.push(csv_side_row("modified_left", row.left.as_deref(), ncols));
-                lines.push(csv_side_row("modified_right", row.right.as_deref(), ncols));
+                lines.push(csv_side_row(
+                    "modified_left",
+                    row.left.as_deref(),
+                    &report.column_data_types,
+                    ncols,
+                ));
+                lines.push(csv_side_row(
+                    "modified_right",
+                    row.right.as_deref(),
+                    &report.column_data_types,
+                    ncols,
+                ));
             }
         }
     }
@@ -314,10 +389,60 @@ mod tests {
             row_payload: RowPayload::Columns,
             key_columns: vec!["xwdm".into(), "security_id".into()],
             value_columns: vec!["cjsl".into(), "yhs".into()],
+            column_data_types: vec![],
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
         }
+    }
+
+    #[test]
+    fn declared_scale_pads_and_trims_driver_literals() {
+        assert_eq!(declared_scale("NUMBER(15,2)"), Some(2));
+        assert_eq!(declared_scale("numeric(15,3)"), Some(3));
+        assert_eq!(declared_scale("NUMBER(24,0)"), Some(0));
+        assert_eq!(declared_scale("varchar2(8)"), None);
+        assert_eq!(
+            format_fixed_scale(Decimal::from_str("12150.0").unwrap(), 2),
+            "12150.00"
+        );
+        assert_eq!(
+            format_fixed_scale(Decimal::from_str("12150").unwrap(), 2),
+            "12150.00"
+        );
+        assert_eq!(
+            format_fixed_scale(Decimal::from_str("748.31").unwrap(), 8),
+            "748.31000000"
+        );
+        assert_eq!(
+            csv_cell_typed(Some(&Value::from(12150.0)), "NUMBER(15,2)"),
+            "12150.00"
+        );
+        assert_eq!(
+            csv_cell_typed(Some(&Value::from(12150)), "NUMBER(15,2)"),
+            "12150.00"
+        );
+    }
+
+    #[test]
+    fn csv_applies_declared_scale_on_value_columns() {
+        let mut r = report();
+        r.column_data_types = vec![
+            "varchar2(7)".into(),
+            "varchar2(19)".into(),
+            "NUMBER(15,2)".into(),
+            "NUMBER(15,2)".into(),
+        ];
+        let csv = render_csv(&r, false);
+        assert!(csv.contains("only_right,59267,600000,100.00,0.50"), "{csv}");
+        assert!(
+            csv.contains("modified_left,59267,600001,10.00,0.10"),
+            "{csv}"
+        );
+        assert!(
+            csv.contains("modified_right,59267,600001,12.00,0.10"),
+            "{csv}"
+        );
     }
 
     #[test]

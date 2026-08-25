@@ -420,6 +420,7 @@ fn assemble(
         row_payload: RowPayload::HashCount,
         key_columns: vec![],
         value_columns: vec![],
+        column_data_types: vec![],
         ident_quote: '"',
         ident_scheme: String::new(),
         backslash_escape: false,
