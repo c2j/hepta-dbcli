@@ -177,7 +177,12 @@ pub(crate) async fn build_table_plan(
         .collect();
 
     let key_columns = if explicit_key.is_empty() {
+        // Drop tokens that are not real table columns (partition names leaked
+        // from pg_get_indexdef LOCAL(...) tails, TABLESPACE, etc.).
         primary_key_columns(&idx_result)
+            .into_iter()
+            .filter_map(|k| find_column_ci(&columns, &k).map(|c| c.name.clone()))
+            .collect()
     } else {
         let mut keys = Vec::with_capacity(explicit_key.len());
         for k in explicit_key {
@@ -397,21 +402,49 @@ fn primary_key_columns(result: &QueryResult) -> Vec<String> {
 /// Parse the columns field of a PRIMARY index row. MySQL returns a CSV
 /// ("id, user_id" from GROUP_CONCAT); GaussDB returns pg_get_indexdef
 /// output ("CREATE UNIQUE INDEX ... USING btree (id, user_id)") where the
-/// parenthesized tail holds the column list.
+/// first balanced parenthesis group holds the column list.
+///
+/// Must not use the last `)` in the string: partitioned local indexes append
+/// `LOCAL(PARTITION part_…, …)` after the column list, and `rfind(')')`
+/// would swallow every partition name as a fake key column.
 fn parse_index_columns(raw: &str) -> Vec<String> {
     let s = raw.trim();
-    let csv = match (s.find('('), s.rfind(')')) {
-        (Some(open), Some(close)) if open < close => &s[open + 1..close],
-        _ => s,
-    };
+    let csv = first_balanced_paren_inner(s).unwrap_or(s);
     csv.split(',')
-        .map(|p| {
-            p.trim()
+        .filter_map(|p| {
+            let token = p
+                .trim()
                 .trim_matches(|c| c == '"' || c == '`' || c == '\'')
-                .to_string()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '`' || c == '\'');
+            if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            }
         })
-        .filter(|p| !p.is_empty())
         .collect()
+}
+
+/// Inner text of the first balanced `(...)` group, or None if none exists.
+fn first_balanced_paren_inner(s: &str) -> Option<&str> {
+    let start = s.find('(')?;
+    let mut depth = 0usize;
+    for (offset, ch) in s[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&s[start + 1..start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn value_str(v: Option<&Value>) -> String {
@@ -911,6 +944,61 @@ mod tests {
             parse_index_columns("`id`, `user_id`"),
             vec!["id", "user_id"]
         );
+    }
+
+    #[test]
+    fn parse_gauss_partitioned_local_indexdef_keeps_only_key_columns() {
+        let def = "CREATE UNIQUE INDEX dat_fund_cjqs_pkey ON bigfund.dat_fund_cjqs \
+             USING btree (xwdm, security_id, scdm, fund_code, trade_type, bs, \
+             pay_type, stock_kind, bcrq, etf_flag, gddm, gddmzm, check_type, mom_fund) \
+             LOCAL(PARTITION part_202401_xwdm_security_id_scdm_fund_code_trade_type_bs_p_idx, \
+             PARTITION part_202402_xwdm_security_id_scdm_fund_code_trade_type_bs_p_idx, \
+             PARTITION part_202601_xwdm_security_id_scdm_fund_code_trade_type_bs_p_idx)";
+        assert_eq!(
+            parse_index_columns(def),
+            vec![
+                "xwdm",
+                "security_id",
+                "scdm",
+                "fund_code",
+                "trade_type",
+                "bs",
+                "pay_type",
+                "stock_kind",
+                "bcrq",
+                "etf_flag",
+                "gddm",
+                "gddmzm",
+                "check_type",
+                "mom_fund",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_index_columns_ignores_tablespace_and_desc() {
+        assert_eq!(
+            parse_index_columns(
+                "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id, user_id DESC) TABLESPACE pg_default"
+            ),
+            vec!["id", "user_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioned_indexdef_junk_is_dropped_against_table_columns() {
+        let cols = as_result(vec![
+            col_row("xwdm", "varchar(6)", false, "PRI"),
+            col_row("security_id", "varchar(20)", false, "PRI"),
+            col_row("accrual", "numeric(16,2)", true, ""),
+        ]);
+        let def = "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (xwdm, security_id) \
+             LOCAL(PARTITION part_202401_xwdm_security_id, PARTITION part_202402_xwdm_security_id)";
+        let mut conn = mock(cols, primary_index(def));
+        let plan = build_table_plan(&mut conn, "public", "t", &[], &[], false)
+            .await
+            .unwrap();
+        assert_eq!(plan.key_columns, vec!["xwdm", "security_id"]);
     }
 
     // ── Value coercion ──

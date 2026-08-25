@@ -377,6 +377,10 @@ impl Dialect for OracleDialect {
         self.md5_hash(&exprs.join(" || '#' || "))
     }
 
+    fn row_hash_text_expr(&self, exprs: &[String]) -> String {
+        format!("LOWER(RAWTOHEX({}))", self.row_hash_expr(exprs))
+    }
+
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let Some((modulus, bucket)) = spec.bucket else {
             return String::from("-- error: bucket spec required for multiset query");
@@ -464,6 +468,15 @@ mod tests {
         assert!(pins[0].contains("NLS_NUMERIC_CHARACTERS = '.,'"));
         assert!(pins[0].contains("NLS_SORT = BINARY"));
         assert!(pins[0].contains("NLS_COMP = BINARY"));
+    }
+
+    #[test]
+    fn row_hash_text_expr_hexes_raw_hash() {
+        let d = OracleDialect::new();
+        let raw = d.row_hash_expr(&["\"XWDM\"".into()]);
+        let text = d.row_hash_text_expr(&["\"XWDM\"".into()]);
+        assert!(text.contains("LOWER(RAWTOHEX("), "{text}");
+        assert!(text.contains(&raw), "{text}");
     }
 
     #[test]

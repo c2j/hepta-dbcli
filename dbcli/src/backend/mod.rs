@@ -212,7 +212,15 @@ pub trait Dialect: Send + Sync {
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String;
 
     /// Same row-hash SQL fragment used inside `render_bucket_multiset_sql`.
+    /// May be a RAW/byte expression (Oracle `DBMS_CRYPTO.HASH`).
     fn row_hash_expr(&self, exprs: &[String]) -> String;
+
+    /// Hex/text form of [`row_hash_expr`], comparable to stored hex hashes
+    /// and safe in `IN ('…')` lists. Default is the raw expression (MySQL /
+    /// GaussDB `MD5()` already returns hex text).
+    fn row_hash_text_expr(&self, exprs: &[String]) -> String {
+        self.row_hash_expr(exprs)
+    }
 
     /// Render an IBLT summary SQL（Addendum A v1.1 §三，j=4 哈希子表）。
     /// 返回行集 (grp, cell, cnt, key_xor, val_xor_1..4)；桶位 j 取 val_xor 第 j 切片

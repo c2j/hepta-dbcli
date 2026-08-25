@@ -173,4 +173,34 @@ mod tests {
         assert_eq!(paired.left_key_columns, vec!["K_XWDM", "SECURITY_ID"]);
         assert_eq!(paired.right_key_columns, vec!["k_xwdm", "security_id"]);
     }
+
+    #[test]
+    fn fourteen_column_composite_pk_pairs_across_oracle_gauss_casing() {
+        let left_keys = [
+            "XWDM",
+            "SECURITY_ID",
+            "SCDM",
+            "FUND_CODE",
+            "TRADE_TYPE",
+            "BS",
+            "PAY_TYPE",
+            "STOCK_KIND",
+            "BCRQ",
+            "ETF_FLAG",
+            "GDDM",
+            "GDDMZM",
+            "CHECK_TYPE",
+            "MOM_FUND",
+        ];
+        let right_keys: Vec<String> = left_keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+        let mut left = plan(&[]);
+        left.key_columns = left_keys.iter().map(|k| (*k).to_string()).collect();
+        let mut right = plan(&[]);
+        right.key_columns = right_keys;
+
+        let paired = pair_plans(&left, &right);
+        assert_eq!(paired.key_columns.len(), 14);
+        assert_eq!(paired.right_key_columns[0], "xwdm");
+        assert_eq!(paired.right_key_columns[13], "mom_fund");
+    }
 }

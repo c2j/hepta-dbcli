@@ -106,37 +106,6 @@ fn changed_value_names(row: &DiffRow, report: &DiffReport) -> Vec<String> {
         .collect()
 }
 
-fn union_changed_value_names(report: &DiffReport, export_rows: bool) -> Vec<String> {
-    if export_rows {
-        return report.value_columns.clone();
-    }
-    let mut seen = vec![false; report.value_columns.len()];
-    let key_len = report.key_columns.len();
-    for row in &report.sample_diffs {
-        match row.status {
-            DiffStatus::Modified => {
-                for (i, on) in seen.iter_mut().enumerate() {
-                    let l = row.left.as_ref().and_then(|r| r.get(key_len + i));
-                    let r = row.right.as_ref().and_then(|r| r.get(key_len + i));
-                    if l != r {
-                        *on = true;
-                    }
-                }
-            }
-            DiffStatus::MissingLeft | DiffStatus::MissingRight => {
-                seen.fill(true);
-            }
-        }
-    }
-    report
-        .value_columns
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| seen[*i])
-        .map(|(_, n)| n.clone())
-        .collect()
-}
-
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -155,56 +124,60 @@ fn csv_cell(v: Option<&Value>) -> String {
     }
 }
 
-fn render_csv(report: &DiffReport, export_rows: bool) -> String {
+fn table_column_names(report: &DiffReport) -> Vec<String> {
+    let mut names = report.key_columns.clone();
+    names.extend(report.value_columns.iter().cloned());
+    names
+}
+
+fn csv_side_row(kind: &str, cells: Option<&[Value]>, ncols: usize) -> String {
+    let mut out = Vec::with_capacity(ncols + 1);
+    out.push(kind.to_string());
+    for i in 0..ncols {
+        out.push(csv_cell(cells.and_then(|c| c.get(i))));
+    }
+    out.join(",")
+}
+
+fn render_csv(report: &DiffReport, _export_rows: bool) -> String {
     if report.row_payload == RowPayload::HashCount {
         return render_keyless_csv(report);
     }
-    let changed = union_changed_value_names(report, export_rows);
-    let mut headers = vec!["status".to_string()];
-    headers.extend(report.key_columns.iter().cloned());
-    for name in &changed {
-        headers.push(format!("{name}_left"));
-        headers.push(format!("{name}_right"));
-    }
+    let names = table_column_names(report);
+    let ncols = names.len();
+    let mut headers = vec!["deltadiff_type".to_string()];
+    headers.extend(names);
     let mut lines = vec![headers.join(",")];
-    let key_len = report.key_columns.len();
     for row in &report.sample_diffs {
-        let mut cells = vec![status_export(row.status).to_string()];
-        let src = row.left.as_ref().or(row.right.as_ref());
-        for i in 0..key_len {
-            let v = src.and_then(|r| r.get(i)).or_else(|| match &row.key {
-                Value::Array(a) => a.get(i),
-                v if i == 0 => Some(v),
-                _ => None,
-            });
-            cells.push(csv_cell(v));
+        match row.status {
+            DiffStatus::MissingRight => {
+                lines.push(csv_side_row("only_left", row.left.as_deref(), ncols));
+            }
+            DiffStatus::MissingLeft => {
+                lines.push(csv_side_row("only_right", row.right.as_deref(), ncols));
+            }
+            DiffStatus::Modified => {
+                lines.push(csv_side_row("modified_left", row.left.as_deref(), ncols));
+                lines.push(csv_side_row("modified_right", row.right.as_deref(), ncols));
+            }
         }
-        for name in &changed {
-            let idx = report
-                .value_columns
-                .iter()
-                .position(|c| c == name)
-                .unwrap_or(0);
-            cells.push(csv_cell(
-                row.left.as_ref().and_then(|r| r.get(key_len + idx)),
-            ));
-            cells.push(csv_cell(
-                row.right.as_ref().and_then(|r| r.get(key_len + idx)),
-            ));
-        }
-        lines.push(cells.join(","));
     }
     lines.join("\n") + "\n"
 }
 
 fn render_keyless_csv(report: &DiffReport) -> String {
-    let mut lines = vec!["status,hash,left_count,right_count".to_string()];
+    let mut lines = vec!["deltadiff_type,hash,left_count,right_count".to_string()];
     for row in &report.sample_diffs {
         let hash = keyless_hash(row);
         let (lc, rc) = keyless_counts(row);
+        let kind = match row.status {
+            DiffStatus::MissingRight => "only_left",
+            DiffStatus::MissingLeft => "only_right",
+            DiffStatus::Modified => "modified",
+        };
         lines.push(format!(
             "{},{},{},{}",
-            status_export(row.status),
+            kind,
             csv_cell(Some(&hash)),
             csv_cell(lc.as_ref()),
             csv_cell(rc.as_ref())
@@ -348,22 +321,25 @@ mod tests {
     }
 
     #[test]
-    fn csv_default_has_status_keys_and_changed_only() {
+    fn csv_is_isomorphic_plus_deltadiff_type() {
         let csv = render_csv(&report(), false);
         let header = csv.lines().next().unwrap();
-        assert!(header.contains("status"), "{header}");
-        assert!(header.contains("xwdm"), "{header}");
-        assert!(header.contains("cjsl_left"), "{header}");
-        assert!(header.contains("cjsl_right"), "{header}");
-        assert_eq!(csv.lines().count(), 3);
+        assert_eq!(header, "deltadiff_type,xwdm,security_id,cjsl,yhs");
+        assert!(!header.contains("_left"), "{header}");
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1], "only_right,59267,600000,100,0.5");
+        assert_eq!(lines[2], "modified_left,59267,600001,10,0.1");
+        assert_eq!(lines[3], "modified_right,59267,600001,12,0.1");
     }
 
     #[test]
-    fn csv_export_rows_splits_all_value_cols() {
+    fn csv_export_rows_keeps_same_table_shape() {
         let csv = render_csv(&report(), true);
-        let header = csv.lines().next().unwrap();
-        assert!(header.contains("yhs_left"), "{header}");
-        assert!(header.contains("yhs_right"), "{header}");
+        assert_eq!(
+            csv.lines().next(),
+            Some("deltadiff_type,xwdm,security_id,cjsl,yhs")
+        );
     }
 
     #[test]
@@ -381,10 +357,10 @@ mod tests {
         }];
         let csv = render_csv(&r, false);
         assert!(
-            csv.starts_with("status,hash,left_count,right_count"),
+            csv.starts_with("deltadiff_type,hash,left_count,right_count"),
             "{csv}"
         );
-        assert!(csv.contains("missing_left,abc,0,1"), "{csv}");
+        assert!(csv.contains("only_right,abc,0,1"), "{csv}");
     }
 
     #[test]
@@ -405,7 +381,7 @@ mod tests {
 
         assert_eq!(
             csv.lines().next(),
-            Some("status,hash,left_count,right_count")
+            Some("deltadiff_type,hash,left_count,right_count")
         );
         assert!(!csv.contains("key_0"), "{csv}");
         assert!(!csv.contains("value_19"), "{csv}");
@@ -460,7 +436,7 @@ mod tests {
     #[test]
     fn export_row_count_equals_sample_diffs_len() {
         let csv = render_csv(&report(), false);
-        assert_eq!(csv.lines().count() - 1, 2);
+        assert_eq!(csv.lines().count() - 1, 3);
         let jsonl = render_jsonl(&report(), false);
         assert_eq!(jsonl.lines().count(), 2);
     }
