@@ -93,7 +93,7 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
     } else if wide {
         (0..value_len).collect()
     } else {
-        visible_value_indices(rows, key_len, value_len)
+        visible_value_indices(rows, report, key_len, value_len)
     };
 
     let mut headers = vec!["status".to_string()];
@@ -115,7 +115,7 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
             cells.extend(key_cells(row, &report.key_columns));
         }
         for i in &val_idxs {
-            cells.push(value_cell(row, key_len, *i, wide));
+            cells.push(value_cell(row, report, key_len, *i, wide));
         }
         table.push(cells);
     }
@@ -142,7 +142,12 @@ fn status_terminal(s: DiffStatus) -> &'static str {
     }
 }
 
-fn visible_value_indices(rows: &[DiffRow], key_len: usize, value_len: usize) -> Vec<usize> {
+fn visible_value_indices(
+    rows: &[DiffRow],
+    report: &DiffReport,
+    key_len: usize,
+    value_len: usize,
+) -> Vec<usize> {
     if value_len == 0 {
         return Vec::new();
     }
@@ -150,7 +155,7 @@ fn visible_value_indices(rows: &[DiffRow], key_len: usize, value_len: usize) -> 
     for row in rows {
         match row.status {
             DiffStatus::Modified => {
-                for i in changed_value_indices(row, key_len, value_len) {
+                for i in changed_value_indices(row, report, key_len, value_len) {
                     seen[i] = true;
                 }
             }
@@ -166,12 +171,38 @@ fn visible_value_indices(rows: &[DiffRow], key_len: usize, value_len: usize) -> 
         .collect()
 }
 
-fn changed_value_indices(row: &DiffRow, key_len: usize, value_len: usize) -> Vec<usize> {
+fn value_data_type(report: &DiffReport, key_len: usize, value_idx: usize) -> &str {
+    report
+        .column_data_types
+        .get(key_len + value_idx)
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+fn cells_differ(left: Option<&Value>, right: Option<&Value>, data_type: &str) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (Some(left), Some(right)) => !crate::delta_diff::rowdiff::values_equal(
+            left,
+            right,
+            crate::delta_diff::metadata::TablePlan::is_numeric_type(data_type),
+        ),
+        _ => true,
+    }
+}
+
+fn changed_value_indices(
+    row: &DiffRow,
+    report: &DiffReport,
+    key_len: usize,
+    value_len: usize,
+) -> Vec<usize> {
     (0..value_len)
         .filter(|&i| {
+            let ty = value_data_type(report, key_len, i);
             let l = row.left.as_ref().and_then(|r| r.get(key_len + i));
             let r = row.right.as_ref().and_then(|r| r.get(key_len + i));
-            l != r
+            cells_differ(l, r, ty)
         })
         .collect()
 }
@@ -207,25 +238,29 @@ fn keyless_label(row: &DiffRow) -> String {
         .unwrap_or_else(|| cell_str(&row.key))
 }
 
-fn value_cell(row: &DiffRow, key_len: usize, value_idx: usize, wide: bool) -> String {
+fn value_cell(
+    row: &DiffRow,
+    report: &DiffReport,
+    key_len: usize,
+    value_idx: usize,
+    wide: bool,
+) -> String {
+    let ty = value_data_type(report, key_len, value_idx);
     let l = row.left.as_ref().and_then(|r| r.get(key_len + value_idx));
     let r = row.right.as_ref().and_then(|r| r.get(key_len + value_idx));
+    let show = |v: Option<&Value>| crate::delta_diff::export::csv_cell_typed(v, ty);
     match row.status {
         DiffStatus::Modified => {
-            if l != r {
-                trunc32(&format!(
-                    "{} → {}",
-                    l.map(cell_str).unwrap_or_default(),
-                    r.map(cell_str).unwrap_or_default()
-                ))
+            if cells_differ(l, r, ty) {
+                trunc32(&format!("{} → {}", show(l), show(r)))
             } else if wide {
-                trunc32(&l.or(r).map(cell_str).unwrap_or_default())
+                trunc32(&show(l.or(r)))
             } else {
                 String::new()
             }
         }
-        DiffStatus::MissingLeft => trunc32(&r.map(cell_str).unwrap_or_default()),
-        DiffStatus::MissingRight => trunc32(&l.map(cell_str).unwrap_or_default()),
+        DiffStatus::MissingLeft => trunc32(&show(r)),
+        DiffStatus::MissingRight => trunc32(&show(l)),
     }
 }
 
@@ -426,6 +461,38 @@ mod tests {
         );
         assert!(!out.contains("key_0"), "{out}");
         assert!(!out.contains("value_19"), "{out}");
+    }
+
+    #[test]
+    fn compact_terminal_hides_numeric_scale_only_differences() {
+        let mut report = keyed_report();
+        report
+            .sample_diffs
+            .retain(|d| d.status == DiffStatus::Modified);
+        report.sample_diffs[0].left = Some(vec![
+            Value::from("59267"),
+            Value::from("600001"),
+            serde_json::json!(12150.0),
+            Value::from(748.31),
+        ]);
+        report.sample_diffs[0].right = Some(vec![
+            Value::from("59267"),
+            Value::from("600001"),
+            Value::from(12150),
+            Value::from(935.38),
+        ]);
+        report.value_columns = vec!["cjsl".into(), "accrual".into()];
+        report.column_data_types = vec![
+            "varchar2(7)".into(),
+            "varchar2(19)".into(),
+            "NUMBER(15,2)".into(),
+            "NUMBER(20,8)".into(),
+        ];
+        let out = render_compact_sample(&report, 20, false);
+        assert!(out.contains("accrual"), "{out}");
+        assert!(out.contains("748.31000000 → 935.38000000"), "{out}");
+        assert!(!out.contains("cjsl"), "{out}");
+        assert!(!out.contains("12150.0 → 12150"), "{out}");
     }
 
     #[test]

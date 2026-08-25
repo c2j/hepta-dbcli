@@ -248,6 +248,10 @@ fn cmp_key(a: &[Value], b: &[Value], numeric_value: &[bool]) -> std::cmp::Orderi
     a.len().cmp(&b.len())
 }
 
+pub(crate) fn values_equal(left: &Value, right: &Value, numeric: bool) -> bool {
+    cmp_value(left, right, numeric) == std::cmp::Ordering::Equal
+}
+
 fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> bool {
     left.len() == right.len()
         && left.len() == numeric_value.len()
@@ -255,9 +259,7 @@ fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> 
             .iter()
             .zip(right)
             .zip(numeric_value)
-            .all(|((left, right), numeric)| {
-                cmp_value(left, right, *numeric) == std::cmp::Ordering::Equal
-            })
+            .all(|((left, right), numeric)| values_equal(left, right, *numeric))
 }
 
 fn diff_key(row: &[Value], arity: usize) -> Value {

@@ -162,7 +162,7 @@ fn format_fixed_scale(d: Decimal, scale: u32) -> String {
     }
 }
 
-fn csv_cell_typed(v: Option<&Value>, data_type: &str) -> String {
+pub(crate) fn csv_cell_typed(v: Option<&Value>, data_type: &str) -> String {
     let Some(scale) = declared_scale(data_type) else {
         return csv_cell(v);
     };
