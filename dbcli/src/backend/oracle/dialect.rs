@@ -377,6 +377,10 @@ impl Dialect for OracleDialect {
         self.md5_hash(&exprs.join(" || '#' || "))
     }
 
+    fn row_hash_text_expr(&self, exprs: &[String]) -> String {
+        format!("LOWER(RAWTOHEX({}))", self.row_hash_expr(exprs))
+    }
+
     fn render_bucket_multiset_sql(&self, spec: &ChecksumSqlSpec) -> String {
         let Some((modulus, bucket)) = spec.bucket else {
             return String::from("-- error: bucket spec required for multiset query");

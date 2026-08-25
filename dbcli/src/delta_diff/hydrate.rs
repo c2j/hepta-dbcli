@@ -241,7 +241,7 @@ async fn pull_hash_rows(
             .plan
             .normalized_exprs(dialect)
             .map_err(|e| e.to_string())?;
-        let hash_expr = dialect.row_hash_expr(&exprs);
+        let hash_expr = dialect.row_hash_text_expr(&exprs);
         let quote = dialect.identifier_quote();
         let scheme = dialect.url_scheme().to_string();
         let filter = crate::delta_diff::strategy::side_filter(ctx, &scheme);
