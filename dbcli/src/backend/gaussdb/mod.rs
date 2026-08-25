@@ -507,6 +507,30 @@ mod tests {
     }
 
     #[test]
+    fn keyset_string_key_quotes_numeric_json_last_key() {
+        let d = GaussdbDialect;
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "dat_fund_cjqs".into(),
+            columns: vec!["xwdm".into()],
+            raw_exprs: false,
+            key_columns: vec!["xwdm".into()],
+            string_key: vec![true],
+            range: None,
+            last_key: Some(vec![serde_json::json!(47872)]),
+            page_size: 8192,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains("\"xwdm\" COLLATE \"C\" > '47872'"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("> 47872"), "sql={sql}");
+    }
+
+    #[test]
     fn batch_checksum_sql_groups_by_mod_expression() {
         let d = GaussdbDialect;
         let spec = ChecksumSqlSpec {

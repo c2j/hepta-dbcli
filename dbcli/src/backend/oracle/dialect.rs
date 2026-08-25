@@ -761,6 +761,37 @@ mod tests {
     }
 
     #[test]
+    fn keyset_oracle_string_key_quotes_numeric_json_last_key() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::KeysetPageSpec {
+            schema: None,
+            table: "DAT_FUND_CJQS".into(),
+            columns: vec!["XWDM".into(), "BS".into()],
+            raw_exprs: false,
+            key_columns: vec!["XWDM".into(), "BS".into()],
+            string_key: vec![true, true],
+            range: None,
+            last_key: Some(vec![serde_json::json!(55958), serde_json::json!(-1)]),
+            page_size: 8192,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(
+            sql.contains(
+                "NLSSORT(\"XWDM\",'NLS_SORT=BINARY') > NLSSORT('55958','NLS_SORT=BINARY')"
+            ),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("NLSSORT(\"BS\",'NLS_SORT=BINARY') > NLSSORT('-1','NLS_SORT=BINARY')"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("NLSSORT(55958,"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT(-1,"), "sql={sql}");
+    }
+
+    #[test]
     fn keyset_page_sql_composite_next_page() {
         let d = OracleDialect::new();
         let spec = crate::backend::KeysetPageSpec {

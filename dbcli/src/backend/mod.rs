@@ -379,6 +379,22 @@ pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
     }
 }
 
+/// Quote `v` as a SQL string literal. Used for string-typed key columns even
+/// when the driver stored a digit-only VARCHAR as a JSON number (`55958` →
+/// `'55958'`). Unquoted numbers inside Oracle `NLSSORT(...)` raise ORA-01722.
+fn sql_literal_as_text(v: &Value, backslash_escape: bool) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::String(s) => format!("'{}'", escape_sql_string(s, backslash_escape)),
+        Value::Number(n) => format!("'{}'", escape_sql_string(&n.to_string(), backslash_escape)),
+        Value::Bool(b) => format!("'{}'", if *b { "true" } else { "false" }),
+        other => format!(
+            "'{}'",
+            escape_sql_string(&other.to_string(), backslash_escape)
+        ),
+    }
+}
+
 pub(crate) fn key_sort_expr(quote: char, name: &str, is_string: bool, scheme: &str) -> String {
     let q = quote_ident(quote, name);
     if !is_string {
@@ -393,7 +409,11 @@ pub(crate) fn key_sort_expr(quote: char, name: &str, is_string: bool, scheme: &s
 }
 
 fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool) -> String {
-    let lit = sql_literal(v, backslash_escape);
+    let lit = if is_string {
+        sql_literal_as_text(v, backslash_escape)
+    } else {
+        sql_literal(v, backslash_escape)
+    };
     if is_string && scheme == "oracle" {
         format!("NLSSORT({lit},'NLS_SORT=BINARY')")
     } else {
@@ -578,5 +598,76 @@ mod tests {
     fn sql_literal_pg_does_not_escape_backslash() {
         let v = Value::String("abc\\".into());
         assert_eq!(sql_literal(&v, false), "'abc\\'");
+    }
+
+    fn string_key_spec(keys: &[&str], last: Vec<Value>) -> KeysetPageSpec {
+        KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: keys.iter().map(|k| (*k).into()).collect(),
+            raw_exprs: false,
+            key_columns: keys.iter().map(|k| (*k).into()).collect(),
+            string_key: vec![true; keys.len()],
+            range: None,
+            last_key: Some(last),
+            page_size: 10,
+            filter: None,
+            scn: None,
+        }
+    }
+
+    #[test]
+    fn string_key_quotes_json_number_in_oracle_nlssort() {
+        // VARCHAR2 keys whose values look numeric (XWDM='55958', BS='-1') are
+        // often deserialized as JSON numbers. NLSSORT(55958) is ORA-01722.
+        let spec = string_key_spec(
+            &["XWDM", "BS"],
+            vec![serde_json::json!(55958), serde_json::json!(-1)],
+        );
+        let sql = render_tuple_gt('"', &spec, spec.last_key.as_ref().unwrap(), false, "oracle");
+        assert!(
+            sql.contains("NLSSORT('55958','NLS_SORT=BINARY')"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("NLSSORT('-1','NLS_SORT=BINARY')"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT(55958,"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT(-1,"), "sql={sql}");
+    }
+
+    #[test]
+    fn string_key_quotes_json_number_in_gaussdb_collate() {
+        let spec = string_key_spec(&["xwdm"], vec![serde_json::json!(47872)]);
+        let sql = render_tuple_gt(
+            '"',
+            &spec,
+            spec.last_key.as_ref().unwrap(),
+            false,
+            "gaussdb",
+        );
+        assert!(
+            sql.contains("\"xwdm\" COLLATE \"C\" > '47872'"),
+            "sql={sql}"
+        );
+        assert!(!sql.contains("> 47872"), "sql={sql}");
+    }
+
+    #[test]
+    fn numeric_key_keeps_unquoted_json_number() {
+        let spec = KeysetPageSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["ID".into()],
+            raw_exprs: false,
+            key_columns: vec!["ID".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: Some(vec![serde_json::json!(42)]),
+            page_size: 10,
+            filter: None,
+            scn: None,
+        };
+        let sql = render_tuple_gt('"', &spec, spec.last_key.as_ref().unwrap(), false, "oracle");
+        assert!(sql.contains("\"ID\" > 42"), "sql={sql}");
+        assert!(!sql.contains("NLSSORT"), "sql={sql}");
     }
 }

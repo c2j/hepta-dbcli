@@ -19,9 +19,8 @@ fn value_at(row: &oracle_rs::Row, idx: usize) -> Value {
         return json!(v);
     }
     if let Some(s) = row.get_string(idx) {
-        if let Ok(json_val) = serde_json::from_str(s) {
-            return json_val;
-        }
+        // Digit-only VARCHAR2 (e.g. '55958') is valid JSON; do not parse it as a
+        // number — keyset pagination would then emit NLSSORT(55958) (ORA-01722).
         return Value::String(s.to_string());
     }
     Value::Null
