@@ -644,7 +644,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 | `execute_query` | 执行只读 SQL（按方言前缀校验） |
 | `get_execution_plan` | 获取 SQL 执行计划（EXPLAIN / EXPLAIN ANALYZE；Oracle 走 EXPLAIN PLAN + DBMS_XPLAN） |
 | `list_connections` | 列出所有配置的连接及其状态 |
-| `delta_diff` | 跨库表比对，返回 JSON 报告。只读、不写文件 |
+| `delta_diff` | 跨库表比对（只读）。支持增量（`update_column`/`update_since`）、`checkpoint`、csv/jsonl/json `export`。SQL 补丁 `--apply-to` 仅 CLI |
 
 `execute_query` 自动追加行数限制：MySQL / GaussDB 为 `LIMIT N`，Oracle 12c+ 为 `FETCH FIRST N ROWS ONLY`，Oracle 11g 为 `ROWNUM`，DuckDB 仅对 `SELECT` / `WITH` 形语句追加 `LIMIT N`（`SHOW` / `DESCRIBE` / `SUMMARIZE` 不追加）。`max_rows` 默认 1000，上限 10000。
 
@@ -656,15 +656,15 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
   - DuckDB：`SELECT`、`EXPLAIN`、`WITH`、`SHOW`、`DESCRIBE`、`DESC`、`SUMMARIZE`（`PRAGMA` 不允许——部分 PRAGMA 有写副作用）
 - **行数限制**：默认 `LIMIT 1000`，可通过 `max_rows` 调整（上限 10000）
 - **超时控制**：支持按查询设置 `timeout_ms`
-- **delta_diff**：只做比对，不导出文件、不写 checkpoint、不做增量窗口、不生成 SQL 补丁。这些能力在 CLI（见第 9 节）
+- **delta_diff 只读**：可导出 csv/jsonl/json 与写 checkpoint 文件；不会对数据库执行 DML。生成 SQL 补丁请用 CLI `--export *.sql --apply-to`。注意：`export` / `checkpoint` 路径由调用方任意指定，MCP 不做路径白名单
 
 ### 8.4 `delta_diff` 工具参数
 
 必填：`left_connection`、`right_connection`、`table`。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。
 
-`where_condition` 禁止包含分号。MCP 返回的差异样本上限由 `sample_limit` 裁剪；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
+`where_condition` 禁止包含分号。提供 `update_column` 时忽略 `where_condition`。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
 ### 8.5 Claude Desktop 配置示例
 
