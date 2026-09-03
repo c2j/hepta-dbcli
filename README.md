@@ -20,7 +20,7 @@ Current version: **0.4.4**.
 
 Prebuilt binaries for Linux (x86_64, arm64) and Windows (x86_64) from [GitHub Releases](https://github.com/c2j/hepta-dbcli/releases):
 
-- `hepta_dbcli-{version}-x86_64-unknown-linux-gnu.zip`
+- `hepta_dbcli-{version}-x86_64-unknown-linux-gnu.zip` (glibc 2.28+, e.g. Debian 10 / RHEL 8 / Ubuntu 20.04)
 - `hepta_dbcli-{version}-aarch64-unknown-linux-gnu.zip`
 - `hepta_dbcli-{version}-x86_64-pc-windows-msvc.zip`
 

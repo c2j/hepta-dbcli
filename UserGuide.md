@@ -24,7 +24,7 @@
 
 从 [GitHub Releases](https://github.com/c2j/hepta-dbcli/releases) 下载对应平台的预编译二进制：
 
-- `hepta_dbcli-{version}-x86_64-unknown-linux-gnu.zip`
+- `hepta_dbcli-{version}-x86_64-unknown-linux-gnu.zip`（glibc 2.28+，如 Debian 10 / RHEL 8 / Ubuntu 20.04）
 - `hepta_dbcli-{version}-aarch64-unknown-linux-gnu.zip`
 - `hepta_dbcli-{version}-x86_64-pc-windows-msvc.zip`
 
