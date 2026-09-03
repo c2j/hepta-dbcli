@@ -1,6 +1,6 @@
 # hepta_dbcli 用户指南
 
-当前版本：**0.4.4**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB，并提供跨库表数据比对（`delta-diff`）。
+当前版本：**0.4.5**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB，并提供跨库表数据比对（`delta-diff`）。
 
 ## 目录
 
@@ -45,7 +45,7 @@ cargo build --release -p polar-mysql
 
 ```bash
 $ hepta_dbcli --version
-hepta_dbcli 0.4.4
+hepta_dbcli 0.4.5
 ```
 
 ---

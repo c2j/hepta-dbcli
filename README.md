@@ -2,7 +2,7 @@
 
 CLI and MCP server for MySQL / PolarDB-X / Oracle / GaussDB database introspection, plus cross-database table comparison (`delta-diff`).
 
-Current version: **0.4.4**.
+Current version: **0.4.5**.
 
 ## Features
 
