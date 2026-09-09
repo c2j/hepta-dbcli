@@ -1,13 +1,13 @@
 # hepta_dbcli
 
-CLI and MCP server for MySQL / PolarDB-X / Oracle / GaussDB database introspection, plus cross-database table comparison (`delta-diff`).
+CLI and MCP server for MySQL / PolarDB-X / Oracle / GaussDB / DuckDB database introspection, plus cross-database table comparison (`delta-diff`).
 
 Current version: **0.4.5**.
 
 ## Features
 
 - **MCP server** — spawn as a Model Context Protocol server for AI tools (Claude, Cursor, etc.) with per-dialect read-only enforcement
-- **Multi-database** — MySQL, PolarDB-X, Oracle, and GaussDB (default features: `oracle-rs`, `oracle`, `gaussdb`)
+- **Multi-database** — MySQL, PolarDB-X, Oracle, GaussDB (default features: `oracle-rs`, `oracle`, `gaussdb`) and DuckDB (optional feature `duckdb`)
 - **One-shot CLI** — execute SQL from command line, file, or stdin with `table` / `json` / `csv` / `vertical` output
 - **Interactive REPL** — database-aware SQL prompt with multi-line editing, history, and dot commands
 - **Cross-DB delta-diff** — compare table data across two named connections (`hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`); CLI + MCP
@@ -34,11 +34,16 @@ git clone https://github.com/c2j/hepta-dbcli.git
 cd hepta-dbcli
 cargo build --release -p polar-mysql
 # binary at: target/release/hepta_dbcli
+
+# With DuckDB support (compiles the bundled DuckDB C++ core — first build takes several minutes)
+cargo build --release -p polar-mysql --features duckdb
 ```
 
 Default features already include Oracle (`oracle-rs` + native fallback) and GaussDB. Oracle 11g connections fall back to the `oracle` crate and need [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) on the PATH.
 
 Optional features: add `--features synth` for synthetic data generation.
+
+DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime. A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff does not support DuckDB yet (planned, issue #49 phase 2).
 
 ## Configuration
 
@@ -92,9 +97,13 @@ user = "gaussdb"
 password = "keyring"
 database = "testdb"
 sslmode = "disable"          # disable | require | verify-ca | verify-full
+
+[connections.duck]
+driver = "duckdb"
+database = "/data/analytics/shop.duckdb"   # file path, or ":memory:"
 ```
 
-`database` also accepts the alias `dbname`. Default ports: MySQL `3306`, Oracle `1521`, GaussDB `5432`.
+`database` also accepts the alias `dbname`. Default ports: MySQL `3306`, Oracle `1521`, GaussDB `5432`. DuckDB is embedded — it has no host/port/user/password; `database` holds the file path (or `:memory:`) and password fields are ignored. A missing database file is an error, never silently created. Add `?mode=ro` to open read-only (multiple processes may then read the same file concurrently).
 
 URL form is also accepted:
 
@@ -104,6 +113,9 @@ url = "oracle://scott:tiger@oracle.internal:1521/FREEPDB1"
 
 [connections.gauss]
 url = "gaussdb://gaussdb:secret@gauss.internal:5432/testdb?sslmode=disable"
+
+[connections.duck]
+url = "duckdb:///data/analytics/shop.duckdb?mode=ro"
 ```
 
 Special characters in passwords must be percent-encoded in URLs (`@` → `%40`).
@@ -114,6 +126,7 @@ Special characters in passwords must be percent-encoded in URLs (`@` → `%40`).
 export HEPTA_DBCLI_URL="mysql://user:password@host:port/database"
 export HEPTA_DBCLI_URL="oracle://scott:tiger@host:1521/FREEPDB1"
 export HEPTA_DBCLI_URL="gaussdb://gaussdb:secret@host:5432/testdb?sslmode=disable"
+export HEPTA_DBCLI_URL="duckdb:///data/analytics/shop.duckdb"
 ```
 
 When `HEPTA_DBCLI_URL` is set, the connection name is `default` and the OS keychain is not used. Optional `HEPTA_DBCLI_PASSWORD` supplies the password separately.
@@ -159,6 +172,7 @@ Runs on stdio. Intended to be spawned by MCP clients. `execute_query` is read-on
 |---------|------------------|
 | MySQL / PolarDB-X | `SELECT`, `EXPLAIN`, `SHOW`, `DESCRIBE`, `DESC` |
 | Oracle / GaussDB | `SELECT`, `EXPLAIN`, `WITH` |
+| DuckDB | `SELECT`, `EXPLAIN`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, `SUMMARIZE` |
 
 ### One-shot SQL
 
@@ -212,6 +226,7 @@ hepta_dbcli check
 hepta_dbcli check --verbose
 hepta_dbcli check --name prod
 hepta_dbcli check --name gauss
+hepta_dbcli check --name duck
 ```
 
 MySQL probes three TLS modes (plain / skip-verify / verify). Oracle and GaussDB each make a single connect attempt (Oracle tries pure-Rust `oracle-rs` first, then Instant Client).
@@ -343,6 +358,9 @@ POLARDB_ORACLE_TEST_URL=oracle://system:testpass@127.0.0.1:1521/FREEPDB1 \
 # GaussDB
 GAUSSDB_TEST_URL="host=127.0.0.1 port=5432 user=gaussdb password=testpass@123 dbname=testdb" \
   cargo test --features "gaussdb,integration" --test regress_gaussdb
+
+# DuckDB (embedded — no external service needed)
+cargo test --features "duckdb,integration" --test regress_duckdb
 ```
 
 CI enforces: `cargo fmt --check` → `cargo clippy` → `cargo test` (in that order).

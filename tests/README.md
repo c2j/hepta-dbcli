@@ -32,7 +32,7 @@ docker exec hepta-mysql-test mysql -u root -ptestpass -e "
 
 ## Regression Tests
 
-Three test suites under `dbcli/tests/`:
+Four test suites under `dbcli/tests/`:
 
 ```bash
 # MySQL (requires Docker MySQL container)
@@ -46,6 +46,9 @@ POLARDB_ORACLE_TEST_URL=oracle://system:testpass@127.0.0.1:1521/FREEPDB1 \
 # GaussDB (requires Docker GaussDB container)
 GAUSSDB_TEST_URL="host=127.0.0.1 port=5432 user=gaussdb password=testpass@123 dbname=testdb" \
   cargo test --features "gaussdb,integration" --test regress_gaussdb
+
+# DuckDB (embedded — no Docker, no env var; uses tempfile fixtures)
+cargo test --features "duckdb,integration" --test regress_duckdb
 ```
 
 Each suite covers: database_info, list_tables, table_columns, table_indexes,

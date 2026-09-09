@@ -1,6 +1,6 @@
 # AGENTS.md — hepta_dbcli (dbcli)
 
-Rust workspace. Single binary crate `hepta_dbcli` (package `polar-mysql`): a CLI + MCP server for MySQL/PolarDB-X/Oracle/GaussDB database introspection.
+Rust workspace. Single binary crate `hepta_dbcli` (package `polar-mysql`): a CLI + MCP server for MySQL/PolarDB-X/Oracle/GaussDB/DuckDB database introspection.
 
 ## TDD 工作流（Red → Green → Refactor）
 
@@ -224,6 +224,12 @@ dbcli/                          # Cargo workspace root
 │           ├── generator.rs    # Engine: per-table seeds (djb2), FK integrity via table.column pools
 │           ├── export.rs       # CSV/JSONL/JSON/SQL with real column names + quoted identifiers
 │           └── report.rs       # Synthesis report (library-only; not wired to CLI yet)
+│       └── duckdb/         # DuckDB backend (feature-gated: --features duckdb)
+│           ├── mod.rs      # DuckDbFactory
+│           ├── pool.rs     # DuckDbPool + duckdb:// URL parser (embedded, open once + try_clone)
+│           ├── conn.rs     # DuckDbConn (sync driver wrapped in spawn_blocking)
+│           ├── dialect.rs  # DuckDbDialect (duckdb_tables/views/indexes, information_schema)
+│           └── types.rs    # duckdb::types::ValueRef → serde_json::Value
 └── .github/workflows/
     ├── ci.yml                  # PR/push: fmt, clippy, test (MySQL 8 service container)
     └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle)
@@ -333,15 +339,16 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - Crate name remains `polar_mysql` (Rust naming convention)
 
 ### Testing
-- Unit tests are **inline** (`#[cfg(test)] mod tests { ... }`) in each source file — there is no `/tests/` directory.
-- Integration tests live behind the `integration` feature flag in the same `#[cfg(test)]` blocks.
+- Unit tests are **inline** (`#[cfg(test)] mod tests { ... }`) in each source file.
+- Regression/integration suites live in `tests/` (`regress_mysql.rs`, `regress_oracle.rs`, `regress_gaussdb.rs`, `regress_duckdb.rs`) behind the `integration` feature flag (plus their backend feature).
 - MySQL integration tests require `HEPTA_DBCLI_TEST_URL` env var and a running MySQL instance.
 - Oracle integration tests require `POLARDB_ORACLE_TEST_URL` env var and a running Oracle instance (Docker: `gvenzl/oracle-free:23-slim`).
+- DuckDB integration tests are **embedded** — no external service, no env var; they use `tempfile` fixtures (`cargo test --features "duckdb,integration" --test regress_duckdb`).
 
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
-- All tool calls from MCP enforce **read-only**: only SELECT, EXPLAIN, SHOW, DESCRIBE, DESC are allowed (MySQL). Oracle only allows SELECT, EXPLAIN, WITH.
-- `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific.
+- All tool calls from MCP enforce **read-only**: only SELECT, EXPLAIN, SHOW, DESCRIBE, DESC are allowed (MySQL). Oracle/GaussDB only allow SELECT, EXPLAIN, WITH. DuckDB allows SELECT, EXPLAIN, WITH, SHOW, DESCRIBE, DESC, SUMMARIZE.
+- `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).
 - Connection pooling: connections are reused and recycled based on `connection_max_lifetime`.
 

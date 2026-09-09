@@ -28,6 +28,11 @@ name = "regress_gaussdb"
 path = "tests/regress_gaussdb.rs"
 required-features = ["integration", "gaussdb"]
 
+[[test]]
+name = "regress_duckdb"
+path = "tests/regress_duckdb.rs"
+required-features = ["integration", "duckdb"]
+
 [features]
 default = ["oracle-rs", "oracle", "gaussdb"]
 integration = []
@@ -35,6 +40,7 @@ oracle-rs = ["dep:oracle-rs"]
 oracle = ["dep:oracle"]
 gaussdb = ["dep:gaussdb"]
 synth = ["dep:rand", "dep:rand_distr", "dep:serde_yaml"]
+duckdb = ["dep:duckdb"]
 
 [dependencies]
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
@@ -69,3 +75,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 rand = { version = "0.8", optional = true }
 rand_distr = { version = "0.4", optional = true }
 serde_yaml = { version = "0.9", optional = true }
+duckdb = { version = "~1.10505.0", optional = true, features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

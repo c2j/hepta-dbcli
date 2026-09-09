@@ -1,6 +1,6 @@
 # hepta_dbcli 用户指南
 
-当前版本：**0.4.5**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB，并提供跨库表数据比对（`delta-diff`）。
+当前版本：**0.4.5**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB / DuckDB，并提供跨库表数据比对（`delta-diff`）。
 
 ## 目录
 
@@ -42,6 +42,14 @@ cargo build --release -p polar-mysql
 
 默认 feature 已包含 `oracle-rs`、`oracle`、`gaussdb`。连接 Oracle 11g 时会回退到 `oracle` crate，需要本机安装 [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) 并配置动态库路径。12c+ 走纯 Rust 的 `oracle-rs`，无需 Instant Client。
 
+DuckDB 为可选 feature（不默认编译）：
+
+```bash
+cargo build --release -p polar-mysql --features duckdb
+```
+
+`bundled` 特性会从源码编译 DuckDB C++ 内核（首次构建需数分钟，要求 C++ 工具链）。注意：bundled 构建不含 ICU 扩展，`now() - interval '1 day'` 等日期运算需运行时 `INSTALL icu; LOAD icu;`。
+
 验证安装：
 
 ```bash
@@ -76,6 +84,7 @@ Oracle / GaussDB 同样可以用 URL：
 ```bash
 export HEPTA_DBCLI_URL="oracle://scott:tiger@127.0.0.1:1521/FREEPDB1"
 export HEPTA_DBCLI_URL="gaussdb://gaussdb:secret@127.0.0.1:5432/testdb?sslmode=disable"
+export HEPTA_DBCLI_URL="duckdb:///data/analytics/shop.duckdb"
 hepta_dbcli cli --sql "SELECT 1"
 ```
 
@@ -146,7 +155,7 @@ connection_max_lifetime = "30min"
 hepta_dbcli cli --name prod --sql "SELECT COUNT(*) FROM orders"
 ```
 
-### 3.4 Oracle / GaussDB 连接
+### 3.4 Oracle / GaussDB / DuckDB 连接
 
 `driver` 决定 URL scheme 与默认端口。省略时为 `mysql`。
 
@@ -155,8 +164,11 @@ hepta_dbcli cli --name prod --sql "SELECT COUNT(*) FROM orders"
 | `mysql`（默认） | `mysql://` | 3306 |
 | `oracle` | `oracle://` | 1521 |
 | `gaussdb` | `gaussdb://` | 5432 |
+| `duckdb` | `duckdb://` | 无（嵌入式） |
 
 `database` 同时接受别名 `dbname`（方便 GaussDB / PostgreSQL 习惯）。
+
+**DuckDB 是嵌入式数据库**：没有 host/port/user/password，`database` 字段填数据库文件路径或 `:memory:`；password 字段（含 `keyring`）一律忽略。文件不存在时**直接报错**，不会静默创建。URL 加 `?mode=ro` 以只读方式打开（多进程可并发读同一文件）。
 
 ```toml
 default_connection = "mysql_dev"
@@ -531,7 +543,17 @@ hepta_dbcli check --name gauss_dev --verbose
 
 GaussDB `--verbose` 额外打印 `version()`、`current_database()`、`current_user()`、服务器地址。若认证失败，会提示钥匙串命名空间与独立 `gaussdb` CLI **不共享**（本工具 service 为 `hepta-dbcli`）。
 
-### 6.3 详细检查（MySQL）
+### 6.3 DuckDB
+
+DuckDB 为嵌入式打开（无网络服务），一次连接尝试：
+
+```bash
+hepta_dbcli check --name duck --verbose
+```
+
+`--verbose` 额外打印 `version()`、`current_database()`。常见失败：文件不存在（不会隐式创建）、文件被其它进程占用写锁（单写者；可改用 `?mode=ro` 并发读）。
+
+### 6.4 详细检查（MySQL）
 
 ```bash
 hepta_dbcli check --verbose
@@ -539,7 +561,7 @@ hepta_dbcli check --verbose
 
 `--verbose` 模式额外显示：服务器版本、当前用户、当前数据库、字符集、排序规则、连接耗时。
 
-### 6.4 通过 CLI 子命令检查
+### 6.5 通过 CLI 子命令检查
 
 ```bash
 hepta_dbcli cli --check-connection
@@ -624,13 +646,14 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 | `list_connections` | 列出所有配置的连接及其状态 |
 | `delta_diff` | 跨库表比对，返回 JSON 报告。只读、不写文件 |
 
-`execute_query` 自动追加行数限制：MySQL / GaussDB 为 `LIMIT N`，Oracle 12c+ 为 `FETCH FIRST N ROWS ONLY`，Oracle 11g 为 `ROWNUM`。`max_rows` 默认 1000，上限 10000。
+`execute_query` 自动追加行数限制：MySQL / GaussDB 为 `LIMIT N`，Oracle 12c+ 为 `FETCH FIRST N ROWS ONLY`，Oracle 11g 为 `ROWNUM`，DuckDB 仅对 `SELECT` / `WITH` 形语句追加 `LIMIT N`（`SHOW` / `DESCRIBE` / `SUMMARIZE` 不追加）。`max_rows` 默认 1000，上限 10000。
 
 ### 8.3 安全限制
 
 - **只读执行**（按方言）：
   - MySQL / PolarDB-X：`SELECT`、`EXPLAIN`、`SHOW`、`DESCRIBE`、`DESC`
   - Oracle / GaussDB：`SELECT`、`EXPLAIN`、`WITH`
+  - DuckDB：`SELECT`、`EXPLAIN`、`WITH`、`SHOW`、`DESCRIBE`、`DESC`、`SUMMARIZE`（`PRAGMA` 不允许——部分 PRAGMA 有写副作用）
 - **行数限制**：默认 `LIMIT 1000`，可通过 `max_rows` 调整（上限 10000）
 - **超时控制**：支持按查询设置 `timeout_ms`
 - **delta_diff**：只做比对，不导出文件、不写 checkpoint、不做增量窗口、不生成 SQL 补丁。这些能力在 CLI（见第 9 节）
