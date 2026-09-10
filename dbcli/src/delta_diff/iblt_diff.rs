@@ -343,7 +343,9 @@ fn classify(entries: &[Entry]) -> Vec<DiffRow> {
 
 fn parse_summary(rows: &[Vec<Value>], scheme: &str) -> Summary {
     match scheme {
-        "gaussdb" => parse_parity_rows(rows),
+        // GaussDB and DuckDB both render the per-bit parity column shape
+        // (kx_0..63 / vx1..4_0..31, issue #49 phase 2).
+        "gaussdb" | "duckdb" => parse_parity_rows(rows),
         _ => parse_bitxor_rows(rows),
     }
 }

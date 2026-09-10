@@ -43,7 +43,7 @@ Default features already include Oracle (`oracle-rs` + native fallback) and Gaus
 
 Optional features: add `--features synth` for synthetic data generation.
 
-DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime. A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff does not support DuckDB yet (planned, issue #49 phase 2).
+DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime. A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff supports DuckDB on both sides (`BLOB`/`JSON`/`TEXT` columns are excluded from row hashing, and `TIMESTAMPTZ` normalizes to UTC text without ICU).
 
 ## Configuration
 

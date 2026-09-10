@@ -1,19 +1,16 @@
 // ─── DuckDB dialect: introspection SQL + syntax adapters ─────────────
 //
-// Phase 1 (issue #49): introspection, read-only MCP query, EXPLAIN, and
-// the full Dialect surface. delta-diff participation is phase 2 — the
-// Result-returning renderers return Err(Unsupported) (the trait's designed
-// clean-degradation channel), while the String-returning renderers emit
-// real DuckDB SQL (verified against in-memory DuckDB in the tests below)
-// so no unreachable-but-wrong SQL can leak out.
+// Full Dialect surface including delta-diff rendering (issue #49 phase 2):
+// checksum/bucket math via '0x'||hex::UBIGINT, IBLT bit-parity columns
+// matching the GaussDB contract, all verified against in-memory DuckDB in
+// the tests below.
 
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, IbltSqlSpec, KeysetPageSpec};
+use crate::backend::{
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, IbltSqlSpec, KeysetPageSpec, NULL_SENTINEL,
+};
 
 pub(crate) struct DuckDbDialect;
-
-const DELTA_DIFF_UNSUPPORTED: &str =
-    "DuckDB delta-diff support is not implemented yet (issue #49 phase 2)";
 
 impl Dialect for DuckDbDialect {
     fn database_info(&self) -> &str {
@@ -43,9 +40,20 @@ impl Dialect for DuckDbDialect {
     }
 
     fn table_indexes(&self) -> &str {
-        "SELECT index_name, is_unique, is_primary, expressions AS columns, 'ART' AS index_type \
-         FROM duckdb_indexes() \
-         WHERE schema_name = ? AND table_name = ? \
+        // duckdb_indexes() does not expose inline PRIMARY KEYs; union in
+        // duckdb_constraints(). The CTE reuses the dialect's 2-parameter
+        // (schema, table) exec contract across both branches. expressions
+        // is normalized to MySQL-style CSV for metadata.rs index parsing.
+        "WITH tgt AS (SELECT ? AS s, ? AS t) \
+         SELECT i.index_name, i.is_unique, i.is_primary, array_to_string(i.expressions, ', ') AS columns, 'ART' AS index_type \
+         FROM duckdb_indexes() i, tgt \
+         WHERE i.schema_name = tgt.s AND i.table_name = tgt.t \
+         UNION ALL \
+         SELECT 'PRIMARY', true, true, \
+                (SELECT string_agg(u.c, ', ') FROM (SELECT unnest(c.constraint_column_names) AS c) u), \
+                'PRIMARY KEY' \
+         FROM duckdb_constraints() c, tgt \
+         WHERE c.schema_name = tgt.s AND c.table_name = tgt.t AND c.constraint_type = 'PRIMARY KEY' \
          ORDER BY index_name"
     }
 
@@ -112,10 +120,58 @@ impl Dialect for DuckDbDialect {
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
-        Err(DbError::unsupported(format!(
-            "column '{}': {DELTA_DIFF_UNSUPPORTED}",
-            col.name
-        )))
+        let q = format!("\"{}\"", col.name.replace('"', "\"\""));
+        let base = col
+            .data_type
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let inner = match base.as_str() {
+            "tinyint" | "smallint" | "integer" | "bigint" | "hugeint" | "utinyint"
+            | "usmallint" | "uinteger" | "ubigint" | "decimal" | "numeric" | "real" | "float"
+            | "double" | "uuid" => format!("CAST({q} AS VARCHAR)"),
+            "boolean" | "bool" => format!("CAST(CAST({q} AS INTEGER) AS VARCHAR)"),
+            "timestamp" => format!("strftime({q}, '%Y-%m-%d %H:%M:%S.%f')"),
+            "timestamp with time zone" | "timestamptz" => {
+                // DuckDB stores TIMESTAMPTZ as UTC micros; rendering without
+                // ICU (not in bundled builds) must avoid AT TIME ZONE. The
+                // epoch-micros round-trip pins the output to UTC explicitly.
+                format!(
+                    "strftime(TIMESTAMP '1970-01-01 00:00:00' + to_microseconds(epoch_us({q})), '%Y-%m-%d %H:%M:%S.%f')"
+                )
+            }
+            "date" => format!("strftime({q}, '%Y-%m-%d')"),
+            "time" => format!("CAST({q} AS VARCHAR)"),
+            "character" | "char" | "bpchar" if col.rtrim_fixed_char => format!("rtrim({q})"),
+            "character" | "char" | "bpchar" | "character varying" | "varchar" => q.clone(),
+            "text" | "json" | "blob" => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' is excluded from checksum normalization (LOB/JSON); \
+                     use --columns to select comparable columns",
+                    col.name, col.data_type
+                )));
+            }
+            other => {
+                return Err(DbError::unsupported(format!(
+                    "column '{}' type '{}' has no normalization rule",
+                    col.name, other
+                )));
+            }
+        };
+        Ok(
+            if col.nullable
+                && col.rtrim_fixed_char
+                && matches!(base.as_str(), "character" | "char" | "bpchar")
+            {
+                format!("COALESCE(NULLIF({inner}, ''), '{NULL_SENTINEL}')")
+            } else if col.nullable {
+                format!("COALESCE({inner}, '{NULL_SENTINEL}')")
+            } else {
+                inner
+            },
+        )
     }
 
     fn render_checksum_sql(&self, spec: &ChecksumSqlSpec) -> String {
@@ -243,8 +299,35 @@ impl Dialect for DuckDbDialect {
         )
     }
 
-    fn render_iblt_sql(&self, _spec: &IbltSqlSpec) -> Result<String, DbError> {
-        Err(DbError::unsupported(DELTA_DIFF_UNSUPPORTED))
+    fn render_iblt_sql(&self, spec: &IbltSqlSpec) -> Result<String, DbError> {
+        // 与 GaussDB 相同的逐位奇偶结构（客户端按 kx_*/vx* 列名消费）：
+        // XOR 第 i 位 = SUM((val >> i) & 1) mod 2；key 64 位 + val 4×32 位共 192 列。
+        let m = spec.cells_per_subtable;
+        let row_hash = self.row_hash_expr(&spec.normalized_exprs);
+        let table = quoted_table(&spec.schema, &spec.table);
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\n  WHERE ({f})"))
+            .unwrap_or_default();
+        let mut cols = Vec::with_capacity(196);
+        cols.push("COUNT(*) AS cnt".to_string());
+        for b in 0..64 {
+            cols.push(format!("MOD(SUM(((k::BIGINT >> {b}) & 1)), 2) AS kx_{b}"));
+        }
+        for s_idx in 1..=4u32 {
+            for b in 0..32 {
+                cols.push(format!(
+                    "MOD(SUM(((('0x' || SUBSTR(h, {}, 8))::UBIGINT >> {b}) & 1)), 2) AS vx{s_idx}_{b}",
+                    s_idx * 8 - 7
+                ));
+            }
+        }
+        Ok(format!(
+            "SELECT g.grp AS grp,\n       MOD(('0x' || SUBSTR(h, g.grp * 8 - 7, 8))::UBIGINT, {m}) AS cell,\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            cols.join(",\n       "),
+            key = spec.key_expr
+        ))
     }
 }
 
@@ -262,6 +345,7 @@ fn bucket_cond(row_hash: &str, modulus: u64, bucket: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::NULL_SENTINEL;
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {
@@ -310,25 +394,90 @@ mod tests {
     }
 
     #[test]
-    fn normalize_expr_is_unsupported_in_phase_1() {
+    fn normalize_expr_matrix() {
         let d = DuckDbDialect;
-        let err = d.normalize_expr(&col("id", "INTEGER", false)).unwrap_err();
-        assert!(err.to_string().contains("phase 2"), "{err}");
+        assert_eq!(
+            d.normalize_expr(&col("id", "BIGINT", false)).unwrap(),
+            "CAST(\"id\" AS VARCHAR)"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("amount", "DECIMAL(10,2)", true))
+                .unwrap(),
+            format!("COALESCE(CAST(\"amount\" AS VARCHAR), '{NULL_SENTINEL}')")
+        );
+        assert_eq!(
+            d.normalize_expr(&col("ts", "TIMESTAMP", true)).unwrap(),
+            format!("COALESCE(strftime(\"ts\", '%Y-%m-%d %H:%M:%S.%f'), '{NULL_SENTINEL}')")
+        );
+        assert_eq!(
+            d.normalize_expr(&col("tz", "TIMESTAMP WITH TIME ZONE", false)).unwrap(),
+            "strftime(TIMESTAMP '1970-01-01 00:00:00' + to_microseconds(epoch_us(\"tz\")), '%Y-%m-%d %H:%M:%S.%f')"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("d", "DATE", true)).unwrap(),
+            format!("COALESCE(strftime(\"d\", '%Y-%m-%d'), '{NULL_SENTINEL}')")
+        );
+        assert_eq!(
+            d.normalize_expr(&col("flag", "BOOLEAN", false)).unwrap(),
+            "CAST(CAST(\"flag\" AS INTEGER) AS VARCHAR)"
+        );
+        assert_eq!(
+            d.normalize_expr(&col("u", "UUID", true)).unwrap(),
+            format!("COALESCE(CAST(\"u\" AS VARCHAR), '{NULL_SENTINEL}')")
+        );
+        let mut fixed = col("code", "CHARACTER(12)", true);
+        assert_eq!(
+            d.normalize_expr(&fixed).unwrap(),
+            format!("COALESCE(\"code\", '{NULL_SENTINEL}')")
+        );
+        fixed.rtrim_fixed_char = true;
+        assert_eq!(
+            d.normalize_expr(&fixed).unwrap(),
+            format!("COALESCE(NULLIF(rtrim(\"code\"), ''), '{NULL_SENTINEL}')")
+        );
+        for lob in ["JSON", "BLOB", "TEXT"] {
+            let err = d.normalize_expr(&col("x", lob, true)).unwrap_err();
+            assert!(
+                err.to_string().contains("--columns"),
+                "{lob} must be excluded with --columns hint: {err}"
+            );
+        }
+        assert!(d.normalize_expr(&col("x", "STRUCT(a INT)", false)).is_err());
     }
 
     #[test]
-    fn iblt_is_unsupported_in_phase_1() {
+    fn iblt_sql_shape_matches_gaussdb_contract() {
         let d = DuckDbDialect;
         let spec = IbltSqlSpec {
-            schema: None,
+            schema: Some("main".into()),
             table: "t".into(),
             key_expr: "\"id\"".into(),
-            normalized_exprs: vec!["\"id\"::text".into()],
-            cells_per_subtable: 1,
-            filter: None,
+            normalized_exprs: vec!["CAST(\"id\" AS VARCHAR)".into()],
+            cells_per_subtable: 3,
+            filter: Some("x=1".into()),
             scn: None,
         };
-        assert!(d.render_iblt_sql(&spec).is_err());
+        let sql = d.render_iblt_sql(&spec).expect("render");
+        assert!(sql.contains("CROSS JOIN"), "sql={sql}");
+        assert!(sql.contains("GROUP BY g.grp, cell"), "sql={sql}");
+        assert!(
+            sql.contains("AS kx_0") && sql.contains("AS kx_63"),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("AS vx1_0") && sql.contains("AS vx4_31"),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("MOD(('0x' || SUBSTR(h, g.grp * 8 - 7, 8))::UBIGINT, 3)"),
+            "sql={sql}"
+        );
+        assert!(sql.contains("(x=1)"), "sql={sql}");
+        assert!(sql.contains("\"main\".\"t\""), "sql={sql}");
+        assert!(
+            sql.contains("MD5(concat_ws('#', CAST(\"id\" AS VARCHAR)))"),
+            "sql={sql}"
+        );
     }
 
     #[test]
@@ -504,6 +653,80 @@ mod live_tests {
     }
 
     #[tokio::test]
+    async fn normalize_expr_covers_all_column_types_live() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query_drop(
+            "CREATE TABLE norm_probe (
+                c_tiny TINYINT, c_small SMALLINT, c_int INTEGER, c_big BIGINT,
+                c_huge HUGEINT, c_utiny UTINYINT, c_double DOUBLE, c_float FLOAT,
+                c_dec DECIMAL(10,2), c_bool BOOLEAN, c_ts TIMESTAMP,
+                c_tstz TIMESTAMP WITH TIME ZONE, c_date DATE, c_time TIME,
+                c_var VARCHAR(32), c_char CHARACTER(8), c_uuid UUID,
+                c_blob BLOB
+            )",
+        )
+        .await
+        .expect("create probe");
+        conn.query_drop(
+            "INSERT INTO norm_probe VALUES (
+                1, 2, 3, 4, 5, 6, 1.5, 2.5, 9.99, true,
+                TIMESTAMP '2024-01-02 03:04:05', TIMESTAMPTZ '2024-01-02 03:04:05+00',
+                DATE '2024-01-02', TIME '03:04:05', 'txt', 'chr',
+                '1b3e4567-e89b-12d3-a456-426614174000', '\\xAA'::BLOB
+            )",
+        )
+        .await
+        .expect("insert probe");
+
+        let cols_sql = DuckDbDialect.table_columns().to_string();
+        let cols = conn
+            .exec(
+                &cols_sql,
+                &[serde_json::json!("main"), serde_json::json!("norm_probe")],
+            )
+            .await
+            .expect("table_columns");
+        let name_pos = cols
+            .columns
+            .iter()
+            .position(|c| c == "column_name")
+            .unwrap();
+        let type_pos = cols.columns.iter().position(|c| c == "data_type").unwrap();
+        assert_eq!(cols.row_count, 18);
+
+        let excluded = ["c_blob"];
+        for row in &cols.rows {
+            let name = row[name_pos].as_str().unwrap().to_string();
+            let data_type = row[type_pos].as_str().unwrap().to_string();
+            let spec = ColumnNormSpec {
+                name: name.clone(),
+                data_type: data_type.clone(),
+                nullable: true,
+                rtrim_fixed_char: name == "c_char",
+            };
+            let expr = match DuckDbDialect.normalize_expr(&spec) {
+                Ok(e) => e,
+                Err(e) => {
+                    assert!(
+                        excluded.contains(&name.as_str()),
+                        "column '{name}' type '{data_type}' must normalize: {e}"
+                    );
+                    continue;
+                }
+            };
+            assert!(
+                !excluded.contains(&name.as_str()),
+                "column '{name}' type '{data_type}' must be excluded, got: {expr}"
+            );
+            let sql = format!("SELECT {expr} AS v FROM norm_probe");
+            if let Err(e) = conn.query(&sql).await {
+                panic!("column '{name}' type '{data_type}' expr failed to execute: {e}\n{sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn checksum_sql_executes_on_duckdb() {
         let pool = memory_pool().await;
         let mut conn = pool.acquire().await.expect("acquire");
@@ -560,6 +783,82 @@ mod live_tests {
             .await
             .expect("keyset sql must execute");
         assert_eq!(r3.row_count, 2);
+    }
+
+    #[tokio::test]
+    async fn iblt_summary_sql_executes_live() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query_drop("CREATE TABLE iblt_probe (id BIGINT PRIMARY KEY, v VARCHAR)")
+            .await
+            .expect("create");
+        conn.query_drop("INSERT INTO iblt_probe VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+            .await
+            .expect("insert");
+
+        let spec = IbltSqlSpec {
+            schema: None,
+            table: "iblt_probe".into(),
+            key_expr: "\"id\"".into(),
+            normalized_exprs: vec![
+                "CAST(\"id\" AS VARCHAR)".into(),
+                format!("COALESCE(CAST(\"v\" AS VARCHAR), '{NULL_SENTINEL}')"),
+            ],
+            cells_per_subtable: 1,
+            filter: None,
+            scn: None,
+        };
+        let sql = DuckDbDialect.render_iblt_sql(&spec).expect("render");
+        let r = conn
+            .query(&sql)
+            .await
+            .expect("iblt summary SQL must execute");
+        assert_eq!(r.row_count, 4, "one row per hash subtable");
+        for expected in ["grp", "cell", "cnt", "kx_0", "kx_63", "vx1_0", "vx4_31"] {
+            assert!(
+                r.columns.iter().any(|c| c == expected),
+                "missing column {expected}: {:?}",
+                r.columns
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn table_indexes_exposes_primary_key_live() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query_drop(
+            "CREATE TABLE pk_probe (id BIGINT PRIMARY KEY, name VARCHAR, code VARCHAR)",
+        )
+        .await
+        .expect("create");
+        conn.query_drop("CREATE INDEX idx_name ON pk_probe (name)")
+            .await
+            .expect("create index");
+
+        let idx_sql = DuckDbDialect.table_indexes().to_string();
+        let idx = conn
+            .exec(
+                &idx_sql,
+                &[serde_json::json!("main"), serde_json::json!("pk_probe")],
+            )
+            .await
+            .expect("table_indexes");
+        let primary: Vec<&Vec<serde_json::Value>> = idx
+            .rows
+            .iter()
+            .filter(|r| r[2] == serde_json::json!(true))
+            .collect();
+        assert!(
+            !primary.is_empty(),
+            "PRIMARY KEY must be visible via table_indexes; rows={:?}",
+            idx.rows
+        );
+        assert!(
+            primary[0][3].as_str().unwrap_or("").contains("id"),
+            "primary index columns must contain 'id': {:?}",
+            primary[0]
+        );
     }
 
     #[tokio::test]

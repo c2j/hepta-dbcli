@@ -496,3 +496,164 @@ mod tests {
         .is_empty());
     }
 }
+
+// ─── DuckDB end-to-end tests (issue #49 phase 2; embedded, no service) ──
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_e2e_tests {
+    use super::*;
+    use crate::backend::duckdb::DuckDbFactory;
+    use crate::backend::{BackendFactory, DbPool};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const DDL: &str =
+        "CREATE TABLE t_dd (id BIGINT PRIMARY KEY, name VARCHAR, amount DECIMAL(10,2))";
+    const ROWS: &str =
+        "INSERT INTO t_dd VALUES (1,'a',1.50),(2,'b',2.00),(3,'c',3.25),(4,'d',4.00),(5,'e',5.75)";
+
+    async fn int_key_pool() -> Arc<dyn DbPool> {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.query_drop(DDL).await.expect("create");
+        conn.query_drop(ROWS).await.expect("insert");
+        pool
+    }
+
+    async fn side_at(pool: &Arc<dyn DbPool>, name: &str) -> SideInput {
+        SideInput {
+            pool: Arc::clone(pool),
+            conn: pool.acquire().await.expect("conn"),
+            name: name.to_string(),
+            schema: Some("main".to_string()),
+            table: "t_dd".to_string(),
+            connection_url: "duckdb://:memory:".to_string(),
+        }
+    }
+
+    fn opts(strategy: Option<crate::delta_diff::cmd::Strategy>) -> DiffOptions {
+        DiffOptions {
+            strategy,
+            iblt_capacity: 65536,
+            // 5 probe rows stay below any full-fetch degrade threshold,
+            // so Auto keeps the IBLT route visible in tests.
+            fetch_all_threshold: 1,
+            strict: false,
+            key: vec![],
+            columns: vec![],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16384,
+            sample_limit: 1000,
+            threads: 4,
+            snapshot: false,
+            recheck: false,
+            checkpoint: None,
+            verbose: false,
+            rtrim_char_columns: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn duckdb_iblt_identical_then_single_row_diff() {
+        let left_pool = int_key_pool().await;
+        let right_pool = int_key_pool().await;
+
+        let report = run_diff(
+            side_at(&left_pool, "l").await,
+            side_at(&right_pool, "r").await,
+            opts(None),
+        )
+        .await
+        .expect("identical run");
+        assert_eq!(
+            report.strategy, "iblt",
+            "cross-instance int key routes iblt"
+        );
+        assert_eq!(report.summary.modified, 0);
+        assert_eq!(report.summary.missing_left, 0);
+        assert_eq!(report.summary.missing_right, 0);
+        assert!(report.sample_diffs.is_empty(), "identical data");
+
+        {
+            let mut conn = right_pool.acquire().await.expect("conn");
+            conn.query_drop("UPDATE t_dd SET amount = 9.99, name = 'zz' WHERE id = 3")
+                .await
+                .expect("update");
+        }
+        let report2 = run_diff(
+            side_at(&left_pool, "l").await,
+            side_at(&right_pool, "r").await,
+            opts(None),
+        )
+        .await
+        .expect("diff run");
+        assert_eq!(report2.strategy, "iblt");
+        assert_eq!(report2.summary.modified, 1, "one modified row");
+        assert_eq!(
+            report2.summary.missing_left + report2.summary.missing_right,
+            0
+        );
+        assert!(
+            report2.sample_diffs.iter().any(|d| d.key == json!(3)),
+            "diff must hit key 3: {:?}",
+            report2.sample_diffs
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_keyeddiff_for_varchar_key() {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop("CREATE TABLE t_dd (code VARCHAR PRIMARY KEY, v INTEGER)")
+                .await
+                .expect("create");
+            conn.query_drop("INSERT INTO t_dd VALUES ('a',1),('b',2)")
+                .await
+                .expect("insert");
+        }
+        let report = run_diff(
+            side_at(&pool, "l").await,
+            side_at(&pool, "r").await,
+            opts(None),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff", "varchar key");
+        assert_eq!(report.summary.modified, 0);
+    }
+
+    #[tokio::test]
+    async fn duckdb_bucketdiff_for_keyless_table() {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop("CREATE TABLE t_dd (v INTEGER, tag VARCHAR)")
+                .await
+                .expect("create");
+            conn.query_drop("INSERT INTO t_dd VALUES (1,'x'),(2,'y')")
+                .await
+                .expect("insert");
+        }
+        let report = run_diff(
+            side_at(&pool, "l").await,
+            side_at(&pool, "r").await,
+            opts(None),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "bucketdiff", "no key");
+        assert_eq!(report.summary.modified, 0);
+    }
+}
