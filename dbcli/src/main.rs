@@ -10,6 +10,8 @@ mod logger;
 mod output;
 mod queries;
 mod server;
+#[cfg(feature = "synth")]
+mod synth;
 
 use clap::{Parser, Subcommand};
 use keyring::Entry;

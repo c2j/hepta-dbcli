@@ -43,6 +43,21 @@ impl Dialect for MySqlDialect {
          ORDER BY s.INDEX_NAME"
     }
 
+    fn foreign_keys_sql(&self, schema: &str) -> String {
+        format!(
+            "SELECT kcu.TABLE_SCHEMA AS schema_name, kcu.TABLE_NAME AS table_name, \
+             kcu.COLUMN_NAME AS column_name, kcu.REFERENCED_TABLE_SCHEMA AS referenced_schema, \
+             kcu.REFERENCED_TABLE_NAME AS referenced_table, \
+             kcu.REFERENCED_COLUMN_NAME AS referenced_column, \
+             kcu.CONSTRAINT_NAME AS constraint_name \
+             FROM information_schema.KEY_COLUMN_USAGE kcu \
+             WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+             AND kcu.TABLE_SCHEMA = '{schema}' \
+             ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+            schema = schema
+        )
+    }
+
     fn read_only_prefixes(&self) -> &[&str] {
         &["SELECT", "EXPLAIN", "SHOW", "DESC", "DESCRIBE"]
     }
