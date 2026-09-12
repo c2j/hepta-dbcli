@@ -77,7 +77,8 @@ pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
             rows,
             seed,
             format,
-        } => cmd::run_generate(&models, &rules, &output, rows, seed, &format),
+            enforce_min_max_values,
+        } => cmd::run_generate(&models, &rules, &output, rows, seed, &format, enforce_min_max_values),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
     };
 
@@ -188,7 +189,7 @@ async fn run_train(
 
         let profile =
             crate::synth::profile::TableProfile::from_rows(table, &result.columns, &result.rows);
-        let (model, skipped) = cmd::build_model(table, &scheme, &profile)?;
+        let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows)?;
         for col in &skipped {
             eprintln!(
                 "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",

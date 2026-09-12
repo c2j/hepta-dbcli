@@ -28,7 +28,27 @@ pub struct ColumnModel {
     pub rounding: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datetime_epoch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
     pub marginal: crate::synth::marginal::Marginal,
+}
+
+impl Default for ColumnModel {
+    fn default() -> Self {
+        Self {
+            logical_type: LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            min: None,
+            max: None,
+            marginal: crate::synth::marginal::Marginal::Normal(crate::synth::marginal::NormalParams {
+                loc: 0.0,
+                scale: 1.0,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +107,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                min: None,
+                max: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 1.0,
@@ -132,6 +154,8 @@ mod tests {
             logical_type: LogicalType::Categorical,
             rounding: None,
             datetime_epoch: None,
+            min: None,
+            max: None,
             marginal: Marginal::Categorical(CategoricalParams {
                 values: vec!["a".to_string(), "b".to_string()],
                 weights: vec![0.5, 0.5],

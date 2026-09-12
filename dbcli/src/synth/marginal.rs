@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use crate::synth::model::ColumnModel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "name")]
@@ -95,14 +97,34 @@ fn normal_cdf(x: f64, loc: f64, scale: f64) -> f64 {
     0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2))
 }
 
+/// Inverse normal CDF via binary search on the CDF.
+/// Guarantees correct roundtrip; fast enough for synth workloads.
 fn normal_ppf(loc: f64, scale: f64, p: f64) -> f64 {
-    let a = -8.0 * (2.0 * p - 1.0).abs().ln();
-    let t = (a.sqrt() - 2.685_924_321_146_84) / 2.729_082_346_098_76;
-    let x = t
-        - (2.515_517 + 0.802_853 * t + 0.010_328 * t * t)
-            / (1.0 + 1.432_788 * t + 0.189_269 * t * t + 0.001_308 * t * t * t);
-    let x = if p < 0.5 { -x } else { x };
-    loc + scale * x
+    const EPS: f64 = 1e-15;
+    let p = p.clamp(EPS, 1.0 - EPS);
+
+    // Quick return for p=0.5
+    if (p - 0.5).abs() < 1e-15 {
+        return loc;
+    }
+
+    // Binary search bounds: normal is effectively bounded at ±10 σ
+    let mut lo = loc - 10.0 * scale;
+    let mut hi = loc + 10.0 * scale;
+
+    for _ in 0..50 {
+        let mid = (lo + hi) * 0.5;
+        let cdf = normal_cdf(mid, loc, scale);
+        if cdf < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo < 1e-12 {
+            break;
+        }
+    }
+    (lo + hi) * 0.5
 }
 
 fn beta_cdf(x: f64, a: f64, b: f64) -> f64 {
@@ -441,6 +463,94 @@ impl MarginalFitter for UniformFitter {
         Ok(Marginal::Uniform(UniformParams { low, high }))
     }
 }
+ 
+/// Compute Gaussian-space correlation matrix from training rows using PIT.
+/// For each column: apply marginal CDF (PIT) → Φ⁻¹ (normal_ppf) → Pearson correlation.
+/// Categorical columns use SDV-style UniformEncoder: map to cumulative frequency intervals.
+pub fn compute_gaussian_correlation(
+    rows: &[Vec<serde_json::Value>],
+    column_order: &[String],
+    columns: &HashMap<String, ColumnModel>,
+) -> Vec<Vec<f64>> {
+    let n_cols = column_order.len();
+    let n_rows = rows.len();
+    if n_rows < 2 || n_cols == 0 {
+        return (0..n_cols).map(|i| (0..n_cols).map(|j| if i == j { 1.0 } else { 0.0 }).collect()).collect();
+    }
+
+    // Transform each column to standard normal space
+    let mut gaussian_data = vec![vec![0.0f64; n_rows]; n_cols];
+
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let col_model = columns.get(col_name);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let val = row.get(col_idx).cloned().unwrap_or(serde_json::Value::Null);
+            let u = if let Some(model) = col_model {
+                match &model.marginal {
+                    crate::synth::marginal::Marginal::Normal(p) => {
+                        let x = val.as_f64().unwrap_or(p.loc);
+                        let cdf = normal_cdf(x, p.loc, p.scale);
+                        // Clamp to avoid ppf at exactly 0 or 1
+                        cdf.clamp(1e-12, 1.0 - 1e-12)
+                    }
+                    crate::synth::marginal::Marginal::Categorical(p) => {
+                        // SDV UniformEncoder: map category to mid-point of its cumulative interval
+                        if let Some(idx) = p.values.iter().position(|v| v == &val.as_str().unwrap_or("").to_string()) {
+                            let total: f64 = p.weights.iter().sum();
+                            let cum_before: f64 = p.weights[..idx].iter().sum();
+                            (cum_before + p.weights[idx] / 2.0) / total
+                        } else {
+                            0.5
+                        }
+                    }
+                    _ => 0.5,
+                }
+            } else {
+                0.5
+            };
+            gaussian_data[col_idx][row_idx] = normal_ppf(0.0, 1.0, u);
+        }
+    }
+
+    // Compute Pearson correlation
+    let mut corr = vec![vec![0.0f64; n_cols]; n_cols];
+    for i in 0..n_cols {
+        corr[i][i] = 1.0;
+        for j in (i + 1)..n_cols {
+            let xi = &gaussian_data[i];
+            let xj = &gaussian_data[j];
+            let mean_i = xi.iter().sum::<f64>() / n_rows as f64;
+            let mean_j = xj.iter().sum::<f64>() / n_rows as f64;
+            let mut cov = 0.0;
+            let mut var_i = 0.0;
+            let mut var_j = 0.0;
+            for k in 0..n_rows {
+                let di = xi[k] - mean_i;
+                let dj = xj[k] - mean_j;
+                cov += di * dj;
+                var_i += di * di;
+                var_j += dj * dj;
+            }
+            let r = if var_i > 0.0 && var_j > 0.0 {
+                cov / (var_i * var_j).sqrt()
+            } else {
+                0.0
+            };
+            corr[i][j] = r;
+            corr[j][i] = r;
+        }
+    }
+
+    // Ensure PSD by adding small epsilon to diagonal if needed
+    for i in 0..n_cols {
+        let row_sum: f64 = (0..n_cols).filter(|&j| j != i).map(|j| corr[i][j].abs()).sum();
+        if corr[i][i] < row_sum {
+            corr[i][i] = row_sum + 1e-6;
+        }
+    }
+
+    corr
+}
 
 #[cfg(test)]
 mod tests {
@@ -651,16 +761,93 @@ mod tests {
             weights: vec![1.0],
         };
         assert_eq!(p.sample_index(0.999999), 0);
+}
+
+/// Compute Gaussian-space correlation matrix from training rows using PIT.
+/// For each column: apply marginal CDF (PIT) → Φ⁻¹ (normal_ppf) → Pearson correlation.
+/// Categorical columns use SDV-style UniformEncoder: map to cumulative frequency intervals.
+pub fn compute_gaussian_correlation(
+    rows: &[Vec<serde_json::Value>],
+    column_order: &[String],
+    columns: &HashMap<String, ColumnModel>,
+) -> Vec<Vec<f64>> {
+    let n_cols = column_order.len();
+    let n_rows = rows.len();
+    if n_rows < 2 || n_cols == 0 {
+        return (0..n_cols).map(|i| (0..n_cols).map(|j| if i == j { 1.0 } else { 0.0 }).collect()).collect();
     }
 
-    #[test]
-    fn normal_cdf_roundtrip() {
-        let params = NormalParams {
-            loc: 0.0,
-            scale: 1.0,
-        };
-        let x = 0.5;
-        let cdf_val = normal_cdf(x, params.loc, params.scale);
-        assert!(cdf_val > 0.0 && cdf_val < 1.0);
+    // Transform each column to standard normal space
+    let mut gaussian_data = vec![vec![0.0f64; n_rows]; n_cols];
+
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let col_model = columns.get(col_name);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let val = row.get(col_idx).cloned().unwrap_or(serde_json::Value::Null);
+            let u = if let Some(model) = col_model {
+                match &model.marginal {
+                    crate::synth::marginal::Marginal::Normal(p) => {
+                        let x = val.as_f64().unwrap_or(p.loc);
+                        let cdf = normal_cdf(x, p.loc, p.scale);
+                        // Clamp to avoid ppf at exactly 0 or 1
+                        cdf.clamp(1e-12, 1.0 - 1e-12)
+                    }
+                    crate::synth::marginal::Marginal::Categorical(p) => {
+                        // SDV UniformEncoder: map category to mid-point of its cumulative interval
+                        if let Some(idx) = p.values.iter().position(|v| v == &val.as_str().unwrap_or("").to_string()) {
+                            let total: f64 = p.weights.iter().sum();
+                            let cum_before: f64 = p.weights[..idx].iter().sum();
+                            (cum_before + p.weights[idx] / 2.0) / total
+                        } else {
+                            0.5
+                        }
+                    }
+                    _ => 0.5,
+                }
+            } else {
+                0.5
+            };
+            gaussian_data[col_idx][row_idx] = normal_ppf(0.0, 1.0, u);
+        }
     }
+
+    // Compute Pearson correlation
+    let mut corr = vec![vec![0.0f64; n_cols]; n_cols];
+    for i in 0..n_cols {
+        corr[i][i] = 1.0;
+        for j in (i + 1)..n_cols {
+            let xi = &gaussian_data[i];
+            let xj = &gaussian_data[j];
+            let mean_i = xi.iter().sum::<f64>() / n_rows as f64;
+            let mean_j = xj.iter().sum::<f64>() / n_rows as f64;
+            let mut cov = 0.0;
+            let mut var_i = 0.0;
+            let mut var_j = 0.0;
+            for k in 0..n_rows {
+                let di = xi[k] - mean_i;
+                let dj = xj[k] - mean_j;
+                cov += di * dj;
+                var_i += di * di;
+                var_j += dj * dj;
+            }
+            let r = if var_i > 0.0 && var_j > 0.0 {
+                cov / (var_i * var_j).sqrt()
+            } else {
+                0.0
+            };
+            corr[i][j] = r;
+            corr[j][i] = r;
+        }
+    }
+
+    // Ensure PSD by adding small epsilon to diagonal if needed
+    for i in 0..n_cols {
+        let row_sum: f64 = (0..n_cols).filter(|&j| j != i).map(|j| corr[i][j].abs()).sum();
+        if corr[i][i] < row_sum {
+            corr[i][i] = row_sum + 1e-6;
+        }
+    }
+
+    corr
+}
 }

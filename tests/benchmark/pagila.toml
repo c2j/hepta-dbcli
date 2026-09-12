@@ -1,0 +1,10 @@
+default_connection = "pagila"
+
+[connections.pagila]
+driver = "gaussdb"
+host = "127.0.0.1"
+port = 5432
+user = "gaussdb"
+password = "Enmo@123"
+database = "pagila"
+sslmode = "disable"
