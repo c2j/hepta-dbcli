@@ -838,8 +838,8 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 | 子命令 | 参数 | 说明 |
 |--------|------|------|
-| `train` | `--name`、`--tables`、`--output`、`--sample` | 每表最多采样 `--sample` 行（默认 10000） |
-| `rules-draft` | `--name`、`--tables`、`--output`、`--models` | `--models` 下的 profile 用于唯一外键检测 |
+| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000） |
+| `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
 | `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |
 
