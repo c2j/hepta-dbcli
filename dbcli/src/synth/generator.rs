@@ -14,12 +14,16 @@ pub struct GeneratorConfig {
 #[derive(Debug)]
 pub struct GeneratedData {
     pub tables: HashMap<String, Vec<Vec<Value>>>,
+    pub columns: HashMap<String, Vec<String>>,
+    pub dialect: String,
 }
 
 struct RelPool {
     column: String,
     pool: FkPool,
     strategy: SelectionStrategy,
+    unique: bool,
+    pool_size: usize,
 }
 
 pub fn generate(
@@ -44,6 +48,8 @@ pub fn generate(
     .map_err(|e| format!("cycle detected: {}", e))?;
 
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
+    let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut dialect = "mysql".to_string();
 
     // "table.column" -> 该列已生成的全部值；子表 FK 从这里采样，保证引用完整性
     let mut column_pools: HashMap<String, Vec<Value>> = HashMap::new();
@@ -76,11 +82,11 @@ pub fn generate(
             }
         };
 
-        let rel_pools = build_rel_pools(table_name, rule, &column_pools, strategy)?;
+        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, strategy)?;
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
-        let uniform_samples = copula.sample(row_count, config.seed);
+        let uniform_samples = copula.sample(row_count, table_seed(config.seed, table_name));
 
         let mut rows = Vec::with_capacity(row_count);
 
@@ -88,13 +94,23 @@ pub fn generate(
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
-                if let Some(rel) = rel_pools.iter().find(|r| &r.column == col_name) {
-                    let value = rel.pool.sample_one(rel.strategy, &mut rng).ok_or_else(|| {
-                        format!(
-                            "FK pool for '{}.{}' is empty; parent table generated no rows",
-                            table_name, col_name
-                        )
-                    })?;
+                if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
+                    let value = if rel.unique {
+                        rel.pool.sample_unique(&mut rng).ok_or_else(|| {
+                            format!(
+                                "table '{}': unique FK '{}' exhausted its parent pool \
+                                 ({} distinct values); reduce row count or set unique: false",
+                                table_name, rel.column, rel.pool_size
+                            )
+                        })?
+                    } else {
+                        rel.pool.sample_one(rel.strategy, &mut rng).ok_or_else(|| {
+                            format!(
+                                "FK pool for '{}.{}' is empty; parent table generated no rows",
+                                table_name, col_name
+                            )
+                        })?
+                    };
                     row.push(value);
                     continue;
                 }
@@ -128,10 +144,29 @@ pub fn generate(
             column_pools.insert(format!("{}.{}", table_name, col_name), values);
         }
 
+        table_columns.insert(table_name.clone(), column_order.clone());
+        if model.dialect != "test" {
+            dialect = model.dialect.clone();
+        }
         tables.insert(table_name.clone(), rows);
     }
 
-    Ok(GeneratedData { tables })
+    Ok(GeneratedData {
+        tables,
+        columns: table_columns,
+        dialect,
+    })
+}
+
+// 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
+fn table_seed(base: Option<u64>, table: &str) -> Option<u64> {
+    base.map(|s| {
+        let mut h = 5381u64;
+        for b in table.as_bytes() {
+            h = h.wrapping_mul(33).wrapping_add(u64::from(*b));
+        }
+        s ^ h
+    })
 }
 
 fn fk_edges(rules: &SynthRules) -> Vec<(String, String)> {
@@ -165,11 +200,12 @@ fn build_rel_pools(
             .first()
             .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
 
-        let pool = match &rel.pool_strategy {
-            PoolStrategy::Fixed { values } => {
-                FkPool::new(values.iter().map(|v| Value::String(v.clone())).collect())
-            }
-            PoolStrategy::Projection { .. } | PoolStrategy::Generated { .. } => {
+        let (pool, unique) = match &rel.pool_strategy {
+            PoolStrategy::Fixed { values } => (
+                FkPool::new(values.iter().map(|v| Value::String(v.clone())).collect()),
+                false,
+            ),
+            PoolStrategy::Projection { unique } | PoolStrategy::Generated { unique } => {
                 let values = column_pools.get(ref_str).ok_or_else(|| {
                     format!(
                         "table '{}' references '{}' but that table.column was not generated \
@@ -177,14 +213,17 @@ fn build_rel_pools(
                         table_name, ref_str
                     )
                 })?;
-                FkPool::new(values.clone())
+                (FkPool::new(values.clone()), *unique)
             }
         };
+        let pool_size = pool.len();
 
         rel_pools.push(RelPool {
             column: rel.pk.clone(),
             pool,
             strategy,
+            unique,
+            pool_size,
         });
     }
     Ok(rel_pools)
@@ -515,5 +554,137 @@ mod tests {
         let config = config(&["users"], 25);
         let result = generate(&models, &rules, &config).unwrap();
         assert_eq!(result.tables.get("users").unwrap().len(), 25);
+    }
+
+    #[test]
+    fn unique_fk_never_repeats() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 10.0, 2.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let config = config(&["users", "orders"], 5);
+        let result = generate(&models, &rules, &config).unwrap();
+
+        let users = result.tables.get("users").unwrap();
+        let orders = result.tables.get("orders").unwrap();
+        assert_eq!(users.len(), 5);
+        assert_eq!(orders.len(), 5);
+
+        let parent_ids: std::collections::HashSet<u64> = users
+            .iter()
+            .filter_map(|r| r.first())
+            .filter_map(|v| v.as_f64())
+            .map(|f| f.to_bits())
+            .collect();
+
+        let mut fk_seen = std::collections::HashSet::new();
+        for row in orders {
+            let f = row[0].as_f64().expect("FK must stay numeric");
+            assert!(parent_ids.contains(&f.to_bits()));
+            assert!(fk_seen.insert(f.to_bits()), "unique FK repeated: {}", f);
+        }
+    }
+
+    #[test]
+    fn unique_fk_errors_when_child_exceeds_parent_pool() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 10.0, 2.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let mut config = config(&["orders"], 5);
+        config.rows_per_table.insert("users".to_string(), 3);
+
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(err.contains("unique FK"), "error: {}", err);
+        assert!(
+            err.contains("'total'"),
+            "error should name the column: {}",
+            err
+        );
+        assert!(err.contains("3 distinct values"), "error: {}", err);
+    }
+
+    #[test]
+    fn same_seed_yields_different_streams_per_table() {
+        let mut models = HashMap::new();
+        models.insert("alpha".to_string(), numerical_model("alpha", "v", 0.0, 1.0));
+        models.insert("beta".to_string(), numerical_model("beta", "v", 0.0, 1.0));
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("alpha", vec![]), single_rule("beta", vec![])],
+        };
+
+        let config = config(&["alpha", "beta"], 8);
+        let result = generate(&models, &rules, &config).unwrap();
+
+        let a = &result.tables.get("alpha").unwrap()[0][0];
+        let b = &result.tables.get("beta").unwrap()[0][0];
+        assert_ne!(
+            a, b,
+            "tables must not share one Gaussian stream under the same --seed"
+        );
+    }
+
+    #[test]
+    fn generated_data_carries_column_names() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+
+        let config = config(&["users"], 3);
+        let result = generate(&models, &rules, &config).unwrap();
+        assert_eq!(result.columns.get("users"), Some(&vec!["id".to_string()]));
     }
 }

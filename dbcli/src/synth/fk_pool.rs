@@ -37,6 +37,14 @@ impl FkPool {
         self.values.get(idx).cloned()
     }
 
+    pub fn sample_unique(&mut self, rng: &mut impl Rng) -> Option<Value> {
+        if self.values.is_empty() {
+            return None;
+        }
+        let idx = rng.gen_range(0..self.values.len());
+        Some(self.values.swap_remove(idx))
+    }
+
     // P(rank) ∝ 1/rank 的逆变换采样；walk 均摊 O(1)（Zipf 集中在头部）
     fn zipf_index(&self, rng: &mut impl Rng) -> usize {
         if self.harmonic <= 0.0 {
@@ -125,5 +133,28 @@ mod tests {
         }
         assert_eq!(p.len(), 3);
         assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn sample_unique_never_repeats_and_exhausts() {
+        let mut p = pool(10);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let v = p.sample_unique(&mut rng).unwrap();
+            assert!(
+                seen.insert(v.as_f64().unwrap().to_bits()),
+                "unique draw repeated"
+            );
+        }
+        assert_eq!(seen.len(), 10);
+        assert!(p.sample_unique(&mut rng).is_none());
+    }
+
+    #[test]
+    fn sample_unique_on_empty_returns_none() {
+        let mut p = pool(0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        assert!(p.sample_unique(&mut rng).is_none());
     }
 }

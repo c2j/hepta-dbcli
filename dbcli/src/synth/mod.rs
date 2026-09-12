@@ -82,24 +82,18 @@ fn resolve_connection(
     raw: &crate::config::McpRawConfig,
     name: &Option<String>,
 ) -> Result<crate::config::ResolvedConnection, String> {
-    let target = match name {
-        Some(wanted) => raw
-            .connections
-            .iter()
-            .find(|c| &c.name == wanted)
-            .ok_or_else(|| {
-                let available: Vec<&str> =
-                    raw.connections.iter().map(|c| c.name.as_str()).collect();
-                format!(
-                    "connection '{}' not found\n  available: {:?}",
-                    wanted, available
-                )
-            })?,
-        None => raw
-            .connections
-            .first()
-            .ok_or_else(|| "no connections configured".to_string())?,
-    };
+    let target_name = name.as_deref().unwrap_or(raw.default_name.as_str());
+    let target = raw
+        .connections
+        .iter()
+        .find(|c| c.name == target_name)
+        .ok_or_else(|| {
+            let available: Vec<&str> = raw.connections.iter().map(|c| c.name.as_str()).collect();
+            format!(
+                "connection '{}' not found\n  available: {:?}",
+                target_name, available
+            )
+        })?;
 
     if raw.is_env_var {
         Ok(crate::config::resolve_env_var_connection(

@@ -121,7 +121,15 @@ pub(crate) fn build_model(
         );
     }
 
-    let column_order: Vec<String> = profile.columns.keys().cloned().collect();
+    let mut column_order: Vec<String> = profile
+        .column_order
+        .iter()
+        .filter(|c| profile.columns.contains_key(*c))
+        .cloned()
+        .collect();
+    if column_order.is_empty() {
+        column_order = profile.columns.keys().cloned().collect();
+    }
     let n = column_order.len();
     let correlation = (0..n)
         .map(|i| {
@@ -251,7 +259,12 @@ pub fn run_generate(
         other => return Err(format!("unsupported format: {}", other)),
     };
 
-    export(&data.tables, &export_format, output_dir)?;
+    let payload = crate::synth::export::ExportPayload {
+        tables: &data.tables,
+        columns: &data.columns,
+        dialect: &data.dialect,
+    };
+    export(&payload, &export_format, output_dir)?;
 
     println!(
         "Generation complete. Data saved to {}",
@@ -407,6 +420,7 @@ mod tests {
         let model = build_model("t", "mysql", &profile).unwrap();
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
+        assert_eq!(model.copula.column_order, vec!["a", "b", "c"]);
         assert_eq!(model.copula.correlation.len(), 3);
         for (i, row) in model.copula.correlation.iter().enumerate() {
             assert_eq!(row.len(), 3, "row {} must be 3 wide", i);

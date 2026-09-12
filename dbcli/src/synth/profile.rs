@@ -6,6 +6,8 @@ use std::collections::HashMap;
 pub struct TableProfile {
     pub table: String,
     pub row_count: usize,
+    #[serde(default)]
+    pub column_order: Vec<String>,
     pub columns: HashMap<String, ColumnProfile>,
 }
 
@@ -111,6 +113,7 @@ impl TableProfile {
         Self {
             table: table.to_string(),
             row_count,
+            column_order: columns.to_vec(),
             columns: column_profiles,
         }
     }
@@ -218,11 +221,44 @@ mod tests {
         let profile = TableProfile {
             table: "t".to_string(),
             row_count: 100,
+            column_order: vec![],
             columns: HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&profile).unwrap();
         let loaded: TableProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.row_count, 100);
+    }
+
+    #[test]
+    fn profile_column_order_follows_input_not_hash() {
+        let columns = vec!["zeta".to_string(), "alpha".to_string(), "mid".to_string()];
+        let rows = vec![vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ]];
+
+        let profile = TableProfile::from_rows("t", &columns, &rows);
+        assert_eq!(profile.column_order, vec!["zeta", "alpha", "mid"]);
+    }
+
+    #[test]
+    fn profile_json_roundtrip_preserves_column_order() {
+        let columns = vec!["b".to_string(), "a".to_string()];
+        let rows = vec![vec![serde_json::json!(1), serde_json::json!(2)]];
+        let profile = TableProfile::from_rows("t", &columns, &rows);
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let loaded: TableProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.column_order, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn profile_json_without_column_order_defaults_empty() {
+        let json = r#"{"table": "t", "row_count": 3, "columns": {}}"#;
+        let loaded: TableProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.table, "t");
+        assert!(loaded.column_order.is_empty());
     }
 }
