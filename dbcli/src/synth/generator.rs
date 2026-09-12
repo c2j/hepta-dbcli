@@ -875,6 +875,113 @@ mod tests {
     }
 
     #[test]
+    fn clipping_enforces_min_max_bounds() {
+        let mut models = HashMap::new();
+        models.insert(
+            "metrics".to_string(),
+            TableModel {
+                version: 1,
+                table: "metrics".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns: HashMap::from([(
+                    "value".to_string(),
+                    ColumnModel {
+                        logical_type: LogicalType::Numerical,
+                        rounding: None,
+                        datetime_epoch: None,
+                        min: Some(0.0),
+                        max: Some(120.0),
+                        marginal: Marginal::Normal(NormalParams {
+                            loc: 100.0,
+                            scale: 50.0,
+                        }),
+                    },
+                )]),
+                copula: CopulaInfo {
+                    column_order: vec!["value".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("metrics", vec![])],
+        };
+
+        let mut config = config(&["metrics"], 200);
+        config.enforce_min_max_values = true;
+        let result = generate(&models, &rules, &config).unwrap();
+        for row in result.tables.get("metrics").unwrap() {
+            let v = row[0].as_f64().unwrap();
+            assert!(
+                (0.0..=120.0).contains(&v),
+                "clipped value {} out of [0, 120]",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn clipping_disabled_allows_out_of_range_values() {
+        let mut models = HashMap::new();
+        models.insert(
+            "metrics".to_string(),
+            TableModel {
+                version: 1,
+                table: "metrics".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns: HashMap::from([(
+                    "value".to_string(),
+                    ColumnModel {
+                        logical_type: LogicalType::Numerical,
+                        rounding: None,
+                        datetime_epoch: None,
+                        min: Some(0.0),
+                        max: Some(101.0),
+                        marginal: Marginal::Normal(NormalParams {
+                            loc: 100.0,
+                            scale: 50.0,
+                        }),
+                    },
+                )]),
+                copula: CopulaInfo {
+                    column_order: vec!["value".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("metrics", vec![])],
+        };
+
+        let mut config = config(&["metrics"], 200);
+        config.enforce_min_max_values = false;
+        let result = generate(&models, &rules, &config).unwrap();
+        let any_over = result
+            .tables
+            .get("metrics")
+            .unwrap()
+            .iter()
+            .any(|row| row[0].as_f64().unwrap() > 101.0);
+        assert!(any_over, "with clipping disabled the tail must exceed max");
+    }
+
+    #[test]
     fn generated_data_carries_column_names() {
         let mut models = HashMap::new();
         models.insert(

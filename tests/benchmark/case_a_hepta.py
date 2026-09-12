@@ -5,6 +5,7 @@ hepta-dbcli 端：synth train | generate + 评测
 输出：hepta_out.csv, hepta_metrics.json
 """
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -13,11 +14,14 @@ import pandas as pd
 from scipy.stats import ks_2samp
 
 ROOT = Path(__file__).parent
+REPO_ROOT = ROOT.parent.parent
 REAL_CSV = ROOT / "real.csv"
 OUT_CSV = ROOT / "hepta_out.csv"
 OUT_METRICS = ROOT / "hepta_metrics.json"
 
-HEPTA_BIN = "/Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/target/release/hepta_dbcli"
+HEPTA_BIN = os.environ.get(
+    "HEPTA_BIN", str(REPO_ROOT / "target" / "release" / "hepta_dbcli")
+)
 CFG = ROOT / "pagila.toml"
 MODEL_DIR = ROOT / "hepta_models"
 OUT_DIR = ROOT / "hepta_out"
@@ -38,17 +42,17 @@ def run_cmd(cmd, cwd=None):
 
 def main():
     # 1. 读真实数据
-    real = pd.read_csv("/Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/real.csv")
+    real = pd.read_csv(REAL_CSV)
     print(f"Real rows: {len(real)}")
 
     # 2. 灌库
     print("Loading data to pagila...")
-    docker_cp = "docker cp /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/real.csv pagila:/tmp/real.csv"
+    docker_cp = f"docker cp {REAL_CSV} pagila:/tmp/real.csv"
     subprocess.run(docker_cp, shell=True, check=True)
     sql = """DROP TABLE IF EXISTS gaussdb.bakeoff_t;
 CREATE TABLE gaussdb.bakeoff_t (qty INT, amount NUMERIC(12,2), category VARCHAR(16), region VARCHAR(16));
 COPY gaussdb.bakeoff_t FROM STDIN WITH CSV HEADER;"""
-    subprocess.run(f"docker exec -i pagila gsql-pagila -c \"{sql}\" < /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/real.csv", shell=True, check=True)
+    subprocess.run(f"docker exec -i pagila gsql-pagila -c \"{sql}\" < {REAL_CSV}", shell=True, check=True)
     print("Data loaded")
 
     # 2. 训练
@@ -57,7 +61,7 @@ COPY gaussdb.bakeoff_t FROM STDIN WITH CSV HEADER;"""
         subprocess.run(f"mkdir -p {d}", shell=True)
 
     t0 = time.perf_counter()
-    r = run_cmd(f"{HEPTA_BIN} --config /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/pagila.toml synth train --name pagila --tables bakeoff_t --schema gaussdb --output /tmp/hepta_models --sample 2000")
+    r = run_cmd(f"{HEPTA_BIN} --config {CFG} synth train --name pagila --tables bakeoff_t --schema gaussdb --output /tmp/hepta_models --sample 2000")
     if r.returncode != 0:
         raise RuntimeError(f"hepta train failed: {r.stderr}")
     train_s = time.perf_counter() - t0
@@ -74,7 +78,7 @@ tables:
 
     # 3. 生成
     t1 = time.perf_counter()
-    r = run_cmd(f"{HEPTA_BIN} --config /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/pagila.toml synth generate --models /tmp/hepta_models --rules /tmp/synth-rules.yaml --output /tmp/hepta_out --rows 2000 --seed 42 --format csv")
+    r = run_cmd(f"{HEPTA_BIN} --config {CFG} synth generate --models /tmp/hepta_models --rules /tmp/synth-rules.yaml --output /tmp/hepta_out --rows 2000 --seed 42 --format csv")
     if r.returncode != 0:
         raise RuntimeError(f"hepta generate failed: {r.stderr}")
     gen_s = time.perf_counter() - t1
@@ -85,7 +89,7 @@ tables:
     print(f"Hepta rows: {len(hepta)}")
 
     # 5. 真实数据（用于对比）
-    real = pd.read_csv("/Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark/real.csv")
+    real = pd.read_csv(REAL_CSV)
 
     # 6. 指标
     from scipy.stats import ks_2samp
@@ -112,12 +116,9 @@ tables:
         "qty_neg_rate": float((hepta["qty"] < 0).mean()),
         "amount_min": float(hepta["amount"].min()),
         "amount_max": float(hepta["amount"].max()),
-        "train_s": time.perf_counter() - time.perf_counter() + 0,  # dummy, will fix
+        "train_s": train_s,
         "gen_s": gen_s,
     }
-
-    # 修正 train_s
-    metrics["train_s"] = train_s
 
     # 保存
     with open("/tmp/hepta_metrics.json", "w") as f:
@@ -125,7 +126,4 @@ tables:
     print(json.dumps(metrics, indent=2))
 
 if __name__ == "__main__":
-    import pandas as pd
-    from scipy.stats import ks_2samp
-    import json
     main()

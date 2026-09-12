@@ -1,6 +1,8 @@
 use crate::synth::export::{export, ExportFormat};
 use crate::synth::generator::{generate, GeneratorConfig};
-use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, compute_gaussian_correlation};
+use crate::synth::marginal::{
+    compute_gaussian_correlation, CategoricalParams, Marginal, NormalParams,
+};
 use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
 use crate::synth::profile::TableProfile;
 use crate::synth::rules::SynthRules;
@@ -92,7 +94,13 @@ pub enum SynthCommand {
         format: String,
 
         /// Clip generated values to training min/max
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = true
+        )]
         enforce_min_max_values: bool,
     },
 
@@ -105,7 +113,7 @@ pub enum SynthCommand {
 }
 
 // ─── 模型拟合（纯函数，无 IO）────────────────────────────────────────────
- 
+
 pub(crate) fn build_model(
     table: &str,
     dialect: &str,
@@ -162,15 +170,34 @@ pub(crate) fn build_model(
     if column_order.is_empty() {
         column_order = columns.keys().cloned().collect();
     }
-let n = column_order.len();
- 
+    let n = column_order.len();
+
     // Compute correlation matrix from training rows
     let correlation = if rows.len() >= 2 && n > 0 {
-        compute_gaussian_correlation(rows, &column_order, &columns)
+        // rows 是全宽（含被跳过的列），先按过滤后的 column_order 投影，
+        // 否则 compute_gaussian_correlation 的列索引会错位
+        let col_pos: HashMap<&str, usize> = profile
+            .column_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        let projected: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|row| {
+                column_order
+                    .iter()
+                    .filter_map(|c| col_pos.get(c.as_str()).and_then(|&i| row.get(i).cloned()))
+                    .collect()
+            })
+            .collect();
+        compute_gaussian_correlation(&projected, &column_order, &columns)
     } else {
-        (0..n).map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect()).collect()
+        (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect()
     };
- 
+
     let model = TableModel {
         version: 1,
         table: table.to_string(),
@@ -576,6 +603,37 @@ mod tests {
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
+    }
+
+    #[test]
+    fn build_model_correlation_ignores_skipped_columns() {
+        // 中间列是驱动占位串会被跳过；id 与 v3 完全线性相关。
+        // 回归：投影前用全宽行索引取数会导致 v3 读到占位串 → 相关性恒 0。
+        let rows: Vec<Vec<Value>> = (0..10)
+            .map(|i| {
+                vec![
+                    Value::from(i),
+                    Value::from("<unsupported type timestamptz>: \\x00"),
+                    Value::from(3 * i),
+                ]
+            })
+            .collect();
+        let columns = vec![
+            "id".to_string(),
+            "last_update".to_string(),
+            "v3".to_string(),
+        ];
+        let profile = TableProfile::from_rows("t", &columns, &rows);
+
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows).unwrap();
+        assert_eq!(skipped, vec!["last_update".to_string()]);
+        assert_eq!(model.copula.column_order, vec!["id", "v3"]);
+        let r = model.copula.correlation[0][1];
+        assert!(
+            r > 0.9,
+            "id–v3 correlation must survive the skipped column, got {}",
+            r
+        );
     }
 
     #[test]

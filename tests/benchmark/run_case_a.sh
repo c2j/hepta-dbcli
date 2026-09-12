@@ -6,7 +6,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HEPTA_BIN="/Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/target/release/hepta_dbcli"
+REPO_ROOT="$(cd "${ROOT}/../.." && pwd)"
+HEPTA_BIN="${HEPTA_BIN:-${REPO_ROOT}/target/release/hepta_dbcli}"
 VENV="${ROOT}/.venv-sdv"
 
 echo "=== Case A Benchmark Runner ==="
@@ -15,16 +16,14 @@ echo "Root: ${ROOT}"
 # 1. 检查 hepta 二进制
 if [[ ! -x "${HEPTA_BIN}" ]]; then
     echo "Building hepta_dbcli (release + synth)..."
-    cd /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli
-    cargo build --features synth --release
-    HEPTA_BIN="/Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/target/release/hepta_dbcli"
+    (cd "${REPO_ROOT}" && cargo build --features synth --release)
 fi
 echo "hepta: ${HEPTA_BIN}"
 
 # 2. 启动 pagila
-echo "Starting pagila..."
-cd /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/ogagila
-docker-compose up -d
+OGAGILA_DIR="${OGAGILA_DIR:?set OGAGILA_DIR to the ogagila checkout (docker-compose.yml with the pagila service)}"
+echo "Starting pagila from ${OGAGILA_DIR}..."
+(cd "${OGAGILA_DIR}" && docker-compose up -d)
 echo "Waiting for pagila..."
 for i in {1..30}; do
     if docker exec pagila gsql-pagila -c "SELECT 1;" >/dev/null 2>&1; then

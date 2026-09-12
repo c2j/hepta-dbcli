@@ -23,10 +23,9 @@
 ### 1. hepta-dbcli（Rust）
 
 ```bash
-# 编译（需 synth feature）
-cd /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli
+# 编译（需 synth feature；在仓库根目录执行）
 cargo build --features synth --release
-# 二进制：target/release/hepta_dbcli
+# 二进制：target/release/hepta_dbcli（也可用 HEPTA_BIN 环境变量指定）
 ```
 
 ### 2. SDV（Python）
@@ -44,7 +43,7 @@ pip install 'sdv>=1.17,<2' sdmetrics pandas scipy numpy
 
 ```bash
 # 使用伞仓库现成的 pagila 容器
-cd /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/ogagila
+cd "$OGAGILA_DIR"   # ogagila 检出目录（含 pagila 的 docker-compose.yml）
 docker-compose up -d
 # 等待健康检查通过（约 10s）
 docker exec pagila gsql-pagila -c "SELECT 1;"
@@ -55,7 +54,7 @@ docker exec pagila gsql-pagila -c "SELECT 1;"
 ## 运行 Case A（一键）
 
 ```bash
-cd /Users/c2j/Projects/Desktop_Projects/DB/GaussDB_Heptadecagon/lib/hepta-dbcli/tests/benchmark
+cd <repo>/tests/benchmark
 chmod +x run_case_a.sh
 ./run_case_a.sh
 ```

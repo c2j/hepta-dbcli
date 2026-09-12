@@ -43,10 +43,12 @@ impl Default for ColumnModel {
             datetime_epoch: None,
             min: None,
             max: None,
-            marginal: crate::synth::marginal::Marginal::Normal(crate::synth::marginal::NormalParams {
-                loc: 0.0,
-                scale: 1.0,
-            }),
+            marginal: crate::synth::marginal::Marginal::Normal(
+                crate::synth::marginal::NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                },
+            ),
         }
     }
 }
