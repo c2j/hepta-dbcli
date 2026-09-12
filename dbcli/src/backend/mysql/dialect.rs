@@ -54,7 +54,7 @@ impl Dialect for MySqlDialect {
              WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL \
              AND kcu.TABLE_SCHEMA = '{schema}' \
              ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
-            schema = schema
+            schema = crate::backend::escape_sql_string(schema, true)
         )
     }
 
@@ -353,6 +353,14 @@ impl Dialect for MySqlDialect {
 mod tests {
     use super::*;
     use crate::backend::is_polardbx_version;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let d = MySqlDialect;
+        let sql = d.foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("evil''; DROP TABLE x;--"));
+    }
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {

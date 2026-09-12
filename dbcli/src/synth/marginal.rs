@@ -41,6 +41,24 @@ pub struct CategoricalParams {
     pub weights: Vec<f64>,
 }
 
+impl CategoricalParams {
+    pub fn sample_index(&self, u: f64) -> usize {
+        let total: f64 = self.weights.iter().sum();
+        if self.values.is_empty() || total <= 0.0 {
+            return 0;
+        }
+        let target = u.clamp(0.0, 1.0) * total;
+        let mut acc = 0.0;
+        for (i, &w) in self.weights.iter().enumerate() {
+            acc += w;
+            if target < acc {
+                return i;
+            }
+        }
+        self.values.len() - 1
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniformParams {
     pub low: f64,
@@ -67,7 +85,7 @@ impl Marginal {
             Marginal::Beta(params) => beta_ppf(params.a, params.b, params.loc, params.scale, p),
             Marginal::Gamma(params) => gamma_ppf(params.shape, params.scale, p),
             Marginal::Uniform(params) => uniform_ppf(params.low, params.high, p),
-            Marginal::Categorical(params) => categorical_ppf(params),
+            Marginal::Categorical(params) => params.sample_index(p) as f64,
         }
     }
 }
@@ -87,30 +105,211 @@ fn normal_ppf(loc: f64, scale: f64, p: f64) -> f64 {
     loc + scale * x
 }
 
-fn beta_cdf(x: f64, _a: f64, _b: f64) -> f64 {
+fn beta_cdf(x: f64, a: f64, b: f64) -> f64 {
+    beta_reg(a, b, x)
+}
+
+fn beta_ppf(a: f64, b: f64, loc: f64, scale: f64, p: f64) -> f64 {
+    if a <= 0.0 || b <= 0.0 || scale <= 0.0 {
+        return loc + scale * a / (a + b);
+    }
+    let target = p.clamp(0.0, 1.0);
+    if target <= 0.0 {
+        return loc;
+    }
+    if target >= 1.0 {
+        return loc + scale;
+    }
+    bisect(
+        |x| beta_reg(a, b, (x - loc) / scale),
+        target,
+        loc,
+        loc + scale,
+    )
+}
+
+fn gamma_cdf(x: f64, shape: f64, scale: f64) -> f64 {
+    if shape <= 0.0 || scale <= 0.0 {
+        return 0.0;
+    }
+    gamma_p(shape, x / scale)
+}
+
+fn gamma_ppf(shape: f64, scale: f64, p: f64) -> f64 {
+    if shape <= 0.0 || scale <= 0.0 {
+        return shape * scale;
+    }
+    let target = p.clamp(0.0, 1.0);
+    if target <= 0.0 {
+        return 0.0;
+    }
+    if target >= 1.0 {
+        return f64::INFINITY;
+    }
+    let mut hi = shape * scale;
+    while gamma_cdf(hi, shape, scale) < target {
+        hi *= 2.0;
+        if hi > 1e300 {
+            break;
+        }
+    }
+    scale * bisect(|u| gamma_p(shape, u), target, 0.0, hi / scale)
+}
+
+fn bisect(f: impl Fn(f64) -> f64, target: f64, mut lo: f64, mut hi: f64) -> f64 {
+    debug_assert!(lo <= hi);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if f(mid) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn ln_gamma(x: f64) -> f64 {
+    const G: f64 = 7.0;
+    const COEFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        let ln_sin_pi_x = (std::f64::consts::PI * x).sin().abs().ln();
+        std::f64::consts::PI.ln() - ln_sin_pi_x - ln_gamma(1.0 - x)
+    } else {
+        let x = x - 1.0;
+        let mut a = COEFS[0];
+        let t = x + G + 0.5;
+        for (i, &c) in COEFS.iter().enumerate().skip(1) {
+            a += c / (x + i as f64);
+        }
+        0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+    }
+}
+
+fn gamma_p(a: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x < a + 1.0 {
+        let mut ap = a;
+        let mut sum = 1.0 / a;
+        let mut del = sum;
+        for _ in 0..1000 {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() < sum.abs() * 1e-15 {
+                break;
+            }
+        }
+        sum * (-x + a * x.ln() - ln_gamma(a)).exp()
+    } else {
+        1.0 - gamma_q_cf(a, x)
+    }
+}
+
+fn gamma_q_cf(a: f64, x: f64) -> f64 {
+    let tiny = 1e-300;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / tiny;
+    let mut d = 1.0 / b;
+    if b.abs() < tiny {
+        b = tiny;
+    }
+    let mut h = d;
+    for i in 1..=1000 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = b + an / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-15 {
+            break;
+        }
+    }
+    (-x + a * x.ln() - ln_gamma(a)).exp() * h
+}
+
+fn beta_reg(a: f64, b: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
     if x >= 1.0 {
         return 1.0;
     }
-    0.5
-}
-
-fn beta_ppf(a: f64, b: f64, loc: f64, scale: f64, _p: f64) -> f64 {
-    let x = a / (a + b);
-    loc + scale * x
-}
-
-fn gamma_cdf(x: f64, _shape: f64, _scale: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
+    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let front = ln_front.exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
     }
-    0.5
 }
 
-fn gamma_ppf(shape: f64, scale: f64, _p: f64) -> f64 {
-    shape * scale
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    let tiny = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < tiny {
+        d = tiny;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=1000 {
+        let mf = m as f64;
+        let m2 = 2.0 * mf;
+        let aa = mf * (b - mf) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-15 {
+            break;
+        }
+    }
+    h
 }
 
 fn uniform_cdf(x: f64, low: f64, high: f64) -> f64 {
@@ -125,13 +324,6 @@ fn uniform_cdf(x: f64, low: f64, high: f64) -> f64 {
 
 fn uniform_ppf(low: f64, high: f64, p: f64) -> f64 {
     low + (high - low) * p
-}
-
-fn categorical_ppf(params: &CategoricalParams) -> f64 {
-    if params.values.is_empty() {
-        return 0.0;
-    }
-    0.0
 }
 
 fn erf(x: f64) -> f64 {
@@ -297,6 +489,168 @@ mod tests {
         } else {
             panic!("expected Uniform");
         }
+    }
+
+    // shape=1, scale=1 的 Gamma 即指数分布：CDF = 1 - e^(-x)
+    #[test]
+    fn gamma_cdf_exponential_known_values() {
+        let m = Marginal::Gamma(GammaParams {
+            shape: 1.0,
+            scale: 1.0,
+        });
+        let cdf2 = m.cdf(2.0);
+        let expected = 1.0 - (-2.0f64).exp();
+        assert!(
+            (cdf2 - expected).abs() < 1e-9,
+            "gamma(1,1).cdf(2) = {} want {}",
+            cdf2,
+            expected
+        );
+    }
+
+    // shape=0.5, scale=1：CDF = erf(sqrt(x))
+    // erf 为 A&S 5.1.26 多项式（误差 ~1.5e-7），两独立实现对比到该精度
+    #[test]
+    fn gamma_cdf_half_shape_matches_erf() {
+        let m = Marginal::Gamma(GammaParams {
+            shape: 0.5,
+            scale: 1.0,
+        });
+        let cdf1 = m.cdf(1.0);
+        let expected = erf(1.0);
+        assert!(
+            (cdf1 - expected).abs() < 2e-7,
+            "gamma(0.5,1).cdf(1) = {} want erf(1) = {}",
+            cdf1,
+            expected
+        );
+    }
+
+    #[test]
+    fn gamma_cdf_monotone_and_bounded() {
+        let m = Marginal::Gamma(GammaParams {
+            shape: 2.5,
+            scale: 1.3,
+        });
+        let mut prev = 0.0;
+        for i in 0..50 {
+            let x = i as f64 * 0.5;
+            let c = m.cdf(x);
+            assert!(c >= prev, "gamma cdf not monotone at x={}", x);
+            assert!((0.0..=1.0).contains(&c));
+            prev = c;
+        }
+        assert!((m.cdf(0.0) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gamma_ppf_roundtrip() {
+        let m = Marginal::Gamma(GammaParams {
+            shape: 2.0,
+            scale: 3.0,
+        });
+        for &p in &[0.05, 0.25, 0.5, 0.75, 0.95] {
+            let x = m.inverse_cdf(p);
+            let back = m.cdf(x);
+            assert!(
+                (back - p).abs() < 1e-6,
+                "gamma roundtrip p={} cdf(ppf(p))={}",
+                p,
+                back
+            );
+        }
+    }
+
+    #[test]
+    fn beta_cdf_uniform_when_ab_equal_one() {
+        let m = Marginal::Beta(BetaParams {
+            a: 1.0,
+            b: 1.0,
+            loc: 0.0,
+            scale: 1.0,
+        });
+        assert!((m.cdf(0.3) - 0.3).abs() < 1e-12);
+    }
+
+    // Beta(1,b)：CDF = 1-(1-x)^b
+    #[test]
+    fn beta_cdf_known_closed_form_b2() {
+        let m = Marginal::Beta(BetaParams {
+            a: 1.0,
+            b: 2.0,
+            loc: 0.0,
+            scale: 1.0,
+        });
+        let expected = 1.0 - 0.7_f64.powi(2);
+        assert!((m.cdf(0.3) - expected).abs() < 1e-12);
+    }
+
+    // Beta(a,1)：CDF = x^a
+    #[test]
+    fn beta_cdf_known_closed_form_a3() {
+        let m = Marginal::Beta(BetaParams {
+            a: 3.0,
+            b: 1.0,
+            loc: 0.0,
+            scale: 1.0,
+        });
+        let expected = 0.3_f64.powi(3);
+        assert!((m.cdf(0.3) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn beta_cdf_support_boundaries() {
+        let m = Marginal::Beta(BetaParams {
+            a: 2.0,
+            b: 5.0,
+            loc: 10.0,
+            scale: 20.0,
+        });
+        assert_eq!(m.cdf(9.999), 0.0);
+        assert_eq!(m.cdf(30.001), 1.0);
+    }
+
+    #[test]
+    fn beta_ppf_roundtrip() {
+        let m = Marginal::Beta(BetaParams {
+            a: 2.0,
+            b: 5.0,
+            loc: 0.0,
+            scale: 1.0,
+        });
+        for &p in &[0.05, 0.25, 0.5, 0.75, 0.95] {
+            let x = m.inverse_cdf(p);
+            let back = m.cdf(x);
+            assert!(
+                (back - p).abs() < 1e-6,
+                "beta roundtrip p={} cdf(ppf(p))={}",
+                p,
+                back
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_sample_index_follows_cumulative_weights() {
+        let p = CategoricalParams {
+            values: vec!["a".into(), "b".into(), "c".into()],
+            weights: vec![0.5, 0.25, 0.25],
+        };
+        assert_eq!(p.sample_index(0.0), 0);
+        assert_eq!(p.sample_index(0.49), 0);
+        assert_eq!(p.sample_index(0.5), 1);
+        assert_eq!(p.sample_index(0.74), 1);
+        assert_eq!(p.sample_index(0.75), 2);
+        assert_eq!(p.sample_index(0.999), 2);
+    }
+
+    #[test]
+    fn categorical_sample_index_clamps_degenerate_weights() {
+        let p = CategoricalParams {
+            values: vec!["only".into()],
+            weights: vec![1.0],
+        };
+        assert_eq!(p.sample_index(0.999999), 0);
     }
 
     #[test]

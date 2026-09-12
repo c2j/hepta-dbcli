@@ -1,49 +1,119 @@
 use crate::synth::export::{export, ExportFormat};
 use crate::synth::generator::{generate, GeneratorConfig};
-use crate::synth::model::TableModel;
+use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
+use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
+use crate::synth::profile::TableProfile;
 use crate::synth::rules::SynthRules;
-use crate::synth::rules_draft::generate_rules_draft;
+use crate::synth::rules_draft::ForeignKeyInfo;
+use clap::{Args, Subcommand};
 use std::collections::HashMap;
+use std::path::Path;
 
-pub fn run_train(
-    model_dir: &std::path::Path,
-    profile: &crate::synth::profile::TableProfile,
-    table_name: &str,
-) -> Result<(), String> {
-    std::fs::create_dir_all(model_dir).map_err(|e| format!("create output dir: {}", e))?;
+// ─── CLI 参数 ───────────────────────────────────────────────────────────
 
-    let mut columns_map = HashMap::new();
+#[derive(Args, Debug)]
+pub struct SynthArgs {
+    #[command(subcommand)]
+    pub command: SynthCommand,
+}
 
+#[derive(Subcommand, Debug)]
+pub enum SynthCommand {
+    /// Train table models from database samples
+    Train {
+        /// Connection name (defaults to first configured connection)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Comma-separated table names
+        #[arg(short, long)]
+        tables: String,
+
+        /// Output directory for model and profile JSON files
+        #[arg(short, long, default_value = ".synth")]
+        output: String,
+
+        /// Max rows sampled per table
+        #[arg(long, default_value_t = 10_000)]
+        sample: usize,
+    },
+
+    /// Draft a rules YAML from database foreign keys
+    RulesDraft {
+        /// Connection name (defaults to first configured connection)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Comma-separated table names
+        #[arg(short, long)]
+        tables: String,
+
+        /// Path of the rules YAML to write
+        #[arg(short, long, default_value = "synth-rules.yaml")]
+        output: String,
+
+        /// Directory holding trained profiles; enables unique-FK detection
+        #[arg(long, default_value = ".synth")]
+        models: String,
+    },
+
+    /// Generate synthetic rows from trained models and rules
+    Generate {
+        /// Directory holding trained model JSON files
+        #[arg(long, default_value = ".synth")]
+        models: String,
+
+        /// Rules YAML path
+        #[arg(long, default_value = "synth-rules.yaml")]
+        rules: String,
+
+        /// Output directory for generated data
+        #[arg(short, long, default_value = "synth-out")]
+        output: String,
+
+        /// Rows per table (default 100)
+        #[arg(long)]
+        rows: Option<usize>,
+
+        /// Deterministic seed
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Output format: csv, jsonl, json, sql
+        #[arg(short, long, default_value = "csv")]
+        format: String,
+    },
+
+    /// Validate a trained model file
+    Validate {
+        /// Path to the model JSON file
+        #[arg(short, long)]
+        model: String,
+    },
+}
+
+// ─── 模型拟合（纯函数，无 IO）────────────────────────────────────────────
+
+pub(crate) fn build_model(
+    table: &str,
+    dialect: &str,
+    profile: &TableProfile,
+) -> Result<TableModel, String> {
+    if profile.columns.is_empty() {
+        return Err(format!("table '{}' has no columns to model", table));
+    }
+
+    let mut columns = HashMap::new();
     for (col_name, col_profile) in &profile.columns {
-        let marginal = match col_profile.logical_type.as_str() {
-            "numerical" => {
-                let mean = col_profile.mean.unwrap_or(0.0);
-                let std_dev = col_profile.std_dev.unwrap_or(1.0);
-                crate::synth::marginal::Marginal::Normal(crate::synth::marginal::NormalParams {
-                    loc: mean,
-                    scale: std_dev,
-                })
-            }
-            "categorical" => crate::synth::marginal::Marginal::Categorical(
-                crate::synth::marginal::CategoricalParams {
-                    values: vec!["unknown".to_string()],
-                    weights: vec![1.0],
-                },
-            ),
-            _ => crate::synth::marginal::Marginal::Normal(crate::synth::marginal::NormalParams {
-                loc: 0.0,
-                scale: 1.0,
-            }),
+        let marginal = fit_marginal(col_name, col_profile)?;
+        let logical_type = match col_profile.logical_type.as_str() {
+            "categorical" => LogicalType::Categorical,
+            _ => LogicalType::Numerical,
         };
-
-        columns_map.insert(
+        columns.insert(
             col_name.clone(),
-            crate::synth::model::ColumnModel {
-                logical_type: match col_profile.logical_type.as_str() {
-                    "numerical" => crate::synth::model::LogicalType::Numerical,
-                    "categorical" => crate::synth::model::LogicalType::Categorical,
-                    _ => crate::synth::model::LogicalType::Numerical,
-                },
+            ColumnModel {
+                logical_type,
                 rounding: None,
                 datetime_epoch: None,
                 marginal,
@@ -51,57 +121,99 @@ pub fn run_train(
         );
     }
 
-    let model = TableModel {
+    let column_order: Vec<String> = profile.columns.keys().cloned().collect();
+    let n = column_order.len();
+    let correlation = (0..n)
+        .map(|i| {
+            let mut row = vec![0.0; n];
+            row[i] = 1.0;
+            row
+        })
+        .collect();
+
+    Ok(TableModel {
         version: 1,
-        table: table_name.to_string(),
-        dialect: "mysql".to_string(),
-        provenance: crate::synth::model::Provenance {
+        table: table.to_string(),
+        dialect: dialect.to_string(),
+        provenance: Provenance {
             source: "native".to_string(),
             converter_version: None,
             sdv_version: None,
         },
         pk: vec![],
-        columns: columns_map,
-        copula: crate::synth::model::CopulaInfo {
-            column_order: profile.columns.keys().cloned().collect(),
-            correlation: vec![vec![1.0]],
+        columns,
+        copula: CopulaInfo {
+            column_order,
+            correlation,
         },
-    };
-
-    let model_path = model_dir.join(format!("{}.model.json", table_name));
-    model.save(&model_path)?;
-
-    println!("Model saved to {}", model_path.display());
-    Ok(())
+    })
 }
 
-pub fn run_rules_draft(
-    tables: &[String],
-    foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
-    output: &std::path::Path,
-) -> Result<(), String> {
-    let table_stats = std::collections::HashMap::new();
-    let rules = generate_rules_draft(tables, foreign_keys, &table_stats);
-
-    let yaml = serde_yaml::to_string(&rules).map_err(|e| format!("serialize rules: {}", e))?;
-
-    std::fs::write(output, yaml).map_err(|e| format!("write rules file: {}", e))?;
-
-    println!("Rules draft saved to {}", output.display());
-    Ok(())
+fn fit_marginal(
+    col_name: &str,
+    col: &crate::synth::profile::ColumnProfile,
+) -> Result<Marginal, String> {
+    match col.logical_type.as_str() {
+        "numerical" => Ok(Marginal::Normal(NormalParams {
+            loc: col.mean.unwrap_or(0.0),
+            scale: col.std_dev.unwrap_or(0.0),
+        })),
+        "categorical" => {
+            let top = col.top_values.as_deref().ok_or_else(|| {
+                format!(
+                    "column '{}' is categorical but profile has no value frequencies; retrain",
+                    col_name
+                )
+            })?;
+            Ok(Marginal::Categorical(CategoricalParams {
+                values: top.iter().map(|(v, _)| v.clone()).collect(),
+                weights: top.iter().map(|(_, w)| *w).collect(),
+            }))
+        }
+        other => Err(format!(
+            "column '{}' has logical type '{}'; training supports numerical and categorical only",
+            col_name, other
+        )),
+    }
 }
+
+pub(crate) fn load_profiles(dir: &Path) -> Result<HashMap<String, TableProfile>, String> {
+    let mut profiles = HashMap::new();
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("read models dir {}: {}", dir.display(), e))?;
+    for entry in entries {
+        let path = entry.map_err(|e| format!("read dir entry: {}", e))?.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(table) = stem.strip_suffix(".profile") else {
+            continue;
+        };
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            let profile = TableProfile::load(&path)?;
+            profiles.insert(table.to_string(), profile);
+        }
+    }
+    Ok(profiles)
+}
+
+// ─── 本地命令（无 DB）──────────────────────────────────────────────────
 
 pub fn run_generate(
-    models_dir: &std::path::Path,
-    rules_path: &std::path::Path,
-    output_dir: &std::path::Path,
+    models_dir: &str,
+    rules_path: &str,
+    output_dir: &str,
     rows_per_table: Option<usize>,
     seed: Option<u64>,
     format: &str,
 ) -> Result<(), String> {
+    let models_dir = Path::new(models_dir);
+    let rules_path = Path::new(rules_path);
+    let output_dir = Path::new(output_dir);
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create output dir: {}", e))?;
 
     let rules = SynthRules::load(rules_path)?;
+    rules.validate()?;
 
     let mut models = HashMap::new();
     for entry in std::fs::read_dir(models_dir).map_err(|e| format!("read models dir: {}", e))? {
@@ -109,8 +221,7 @@ pub fn run_generate(
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
             if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                if name.ends_with(".model") {
-                    let table_name = name.strip_suffix(".model").unwrap_or(name);
+                if let Some(table_name) = name.strip_suffix(".model") {
                     let model = TableModel::load(&path)?;
                     models.insert(table_name.to_string(), model);
                 }
@@ -137,7 +248,7 @@ pub fn run_generate(
         "jsonl" => ExportFormat::Jsonl,
         "json" => ExportFormat::Json,
         "sql" => ExportFormat::Sql,
-        _ => return Err(format!("unsupported format: {}", format)),
+        other => return Err(format!("unsupported format: {}", other)),
     };
 
     export(&data.tables, &export_format, output_dir)?;
@@ -149,56 +260,269 @@ pub fn run_generate(
     Ok(())
 }
 
-pub fn run_validate(model_path: &std::path::Path) -> Result<(), String> {
-    let model = TableModel::load(model_path)?;
+pub fn run_validate(model_path: &str) -> Result<(), String> {
+    let model = TableModel::load(Path::new(model_path))?;
 
     println!("Model validation passed:");
     println!("  Table: {}", model.table);
     println!("  Columns: {}", model.columns.len());
+    println!("  Copula dimension: {}", model.copula.correlation.len());
     println!("  Dialect: {}", model.dialect);
 
     Ok(())
 }
 
-pub fn run_import_sdv(pkl_path: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
-    let _content = std::fs::read(pkl_path).map_err(|e| format!("read pkl file: {}", e))?;
-    let _ = output;
+pub(crate) fn parse_foreign_keys(
+    result: &crate::backend::QueryResult,
+) -> Result<Vec<ForeignKeyInfo>, String> {
+    let col = |wanted: &str| -> Result<usize, String> {
+        result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| format!("FK query result missing column '{}'", wanted))
+    };
 
-    Err("SDV pkl import not yet implemented".to_string())
+    let t = col("table_name")?;
+    let c = col("column_name")?;
+    let rt = col("referenced_table")?;
+    let rc = col("referenced_column")?;
+
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            Some(ForeignKeyInfo {
+                from_table: row.get(t)?.as_str()?.to_string(),
+                from_column: row.get(c)?.as_str()?.to_string(),
+                to_table: row.get(rt)?.as_str()?.to_string(),
+                to_column: row.get(rc)?.as_str()?.to_string(),
+            })
+        })
+        .collect())
 }
+
+// ─── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use serde_json::Value;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: SynthCommand,
+    }
+
+    fn parse(argv: &[&str]) -> SynthCommand {
+        TestCli::try_parse_from(argv)
+            .expect("parse synth args")
+            .command
+    }
 
     #[test]
-    fn validate_model_file() {
-        let temp_dir = std::env::temp_dir().join("synth_test_validate");
-        std::fs::create_dir_all(&temp_dir).unwrap();
+    fn parses_train_subcommand() {
+        let cmd = parse(&["synth", "train", "--tables", "users,orders"]);
+        match cmd {
+            SynthCommand::Train {
+                tables,
+                output,
+                sample,
+                ..
+            } => {
+                assert_eq!(tables, "users,orders");
+                assert_eq!(output, ".synth");
+                assert_eq!(sample, 10_000);
+            }
+            other => panic!("expected Train, got {:?}", other),
+        }
+    }
 
-        let model = TableModel {
-            version: 1,
-            table: "test".to_string(),
-            dialect: "mysql".to_string(),
-            provenance: crate::synth::model::Provenance {
-                source: "test".to_string(),
-                converter_version: None,
-                sdv_version: None,
-            },
-            pk: vec![],
-            columns: std::collections::HashMap::new(),
-            copula: crate::synth::model::CopulaInfo {
-                column_order: vec![],
-                correlation: vec![],
-            },
+    #[test]
+    fn parses_generate_with_overrides() {
+        let cmd = parse(&[
+            "synth", "generate", "--models", "m", "--rows", "42", "--seed", "7", "--format", "sql",
+        ]);
+        match cmd {
+            SynthCommand::Generate {
+                models,
+                rules,
+                rows,
+                seed,
+                format,
+                ..
+            } => {
+                assert_eq!(models, "m");
+                assert_eq!(rules, "synth-rules.yaml");
+                assert_eq!(rows, Some(42));
+                assert_eq!(seed, Some(7));
+                assert_eq!(format, "sql");
+            }
+            other => panic!("expected Generate, got {:?}", other),
+        }
+    }
+
+    fn profile_from(columns: &[(&str, Vec<Value>)]) -> TableProfile {
+        let names: Vec<String> = columns.iter().map(|(n, _)| n.to_string()).collect();
+        let rows: Vec<Vec<Value>> = (0..4)
+            .map(|i| columns.iter().map(|(_, vals)| vals[i].clone()).collect())
+            .collect();
+        TableProfile::from_rows("t", &names, &rows)
+    }
+
+    #[test]
+    fn build_model_correlation_matches_column_count() {
+        let profile = profile_from(&[
+            (
+                "a",
+                vec![
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from(3),
+                    Value::from(4),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    Value::from(10),
+                    Value::from(20),
+                    Value::from(30),
+                    Value::from(40),
+                ],
+            ),
+            (
+                "c",
+                vec![
+                    Value::from("x"),
+                    Value::from("x"),
+                    Value::from("y"),
+                    Value::from("y"),
+                ],
+            ),
+        ]);
+
+        let model = build_model("t", "mysql", &profile).unwrap();
+        let n = model.copula.column_order.len();
+        assert_eq!(n, 3);
+        assert_eq!(model.copula.correlation.len(), 3);
+        for (i, row) in model.copula.correlation.iter().enumerate() {
+            assert_eq!(row.len(), 3, "row {} must be 3 wide", i);
+            for (j, &v) in row.iter().enumerate() {
+                assert_eq!(v, if i == j { 1.0 } else { 0.0 });
+            }
+        }
+    }
+
+    #[test]
+    fn build_model_rejects_empty_profile() {
+        let profile = TableProfile::from_rows("t", &[], &[]);
+        assert!(build_model("t", "mysql", &profile).is_err());
+    }
+
+    #[test]
+    fn build_model_fits_categorical_from_top_values() {
+        let profile = profile_from(&[(
+            "status",
+            vec![
+                Value::from("open"),
+                Value::from("open"),
+                Value::from("closed"),
+                Value::from("closed"),
+            ],
+        )]);
+
+        let model = build_model("t", "mysql", &profile).unwrap();
+        let col = model.columns.get("status").unwrap();
+        match &col.marginal {
+            Marginal::Categorical(p) => {
+                let total: f64 = p.weights.iter().sum();
+                assert!((total - 1.0).abs() < 1e-10);
+                assert_eq!(p.values.len(), 2);
+            }
+            other => panic!("expected Categorical, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_model_constant_column_reproduces_value() {
+        let profile = profile_from(&[(
+            "flag",
+            vec![
+                Value::from(5),
+                Value::from(5),
+                Value::from(5),
+                Value::from(5),
+            ],
+        )]);
+
+        let model = build_model("t", "mysql", &profile).unwrap();
+        let col = model.columns.get("flag").unwrap();
+        let generated = col.marginal.inverse_cdf(0.01);
+        let generated2 = col.marginal.inverse_cdf(0.99);
+        assert_eq!(generated, 5.0);
+        assert_eq!(generated2, 5.0);
+    }
+
+    #[test]
+    fn load_profiles_roundtrip_and_ignores_models() {
+        let dir = std::env::temp_dir().join("synth_test_profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let profile = profile_from(&[(
+            "a",
+            vec![
+                Value::from(1),
+                Value::from(2),
+                Value::from(3),
+                Value::from(4),
+            ],
+        )]);
+        profile.save(&dir.join("users.profile.json")).unwrap();
+
+        let model = build_model("users", "mysql", &profile).unwrap();
+        model.save(&dir.join("users.model.json")).unwrap();
+
+        let loaded = load_profiles(&dir).unwrap();
+        assert_eq!(loaded.len(), 1, "model json must not load as profile");
+        assert!(loaded.contains_key("users"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_foreign_keys_maps_columns_case_insensitively() {
+        let result = crate::backend::QueryResult {
+            columns: vec![
+                "TABLE_NAME".to_string(),
+                "COLUMN_NAME".to_string(),
+                "REFERENCED_TABLE".to_string(),
+                "REFERENCED_COLUMN".to_string(),
+            ],
+            rows: vec![vec![
+                Value::from("orders"),
+                Value::from("user_id"),
+                Value::from("users"),
+                Value::from("id"),
+            ]],
+            row_count: 1,
         };
 
-        let model_path = temp_dir.join("test.model.json");
-        model.save(&model_path).unwrap();
+        let fks = parse_foreign_keys(&result).unwrap();
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].from_table, "orders");
+        assert_eq!(fks[0].to_table, "users");
+    }
 
-        let result = run_validate(&model_path);
-        assert!(result.is_ok());
-
-        std::fs::remove_dir_all(&temp_dir).unwrap();
+    #[test]
+    fn parse_foreign_keys_errors_on_missing_column() {
+        let result = crate::backend::QueryResult {
+            columns: vec!["table_name".to_string()],
+            rows: vec![],
+            row_count: 0,
+        };
+        assert!(parse_foreign_keys(&result).is_err());
     }
 }

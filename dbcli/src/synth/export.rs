@@ -97,23 +97,24 @@ fn export_sql(
         let mut file =
             std::fs::File::create(&path).map_err(|e| format!("create SQL file: {}", e))?;
 
-        if let Some(first_row) = rows.first() {
-            let placeholders = vec!["?"; first_row.len()].join(", ");
-            let insert = format!("INSERT INTO {} VALUES ({});", table_name, placeholders);
-
-            for row in rows {
-                let values: Vec<String> = row
-                    .iter()
-                    .map(|v| match v {
-                        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                        Value::Null => "NULL".to_string(),
-                        Value::Number(n) => n.to_string(),
-                        _ => format!("'{}'", v),
-                    })
-                    .collect();
-                let sql = insert.replace("?", &values.join(", "));
-                writeln!(file, "{}", sql).map_err(|e| format!("write SQL row: {}", e))?;
-            }
+        for row in rows {
+            let values: Vec<String> = row
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                    Value::Null => "NULL".to_string(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => format!("'{}'", v),
+                })
+                .collect();
+            writeln!(
+                file,
+                "INSERT INTO {} VALUES ({});",
+                table_name,
+                values.join(", ")
+            )
+            .map_err(|e| format!("write SQL row: {}", e))?;
         }
     }
     Ok(())
@@ -168,6 +169,42 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("col_0"));
         assert!(content.contains("hello"));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn sql_export_emits_each_value_once() {
+        let mut data = HashMap::new();
+        data.insert(
+            "t".to_string(),
+            vec![vec![Value::from(1), Value::from("hello")]],
+        );
+
+        let temp_dir = std::env::temp_dir().join("synth_test_sql");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        export(&data, &ExportFormat::Sql, &temp_dir).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.join("t.sql")).unwrap();
+        let line = content.lines().next().unwrap();
+        assert_eq!(line, "INSERT INTO t VALUES (1, 'hello');");
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn sql_export_escapes_single_quotes() {
+        let mut data = HashMap::new();
+        data.insert("t".to_string(), vec![vec![Value::from("o'brien")]]);
+
+        let temp_dir = std::env::temp_dir().join("synth_test_sql_quote");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        export(&data, &ExportFormat::Sql, &temp_dir).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.join("t.sql")).unwrap();
+        assert!(content.contains("'o''brien'"));
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }

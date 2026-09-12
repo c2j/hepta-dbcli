@@ -1,21 +1,29 @@
 use crate::synth::copula::GaussianCopula;
-use crate::synth::fk_pool::FkPool;
+use crate::synth::fk_pool::{FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
-use crate::synth::rules::SynthRules;
+use crate::synth::rules::{PoolStrategy, SynthRules, TableStrategy};
 use rand::SeedableRng;
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub struct GeneratorConfig {
-    pub rows_per_table: std::collections::HashMap<String, usize>,
+    pub rows_per_table: HashMap<String, usize>,
     pub seed: Option<u64>,
 }
 
+#[derive(Debug)]
 pub struct GeneratedData {
-    pub tables: std::collections::HashMap<String, Vec<Vec<Value>>>,
+    pub tables: HashMap<String, Vec<Vec<Value>>>,
+}
+
+struct RelPool {
+    column: String,
+    pool: FkPool,
+    strategy: SelectionStrategy,
 }
 
 pub fn generate(
-    models: &std::collections::HashMap<String, TableModel>,
+    models: &HashMap<String, TableModel>,
     rules: &SynthRules,
     config: &GeneratorConfig,
 ) -> Result<GeneratedData, String> {
@@ -31,28 +39,14 @@ pub fn generate(
             .iter()
             .map(|t| t.name.clone())
             .collect::<Vec<String>>(),
-        &{
-            let mut edges = Vec::new();
-            for t in &rules.tables {
-                for r in &t.relationships {
-                    for ref_str in &r.references {
-                        let parts: Vec<&str> = ref_str.split('.').collect();
-                        if parts.len() == 2 {
-                            edges.push((t.name.clone(), parts[0].to_string()));
-                        }
-                    }
-                }
-            }
-            edges
-        },
+        &fk_edges(rules),
     )
     .map_err(|e| format!("cycle detected: {}", e))?;
 
-    let mut tables: std::collections::HashMap<String, Vec<Vec<Value>>> =
-        std::collections::HashMap::new();
+    let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
 
-    let mut fk_pools: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    // "table.column" -> 该列已生成的全部值；子表 FK 从这里采样，保证引用完整性
+    let mut column_pools: HashMap<String, Vec<Value>> = HashMap::new();
 
     for table_name in &table_order {
         let model = models
@@ -71,6 +65,19 @@ pub fn generate(
             .copied()
             .unwrap_or(100);
 
+        let strategy = match rule.strategy {
+            TableStrategy::Uniform => SelectionStrategy::Uniform,
+            TableStrategy::Zipf => SelectionStrategy::Zipf,
+            TableStrategy::Weighted => {
+                return Err(format!(
+                    "table '{}': Weighted strategy is not supported; use uniform or zipf",
+                    table_name
+                ));
+            }
+        };
+
+        let rel_pools = build_rel_pools(table_name, rule, &column_pools, strategy)?;
+
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
         let uniform_samples = copula.sample(row_count, config.seed);
@@ -81,71 +88,44 @@ pub fn generate(
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
-                let column_model = model.columns.get(col_name);
+                if let Some(rel) = rel_pools.iter().find(|r| &r.column == col_name) {
+                    let value = rel.pool.sample_one(rel.strategy, &mut rng).ok_or_else(|| {
+                        format!(
+                            "FK pool for '{}.{}' is empty; parent table generated no rows",
+                            table_name, col_name
+                        )
+                    })?;
+                    row.push(value);
+                    continue;
+                }
 
-                let rel = rule.relationships.iter().find(|r| &r.pk == col_name);
+                let uniform_val = uniform_samples
+                    .get(col_idx)
+                    .and_then(|col| col.get(t))
+                    .copied()
+                    .unwrap_or(0.5);
 
-                if let Some(rel) = rel {
-                    let ref_str = rel
-                        .references
-                        .first()
-                        .ok_or_else(|| format!("relationship '{}' has no references", col_name))?;
-                    let parts: Vec<&str> = ref_str.split('.').collect();
-                    let ref_table = parts[0].to_string();
-
-                    if let Some(pool) = fk_pools.get(&ref_table) {
-                        let values = pool.clone();
-                        let fanout = crate::synth::fk_pool::FanoutStrategy::Fixed(1);
-                        let fk_pool = FkPool::new_projection(values);
-                        let sampled = fk_pool.sample(&fanout, &mut rng);
-                        let val = sampled.first().cloned().unwrap_or_default();
-                        row.push(Value::String(val));
-                    } else if let Some(ref_model) = models.get(&ref_table) {
-                        if let Some(ref_col) = ref_model.columns.get(parts[1]) {
-                            let uniform_val = uniform_samples
-                                .get(col_idx)
-                                .and_then(|col| col.get(t))
-                                .copied()
-                                .unwrap_or(0.5);
-                            let generated = ref_col.marginal.inverse_cdf(uniform_val);
-                            row.push(Value::from(generated));
-                        } else {
-                            row.push(Value::Null);
-                        }
-                    } else {
-                        row.push(Value::Null);
+                match model.columns.get(col_name).map(|c| &c.marginal) {
+                    Some(crate::synth::marginal::Marginal::Categorical(p)) => {
+                        let idx = p.sample_index(uniform_val);
+                        row.push(Value::String(
+                            p.values.get(idx).cloned().unwrap_or_default(),
+                        ));
                     }
-                } else if let Some(col_model) = column_model {
-                    let uniform_val = uniform_samples
-                        .get(col_idx)
-                        .and_then(|col| col.get(t))
-                        .copied()
-                        .unwrap_or(0.5);
-                    let generated = col_model.marginal.inverse_cdf(uniform_val);
-                    row.push(Value::from(generated));
-                } else {
-                    row.push(Value::Null);
+                    Some(marginal) => row.push(Value::from(marginal.inverse_cdf(uniform_val))),
+                    None => row.push(Value::Null),
                 }
             }
 
             rows.push(row);
         }
 
-        if let Some(_pk_col) = model.pk.first() {
-            let pk_values: Vec<String> = rows
+        for (col_idx, col_name) in column_order.iter().enumerate() {
+            let values: Vec<Value> = rows
                 .iter()
-                .enumerate()
-                .map(|(i, row)| {
-                    row.first()
-                        .map(|v| match v {
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => s.clone(),
-                            _ => i.to_string(),
-                        })
-                        .unwrap_or_else(|| i.to_string())
-                })
+                .filter_map(|r| r.get(col_idx).cloned())
                 .collect();
-            fk_pools.insert(table_name.clone(), pk_values);
+            column_pools.insert(format!("{}.{}", table_name, col_name), values);
         }
 
         tables.insert(table_name.clone(), rows);
@@ -154,18 +134,158 @@ pub fn generate(
     Ok(GeneratedData { tables })
 }
 
+fn fk_edges(rules: &SynthRules) -> Vec<(String, String)> {
+    let known: std::collections::HashSet<&str> =
+        rules.tables.iter().map(|t| t.name.as_str()).collect();
+    let mut edges = Vec::new();
+    for t in &rules.tables {
+        for r in &t.relationships {
+            for ref_str in &r.references {
+                let parts: Vec<&str> = ref_str.split('.').collect();
+                if parts.len() == 2 && known.contains(parts[0]) {
+                    // 边语义 (from, to) = from 先于 to：父表必须先生成
+                    edges.push((parts[0].to_string(), t.name.clone()));
+                }
+            }
+        }
+    }
+    edges
+}
+
+fn build_rel_pools(
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    column_pools: &HashMap<String, Vec<Value>>,
+    strategy: SelectionStrategy,
+) -> Result<Vec<RelPool>, String> {
+    let mut rel_pools = Vec::new();
+    for rel in &rule.relationships {
+        let ref_str = rel
+            .references
+            .first()
+            .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
+
+        let pool = match &rel.pool_strategy {
+            PoolStrategy::Fixed { values } => {
+                FkPool::new(values.iter().map(|v| Value::String(v.clone())).collect())
+            }
+            PoolStrategy::Projection { .. } | PoolStrategy::Generated { .. } => {
+                let values = column_pools.get(ref_str).ok_or_else(|| {
+                    format!(
+                        "table '{}' references '{}' but that table.column was not generated \
+                         first; add a rule and model for it",
+                        table_name, ref_str
+                    )
+                })?;
+                FkPool::new(values.clone())
+            }
+        };
+
+        rel_pools.push(RelPool {
+            column: rel.pk.clone(),
+            pool,
+            strategy,
+        });
+    }
+    Ok(rel_pools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synth::marginal::{Marginal, NormalParams};
-    use std::collections::HashMap;
+    use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
+    use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
+    use crate::synth::rules::{Relationship, TableRule};
 
-    fn make_test_model(table: &str) -> TableModel {
+    fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
         let mut columns = HashMap::new();
         columns.insert(
-            "id".to_string(),
-            crate::synth::model::ColumnModel {
-                logical_type: crate::synth::model::LogicalType::Numerical,
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                marginal: Marginal::Normal(NormalParams { loc, scale }),
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+            },
+            pk: vec![column.to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![column.to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        }
+    }
+
+    fn single_rule(table: &str, relationships: Vec<Relationship>) -> TableRule {
+        TableRule {
+            name: table.to_string(),
+            relationships,
+            strategy: TableStrategy::default(),
+        }
+    }
+
+    fn config(tables: &[&str], rows: usize) -> GeneratorConfig {
+        GeneratorConfig {
+            rows_per_table: tables.iter().map(|t| (t.to_string(), rows)).collect(),
+            seed: Some(42),
+        }
+    }
+
+    #[test]
+    fn generator_produces_correct_row_count() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+
+        let config = config(&["users"], 50);
+
+        let result = generate(&models, &rules, &config).unwrap();
+        assert_eq!(result.tables.get("users").unwrap().len(), 50);
+    }
+
+    #[test]
+    fn child_fk_values_come_from_parent_column() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        // orders 模型含全部列（与真实训练产物一致）：total + FK 列 user_id
+        let mut order_columns = HashMap::new();
+        order_columns.insert(
+            "total".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 10.0,
+                    scale: 2.0,
+                }),
+            },
+        );
+        order_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
                 marginal: Marginal::Normal(NormalParams {
@@ -174,48 +294,226 @@ mod tests {
                 }),
             },
         );
+        models.insert(
+            "orders".to_string(),
+            TableModel {
+                version: 1,
+                table: "orders".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns: order_columns,
+                copula: CopulaInfo {
+                    column_order: vec!["total".to_string(), "user_id".to_string()],
+                    correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                },
+            },
+        );
 
-        TableModel {
-            version: 1,
-            table: table.to_string(),
-            dialect: "mysql".to_string(),
-            provenance: crate::synth::model::Provenance {
-                source: "test".to_string(),
-                converter_version: None,
-                sdv_version: None,
-            },
-            pk: vec!["id".to_string()],
-            columns,
-            copula: crate::synth::model::CopulaInfo {
-                column_order: vec!["id".to_string()],
-                correlation: vec![vec![1.0]],
-            },
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let config = config(&["users", "orders"], 30);
+
+        let result = generate(&models, &rules, &config).unwrap();
+
+        let users = result.tables.get("users").unwrap();
+        let orders = result.tables.get("orders").unwrap();
+        assert_eq!(users.len(), 30);
+        assert_eq!(orders.len(), 30);
+
+        let parent_ids: std::collections::HashSet<u64> = users
+            .iter()
+            .filter_map(|r| r.first())
+            .filter_map(|v| v.as_f64())
+            .map(|f| f.to_bits())
+            .collect();
+        assert!(!parent_ids.is_empty());
+
+        let user_id_idx = 1;
+        for row in orders {
+            let f = row[user_id_idx].as_f64().expect("FK must stay numeric");
+            assert!(
+                parent_ids.contains(&f.to_bits()),
+                "FK value {} not in parent ids",
+                f
+            );
         }
     }
 
     #[test]
-    fn generator_produces_correct_row_count() {
+    fn generate_errors_when_reference_target_missing() {
         let mut models = HashMap::new();
-        models.insert("users".to_string(), make_test_model("users"));
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 10.0, 2.0),
+        );
 
         let rules = SynthRules {
             version: "1".to_string(),
-            tables: vec![crate::synth::rules::TableRule {
+            tables: vec![single_rule(
+                "orders",
+                vec![Relationship {
+                    pk: "total".to_string(),
+                    references: vec!["ghost.id".to_string()],
+                    pool_strategy: PoolStrategy::Projection { unique: false },
+                    null_label: "null".to_string(),
+                }],
+            )],
+        };
+
+        let config = config(&["orders"], 5);
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(
+            err.contains("ghost.id"),
+            "error should name the target: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn weighted_strategy_rejected_with_clear_error() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![TableRule {
                 name: "users".to_string(),
                 relationships: vec![],
-                strategy: crate::synth::rules::TableStrategy::default(),
+                strategy: TableStrategy::Weighted,
             }],
         };
 
-        let mut rows_per_table = HashMap::new();
-        rows_per_table.insert("users".to_string(), 50);
+        let config = config(&["users"], 5);
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(err.contains("Weighted"), "error: {}", err);
+    }
 
-        let config = GeneratorConfig {
-            rows_per_table,
-            seed: Some(42),
+    #[test]
+    fn fixed_pool_strategy_uses_yaml_values() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule(
+                "users",
+                vec![Relationship {
+                    pk: "id".to_string(),
+                    references: vec!["region.code".to_string()],
+                    pool_strategy: PoolStrategy::Fixed {
+                        values: vec!["CN".to_string(), "US".to_string()],
+                    },
+                    null_label: "null".to_string(),
+                }],
+            )],
         };
 
+        let config = config(&["users"], 10);
         let result = generate(&models, &rules, &config).unwrap();
-        assert_eq!(result.tables.get("users").unwrap().len(), 50);
+        let users = result.tables.get("users").unwrap();
+        assert_eq!(users.len(), 10);
+        for row in users {
+            let v = row.last().unwrap();
+            if let Some(s) = v.as_str() {
+                assert!(s == "CN" || s == "US", "unexpected FK value: {}", s);
+            }
+        }
+    }
+
+    #[test]
+    fn categorical_column_generates_declared_values() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "status".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: None,
+                datetime_epoch: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["open".to_string(), "closed".to_string()],
+                    weights: vec![0.5, 0.5],
+                }),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "tasks".to_string(),
+            TableModel {
+                version: 1,
+                table: "tasks".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec!["status".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("tasks", vec![])],
+        };
+
+        let config = config(&["tasks"], 20);
+        let result = generate(&models, &rules, &config).unwrap();
+        for row in result.tables.get("tasks").unwrap() {
+            let v = row.first().unwrap();
+            let s = v.as_str().expect("categorical value must be a string");
+            assert!(s == "open" || s == "closed", "unexpected: {}", s);
+        }
+    }
+
+    #[test]
+    fn zipf_strategy_generates_all_rows() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![TableRule {
+                name: "users".to_string(),
+                relationships: vec![],
+                strategy: TableStrategy::Zipf,
+            }],
+        };
+
+        let config = config(&["users"], 25);
+        let result = generate(&models, &rules, &config).unwrap();
+        assert_eq!(result.tables.get("users").unwrap().len(), 25);
     }
 }

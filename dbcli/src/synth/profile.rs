@@ -18,7 +18,11 @@ pub struct ColumnProfile {
     pub max: Option<Value>,
     pub mean: Option<f64>,
     pub std_dev: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_values: Option<Vec<(String, f64)>>,
 }
+
+const TOP_VALUES_CAP: usize = 50;
 
 impl ColumnProfile {
     pub fn from_samples(samples: &[Value]) -> Self {
@@ -60,6 +64,24 @@ impl ColumnProfile {
             ("unknown".to_string(), None, None, None, None)
         };
 
+        let top_values = if logical_type == "categorical" {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for v in &non_null {
+                if let Some(s) = v.as_str() {
+                    *counts.entry(s.to_string()).or_insert(0) += 1;
+                }
+            }
+            let mut entries: Vec<(String, f64)> = counts
+                .into_iter()
+                .map(|(k, c)| (k, c as f64 / non_null.len() as f64))
+                .collect();
+            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            entries.truncate(TOP_VALUES_CAP);
+            Some(entries)
+        } else {
+            None
+        };
+
         Self {
             logical_type,
             null_rate,
@@ -68,6 +90,7 @@ impl ColumnProfile {
             max,
             mean,
             std_dev,
+            top_values,
         }
     }
 }
@@ -125,6 +148,41 @@ mod tests {
         let profile = ColumnProfile::from_samples(&samples);
         assert!((profile.null_rate - 0.25).abs() < 0.01);
         assert_eq!(profile.cardinality, 3);
+    }
+
+    #[test]
+    fn column_profile_captures_top_values_for_categorical() {
+        let samples: Vec<Value> = ["a", "a", "a", "b", "b", "c"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        let top = profile.top_values.expect("top_values captured");
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0], ("a".to_string(), 0.5));
+        assert_eq!(top[1], ("b".to_string(), 1.0 / 3.0));
+        assert_eq!(top[2], ("c".to_string(), 1.0 / 6.0));
+    }
+
+    #[test]
+    fn column_profile_top_values_capped_at_50() {
+        let samples: Vec<Value> = (0..80)
+            .map(|i| Value::from(format!("v{}", i)))
+            .chain(std::iter::repeat_n(Value::from("common"), 20))
+            .collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        let top = profile.top_values.expect("top_values captured");
+        assert_eq!(top.len(), 50);
+        assert_eq!(top[0], ("common".to_string(), 0.2));
+    }
+
+    #[test]
+    fn column_profile_numerical_has_no_top_values() {
+        let samples = vec![serde_json::json!(1), serde_json::json!(2)];
+        let profile = ColumnProfile::from_samples(&samples);
+        assert!(profile.top_values.is_none());
     }
 
     #[test]

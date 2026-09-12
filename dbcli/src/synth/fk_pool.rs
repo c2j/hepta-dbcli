@@ -1,82 +1,56 @@
 use rand::Rng;
+use serde_json::Value;
 
-pub enum FkPool {
-    Projection(Vec<String>),
-    Generated(Vec<String>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionStrategy {
+    Uniform,
+    Zipf,
 }
 
-pub enum FanoutStrategy {
-    Fixed(usize),
-    Uniform(usize, usize),
-    Zipf(usize),
+pub struct FkPool {
+    values: Vec<Value>,
+    harmonic: f64,
 }
 
 impl FkPool {
-    pub fn sample(&self, strategy: &FanoutStrategy, rng: &mut impl Rng) -> Vec<String> {
-        match self {
-            FkPool::Projection(values) => {
-                if values.is_empty() {
-                    return vec![];
-                }
-                match strategy {
-                    FanoutStrategy::Fixed(n) => {
-                        let mut result = Vec::new();
-                        for _ in 0..*n {
-                            let idx = rng.gen_range(0..values.len());
-                            result.push(values[idx].clone());
-                        }
-                        result
-                    }
-                    FanoutStrategy::Uniform(min, max) => {
-                        let n = rng.gen_range(*min..=*max);
-                        let mut result = Vec::new();
-                        for _ in 0..n {
-                            let idx = rng.gen_range(0..values.len());
-                            result.push(values[idx].clone());
-                        }
-                        result
-                    }
-                    FanoutStrategy::Zipf(_n) => {
-                        vec![values[0].clone()]
-                    }
-                }
-            }
-            FkPool::Generated(values) => {
-                if values.is_empty() {
-                    return vec![];
-                }
-                match strategy {
-                    FanoutStrategy::Fixed(n) => {
-                        let mut result = Vec::new();
-                        for _ in 0..*n {
-                            let idx = rng.gen_range(0..values.len());
-                            result.push(values[idx].clone());
-                        }
-                        result
-                    }
-                    FanoutStrategy::Uniform(min, max) => {
-                        let n = rng.gen_range(*min..=*max);
-                        let mut result = Vec::new();
-                        for _ in 0..n {
-                            let idx = rng.gen_range(0..values.len());
-                            result.push(values[idx].clone());
-                        }
-                        result
-                    }
-                    FanoutStrategy::Zipf(_n) => {
-                        vec![values[0].clone()]
-                    }
-                }
+    pub fn new(values: Vec<Value>) -> Self {
+        let harmonic: f64 = (1..=values.len()).map(|k| 1.0 / k as f64).sum();
+        Self { values, harmonic }
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn sample_one(&self, strategy: SelectionStrategy, rng: &mut impl Rng) -> Option<Value> {
+        if self.values.is_empty() {
+            return None;
+        }
+        let idx = match strategy {
+            SelectionStrategy::Uniform => rng.gen_range(0..self.values.len()),
+            SelectionStrategy::Zipf => self.zipf_index(rng),
+        };
+        self.values.get(idx).cloned()
+    }
+
+    // P(rank) ∝ 1/rank 的逆变换采样；walk 均摊 O(1)（Zipf 集中在头部）
+    fn zipf_index(&self, rng: &mut impl Rng) -> usize {
+        if self.harmonic <= 0.0 {
+            return 0;
+        }
+        let u: f64 = rng.gen_range(0.0..self.harmonic);
+        let mut acc = 0.0;
+        for (i, k) in (1..=self.values.len()).enumerate() {
+            acc += 1.0 / k as f64;
+            if u < acc {
+                return i;
             }
         }
-    }
-
-    pub fn new_projection(values: Vec<String>) -> Self {
-        Self::Projection(values)
-    }
-
-    pub fn new_generated(values: Vec<String>) -> Self {
-        Self::Generated(values)
+        self.values.len() - 1
     }
 }
 
@@ -85,37 +59,71 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
-    #[test]
-    fn projection_pool_samples_correct_count() {
-        let pool = FkPool::new_projection(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let result = pool.sample(&FanoutStrategy::Fixed(5), &mut rng);
-        assert_eq!(result.len(), 5);
+    fn pool(n: usize) -> FkPool {
+        FkPool::new((0..n).map(|i| Value::from(i as f64)).collect())
     }
 
     #[test]
-    fn projection_pool_empty_returns_empty() {
-        let pool = FkPool::new_projection(vec![]);
+    fn empty_pool_returns_none() {
+        let p = pool(0);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let result = pool.sample(&FanoutStrategy::Fixed(5), &mut rng);
-        assert!(result.is_empty());
+        assert!(p.sample_one(SelectionStrategy::Uniform, &mut rng).is_none());
+        assert!(p.sample_one(SelectionStrategy::Zipf, &mut rng).is_none());
     }
 
     #[test]
-    fn uniform_fanout_generates_within_range() {
-        let pool = FkPool::new_projection(vec!["x".to_string()]);
+    fn uniform_covers_most_of_pool() {
+        let p = pool(50);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-
-        let mut min_seen = usize::MAX;
-        let mut max_seen = usize::MIN;
-
-        for _ in 0..100 {
-            let result = pool.sample(&FanoutStrategy::Uniform(3, 7), &mut rng);
-            min_seen = min_seen.min(result.len());
-            max_seen = max_seen.max(result.len());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            if let Some(v) = p.sample_one(SelectionStrategy::Uniform, &mut rng) {
+                seen.insert(v.as_f64().unwrap() as usize);
+            }
         }
+        assert!(
+            seen.len() >= 45,
+            "uniform covered only {} of 50",
+            seen.len()
+        );
+    }
 
-        assert!(min_seen >= 3);
-        assert!(max_seen <= 7);
+    #[test]
+    fn zipf_skews_toward_head() {
+        let p = pool(100);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut head_hits = 0usize;
+        let mut tail_hits = 0usize;
+        for _ in 0..5000 {
+            let v = p
+                .sample_one(SelectionStrategy::Zipf, &mut rng)
+                .unwrap()
+                .as_f64()
+                .unwrap() as usize;
+            if v < 10 {
+                head_hits += 1;
+            } else if v >= 90 {
+                tail_hits += 1;
+            }
+        }
+        assert!(
+            head_hits > tail_hits * 10,
+            "head {} should dominate tail {} under Zipf",
+            head_hits,
+            tail_hits
+        );
+    }
+
+    #[test]
+    fn sample_one_returns_pool_values() {
+        let p = pool(3);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..20 {
+            let v = p.sample_one(SelectionStrategy::Uniform, &mut rng).unwrap();
+            let f = v.as_f64().unwrap();
+            assert!((0.0..3.0).contains(&f));
+        }
+        assert_eq!(p.len(), 3);
+        assert!(!p.is_empty());
     }
 }

@@ -92,6 +92,13 @@ enum Commands {
         args: Box<delta_diff::cmd::DeltaDiffArgs>,
     },
 
+    /// Synthetic data generation (train / rules-draft / generate / validate)
+    #[cfg(feature = "synth")]
+    Synth {
+        #[command(flatten)]
+        args: Box<synth::cmd::SynthArgs>,
+    },
+
     /// Execute SQL from command line
     Cli {
         /// SQL statement to execute
@@ -1017,6 +1024,11 @@ async fn main() {
         }
         Some(Commands::DeltaDiff { args }) => {
             let code = delta_diff::run(*args, cli.config).await;
+            std::process::exit(code);
+        }
+        #[cfg(feature = "synth")]
+        Some(Commands::Synth { args }) => {
+            let code = synth::run(*args, cli.config).await;
             std::process::exit(code);
         }
         Some(Commands::Cli {

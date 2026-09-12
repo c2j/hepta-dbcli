@@ -355,7 +355,7 @@ pub(crate) fn quote_table_scheme(
     }
 }
 
-fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
+pub(crate) fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
     let s = if backslash_escape {
         s.replace('\\', "\\\\")
     } else {

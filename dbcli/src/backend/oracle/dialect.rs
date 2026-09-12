@@ -134,7 +134,7 @@ impl Dialect for OracleDialect {
              WHERE ac.CONSTRAINT_TYPE = 'R' \
                AND ac.OWNER = '{schema}' \
              ORDER BY acc.CONSTRAINT_NAME, acc.POSITION",
-            schema = schema.to_uppercase()
+            schema = crate::backend::escape_sql_string(&schema.to_uppercase(), false)
         )
     }
 
@@ -480,6 +480,13 @@ fn oracle_number_scale(data_type_upper: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::backend::Dialect;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let sql = OracleDialect::new().foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("EVIL''; DROP TABLE X;--"));
+    }
 
     #[test]
     fn test_session_pin_sets_deterministic_nls() {

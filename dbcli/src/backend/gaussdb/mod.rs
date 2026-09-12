@@ -74,7 +74,7 @@ impl Dialect for GaussdbDialect {
              JOIN pg_attribute ar ON ar.attrelid = cr.oid AND ar.attnum = ANY(con.confkey) \
              WHERE con.contype = 'f' AND n.nspname = '{schema}' \
              ORDER BY con.conname, a.attnum",
-            schema = schema
+            schema = crate::backend::escape_sql_string(schema, false)
         )
     }
 
@@ -379,6 +379,14 @@ impl Dialect for GaussdbDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let d = GaussdbDialect;
+        let sql = d.foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("evil''; DROP TABLE x;--"));
+    }
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {
