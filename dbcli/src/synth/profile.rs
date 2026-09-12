@@ -22,9 +22,15 @@ pub struct ColumnProfile {
     pub std_dev: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_values: Option<Vec<(String, f64)>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_integer: bool,
 }
 
 const TOP_VALUES_CAP: usize = 50;
+
+fn is_unsupported_placeholder(s: &str) -> bool {
+    s.starts_with("<unsupported type")
+}
 
 impl ColumnProfile {
     pub fn from_samples(samples: &[Value]) -> Self {
@@ -61,10 +67,23 @@ impl ColumnProfile {
                 Some(std_dev),
             )
         } else if non_null[0].is_string() {
-            ("categorical".to_string(), None, None, None, None)
+            if non_null
+                .iter()
+                .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
+            {
+                ("unsupported".to_string(), None, None, None, None)
+            } else {
+                ("categorical".to_string(), None, None, None, None)
+            }
         } else {
             ("unknown".to_string(), None, None, None, None)
         };
+
+        let is_integer = logical_type == "numerical"
+            && non_null
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .all(|f| f.fract() == 0.0);
 
         let top_values = if logical_type == "categorical" {
             let mut counts: HashMap<String, usize> = HashMap::new();
@@ -93,6 +112,7 @@ impl ColumnProfile {
             mean,
             std_dev,
             top_values,
+            is_integer,
         }
     }
 }
@@ -179,6 +199,34 @@ mod tests {
         let top = profile.top_values.expect("top_values captured");
         assert_eq!(top.len(), 50);
         assert_eq!(top[0], ("common".to_string(), 0.2));
+    }
+
+    #[test]
+    fn column_profile_detects_integer_columns() {
+        let samples = vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ];
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(profile.is_integer);
+    }
+
+    #[test]
+    fn column_profile_detects_fractional_numerical() {
+        let samples = vec![serde_json::json!(1.5), serde_json::json!(2.0)];
+        let profile = ColumnProfile::from_samples(&samples);
+        assert!(!profile.is_integer);
+    }
+
+    #[test]
+    fn column_profile_marks_driver_placeholder_unsupported() {
+        let placeholder = "<unsupported type timestamptz>: \\x0002b0cf204c2000";
+        let samples = vec![Value::from(placeholder), Value::from(placeholder)];
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "unsupported");
+        assert!(profile.top_values.is_none());
     }
 
     #[test]

@@ -50,6 +50,7 @@ jobs:
           key: clippy-target-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo clippy --all --all-targets
+      - run: cargo clippy --all --all-targets --features synth
 
   test:
     name: test
@@ -96,6 +97,7 @@ jobs:
             FLUSH PRIVILEGES;
           "
       - run: cargo test --all
+      - run: cargo test --all --features synth
       - run: cargo test --all --features integration
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb

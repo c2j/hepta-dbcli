@@ -39,18 +39,31 @@ pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
         cmd::SynthCommand::Train {
             name,
             tables,
+            schema,
             output,
             sample,
-        } => run_train(name, &tables, Path::new(&output), sample, config_path).await,
+        } => {
+            run_train(
+                name,
+                &tables,
+                schema.as_deref(),
+                Path::new(&output),
+                sample,
+                config_path,
+            )
+            .await
+        }
         cmd::SynthCommand::RulesDraft {
             name,
             tables,
+            schema,
             output,
             models,
         } => {
             run_rules_draft(
                 name,
                 &tables,
+                schema,
                 Path::new(&output),
                 Path::new(&models),
                 config_path,
@@ -138,6 +151,7 @@ fn split_tables(tables: &str) -> Vec<String> {
 async fn run_train(
     name: Option<String>,
     tables: &str,
+    schema: Option<&str>,
     output_dir: &Path,
     sample: usize,
     config_path: Option<String>,
@@ -163,7 +177,7 @@ async fn run_train(
         let sql = {
             let dialect = conn.dialect();
             dialect.add_limit(
-                &format!("SELECT * FROM {}", dialect.quote_ident(table)),
+                &format!("SELECT * FROM {}", dialect.quote_table(schema, table)),
                 sample,
             )
         };
@@ -174,7 +188,13 @@ async fn run_train(
 
         let profile =
             crate::synth::profile::TableProfile::from_rows(table, &result.columns, &result.rows);
-        let model = cmd::build_model(table, &scheme, &profile)?;
+        let (model, skipped) = cmd::build_model(table, &scheme, &profile)?;
+        for col in &skipped {
+            eprintln!(
+                "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",
+                table, col
+            );
+        }
 
         let model_path = output_dir.join(format!("{}.model.json", table));
         let profile_path = output_dir.join(format!("{}.profile.json", table));
@@ -196,6 +216,7 @@ async fn run_train(
 async fn run_rules_draft(
     name: Option<String>,
     tables: &str,
+    schema: Option<String>,
     output: &Path,
     models_dir: &Path,
     config_path: Option<String>,
@@ -210,9 +231,15 @@ async fn run_rules_draft(
     let side = resolve_connection(&raw, &name)?;
     let mut conn = connect(&side).await?;
 
-    let schema =
-        crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
-            .await?;
+    // 与 train 的 --schema 语义一致：显式指定优先，否则取连接默认 schema，
+    // 保证 FK 发现与训练看到同一张表
+    let schema = match schema {
+        Some(s) => s,
+        None => {
+            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
+                .await?
+        }
+    };
 
     let fk_sql = conn.dialect().foreign_keys_sql(&schema);
     let result = conn

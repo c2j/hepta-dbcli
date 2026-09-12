@@ -21,13 +21,17 @@ pub struct SynthArgs {
 pub enum SynthCommand {
     /// Train table models from database samples
     Train {
-        /// Connection name (defaults to first configured connection)
+        /// Connection name (defaults to configured default connection)
         #[arg(short, long)]
         name: Option<String>,
 
         /// Comma-separated table names
         #[arg(short, long)]
         tables: String,
+
+        /// Schema qualifier for the tables (defaults to the connection default)
+        #[arg(long)]
+        schema: Option<String>,
 
         /// Output directory for model and profile JSON files
         #[arg(short, long, default_value = ".synth")]
@@ -40,13 +44,17 @@ pub enum SynthCommand {
 
     /// Draft a rules YAML from database foreign keys
     RulesDraft {
-        /// Connection name (defaults to first configured connection)
+        /// Connection name (defaults to configured default connection)
         #[arg(short, long)]
         name: Option<String>,
 
         /// Comma-separated table names
         #[arg(short, long)]
         tables: String,
+
+        /// Schema to scan for foreign keys (defaults to the connection default)
+        #[arg(long)]
+        schema: Option<String>,
 
         /// Path of the rules YAML to write
         #[arg(short, long, default_value = "synth-rules.yaml")]
@@ -98,48 +106,58 @@ pub(crate) fn build_model(
     table: &str,
     dialect: &str,
     profile: &TableProfile,
-) -> Result<TableModel, String> {
+) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
     }
 
     let mut columns = HashMap::new();
+    let mut skipped = Vec::new();
     for (col_name, col_profile) in &profile.columns {
-        let marginal = fit_marginal(col_name, col_profile)?;
-        let logical_type = match col_profile.logical_type.as_str() {
-            "categorical" => LogicalType::Categorical,
-            _ => LogicalType::Numerical,
-        };
-        columns.insert(
-            col_name.clone(),
-            ColumnModel {
-                logical_type,
-                rounding: None,
-                datetime_epoch: None,
-                marginal,
-            },
-        );
+        match fit_marginal(col_name, col_profile) {
+            Ok(marginal) => {
+                let logical_type = match col_profile.logical_type.as_str() {
+                    "categorical" => LogicalType::Categorical,
+                    _ => LogicalType::Numerical,
+                };
+                let rounding = if col_profile.is_integer {
+                    Some(0)
+                } else {
+                    None
+                };
+                columns.insert(
+                    col_name.clone(),
+                    ColumnModel {
+                        logical_type,
+                        rounding,
+                        datetime_epoch: None,
+                        marginal,
+                    },
+                );
+            }
+            Err(_) => skipped.push(col_name.clone()),
+        }
+    }
+
+    if columns.is_empty() {
+        return Err(format!(
+            "table '{}' has no trainable columns (all unsupported)",
+            table
+        ));
     }
 
     let mut column_order: Vec<String> = profile
         .column_order
         .iter()
-        .filter(|c| profile.columns.contains_key(*c))
+        .filter(|c| columns.contains_key(*c))
         .cloned()
         .collect();
     if column_order.is_empty() {
-        column_order = profile.columns.keys().cloned().collect();
+        column_order = columns.keys().cloned().collect();
     }
     let n = column_order.len();
-    let correlation = (0..n)
-        .map(|i| {
-            let mut row = vec![0.0; n];
-            row[i] = 1.0;
-            row
-        })
-        .collect();
 
-    Ok(TableModel {
+    let model = TableModel {
         version: 1,
         table: table.to_string(),
         dialect: dialect.to_string(),
@@ -152,9 +170,16 @@ pub(crate) fn build_model(
         columns,
         copula: CopulaInfo {
             column_order,
-            correlation,
+            correlation: (0..n)
+                .map(|i| {
+                    let mut row = vec![0.0; n];
+                    row[i] = 1.0;
+                    row
+                })
+                .collect(),
         },
-    })
+    };
+    Ok((model, skipped))
 }
 
 fn fit_marginal(
@@ -288,6 +313,10 @@ pub fn run_validate(model_path: &str) -> Result<(), String> {
 pub(crate) fn parse_foreign_keys(
     result: &crate::backend::QueryResult,
 ) -> Result<Vec<ForeignKeyInfo>, String> {
+    if result.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let col = |wanted: &str| -> Result<usize, String> {
         result
             .columns
@@ -417,7 +446,8 @@ mod tests {
             ),
         ]);
 
-        let model = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        assert!(skipped.is_empty());
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
         assert_eq!(model.copula.column_order, vec!["a", "b", "c"]);
@@ -448,7 +478,8 @@ mod tests {
             ],
         )]);
 
-        let model = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        assert!(skipped.is_empty());
         let col = model.columns.get("status").unwrap();
         match &col.marginal {
             Marginal::Categorical(p) => {
@@ -472,7 +503,8 @@ mod tests {
             ],
         )]);
 
-        let model = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        assert!(skipped.is_empty());
         let col = model.columns.get("flag").unwrap();
         let generated = col.marginal.inverse_cdf(0.01);
         let generated2 = col.marginal.inverse_cdf(0.99);
@@ -496,7 +528,7 @@ mod tests {
         )]);
         profile.save(&dir.join("users.profile.json")).unwrap();
 
-        let model = build_model("users", "mysql", &profile).unwrap();
+        let (model, _) = build_model("users", "mysql", &profile).unwrap();
         model.save(&dir.join("users.model.json")).unwrap();
 
         let loaded = load_profiles(&dir).unwrap();
@@ -504,6 +536,70 @@ mod tests {
         assert!(loaded.contains_key("users"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn build_model_skips_unsupported_columns() {
+        let placeholder = "<unsupported type timestamptz>: \\x00";
+        let profile = profile_from(&[
+            (
+                "id",
+                vec![
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from(3),
+                    Value::from(4),
+                ],
+            ),
+            (
+                "last_update",
+                vec![
+                    Value::from(placeholder),
+                    Value::from(placeholder),
+                    Value::from(placeholder),
+                    Value::from(placeholder),
+                ],
+            ),
+        ]);
+
+        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        assert_eq!(skipped, vec!["last_update".to_string()]);
+        assert_eq!(model.copula.column_order, vec!["id"]);
+        assert!(!model.columns.contains_key("last_update"));
+    }
+
+    #[test]
+    fn build_model_marks_integer_columns_for_rounding() {
+        let profile = profile_from(&[(
+            "id",
+            vec![
+                Value::from(1),
+                Value::from(2),
+                Value::from(3),
+                Value::from(4),
+            ],
+        )]);
+
+        let (model, _) = build_model("t", "mysql", &profile).unwrap();
+        let col = model.columns.get("id").unwrap();
+        assert_eq!(col.rounding, Some(0));
+    }
+
+    #[test]
+    fn build_model_allows_negative_integer_column() {
+        let profile = profile_from(&[(
+            "v",
+            vec![
+                Value::from(-3),
+                Value::from(-2),
+                Value::from(5),
+                Value::from(9),
+            ],
+        )]);
+
+        let (model, _) = build_model("t", "mysql", &profile).unwrap();
+        let col = model.columns.get("v").unwrap();
+        assert_eq!(col.rounding, Some(0));
     }
 
     #[test]
@@ -534,9 +630,32 @@ mod tests {
     fn parse_foreign_keys_errors_on_missing_column() {
         let result = crate::backend::QueryResult {
             columns: vec!["table_name".to_string()],
+            rows: vec![vec![Value::from("orders")]],
+            row_count: 1,
+        };
+        assert!(parse_foreign_keys(&result).is_err());
+    }
+
+    // GaussDB 等驱动对 0 行结果返回 QueryResult::empty()（无列名），
+    // 无外键是正常状态，不得报错
+    #[test]
+    fn parse_foreign_keys_empty_result_yields_no_fks() {
+        let result = crate::backend::QueryResult::empty();
+        assert_eq!(parse_foreign_keys(&result).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_foreign_keys_zero_rows_with_columns_yields_no_fks() {
+        let result = crate::backend::QueryResult {
+            columns: vec![
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "referenced_table".to_string(),
+                "referenced_column".to_string(),
+            ],
             rows: vec![],
             row_count: 0,
         };
-        assert!(parse_foreign_keys(&result).is_err());
+        assert_eq!(parse_foreign_keys(&result).unwrap(), vec![]);
     }
 }

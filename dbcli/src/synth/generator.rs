@@ -99,7 +99,7 @@ pub fn generate(
                         rel.pool.sample_unique(&mut rng).ok_or_else(|| {
                             format!(
                                 "table '{}': unique FK '{}' exhausted its parent pool \
-                                 ({} distinct values); reduce row count or set unique: false",
+                                 ({} parent rows); reduce row count or set unique: false",
                                 table_name, rel.column, rel.pool_size
                             )
                         })?
@@ -121,14 +121,22 @@ pub fn generate(
                     .copied()
                     .unwrap_or(0.5);
 
-                match model.columns.get(col_name).map(|c| &c.marginal) {
+                let column_model = model.columns.get(col_name);
+                match column_model.map(|c| &c.marginal) {
                     Some(crate::synth::marginal::Marginal::Categorical(p)) => {
                         let idx = p.sample_index(uniform_val);
                         row.push(Value::String(
                             p.values.get(idx).cloned().unwrap_or_default(),
                         ));
                     }
-                    Some(marginal) => row.push(Value::from(marginal.inverse_cdf(uniform_val))),
+                    Some(marginal) => {
+                        let generated = marginal.inverse_cdf(uniform_val);
+                        if column_model.and_then(|c| c.rounding) == Some(0) {
+                            row.push(Value::from(generated.round() as i64));
+                        } else {
+                            row.push(Value::from(generated));
+                        }
+                    }
                     None => row.push(Value::Null),
                 }
             }
@@ -216,6 +224,15 @@ fn build_rel_pools(
                 (FkPool::new(values.clone()), *unique)
             }
         };
+
+        if unique && strategy == SelectionStrategy::Zipf {
+            return Err(format!(
+                "table '{}': zipf strategy cannot be combined with unique FK '{}'; \
+                 unique requires uniform selection",
+                table_name, rel.pk
+            ));
+        }
+
         let pool_size = pool.len();
 
         rel_pools.push(RelPool {
@@ -645,7 +662,42 @@ mod tests {
             "error should name the column: {}",
             err
         );
-        assert!(err.contains("3 distinct values"), "error: {}", err);
+        assert!(err.contains("3 parent rows"), "error: {}", err);
+    }
+
+    #[test]
+    fn unique_fk_with_zipf_is_rejected() {
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 5.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                TableRule {
+                    name: "orders".to_string(),
+                    relationships: vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                    }],
+                    strategy: TableStrategy::Zipf,
+                },
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let config = config(&["users", "orders"], 5);
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(err.contains("zipf"), "error: {}", err);
+        assert!(err.contains("unique"), "error: {}", err);
     }
 
     #[test]
@@ -668,6 +720,125 @@ mod tests {
             a, b,
             "tables must not share one Gaussian stream under the same --seed"
         );
+    }
+
+    #[test]
+    fn integer_column_generates_whole_numbers() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 100.0,
+                    scale: 15.0,
+                }),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            TableModel {
+                version: 1,
+                table: "users".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec!["id".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+
+        let config = config(&["users"], 30);
+        let result = generate(&models, &rules, &config).unwrap();
+        for row in result.tables.get("users").unwrap() {
+            let v = row.first().unwrap();
+            let f = v
+                .as_i64()
+                .expect("integer column must emit integral values");
+            assert_eq!(f as f64, f as f64);
+        }
+    }
+
+    #[test]
+    fn fk_copies_preserve_parent_integer_type() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 100.0,
+                    scale: 15.0,
+                }),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            TableModel {
+                version: 1,
+                table: "users".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec!["id".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 5.0, 1.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let config = config(&["users", "orders"], 4);
+        let result = generate(&models, &rules, &config).unwrap();
+        for row in result.tables.get("orders").unwrap() {
+            assert!(
+                row[0].is_i64() || row[0].is_u64(),
+                "FK copy must stay integer, got {}",
+                row[0]
+            );
+        }
     }
 
     #[test]

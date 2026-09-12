@@ -223,7 +223,7 @@ dbcli/                          # Cargo workspace root
 │           ├── fk_pool.rs      # FK pools: uniform/zipf selection, sample_unique (without replacement)
 │           ├── generator.rs    # Engine: per-table seeds (djb2), FK integrity via table.column pools
 │           ├── export.rs       # CSV/JSONL/JSON/SQL with real column names + quoted identifiers
-│           └── report.rs       # Synthesis report
+│           └── report.rs       # Synthesis report (library-only; not wired to CLI yet)
 └── .github/workflows/
     ├── ci.yml                  # PR/push: fmt, clippy, test (MySQL 8 service container)
     └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle)

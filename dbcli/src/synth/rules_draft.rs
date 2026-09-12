@@ -1,5 +1,6 @@
 use crate::synth::rules::{PoolStrategy, Relationship, SynthRules, TableRule};
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct ForeignKeyInfo {
     pub from_table: String,
     pub from_column: String,

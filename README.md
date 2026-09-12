@@ -11,7 +11,7 @@ Current version: **0.4.5**.
 - **One-shot CLI** — execute SQL from command line, file, or stdin with `table` / `json` / `csv` / `vertical` output
 - **Interactive REPL** — database-aware SQL prompt with multi-line editing, history, and dot commands
 - **Cross-DB delta-diff** — compare table data across two named connections (`hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`); CLI + MCP
-- **Synthetic data generation** — train Gaussian Copula models from real tables, then generate look-alike data with FK integrity (`--features synth`, CLI-only)
+- **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`--features synth`, CLI-only)
 - **Multi-connection** — `~/.hepta-dbcli.toml` with per-connection timeouts
 - **OS keychain** — passwords stored in macOS Keychain or Linux Secret Service, with automatic migration from plaintext config files
 
@@ -274,10 +274,11 @@ See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--
 
 ### Synthetic data generation (`--features synth`)
 
-Train Gaussian Copula models from real tables, then generate look-alike data with cross-table foreign-key integrity. CLI-only; build with `--features synth`.
+Sample-based generation: train per-column marginals (Gaussian copula sampling with an identity correlation matrix) from real tables, then generate look-alike data with cross-table foreign-key integrity. CLI-only; build with `--features synth`.
 
 ```bash
-# 1. Train table models (samples tables, fits per-column marginals + copula)
+# 1. Train table models (samples tables, fits per-column marginals;
+#    copula correlation is an identity matrix — independent columns)
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
 # 2. Draft a rules YAML from the database's foreign keys

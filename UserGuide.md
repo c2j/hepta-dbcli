@@ -794,8 +794,8 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 
 ## 10. 合成数据生成 (synth)
 
-`synth` 基于 Gaussian Copula 从真实表学习统计分布并生成形似的合成数据，
-跨表外键保持引用完整性。全部功能位于 `--features synth` 门控之后，
+`synth` 从真实表学习每列统计分布（采样时经 Gaussian Copula 路径，相关矩阵为单位阵，
+即列间独立），生成形似的合成数据，跨表外键保持引用完整性。全部功能位于 `--features synth` 门控之后，
 仅提供 CLI 子命令（MCP 不暴露）。
 
 ### 10.1 编译启用
@@ -811,7 +811,8 @@ cargo build --release -p polar-mysql --features "oracle,gaussdb,synth"
 ### 10.2 工作流
 
 ```bash
-# 1. 训练：采样真实数据，拟合每列边际分布与 Copula 结构
+# 1. 训练：采样真实数据，拟合每列边际分布（Copula 相关矩阵为单位阵，
+#    即列间独立；相关性拟合见「语义与限制」）
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
 # 2. 起草规则：从数据库外键自动生成 YAML 规则草案
@@ -873,9 +874,12 @@ tables:
 
 - 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
 - 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
-- 数值列拟合 Normal 分布，字符串列拟合分类分布；分类列输出原始字符串值
-- SQL 导出携带引用标识符（MySQL 反引号，其余双引号）与列名，可直接灌库
-- 训练读取连接默认 schema；跨 schema 场景请通过 `--name` 指向对应连接
+- 数值列拟合 Normal 分布（整数列生成取整值），字符串列拟合分类分布，分类列输出原始字符串值
+- Copula 相关矩阵恒为单位阵（列间独立）；从数据估计相关性尚未实现
+- `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
+- 不支持的列类型（如驱动的 `<unsupported type …>` 占位、时间戳等非数值非字符串）在训练时跳过并打印警告，生成的数据不含这些列
+- SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写；导出语句**不带 schema 限定**，灌库前请确认目标 schema 在 search_path 中（或手工补前缀）
+- `train` / `rules-draft` 的 `--schema` 显式指定表所在 schema；缺省时 train 依赖连接默认 schema，rules-draft 取 `current_schema`，两者可能不同——跨 schema 场景请两侧都显式传 `--schema`
 
 ---
 
@@ -1059,6 +1063,10 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --update-column updated_at --update-since "1 day" \
   --export /tmp/orders.diff.csv
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --checkpoint /tmp/orders.ckpt
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --export /tmp/orders.patch.sql --apply-to right
 
 # 合成数据生成（需 --features synth 编译）
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
@@ -1066,8 +1074,4 @@ hepta_dbcli synth rules-draft --name dev --tables users,orders --output synth-ru
 hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
   --output synth-out --rows 1000 --seed 42 --format csv
 hepta_dbcli synth validate --model .synth/users.model.json
-hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
-  --checkpoint /tmp/orders.ckpt
-hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
-  --export /tmp/orders.patch.sql --apply-to right
 ```

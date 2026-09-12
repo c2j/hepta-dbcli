@@ -119,6 +119,9 @@ fn export_json(payload: &ExportPayload<'_>, output_dir: &std::path::Path) -> Res
 fn export_ident(dialect: &str, name: &str) -> String {
     if dialect == "mysql" {
         format!("`{}`", name.replace('`', "``"))
+    } else if dialect.starts_with("oracle") {
+        // Oracle 将未加引号的标识符折叠为大写存储；导出须同步折叠才能命中
+        format!("\"{}\"", name.to_ascii_uppercase().replace('"', "\"\""))
     } else {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
@@ -347,7 +350,7 @@ mod tests {
         let payload = ExportPayload {
             tables: &tables,
             columns: &columns,
-            dialect: "oracle",
+            dialect: "gaussdb",
         };
         let temp_dir = std::env::temp_dir().join("synth_test_sql_ansi");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -356,6 +359,30 @@ mod tests {
 
         let content = std::fs::read_to_string(temp_dir.join("t.sql")).unwrap();
         assert!(content.contains("INSERT INTO \"t\" (\"id\") VALUES (1);"));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn sql_export_folds_oracle_identifiers_to_uppercase() {
+        let mut tables = HashMap::new();
+        tables.insert("users".to_string(), vec![vec![Value::from(1)]]);
+
+        let mut columns = HashMap::new();
+        columns.insert("users".to_string(), vec!["id".to_string()]);
+
+        let payload = ExportPayload {
+            tables: &tables,
+            columns: &columns,
+            dialect: "oracle",
+        };
+        let temp_dir = std::env::temp_dir().join("synth_test_sql_oracle");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        export(&payload, &ExportFormat::Sql, &temp_dir).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.join("users.sql")).unwrap();
+        assert!(content.contains("INSERT INTO \"USERS\" (\"ID\") VALUES (1);"));
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
