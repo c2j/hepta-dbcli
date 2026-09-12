@@ -116,22 +116,27 @@ pub(crate) fn side_filter(ctx: &DiffContext, scheme: &str) -> Option<String> {
     let parts: Vec<&str> = since.split_whitespace().collect();
     if parts.len() == 2 && parts[0].chars().all(|c| c.is_ascii_digit()) {
         let n = parts[0];
-        let (mysql, gauss, oracle) = match parts[1].trim_end_matches('s') {
+        let (mysql, gauss, oracle, duck) = match parts[1].trim_end_matches('s') {
             "day" => (
                 format!("{col} >= DATE_SUB(NOW(), INTERVAL {n} DAY)"),
                 format!("{col} >= NOW() - INTERVAL '{n} days'"),
                 format!("{col} >= SYSDATE - {n}"),
+                format!("{col} >= CAST(NOW() AS TIMESTAMP) - INTERVAL {n} DAY"),
             ),
             "hour" => (
                 format!("{col} >= DATE_SUB(NOW(), INTERVAL {n} HOUR)"),
                 format!("{col} >= NOW() - INTERVAL '{n} hours'"),
                 format!("{col} >= SYSDATE - {n}/24"),
+                format!("{col} >= CAST(NOW() AS TIMESTAMP) - INTERVAL {n} HOUR"),
             ),
             _ => return Some(literal(col, since)),
         };
         return Some(match scheme {
             "gaussdb" => gauss,
             "oracle" => oracle,
+            // Bundled DuckDB has no ICU, so TIMESTAMPTZ - INTERVAL does not
+            // bind; fall back to a naive-TIMESTAMP cutoff first.
+            "duckdb" => duck,
             _ => mysql,
         });
     }
@@ -215,7 +220,24 @@ mod filter_tests {
         assert!(side_filter(&c, "gaussdb")
             .unwrap()
             .contains("NOW() - INTERVAL '3 days'"));
+        assert!(side_filter(&c, "duckdb")
+            .unwrap()
+            .contains("CAST(NOW() AS TIMESTAMP) - INTERVAL 3 DAY"));
         assert!(side_filter(&c, "oracle").unwrap().contains("SYSDATE - 3"));
+    }
+
+    #[test]
+    fn relative_hour_per_dialect() {
+        let c = ctx(None, Some(("ts", "6 hours")));
+        assert!(side_filter(&c, "mysql")
+            .unwrap()
+            .contains("DATE_SUB(NOW(), INTERVAL 6 HOUR)"));
+        assert!(side_filter(&c, "duckdb")
+            .unwrap()
+            .contains("CAST(NOW() AS TIMESTAMP) - INTERVAL 6 HOUR"));
+        assert!(side_filter(&c, "oracle")
+            .unwrap()
+            .contains("SYSDATE - 6/24"));
     }
 
     #[test]

@@ -732,7 +732,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | `iblt` | 跨连接（或非 MySQL）+ 单列整数键 | 可逆布隆表快路径；`--strict` 时解码失败 exit 2 而不回退 |
 | `hashdiff` | `auto` **不会**选它 | `--strategy hashdiff` 强制二分 checksum |
 
-DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致。`BLOB` / `JSON` / `TEXT` 列不参与行哈希（预检排除并给出 warning）；`TIMESTAMPTZ` 以 UTC 文本规范化（bundled 构建无 ICU，不受影响）。
+DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致（含 `--update-column`/`--update-since` 增量窗口）。`BLOB` / `JSON` / `TEXT` 列不参与行哈希（预检排除并给出 warning）；`TIMESTAMPTZ` 以 UTC 文本规范化（bundled 构建无 ICU，不受影响）。跨引擎注意：UUID / BLOB / 非有限浮点（NaN/Infinity）在 DuckDB 与 GaussDB/Oracle 的规范化行为不同——相应列会被响亮排除或可能报差异，跨引擎比对时先核对。
 
 预检（只看元数据与路由，不跑比对）：
 

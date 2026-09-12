@@ -188,7 +188,7 @@ dbcli/                          # Cargo workspace root
 │       ├── main.rs             # CLI arg parsing (clap), entrypoint + MCP server bootstrap
 │       ├── cli.rs              # SQL execution, output rendering, read-only enforcement
 │       ├── config.rs           # TOML config parsing, URL building (mysql:// + oracle://), keyring
-│       ├── server.rs           # MCP server via rmcp: DbMcp with 6 tools (multi-backend)
+│       ├── server.rs           # MCP server via rmcp: DbMcp with 7 tools (multi-backend)
 │       ├── interactive.rs      # REPL mode: rustyline + SQL tokenizer (MySQL/Oracle aware)
 │       ├── output.rs           # Table formatting (type mapping moved to backend/)
 │       ├── queries.rs          # Legacy: MySQL SQL strings (still used by check command)
@@ -302,7 +302,9 @@ url = "oracle://scott:tiger@oracle.internal:1521/FREEPDB1"
 The `BackendRegistry` routes connections by URL scheme:
 - `mysql://...` → `MySqlFactory`
 - `oracle://...` → `OracleFactory`
-- Config field `driver = "oracle"` also routes to `OracleFactory`
+- `gaussdb://...` → `GaussdbFactory`
+- `duckdb://...` → `DuckDbFactory`
+- Config field `driver = "oracle"` / `"gaussdb"` / `"duckdb"` also routes accordingly
 
 ### Password Flow
 When a connection has `password = "keyring"` (sentinel value), the system reads from OS keychain. The migration rewrites the config file replacing the password with `"keyring"`. This is important: do NOT commit config files with plaintext passwords to git.

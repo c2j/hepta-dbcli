@@ -862,6 +862,23 @@ mod live_tests {
     }
 
     #[tokio::test]
+    async fn incremental_window_sql_executes_live() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query_drop("CREATE TABLE inc_probe (ts TIMESTAMP, v INTEGER)")
+            .await
+            .expect("create");
+        conn.query_drop("INSERT INTO inc_probe VALUES (NOW(), 1)")
+            .await
+            .expect("insert");
+        let r = conn
+            .query("SELECT v FROM inc_probe WHERE ts >= CAST(NOW() AS TIMESTAMP) - INTERVAL 3 DAY")
+            .await
+            .expect("interval predicate must execute");
+        assert_eq!(r.row_count, 1);
+    }
+
+    #[tokio::test]
     async fn read_only_file_rejects_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ro.duckdb");

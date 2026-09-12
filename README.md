@@ -37,13 +37,15 @@ cargo build --release -p polar-mysql
 
 # With DuckDB support (compiles the bundled DuckDB C++ core — first build takes several minutes)
 cargo build --release -p polar-mysql --features duckdb
+# On memory-constrained machines, limit build parallelism to avoid OOM during the C++ compile:
+cargo build --release -p polar-mysql --features duckdb -j 2
 ```
 
 Default features already include Oracle (`oracle-rs` + native fallback) and GaussDB. Oracle 11g connections fall back to the `oracle` crate and need [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) on the PATH.
 
 Optional features: add `--features synth` for synthetic data generation.
 
-DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime. A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff supports DuckDB on both sides (`BLOB`/`JSON`/`TEXT` columns are excluded from row hashing, and `TIMESTAMPTZ` normalizes to UTC text without ICU).
+DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime (`TIMESTAMPTZ - INTERVAL` fails without it; the delta-diff incremental window casts `NOW()` to naive `TIMESTAMP` first). A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff supports DuckDB on both sides (`BLOB`/`JSON`/`TEXT` columns are excluded from row hashing, and `TIMESTAMPTZ` normalizes to UTC text without ICU). Cross-backend caveat: UUID/BLOB/non-finite-float values may normalize differently than GaussDB/Oracle — such columns are either excluded loudly or may report diffs; verify when comparing across engines.
 
 ## Configuration
 
