@@ -131,7 +131,7 @@ pub fn generate(
             rows.push(row);
         }
 
-        if let Some(pk_col) = model.pk.first() {
+        if let Some(_pk_col) = model.pk.first() {
             let pk_values: Vec<String> = rows
                 .iter()
                 .enumerate()

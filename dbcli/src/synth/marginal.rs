@@ -87,7 +87,7 @@ fn normal_ppf(loc: f64, scale: f64, p: f64) -> f64 {
     loc + scale * x
 }
 
-fn beta_cdf(x: f64, a: f64, b: f64) -> f64 {
+fn beta_cdf(x: f64, _a: f64, _b: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
@@ -97,7 +97,7 @@ fn beta_cdf(x: f64, a: f64, b: f64) -> f64 {
     0.5
 }
 
-fn beta_ppf(a: f64, b: f64, loc: f64, scale: f64, p: f64) -> f64 {
+fn beta_ppf(a: f64, b: f64, loc: f64, scale: f64, _p: f64) -> f64 {
     let x = a / (a + b);
     loc + scale * x
 }

@@ -9,12 +9,12 @@ pub fn topological_sort<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
 
     for node in nodes {
         in_degree.entry(node).or_insert(0);
-        adjacency.entry(node).or_insert_with(Vec::new);
+        adjacency.entry(node).or_default();
     }
 
     for (from, to) in edges {
         *in_degree.entry(to).or_insert(0) += 1;
-        adjacency.entry(from).or_insert_with(Vec::new).push(to);
+        adjacency.entry(from).or_default().push(to);
     }
 
     let mut queue: VecDeque<&T> = in_degree
@@ -120,10 +120,10 @@ impl<'a, T: Eq + std::hash::Hash + Clone> TarjanState<'a, T> {
     fn new(nodes: &'a [T], edges: &'a [(T, T)]) -> Self {
         let mut adjacency: HashMap<&T, Vec<&T>> = HashMap::new();
         for node in nodes {
-            adjacency.entry(node).or_insert_with(Vec::new);
+            adjacency.entry(node).or_default();
         }
         for (from, to) in edges {
-            adjacency.entry(from).or_insert_with(Vec::new).push(to);
+            adjacency.entry(from).or_default().push(to);
         }
 
         Self {

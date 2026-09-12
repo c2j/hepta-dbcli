@@ -1,5 +1,4 @@
 use crate::synth::rules::{PoolStrategy, Relationship, SynthRules, TableRule};
-use serde_json::Value;
 
 pub struct ForeignKeyInfo {
     pub from_table: String,

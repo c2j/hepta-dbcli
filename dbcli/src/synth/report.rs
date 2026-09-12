@@ -46,8 +46,8 @@ impl SynthReport {
 
     pub fn summary(&self) -> String {
         let mut lines = vec![];
-        lines.push(format!("Synthesis Report"));
-        lines.push(format!("================"));
+        lines.push("Synthesis Report".to_string());
+        lines.push("================".to_string());
         lines.push(format!("Total rows generated: {}", self.total_rows));
         lines.push(format!("Tables: {}", self.tables.len()));
         lines.push("".to_string());

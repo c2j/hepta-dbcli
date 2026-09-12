@@ -1,5 +1,4 @@
 use rand::Rng;
-use rand::SeedableRng;
 
 pub enum FkPool {
     Projection(Vec<String>),
@@ -84,6 +83,7 @@ impl FkPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     #[test]
     fn projection_pool_samples_correct_count() {

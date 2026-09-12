@@ -38,18 +38,13 @@ impl Default for PoolStrategy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableStrategy {
+    #[default]
     Uniform,
     Weighted,
     Zipf,
-}
-
-impl Default for TableStrategy {
-    fn default() -> Self {
-        Self::Uniform
-    }
 }
 
 fn default_null_label() -> String {

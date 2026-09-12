@@ -1,7 +1,6 @@
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
+use rand_distr::StandardNormal;
 
 pub struct GaussianCopula {
     dimension: usize,
@@ -36,12 +35,12 @@ impl GaussianCopula {
         let mut correlated = vec![vec![0.0; n]; self.dimension];
 
         for t in 0..n {
-            for i in 0..self.dimension {
+            for (i, corr_row) in correlated.iter_mut().enumerate().take(self.dimension) {
                 let mut sum = 0.0;
-                for j in 0..=i {
-                    sum += self.cholesky[i][j] * independent[j][t];
+                for (j, ind_col) in independent.iter().enumerate().take(i + 1) {
+                    sum += self.cholesky[i][j] * ind_col[t];
                 }
-                correlated[i][t] = sum;
+                corr_row[t] = sum;
             }
         }
 
@@ -52,6 +51,7 @@ impl GaussianCopula {
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     let dim = matrix.len();
 
@@ -63,19 +63,22 @@ fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
         }
     }
 
-    for i in 0..dim {
-        let row_sum: f64 = (0..dim)
-            .filter(|&j| j != i)
-            .map(|j| matrix[i][j].abs())
+    for (i, row) in matrix.iter_mut().enumerate() {
+        let row_sum: f64 = row
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, &val)| val.abs())
             .sum();
-        if matrix[i][i] < row_sum {
-            matrix[i][i] = row_sum + 0.001;
+        if row[i] < row_sum {
+            row[i] = row_sum + 0.001;
         }
     }
 
     matrix
 }
 
+#[allow(clippy::needless_range_loop)]
 fn cholesky_decomposition(matrix: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = matrix.len();
     let mut l = vec![vec![0.0; n]; n];
