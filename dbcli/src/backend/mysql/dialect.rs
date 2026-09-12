@@ -43,6 +43,21 @@ impl Dialect for MySqlDialect {
          ORDER BY s.INDEX_NAME"
     }
 
+    fn foreign_keys_sql(&self, schema: &str) -> String {
+        format!(
+            "SELECT kcu.TABLE_SCHEMA AS schema_name, kcu.TABLE_NAME AS table_name, \
+             kcu.COLUMN_NAME AS column_name, kcu.REFERENCED_TABLE_SCHEMA AS referenced_schema, \
+             kcu.REFERENCED_TABLE_NAME AS referenced_table, \
+             kcu.REFERENCED_COLUMN_NAME AS referenced_column, \
+             kcu.CONSTRAINT_NAME AS constraint_name \
+             FROM information_schema.KEY_COLUMN_USAGE kcu \
+             WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+             AND kcu.TABLE_SCHEMA = '{schema}' \
+             ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+            schema = crate::backend::escape_sql_string(schema, true)
+        )
+    }
+
     fn read_only_prefixes(&self) -> &[&str] {
         &["SELECT", "EXPLAIN", "SHOW", "DESC", "DESCRIBE"]
     }
@@ -338,6 +353,14 @@ impl Dialect for MySqlDialect {
 mod tests {
     use super::*;
     use crate::backend::is_polardbx_version;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let d = MySqlDialect;
+        let sql = d.foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("evil''; DROP TABLE x;--"));
+    }
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {

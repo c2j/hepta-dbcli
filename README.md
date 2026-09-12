@@ -11,6 +11,7 @@ Current version: **0.4.5**.
 - **One-shot CLI** — execute SQL from command line, file, or stdin with `table` / `json` / `csv` / `vertical` output
 - **Interactive REPL** — database-aware SQL prompt with multi-line editing, history, and dot commands
 - **Cross-DB delta-diff** — compare table data across two named connections (`hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`); CLI + MCP
+- **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`--features synth`, CLI-only)
 - **Multi-connection** — `~/.hepta-dbcli.toml` with per-connection timeouts
 - **OS keychain** — passwords stored in macOS Keychain or Linux Secret Service, with automatic migration from plaintext config files
 
@@ -36,6 +37,8 @@ cargo build --release -p polar-mysql
 ```
 
 Default features already include Oracle (`oracle-rs` + native fallback) and GaussDB. Oracle 11g connections fall back to the `oracle` crate and need [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) on the PATH.
+
+Optional features: add `--features synth` for synthetic data generation.
 
 ## Configuration
 
@@ -269,6 +272,29 @@ Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dr
 
 See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--rtrim-char-columns`.
 
+### Synthetic data generation (`--features synth`)
+
+Sample-based generation: train per-column marginals (Gaussian copula sampling with an identity correlation matrix) from real tables, then generate look-alike data with cross-table foreign-key integrity. CLI-only; build with `--features synth`.
+
+```bash
+# 1. Train table models (samples tables, fits per-column marginals;
+#    copula correlation is an identity matrix — independent columns)
+hepta_dbcli synth train --name dev --tables users,orders --output .synth
+
+# 2. Draft a rules YAML from the database's foreign keys
+hepta_dbcli synth rules-draft --name dev --tables users,orders \
+  --models .synth --output synth-rules.yaml
+
+# 3. Generate synthetic rows
+hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
+  --output synth-out --rows 1000 --seed 42 --format csv   # csv / jsonl / json / sql
+
+# Validate a trained model file
+hepta_dbcli synth validate --model .synth/users.model.json
+```
+
+Tables are generated in FK topological order (cycles rejected). Child FK values are drawn from the parent's generated keys; `pool_strategy: !projection { unique: true }` samples them without replacement. `--seed` derives a stable per-table RNG stream. See [UserGuide.md](UserGuide.md) §10 for the rules YAML reference.
+
 ## MCP Tools
 
 When running as MCP server, the following tools are available:
@@ -301,6 +327,9 @@ cargo clippy --all --all-targets
 
 # Unit tests
 cargo test --all
+
+# Synth unit tests (no DB needed)
+cargo test --all --features synth
 
 # Integration tests — see tests/README.md
 # MySQL

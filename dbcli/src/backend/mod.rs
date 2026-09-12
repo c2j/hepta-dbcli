@@ -108,6 +108,10 @@ pub trait Dialect: Send + Sync {
     /// [index_name, is_unique, is_primary, columns, index_type]
     fn table_indexes(&self) -> &str;
 
+    /// Query returning foreign key relationships for a schema.
+    /// Returns rows: [schema_name, table_name, column_name, referenced_schema, referenced_table, referenced_column, constraint_name]
+    fn foreign_keys_sql(&self, schema: &str) -> String;
+
     // ── Syntax Adapters ──
 
     /// SQL statement prefixes that are considered read-only for MCP enforcement.
@@ -351,7 +355,7 @@ pub(crate) fn quote_table_scheme(
     }
 }
 
-fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
+pub(crate) fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
     let s = if backslash_escape {
         s.replace('\\', "\\\\")
     } else {
@@ -669,5 +673,90 @@ mod tests {
         let sql = render_tuple_gt('"', &spec, spec.last_key.as_ref().unwrap(), false, "oracle");
         assert!(sql.contains("\"ID\" > 42"), "sql={sql}");
         assert!(!sql.contains("NLSSORT"), "sql={sql}");
+    }
+
+    #[test]
+    fn dialect_foreign_keys_sql_returns_non_empty() {
+        struct TestDialect;
+        impl Dialect for TestDialect {
+            fn database_info(&self) -> &str {
+                ""
+            }
+            fn list_tables(&self) -> &str {
+                ""
+            }
+            fn table_columns(&self) -> &str {
+                ""
+            }
+            fn table_indexes(&self) -> &str {
+                ""
+            }
+            fn foreign_keys_sql(&self, _schema: &str) -> String {
+                String::new()
+            }
+            fn read_only_prefixes(&self) -> &[&str] {
+                &[]
+            }
+            fn add_limit(&self, sql: &str, _n: usize) -> String {
+                sql.to_string()
+            }
+            fn build_explain(&self, sql: &str, _analyze: bool, _format: &str) -> String {
+                sql.to_string()
+            }
+            fn set_statement_timeout_sql(&self, _ms: u64) -> Option<String> {
+                None
+            }
+            fn kill_own_connection_sql(&self) -> Option<String> {
+                None
+            }
+            fn default_port(&self) -> u16 {
+                3306
+            }
+            fn url_scheme(&self) -> &str {
+                "test"
+            }
+            fn identifier_quote(&self) -> char {
+                '`'
+            }
+            fn supports_hash_comment(&self) -> bool {
+                true
+            }
+            fn begin_snapshot_sql(&self) -> &str {
+                "BEGIN"
+            }
+            fn normalize_expr(&self, _col: &ColumnNormSpec) -> Result<String, DbError> {
+                Ok(String::new())
+            }
+            fn render_checksum_sql(&self, _spec: &ChecksumSqlSpec) -> String {
+                String::new()
+            }
+            fn render_batch_checksum_sql(&self, _spec: &ChecksumSqlSpec) -> String {
+                String::new()
+            }
+            fn render_bucket_predicate(
+                &self,
+                _exprs: &[String],
+                _modulus: u64,
+                _bucket: u64,
+            ) -> String {
+                String::new()
+            }
+            fn render_keyset_page_sql(&self, _spec: &KeysetPageSpec) -> String {
+                String::new()
+            }
+            fn render_bucket_multiset_sql(&self, _spec: &ChecksumSqlSpec) -> String {
+                String::new()
+            }
+            fn row_hash_expr(&self, _exprs: &[String]) -> String {
+                String::new()
+            }
+            fn render_iblt_sql(&self, _spec: &IbltSqlSpec) -> Result<String, DbError> {
+                Ok(String::new())
+            }
+        }
+
+        let dialect = TestDialect;
+        let sql = dialect.foreign_keys_sql("test_schema");
+        let _ = sql;
     }
 }

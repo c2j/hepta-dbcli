@@ -60,6 +60,24 @@ impl Dialect for GaussdbDialect {
         "SELECT i.relname::text AS index_name, ix.indisunique AS is_unique, ix.indisprimary AS is_primary, pg_catalog.pg_get_indexdef(ix.indexrelid)::text AS columns, am.amname::text AS index_type FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE t.oid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1) ORDER BY i.relname"
     }
 
+    fn foreign_keys_sql(&self, schema: &str) -> String {
+        format!(
+            "SELECT n.nspname AS schema_name, cl.relname AS table_name, a.attname AS column_name, \
+             nr.nspname AS referenced_schema, cr.relname AS referenced_table, \
+             ar.attname AS referenced_column, con.conname AS constraint_name \
+             FROM pg_constraint con \
+             JOIN pg_class cl ON con.conrelid = cl.oid \
+             JOIN pg_namespace n ON cl.relnamespace = n.oid \
+             JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = ANY(con.conkey) \
+             JOIN pg_class cr ON con.confrelid = cr.oid \
+             JOIN pg_namespace nr ON cr.relnamespace = nr.oid \
+             JOIN pg_attribute ar ON ar.attrelid = cr.oid AND ar.attnum = ANY(con.confkey) \
+             WHERE con.contype = 'f' AND n.nspname = '{schema}' \
+             ORDER BY con.conname, a.attnum",
+            schema = crate::backend::escape_sql_string(schema, false)
+        )
+    }
+
     fn read_only_prefixes(&self) -> &[&str] {
         &["SELECT", "EXPLAIN", "WITH"]
     }
@@ -361,6 +379,14 @@ impl Dialect for GaussdbDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let d = GaussdbDialect;
+        let sql = d.foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("evil''; DROP TABLE x;--"));
+    }
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {

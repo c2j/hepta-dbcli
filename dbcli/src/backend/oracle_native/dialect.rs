@@ -119,6 +119,25 @@ impl Dialect for OracleDialect {
          ORDER BY i.INDEX_NAME"
     }
 
+    fn foreign_keys_sql(&self, schema: &str) -> String {
+        format!(
+            "SELECT acc.OWNER AS \"schema_name\", acc.TABLE_NAME AS \"table_name\", \
+             acc.COLUMN_NAME AS \"column_name\", pkcol.OWNER AS \"referenced_schema\", \
+             pkcol.TABLE_NAME AS \"referenced_table\", pkcol.COLUMN_NAME AS \"referenced_column\", \
+             acc.CONSTRAINT_NAME AS \"constraint_name\" \
+             FROM ALL_CONS_COLUMNS acc \
+             JOIN ALL_CONSTRAINTS ac ON acc.CONSTRAINT_NAME = ac.CONSTRAINT_NAME \
+               AND acc.OWNER = ac.OWNER \
+             JOIN ALL_CONS_COLUMNS pkcol ON ac.R_CONSTRAINT_NAME = pkcol.CONSTRAINT_NAME \
+               AND ac.R_OWNER = pkcol.OWNER \
+               AND acc.POSITION = pkcol.POSITION \
+             WHERE ac.CONSTRAINT_TYPE = 'R' \
+               AND ac.OWNER = '{schema}' \
+             ORDER BY acc.CONSTRAINT_NAME, acc.POSITION",
+            schema = crate::backend::escape_sql_string(&schema.to_uppercase(), false)
+        )
+    }
+
     fn read_only_prefixes(&self) -> &[&str] {
         &["SELECT", "EXPLAIN", "WITH"]
     }
@@ -460,6 +479,13 @@ fn oracle_number_scale(data_type_upper: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::backend::Dialect;
+
+    #[test]
+    fn foreign_keys_sql_escapes_quote_in_schema() {
+        let sql = OracleDialect::new().foreign_keys_sql("evil'; DROP TABLE x;--");
+        assert!(!sql.contains("evil';"), "schema interpolated unescaped");
+        assert!(sql.contains("EVIL''; DROP TABLE X;--"));
+    }
 
     #[test]
     fn test_session_pin_sets_deterministic_nls() {
