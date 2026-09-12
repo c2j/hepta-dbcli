@@ -13,8 +13,9 @@
 7. [密码管理](#7-密码管理)
 8. [MCP 服务器模式](#8-mcp-服务器模式)
 9. [跨库比对](#9-跨库比对-delta-diff)
-10. [进阶用法](#10-进阶用法)
-11. [错误排查](#11-错误排查)
+10. [合成数据生成](#10-合成数据生成-synth)
+11. [进阶用法](#11-进阶用法)
+12. [错误排查](#12-错误排查)
 
 ---
 
@@ -791,9 +792,96 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 
 ---
 
-## 10. 进阶用法
+## 10. 合成数据生成 (synth)
 
-### 10.1 多连接切换
+`synth` 基于 Gaussian Copula 从真实表学习统计分布并生成形似的合成数据，
+跨表外键保持引用完整性。全部功能位于 `--features synth` 门控之后，
+仅提供 CLI 子命令（MCP 不暴露）。
+
+### 10.1 编译启用
+
+synth 是可选 feature，默认不参与编译：
+
+```bash
+cargo build --features synth
+# 发布构建（连同 Oracle/GaussDB）
+cargo build --release -p polar-mysql --features "oracle,gaussdb,synth"
+```
+
+### 10.2 工作流
+
+```bash
+# 1. 训练：采样真实数据，拟合每列边际分布与 Copula 结构
+hepta_dbcli synth train --name dev --tables users,orders --output .synth
+
+# 2. 起草规则：从数据库外键自动生成 YAML 规则草案
+hepta_dbcli synth rules-draft --name dev --tables users,orders \
+  --models .synth --output synth-rules.yaml
+
+# 3. 生成：按模型与规则批量产出合成数据
+hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
+  --output synth-out --rows 1000 --seed 42 --format csv
+
+# 校验模型文件
+hepta_dbcli synth validate --model .synth/users.model.json
+```
+
+`train` 为每张表写出两个文件：
+
+| 文件 | 内容 |
+|------|------|
+| `{table}.model.json` | 边际分布参数 + Copula 相关矩阵（带版本号，拒绝更高版本） |
+| `{table}.profile.json` | 列统计（类型 / 基数 / top 值频次），供 rules-draft 唯一性检测 |
+
+### 10.3 子命令参数
+
+| 子命令 | 参数 | 说明 |
+|--------|------|------|
+| `train` | `--name`、`--tables`、`--output`、`--sample` | 每表最多采样 `--sample` 行（默认 10000） |
+| `rules-draft` | `--name`、`--tables`、`--output`、`--models` | `--models` 下的 profile 用于唯一外键检测 |
+| `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql |
+| `validate` | `--model` | 校验模型 JSON 版本与结构 |
+
+未指定 `--name` 时使用配置的 `default_connection`，与 `check` / MCP 行为一致。
+退出码：`0` 成功，`1` 出错。
+
+### 10.4 规则 YAML
+
+```yaml
+version: "1"
+tables:
+  - name: users
+    strategy: uniform            # uniform | zipf（weighted 暂不支持，会报错）
+    relationships: []
+  - name: orders
+    strategy: zipf               # 子表按 Zipf 偏置引用父表键
+    relationships:
+      - pk: user_id              # 本表 FK 列
+        references: [users.id]   # 父表.列
+        pool_strategy: !projection
+          unique: false          # true = 无放回采样（1:1）；子行数超过父池时报错
+```
+
+`pool_strategy` 取值：
+
+| 取值 | 行为 |
+|------|------|
+| `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
+| `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
+
+### 10.5 语义与限制
+
+- 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
+- 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
+- 数值列拟合 Normal 分布，字符串列拟合分类分布；分类列输出原始字符串值
+- SQL 导出携带引用标识符（MySQL 反引号，其余双引号）与列名，可直接灌库
+- 训练读取连接默认 schema；跨 schema 场景请通过 `--name` 指向对应连接
+
+---
+
+## 11. 进阶用法
+
+### 11.1 多连接切换
 
 ```bash
 # CLI 模式切换连接
@@ -807,7 +895,7 @@ $ .connect prod
 hepta_dbcli interactive -- connected to 'prod'
 ```
 
-### 10.2 超时控制
+### 11.2 超时控制
 
 ```bash
 # 设置单条 SQL 最大 5 分钟
@@ -820,7 +908,7 @@ hepta_dbcli cli --connection-max-lifetime 10min --sql "..."
 hepta_dbcli cli --timeout-action disconnect --sql "..."
 ```
 
-### 10.3 使用 PolarDB-X
+### 11.3 使用 PolarDB-X
 
 hepta_dbcli 完全兼容 PolarDB-X（基于 MySQL 协议）：
 
@@ -845,7 +933,7 @@ hepta_dbcli cli --sql "SELECT VERSION()"
 
 > **注意**：PolarDB-X 默认端口为 `8527`（非 3306），默认用户 `polardbx_root`。
 
-### 10.4 本地三后端 Docker
+### 11.4 本地三后端 Docker
 
 仓库 `tests/` 下有现成 compose 与 TOML：
 
@@ -859,7 +947,7 @@ hepta_dbcli --config tests/docker-all.toml check --name gaussdb
 
 GaussDB 测试配置见 `tests/docker-gaussdb.toml`（`sslmode = "disable"`）。
 
-### 10.5 在脚本中使用
+### 11.5 在脚本中使用
 
 ```bash
 #!/bin/bash
@@ -880,9 +968,9 @@ esac
 
 ---
 
-## 11. 错误排查
+## 12. 错误排查
 
-### 11.1 常见错误
+### 12.1 常见错误
 
 | 错误信息 | 原因 | 解决方案 |
 |----------|------|----------|
@@ -900,7 +988,7 @@ esac
 | GaussDB `28P01` 密码被拒 | 密码错误，或钥匙串不是这一套 | 本工具 service 是 `hepta-dbcli`，与独立 `gaussdb` CLI 的钥匙串**不共享** |
 | `No backend registered for scheme '…'` | 二进制未编入对应 feature | 用默认 feature 重新 `cargo build --release -p polar-mysql` |
 
-### 11.2 诊断流程
+### 12.2 诊断流程
 
 ```bash
 # 1. 检查配置文件是否能正确解析
@@ -918,7 +1006,7 @@ hepta_dbcli check --name gauss_dev --verbose
 cat ~/.local/share/hepta-dbcli/hepta-dbcli.log
 ```
 
-### 11.3 TLS 证书问题
+### 12.3 TLS 证书问题
 
 如果 MySQL 的 `TLS(verify)` 失败但 `NoTls` 和 `TLS(skip-verify)` 成功，说明服务器 TLS 证书配置有问题。可以：
 
@@ -937,6 +1025,7 @@ GaussDB 本地 Docker 几乎都应设 `sslmode = "disable"`。
 hepta_dbcli --help
 hepta_dbcli cli --help
 hepta_dbcli delta-diff --help
+hepta_dbcli synth --help
 
 # 连接检查
 hepta_dbcli check
@@ -970,6 +1059,13 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --update-column updated_at --update-since "1 day" \
   --export /tmp/orders.diff.csv
+
+# 合成数据生成（需 --features synth 编译）
+hepta_dbcli synth train --name dev --tables users,orders --output .synth
+hepta_dbcli synth rules-draft --name dev --tables users,orders --output synth-rules.yaml
+hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
+  --output synth-out --rows 1000 --seed 42 --format csv
+hepta_dbcli synth validate --model .synth/users.model.json
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --checkpoint /tmp/orders.ckpt
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \

@@ -101,6 +101,9 @@ cargo test --all
 # Oracle 单元测试（`oracle` 已在 default features 里，此行只是显式说明）
 cargo test --all --features oracle
 
+# synth 单元测试（无需 DB；synth 是可选 feature）
+cargo test --all --features synth
+
 # MySQL 集成测试（需运行 MySQL + 环境变量）
 HEPTA_DBCLI_TEST_URL=mysql://mcp:testpass@127.0.0.1:3306/testdb cargo test --all --features integration
 
@@ -207,6 +210,20 @@ dbcli/                          # Cargo workspace root
 │               ├── conn.rs     # OracleConn (wraps oracle_rs::Connection)
 │               ├── dialect.rs  # OracleDialect (ALL_TABLES, SYS_CONTEXT, LISTAGG)
 │               └── types.rs    # oracle_rs::Row → serde_json::Value
+│       ├── synth/              # Synthetic data generation (feature-gated: --features synth, CLI-only)
+│           ├── mod.rs          # synth::run dispatcher; config/connection resolution (default_connection aware)
+│           ├── cmd.rs          # clap SynthArgs + build_model (fits marginals, n×n identity copula)
+│           ├── graph.rs        # Topological sort (Kahn) + Tarjan SCC; edge (from,to) = from first
+│           ├── marginal.rs     # Marginals: Normal/Beta/Gamma/Categorical/Uniform (real CDF+PPF, bisection inverse)
+│           ├── copula.rs       # GaussianCopula: Cholesky + PSD projection + correlated sampling
+│           ├── model.rs        # TableModel JSON (version-checked load)
+│           ├── profile.rs      # Column/table stats incl. top_values + column_order
+│           ├── rules.rs        # YAML rules parser (!projection/!generated/!fixed pool strategies)
+│           ├── rules_draft.rs  # FK-driven rules draft (profiles feed unique-FK detection)
+│           ├── fk_pool.rs      # FK pools: uniform/zipf selection, sample_unique (without replacement)
+│           ├── generator.rs    # Engine: per-table seeds (djb2), FK integrity via table.column pools
+│           ├── export.rs       # CSV/JSONL/JSON/SQL with real column names + quoted identifiers
+│           └── report.rs       # Synthesis report
 └── .github/workflows/
     ├── ci.yml                  # PR/push: fmt, clippy, test (MySQL 8 service container)
     └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle)
@@ -226,6 +243,8 @@ dbcli/                          # Cargo workspace root
 | `rustyline` 18 | Interactive REPL |
 | `tracing` | Structured logging |
 | `async-trait` 0.1 | Async trait support |
+| `rand` 0.8 + `rand_distr` 0.4 | RNG for synth (optional, `--features synth`) |
+| `serde_yaml` 0.9 | synth rules YAML (optional, `--features synth`) |
 
 ## Multi-Database Abstraction
 
