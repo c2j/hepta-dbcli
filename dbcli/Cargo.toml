@@ -34,7 +34,7 @@ path = "tests/regress_duckdb.rs"
 required-features = ["integration", "duckdb"]
 
 [features]
-default = ["oracle-rs", "oracle", "gaussdb"]
+default = ["oracle-rs", "oracle", "gaussdb", "synth"]
 integration = []
 oracle-rs = ["dep:oracle-rs"]
 oracle = ["dep:oracle"]
