@@ -437,6 +437,7 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
     async fn oracle_native_varchar_digit_stays_json_string() {
         let Some(mut conn) = try_connect_native().await else {
             return;
