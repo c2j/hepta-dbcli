@@ -1,2 +1,3 @@
 /target/
 .sisyphus/
+tests/benchmark/*.csv

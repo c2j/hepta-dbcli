@@ -494,7 +494,11 @@ pub fn compute_gaussian_correlation(
             let u = if let Some(model) = col_model {
                 match &model.marginal {
                     crate::synth::marginal::Marginal::Normal(p) => {
-                        let x = val.as_f64().unwrap_or(p.loc);
+                        // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
+                        let x = val
+                            .as_f64()
+                            .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                            .unwrap_or(p.loc);
                         let cdf = normal_cdf(x, p.loc, p.scale);
                         // Clamp to avoid ppf at exactly 0 or 1
                         cdf.clamp(1e-12, 1.0 - 1e-12)
@@ -831,6 +835,31 @@ mod tests {
         assert_eq!(corr[0][0], 1.0);
         assert_eq!(corr[1][1], 1.0);
         assert!((corr[1][0] - corr[0][1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn correlation_handles_numeric_strings_from_drivers() {
+        // DECIMAL/NUMBER 常被驱动序列化为 JSON 字符串；相关性不得因此静默归零
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i),
+                    serde_json::Value::from(format!("{:.2}", 3.0 * i as f64)),
+                ]
+            })
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(73.5, 45.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1] > 0.99,
+            "numeric strings must still correlate, got {}",
+            corr[0][1]
+        );
     }
 
     #[test]

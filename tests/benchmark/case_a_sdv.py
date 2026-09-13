@@ -59,7 +59,8 @@ def main():
 
     # 4. 采样
     t1 = time.perf_counter()
-    sdv_out = syn.sample(num_rows=len(real), random_state=42)
+    syn._set_random_state(42)
+    sdv_out = syn.sample(num_rows=len(real))
     sample_s = time.perf_counter() - t1
     print(f"SDV sample: {sample_s:.3f}s")
 
