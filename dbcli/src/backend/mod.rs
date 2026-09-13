@@ -5,6 +5,8 @@
 // database (MySQL, Oracle, GaussDB, etc.) implements these traits in its own
 // submodule under backend/.
 
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
 pub mod error;
 pub mod factory;
 #[cfg(feature = "gaussdb")]
@@ -521,7 +523,8 @@ pub(crate) fn default_port_for_scheme(scheme: &str) -> u16 {
     match scheme {
         "oracle" => 1521,
         "gaussdb" => 5432,
-        _ => 3306, // mysql and unknown
+        "duckdb" => 0, // embedded file DB, no TCP port
+        _ => 3306,     // mysql and unknown
     }
 }
 
@@ -531,6 +534,7 @@ pub(crate) fn ssl_url_param_for_scheme(scheme: &str) -> &'static str {
     match scheme {
         "oracle" => "",
         "gaussdb" => "?sslmode=require",
+        "duckdb" => "",            // in-process file DB, no TLS
         _ => "?ssl-mode=REQUIRED", // mysql
     }
 }
@@ -570,6 +574,18 @@ mod tests {
     #[test]
     fn test_default_port_gaussdb() {
         assert_eq!(default_port_for_scheme("gaussdb"), 5432);
+    }
+
+    #[test]
+    fn test_default_port_duckdb_is_zero() {
+        // DuckDB is embedded: no TCP port. 0 means "no port".
+        assert_eq!(default_port_for_scheme("duckdb"), 0);
+    }
+
+    #[test]
+    fn test_ssl_url_param_duckdb_is_empty() {
+        // DuckDB is an in-process file DB — no TLS concept.
+        assert_eq!(ssl_url_param_for_scheme("duckdb"), "");
     }
 
     #[test]

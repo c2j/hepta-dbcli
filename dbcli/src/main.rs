@@ -633,6 +633,88 @@ fn gaussdb_failure_hints(err_msg: &str) -> Vec<&'static str> {
     hints
 }
 
+#[cfg(feature = "duckdb")]
+async fn do_duckdb_check(resolved: &ResolvedConnection, registry: &BackendRegistry, verbose: bool) {
+    let base_url = &resolved.connection_url;
+
+    eprintln!("Connection: {}", resolved.name);
+    eprintln!();
+    print_password_status(resolved);
+
+    eprintln!("[1/1] Opening DuckDB database ...");
+    let start = Instant::now();
+    match registry
+        .connect_with_fallback("duckdb", base_url, None)
+        .await
+    {
+        Ok(pool) => {
+            let elapsed = start.elapsed();
+            match pool.acquire().await {
+                Ok(mut conn) => {
+                    let ver = {
+                        let sql = conn.dialect().database_info().to_string();
+                        conn.query(&sql).await.ok().and_then(|r| {
+                            r.rows.first().and_then(|row| {
+                                row.first().and_then(|v| v.as_str().map(|s| s.to_string()))
+                            })
+                        })
+                    };
+                    eprintln!(
+                        "  \u{2713} DuckDB  — {}ms  {}",
+                        elapsed.as_millis(),
+                        ver.as_deref().unwrap_or("(unknown)")
+                    );
+                    if verbose {
+                        if let Ok(result) = conn.query("SELECT current_database()").await {
+                            if let Some(row) = result.rows.first() {
+                                eprintln!(
+                                    "  Database   : {}",
+                                    row[0].as_str().unwrap_or("(unknown)")
+                                );
+                                eprintln!("  Mode       : embedded (no server process)");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  \u{2717} DuckDB  — FAILED to acquire: {}", e);
+                    let msg = e.to_string();
+                    for hint in duckdb_failure_hints(&msg) {
+                        eprintln!("    hint: {}", hint);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  \u{2717} DuckDB  — FAILED: {}", e);
+            let msg = e.to_string();
+            for hint in duckdb_failure_hints(&msg) {
+                eprintln!("    hint: {}", hint);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_failure_hints(err_msg: &str) -> Vec<&'static str> {
+    let lower = err_msg.to_ascii_lowercase();
+    let mut hints: Vec<&'static str> = Vec::new();
+    if lower.contains("not found") {
+        hints.push(
+            "database file does not exist; DuckDB never creates files implicitly — check the `database` path",
+        );
+    }
+    if lower.contains("lock") {
+        hints.push(
+            "file is locked by another process (single-writer): close the other DuckDB instance, or open with ?mode=ro",
+        );
+    }
+    if hints.is_empty() {
+        hints.push("verify the `database` path and that the file is a valid DuckDB database");
+    }
+    hints
+}
+
 async fn handle_check_connection(
     resolved: &ResolvedConnection,
     verbose: bool,
@@ -652,6 +734,12 @@ async fn handle_check_connection(
     #[cfg(feature = "gaussdb")]
     if scheme == "gaussdb" {
         do_gaussdb_check(resolved, registry, verbose).await;
+        return;
+    }
+
+    #[cfg(feature = "duckdb")]
+    if scheme == "duckdb" {
+        do_duckdb_check(resolved, registry, verbose).await;
         return;
     }
 
@@ -916,6 +1004,8 @@ fn create_registry() -> BackendRegistry {
     registry.register(Arc::new(crate::backend::oracle_native::OracleFactory));
     #[cfg(feature = "gaussdb")]
     registry.register(Arc::new(crate::backend::gaussdb::GaussdbFactory));
+    #[cfg(feature = "duckdb")]
+    registry.register(Arc::new(crate::backend::duckdb::DuckDbFactory));
     registry
 }
 

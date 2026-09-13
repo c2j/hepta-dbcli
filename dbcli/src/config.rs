@@ -424,6 +424,21 @@ fn gaussdb_ssl_url_param(mode: &str) -> &'static str {
     }
 }
 
+pub(crate) fn is_duckdb_driver(driver: Option<&str>) -> bool {
+    driver.is_some_and(|d| d.eq_ignore_ascii_case("duckdb"))
+}
+
+/// DuckDB is embedded: `database` holds the file path or `:memory:`.
+/// No host/port/user/password is involved.
+pub(crate) fn build_duckdb_url(database: Option<&str>) -> Result<String, String> {
+    match database.map(str::trim) {
+        Some(db) if !db.is_empty() => Ok(format!("duckdb://{db}")),
+        _ => {
+            Err("duckdb connection requires `database` to be a file path or ':memory:'".to_string())
+        }
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -496,8 +511,12 @@ pub(crate) fn resolve_single_connection(
     config_path: Option<PathBuf>,
     base_tc: Option<&TimeoutConfig>,
 ) -> Result<ResolvedConnection, String> {
+    let is_duckdb = is_duckdb_driver(conn.driver.as_deref());
+
     let url = if let Some(ref u) = conn.url {
         u.clone()
+    } else if is_duckdb {
+        build_duckdb_url(conn.database.as_deref())?
     } else {
         let host = conn
             .host
@@ -515,15 +534,21 @@ pub(crate) fn resolve_single_connection(
         build_db_url(scheme, host, port, user, password, database, sslmode)
     };
 
-    let password_source = match conn.password.as_deref() {
-        Some(p) if p == KEYRING_SENTINEL => PasswordSource::Keyring,
-        Some(p) => PasswordSource::Plaintext(p.to_string()),
-        None => {
-            // Check env var
-            if let Ok(_pw) = std::env::var("HEPTA_DBCLI_PASSWORD") {
-                PasswordSource::EnvVar
-            } else {
-                PasswordSource::None
+    let password_source = if is_duckdb {
+        // Embedded DB: no authentication. user/password fields (including
+        // the keyring sentinel) are ignored, so no keyring or env lookup.
+        PasswordSource::None
+    } else {
+        match conn.password.as_deref() {
+            Some(p) if p == KEYRING_SENTINEL => PasswordSource::Keyring,
+            Some(p) => PasswordSource::Plaintext(p.to_string()),
+            None => {
+                // Check env var
+                if let Ok(_pw) = std::env::var("HEPTA_DBCLI_PASSWORD") {
+                    PasswordSource::EnvVar
+                } else {
+                    PasswordSource::None
+                }
             }
         }
     };
@@ -645,7 +670,8 @@ pub(crate) fn build_lazy_resolver(
         .as_ref()
         .is_some_and(|p| p != KEYRING_SENTINEL);
 
-    if is_plaintext || conn.url.is_some() {
+    // DuckDB is embedded and has no keyring dependency — resolve eagerly.
+    if is_plaintext || conn.url.is_some() || is_duckdb_driver(conn.driver.as_deref()) {
         let resolved = resolve_single_connection(conn, config_path, base_timeout)?;
         return Ok(LazyConnectionEntry::Ready(resolved));
     }
@@ -812,6 +838,90 @@ mod tests {
     fn test_build_url_special_chars() {
         let url = build_mysql_url("127.0.0.1", 3306, "user", Some("p@ss:w0rd"), None, None);
         assert_eq!(url, "mysql://user:p%40ss%3Aw0rd@127.0.0.1:3306");
+    }
+
+    #[test]
+    fn test_build_duckdb_url_from_database_path() {
+        let url = build_duckdb_url(Some("/data/shop.duckdb")).unwrap();
+        assert_eq!(url, "duckdb:///data/shop.duckdb");
+    }
+
+    #[test]
+    fn test_build_duckdb_url_memory() {
+        let url = build_duckdb_url(Some(":memory:")).unwrap();
+        assert_eq!(url, "duckdb://:memory:");
+    }
+
+    #[test]
+    fn test_build_duckdb_url_requires_database() {
+        assert!(build_duckdb_url(None).is_err());
+        assert!(build_duckdb_url(Some("")).is_err());
+        assert!(build_duckdb_url(Some("  ")).is_err());
+    }
+
+    #[test]
+    fn test_resolve_duckdb_connection_needs_no_host_or_user() {
+        let conn = NamedConnection {
+            name: "duck".into(),
+            url: None,
+            driver: Some("duckdb".into()),
+            host: None,
+            port: None,
+            user: None,
+            password: Some("ignored".into()),
+            database: Some("/tmp/shop.duckdb".into()),
+            sslmode: None,
+            statement_timeout: None,
+            connection_max_lifetime: None,
+        };
+        let resolved = resolve_single_connection(&conn, None, None).unwrap();
+        assert_eq!(resolved.connection_url, "duckdb:///tmp/shop.duckdb");
+        assert!(matches!(resolved.password_source, PasswordSource::None));
+    }
+
+    #[test]
+    fn test_resolve_duckdb_url_passthrough() {
+        let conn = NamedConnection {
+            name: "duck".into(),
+            url: Some("duckdb://:memory:".into()),
+            driver: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            sslmode: None,
+            statement_timeout: None,
+            connection_max_lifetime: None,
+        };
+        let resolved = resolve_single_connection(&conn, None, None).unwrap();
+        assert_eq!(resolved.connection_url, "duckdb://:memory:");
+    }
+
+    #[test]
+    fn test_lazy_resolver_duckdb_is_ready_not_pending() {
+        let conn = NamedConnection {
+            name: "duck".into(),
+            url: None,
+            driver: Some("duckdb".into()),
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: Some(":memory:".into()),
+            sslmode: None,
+            statement_timeout: None,
+            connection_max_lifetime: None,
+        };
+        let entry = build_lazy_resolver(&conn, None, None).unwrap();
+        match entry {
+            LazyConnectionEntry::Ready(r) => {
+                assert_eq!(r.connection_url, "duckdb://:memory:");
+            }
+            LazyConnectionEntry::Pending { .. } => {
+                panic!("duckdb has no keyring dependency; must resolve eagerly");
+            }
+        }
     }
 
     #[test]
