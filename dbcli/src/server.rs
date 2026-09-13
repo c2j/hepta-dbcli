@@ -150,7 +150,7 @@ pub struct DeltaDiffParams {
     pub columns: Option<Vec<String>>,
     /// WHERE 条件（两侧同时应用；禁止分号）
     pub where_condition: Option<String>,
-    /// 策略：auto | hashdiff | joindiff | bucketdiff | iblt
+    /// 策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
     pub strategy: Option<String>,
     /// 一致性模式：snapshot | none
     pub consistency: Option<String>,
@@ -160,6 +160,18 @@ pub struct DeltaDiffParams {
     pub sample_limit: Option<usize>,
     /// 仅输出统计
     pub summary_only: Option<bool>,
+    /// 增量比对列（与 where_condition 互斥）
+    pub update_column: Option<String>,
+    /// 增量窗口，默认 "1 day"；需同时提供 update_column
+    pub update_since: Option<String>,
+    /// 断点续跑文件路径
+    pub checkpoint: Option<String>,
+    /// 只读导出路径（csv/jsonl/json；不支持 sql，SQL 补丁仍走 CLI --apply-to）
+    pub export: Option<String>,
+    /// 导出格式：csv | jsonl | json
+    pub export_format: Option<String>,
+    /// 导出时附带行内容
+    pub export_rows: Option<bool>,
 }
 
 // ─── Connection State ───────────────────────────────────────────────
@@ -701,22 +713,17 @@ impl DbMcp {
             params.left_connection, params.right_connection, params.table
         );
 
-        if let Some(w) = &params.where_condition {
-            if w.contains(';') {
-                return Err(McpError::invalid_request(
-                    "where_condition must not contain ';'",
-                    None,
-                ));
-            }
-        }
-        let strategy = match parse_delta_diff_strategy(params.strategy.as_deref()) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(McpError::invalid_request(e, None));
-            }
+        let opts = match build_mcp_diff_options(&params) {
+            Ok(opts) => opts,
+            Err(e) => return Err(McpError::invalid_request(e, None)),
         };
-        let snapshot = !matches!(params.consistency.as_deref(), Some("none"));
-        let recheck = params.recheck.unwrap_or(snapshot);
+        let export_plan = match parse_mcp_export_format(
+            params.export.as_deref(),
+            params.export_format.as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(e) => return Err(McpError::invalid_request(e, None)),
+        };
 
         let (lpool, lconn) = self.get_connection(Some(&params.left_connection)).await?;
         let (rpool, rconn) = self.get_connection(Some(&params.right_connection)).await?;
@@ -748,34 +755,41 @@ impl DbMcp {
                 .unwrap_or_else(|| params.table.clone()),
             connection_url: rurl,
         };
-        let opts = crate::delta_diff::api::DiffOptions {
-            iblt_capacity: 65536,
-            fetch_all_threshold: 4096,
-            strict: false,
-            strategy,
-            key: params.key_columns.clone().unwrap_or_default(),
-            columns: params.columns.clone().unwrap_or_default(),
-            filter: params.where_condition.clone(),
-            incremental: None,
-            bisection_factor: 32,
-            bisection_threshold: 16384,
-            sample_limit: params.sample_limit.unwrap_or(1000),
-            threads: 4,
-            snapshot,
-            recheck,
-            checkpoint: None,
-            verbose: false,
-            rtrim_char_columns: false,
-        };
-
         match crate::delta_diff::api::run_diff(left, right, opts).await {
             Ok(mut report) => {
-                // Engine keeps full diffs for CLI --export; MCP payload stays capped.
+                let mut export_path = None;
+                if let (Some(path), Some(fmt)) = (params.export.as_deref(), export_plan) {
+                    match crate::delta_diff::export::render_export(
+                        &report,
+                        fmt,
+                        params.export_rows.unwrap_or(false),
+                    ) {
+                        Ok(body) => {
+                            if let Err(e) = std::fs::write(path, body) {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "export write failed: {e}"
+                                ))]));
+                            }
+                            export_path = Some(path.to_string());
+                        }
+                        Err(e) => {
+                            return Ok(CallToolResult::error(vec![Content::text(e)]));
+                        }
+                    }
+                }
+                // Engine keeps full diffs for export; MCP payload stays capped.
                 crate::delta_diff::report::cap_sample_diffs(
                     &mut report,
                     params.sample_limit.unwrap_or(1000),
                 );
-                let text = serde_json::to_string_pretty(&report)
+                let mut payload = serde_json::to_value(&report)
+                    .unwrap_or_else(|e| json!({"error": format!("json serialize: {e}")}));
+                if let Some(path) = export_path {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("export_path".into(), json!(path));
+                    }
+                }
+                let text = serde_json::to_string_pretty(&payload)
                     .unwrap_or_else(|e| format!("{{\"error\":\"json serialize: {e}\"}}"));
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
@@ -814,6 +828,94 @@ fn parse_delta_diff_strategy(
     }
 }
 
+fn mcp_incremental(params: &DeltaDiffParams) -> Result<Option<(String, String)>, String> {
+    if params.where_condition.is_some() && params.update_column.is_some() {
+        return Err("where_condition and update_column are mutually exclusive".into());
+    }
+    if params.update_since.is_some() && params.update_column.is_none() {
+        return Err("update_since requires update_column".into());
+    }
+    Ok(params.update_column.as_ref().map(|col| {
+        (
+            col.clone(),
+            params
+                .update_since
+                .clone()
+                .unwrap_or_else(|| "1 day".into()),
+        )
+    }))
+}
+
+fn parse_mcp_export_format(
+    path: Option<&str>,
+    format: Option<&str>,
+) -> Result<Option<crate::delta_diff::cmd::ExportFormat>, String> {
+    if format.is_some() && path.is_none() {
+        return Err("export_format requires export path".into());
+    }
+    if path.is_none() && format.is_none() {
+        return Ok(None);
+    }
+    let override_fmt = match format {
+        None => None,
+        Some("csv") => Some(crate::delta_diff::cmd::ExportFormat::Csv),
+        Some("jsonl") => Some(crate::delta_diff::cmd::ExportFormat::Jsonl),
+        Some("json") => Some(crate::delta_diff::cmd::ExportFormat::Json),
+        Some("sql") => {
+            return Err(
+                "export_format sql requires CLI --apply-to; MCP export is csv/jsonl/json only"
+                    .into(),
+            )
+        }
+        Some(other) => return Err(format!("unknown export_format '{other}'")),
+    };
+    let fmt = crate::delta_diff::cmd::infer_export_format(path, override_fmt)?;
+    if matches!(fmt, crate::delta_diff::cmd::ExportFormat::Sql) {
+        return Err(
+            "export *.sql requires CLI --apply-to; MCP export is csv/jsonl/json only".into(),
+        );
+    }
+    Ok(Some(fmt))
+}
+
+fn build_mcp_diff_options(
+    params: &DeltaDiffParams,
+) -> Result<crate::delta_diff::api::DiffOptions, String> {
+    if let Some(w) = &params.where_condition {
+        if w.contains(';') {
+            return Err("where_condition must not contain ';'".into());
+        }
+    }
+    let strategy = parse_delta_diff_strategy(params.strategy.as_deref())?;
+    let snapshot = !matches!(params.consistency.as_deref(), Some("none"));
+    let recheck = params.recheck.unwrap_or(snapshot);
+    let incremental = mcp_incremental(params)?;
+    let filter = if incremental.is_some() {
+        None
+    } else {
+        params.where_condition.clone()
+    };
+    Ok(crate::delta_diff::api::DiffOptions {
+        iblt_capacity: 65536,
+        fetch_all_threshold: 4096,
+        strict: false,
+        strategy,
+        key: params.key_columns.clone().unwrap_or_default(),
+        columns: params.columns.clone().unwrap_or_default(),
+        filter,
+        incremental,
+        bisection_factor: 32,
+        bisection_threshold: 16384,
+        sample_limit: params.sample_limit.unwrap_or(1000),
+        threads: 4,
+        snapshot,
+        recheck,
+        checkpoint: params.checkpoint.clone(),
+        verbose: false,
+        rtrim_char_columns: false,
+    })
+}
+
 #[cfg(test)]
 mod delta_diff_strategy_tests {
     use super::parse_delta_diff_strategy;
@@ -830,5 +932,120 @@ mod delta_diff_strategy_tests {
     #[test]
     fn rejects_unknown() {
         assert!(parse_delta_diff_strategy(Some("magic")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod delta_diff_mcp_plan_tests {
+    use super::{build_mcp_diff_options, parse_mcp_export_format, DeltaDiffParams};
+    use crate::delta_diff::cmd::ExportFormat;
+
+    fn base_params() -> DeltaDiffParams {
+        DeltaDiffParams {
+            left_connection: "l".into(),
+            right_connection: "r".into(),
+            table: "t".into(),
+            left_table: None,
+            right_table: None,
+            schema: None,
+            left_schema: None,
+            right_schema: None,
+            key_columns: None,
+            columns: None,
+            where_condition: None,
+            strategy: None,
+            consistency: None,
+            recheck: None,
+            sample_limit: None,
+            summary_only: None,
+            update_column: None,
+            update_since: None,
+            checkpoint: None,
+            export: None,
+            export_format: None,
+            export_rows: None,
+        }
+    }
+
+    #[test]
+    fn incremental_uses_update_column_and_since() {
+        let mut p = base_params();
+        p.update_column = Some("updated_at".into());
+        p.update_since = Some("2 hours".into());
+        let opts = build_mcp_diff_options(&p).unwrap();
+        assert_eq!(
+            opts.incremental
+                .as_ref()
+                .map(|(c, s)| (c.as_str(), s.as_str())),
+            Some(("updated_at", "2 hours"))
+        );
+    }
+
+    #[test]
+    fn incremental_defaults_since_to_one_day() {
+        let mut p = base_params();
+        p.update_column = Some("updated_at".into());
+        let opts = build_mcp_diff_options(&p).unwrap();
+        assert_eq!(
+            opts.incremental
+                .as_ref()
+                .map(|(c, s)| (c.as_str(), s.as_str())),
+            Some(("updated_at", "1 day"))
+        );
+    }
+
+    #[test]
+    fn rejects_update_since_without_column() {
+        let mut p = base_params();
+        p.update_since = Some("1 day".into());
+        assert!(build_mcp_diff_options(&p).is_err());
+    }
+
+    #[test]
+    fn rejects_where_with_update_column() {
+        let mut p = base_params();
+        p.where_condition = Some("id > 1".into());
+        p.update_column = Some("updated_at".into());
+        assert!(build_mcp_diff_options(&p).is_err());
+    }
+
+    #[test]
+    fn checkpoint_is_passed_through() {
+        let mut p = base_params();
+        p.checkpoint = Some("/tmp/dd.ckpt".into());
+        let opts = build_mcp_diff_options(&p).unwrap();
+        assert_eq!(opts.checkpoint.as_deref(), Some("/tmp/dd.ckpt"));
+    }
+
+    #[test]
+    fn rejects_sql_export_without_apply() {
+        assert!(parse_mcp_export_format(Some("out.sql"), Some("sql")).is_err());
+        assert!(parse_mcp_export_format(Some("out.sql"), None).is_err());
+    }
+
+    #[test]
+    fn infers_csv_export_from_path() {
+        assert_eq!(
+            parse_mcp_export_format(Some("out.csv"), None).unwrap(),
+            Some(ExportFormat::Csv)
+        );
+    }
+
+    #[test]
+    fn export_format_without_path_is_rejected() {
+        for fmt in ["csv", "jsonl", "json"] {
+            assert!(
+                parse_mcp_export_format(None, Some(fmt)).is_err(),
+                "export_format '{fmt}' without export path must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn export_format_overrides_path_inference() {
+        assert_eq!(
+            parse_mcp_export_format(Some("out.csv"), Some("jsonl")).unwrap(),
+            Some(ExportFormat::Jsonl)
+        );
     }
 }

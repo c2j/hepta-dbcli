@@ -346,6 +346,8 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
+- MCP tools (7): `get_database_info`, `list_tables`, `get_table_metadata`, `execute_query`, `get_execution_plan`, `list_connections`, `delta_diff`.
+- `delta_diff` is read-only: compare + csv/jsonl/json export + checkpoint + incremental. SQL patch (`--apply-to`) stays on the CLI.
 - All tool calls from MCP enforce **read-only**: only SELECT, EXPLAIN, SHOW, DESCRIBE, DESC are allowed (MySQL). Oracle/GaussDB only allow SELECT, EXPLAIN, WITH. DuckDB allows SELECT, EXPLAIN, WITH, SHOW, DESCRIBE, DESC, SUMMARIZE.
 - `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).

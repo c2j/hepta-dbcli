@@ -312,6 +312,26 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 Tables are generated in FK topological order (cycles rejected). Child FK values are drawn from the parent's generated keys; `pool_strategy: !projection { unique: true }` samples them without replacement. `--seed` derives a stable per-table RNG stream. See [UserGuide.md](UserGuide.md) §10 for the rules YAML reference.
 
+### Cross-database delta-diff
+
+```bash
+# Compare the same table on two connections
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders
+
+# Incremental window + CSV export
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --update-column updated_at --update-since "1 day" \
+  --export /tmp/orders.diff.csv
+
+# Resume a long run
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --checkpoint /tmp/orders.ckpt
+
+# SQL patch generation stays CLI-only (writes DML)
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --export /tmp/orders.patch.sql --apply-to right
+```
+
 ## MCP Tools
 
 When running as MCP server, the following tools are available:
@@ -324,11 +344,9 @@ When running as MCP server, the following tools are available:
 | `execute_query` | Read-only query (dialect prefixes above). Appends `LIMIT N` / `FETCH FIRST N ROWS ONLY` / 11g `ROWNUM`. Default `max_rows` 1000, cap 10000 |
 | `get_execution_plan` | EXPLAIN or EXPLAIN ANALYZE (MySQL TEXT/JSON; Oracle `EXPLAIN PLAN` + `DBMS_XPLAN`; GaussDB `EXPLAIN`) |
 | `list_connections` | List all configured connections and their status |
-| `delta_diff` | Cross-DB table compare. Returns a JSON report. Compare-only: no file export, no checkpoint, no incremental window, no SQL patch |
+| `delta_diff` | Cross-DB table compare (read-only). Supports incremental (`update_column`/`update_since`), `checkpoint`, and csv/jsonl/json `export`. SQL patch `--apply-to` stays on the CLI. |
 
-`delta_diff` parameters: `left_connection`, `right_connection`, `table` (required); optional `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `where_condition`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
-
-Incremental (`--update-column` / `--update-since`), `--checkpoint`, `--export` (csv/jsonl/json/sql), and `--apply-to` stay on the CLI.
+`delta_diff` parameters: `left_connection`, `right_connection`, `table` (required); optional `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `where_condition`, `update_column` / `update_since`, `checkpoint`, `export`, `export_format` (csv/jsonl/json), `export_rows`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
 
 ## Development
 
