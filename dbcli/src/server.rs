@@ -795,7 +795,7 @@ impl DbMcp {
 
 #[tool_handler(
     name = "hepta_dbcli",
-    version = "0.4.5",
+    version = "0.5.0",
     instructions = "MCP server for MySQL/PolarDB-X/Oracle/GaussDB/DuckDB database introspection with multi-connection support"
 )]
 impl ServerHandler for DbMcp {}
