@@ -1,6 +1,6 @@
 # hepta_dbcli 用户指南
 
-当前版本：**0.4.5**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB / DuckDB，并提供跨库表数据比对（`delta-diff`）。
+当前版本：**0.5.0**。CLI + MCP Server，覆盖 MySQL / PolarDB-X / Oracle / GaussDB / DuckDB，并提供跨库表数据比对（`delta-diff`）。
 
 ## 目录
 
@@ -40,7 +40,7 @@ cargo build --release -p polar-mysql
 # 二进制位于: target/release/hepta_dbcli
 ```
 
-默认 feature 已包含 `oracle-rs`、`oracle`、`gaussdb`。连接 Oracle 11g 时会回退到 `oracle` crate，需要本机安装 [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) 并配置动态库路径。12c+ 走纯 Rust 的 `oracle-rs`，无需 Instant Client。
+默认 feature 已包含 `oracle-rs`、`oracle`、`gaussdb`、`synth`（自 0.5.0）。GitHub Release 预编译包与此一致。连接 Oracle 11g 时会回退到 `oracle` crate，需要本机安装 [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) 并配置动态库路径。12c+ 走纯 Rust 的 `oracle-rs`，无需 Instant Client。若不需要 synth：`cargo build --release -p polar-mysql --no-default-features --features "oracle-rs,oracle,gaussdb"`。
 
 DuckDB 为可选 feature（不默认编译）：
 
@@ -54,7 +54,7 @@ cargo build --release -p polar-mysql --features duckdb
 
 ```bash
 $ hepta_dbcli --version
-hepta_dbcli 0.4.5
+hepta_dbcli 0.5.0
 ```
 
 ---
@@ -819,25 +819,20 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 
 ## 10. 合成数据生成 (synth)
 
-`synth` 从真实表学习每列统计分布（采样时经 Gaussian Copula 路径，相关矩阵为单位阵，
-即列间独立），生成形似的合成数据，跨表外键保持引用完整性。全部功能位于 `--features synth` 门控之后，
-仅提供 CLI 子命令（MCP 不暴露）。
+`synth` 从真实表学习每列统计分布（Gaussian Copula：边际 + 从训练数据估计的相关矩阵），生成形似的合成数据，跨表外键保持引用完整性。自 **0.5.0** 起 `synth` 在默认 feature 中（预编译包同样包含）；仅提供 CLI 子命令（MCP 不暴露）。
 
 ### 10.1 编译启用
 
-synth 是可选 feature，默认不参与编译：
+默认 `cargo build --release -p polar-mysql` 已包含 synth。若从源码关闭：
 
 ```bash
-cargo build --features synth
-# 发布构建（连同 Oracle/GaussDB）
-cargo build --release -p polar-mysql --features "oracle,gaussdb,synth"
+cargo build --release -p polar-mysql --no-default-features --features "oracle-rs,oracle,gaussdb"
 ```
 
 ### 10.2 工作流
 
 ```bash
-# 1. 训练：采样真实数据，拟合每列边际分布（Copula 相关矩阵为单位阵，
-#    即列间独立；相关性拟合见「语义与限制」）
+# 1. 训练：采样真实数据，拟合每列边际分布 + Copula 相关矩阵
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
 # 2. 起草规则：从数据库外键自动生成 YAML 规则草案
@@ -1096,7 +1091,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --export /tmp/orders.patch.sql --apply-to right
 
-# 合成数据生成（需 --features synth 编译）
+# 合成数据生成（默认 feature 自 0.5.0 起包含 synth）
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 hepta_dbcli synth rules-draft --name dev --tables users,orders --output synth-rules.yaml
 hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \

@@ -101,8 +101,8 @@ cargo test --all
 # Oracle 单元测试（`oracle` 已在 default features 里，此行只是显式说明）
 cargo test --all --features oracle
 
-# synth 单元测试（无需 DB；synth 是可选 feature）
-cargo test --all --features synth
+# synth 单元测试（无需 DB；synth 自 0.5.0 起在 default features 中）
+cargo test --all
 
 # MySQL 集成测试（需运行 MySQL + 环境变量）
 HEPTA_DBCLI_TEST_URL=mysql://mcp:testpass@127.0.0.1:3306/testdb cargo test --all --features integration
@@ -146,14 +146,11 @@ cargo test --all --features integration   # CI 也跑这条；无 DB 时集成�
 ## Build & Dev Commands
 
 ```bash
-# Build (debug, MySQL only)
+# Build (debug, default: oracle-rs + oracle + gaussdb + synth)
 cargo build
 
-# Build with Oracle support
-cargo build --features oracle
-
-# Build release
-cargo build --release -p polar-mysql --features oracle,gaussdb
+# Build release (same default features)
+cargo build --release -p polar-mysql
 
 # Format check
 cargo fmt --all -- --check
@@ -210,9 +207,9 @@ dbcli/                          # Cargo workspace root
 │               ├── conn.rs     # OracleConn (wraps oracle_rs::Connection)
 │               ├── dialect.rs  # OracleDialect (ALL_TABLES, SYS_CONTEXT, LISTAGG)
 │               └── types.rs    # oracle_rs::Row → serde_json::Value
-│       ├── synth/              # Synthetic data generation (feature-gated: --features synth, CLI-only)
+│       ├── synth/              # Synthetic data generation (default feature `synth` since 0.5.0, CLI-only)
 │           ├── mod.rs          # synth::run dispatcher; config/connection resolution (default_connection aware)
-│           ├── cmd.rs          # clap SynthArgs + build_model (fits marginals, n×n identity copula)
+│           ├── cmd.rs          # clap SynthArgs + build_model (marginals + PIT/Pearson copula)
 │           ├── graph.rs        # Topological sort (Kahn) + Tarjan SCC; edge (from,to) = from first
 │           ├── marginal.rs     # Marginals: Normal/Beta/Gamma/Categorical/Uniform (real CDF+PPF, bisection inverse)
 │           ├── copula.rs       # GaussianCopula: Cholesky + PSD projection + correlated sampling
@@ -232,7 +229,7 @@ dbcli/                          # Cargo workspace root
 │           └── types.rs    # duckdb::types::ValueRef → serde_json::Value
 └── .github/workflows/
     ├── ci.yml                  # PR/push: fmt, clippy, test (MySQL 8 service container)
-    └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle)
+    └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle-rs,oracle,gaussdb,synth)
 ```
 
 **Dual mode**: The binary defaults to MCP server (`hepta_dbcli` with no subcommand). Use `hepta_dbcli cli` for one-shot SQL or `hepta_dbcli cli --interactive` for REPL.
@@ -249,8 +246,8 @@ dbcli/                          # Cargo workspace root
 | `rustyline` 18 | Interactive REPL |
 | `tracing` | Structured logging |
 | `async-trait` 0.1 | Async trait support |
-| `rand` 0.8 + `rand_distr` 0.4 | RNG for synth (optional, `--features synth`) |
-| `serde_yaml` 0.9 | synth rules YAML (optional, `--features synth`) |
+| `rand` 0.8 + `rand_distr` 0.4 | RNG for synth (default feature) |
+| `serde_yaml` 0.9 | synth rules YAML (default feature) |
 
 ## Multi-Database Abstraction
 
@@ -358,7 +355,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - `libdbus-1-dev` and `pkg-config` are system dependencies for `clippy` and `test`. Without them, `cargo clippy` will fail on the `keyring` crate.
 - Release builds on Windows link statically (`-C target-feature=+crt-static`).
 - Release tags: `v*` (e.g. `v0.2.1`).
-- Release binaries are built with `--features oracle` to include both MySQL and Oracle backends.
+- Release binaries are built with `--features oracle-rs,oracle,gaussdb,synth` (not `--all-features`; `integration` and `duckdb` stay out).
 
 ### Style Conventions
 - Section headers use `// ─── ... ───` style.

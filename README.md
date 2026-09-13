@@ -2,16 +2,16 @@
 
 CLI and MCP server for MySQL / PolarDB-X / Oracle / GaussDB / DuckDB database introspection, plus cross-database table comparison (`delta-diff`).
 
-Current version: **0.4.5**.
+Current version: **0.5.0**.
 
 ## Features
 
 - **MCP server** — spawn as a Model Context Protocol server for AI tools (Claude, Cursor, etc.) with per-dialect read-only enforcement
-- **Multi-database** — MySQL, PolarDB-X, Oracle, GaussDB (default features: `oracle-rs`, `oracle`, `gaussdb`) and DuckDB (optional feature `duckdb`)
+- **Multi-database** — MySQL, PolarDB-X, Oracle, GaussDB (default features: `oracle-rs`, `oracle`, `gaussdb`, `synth`) and DuckDB (optional feature `duckdb`)
 - **One-shot CLI** — execute SQL from command line, file, or stdin with `table` / `json` / `csv` / `vertical` output
 - **Interactive REPL** — database-aware SQL prompt with multi-line editing, history, and dot commands
 - **Cross-DB delta-diff** — compare table data across two named connections (`hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`); CLI + MCP
-- **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`--features synth`, CLI-only)
+- **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`synth` CLI; in default features since 0.5.0, MCP does not expose it)
 - **Multi-connection** — `~/.hepta-dbcli.toml` with per-connection timeouts
 - **OS keychain** — passwords stored in macOS Keychain or Linux Secret Service, with automatic migration from plaintext config files
 
@@ -41,9 +41,9 @@ cargo build --release -p polar-mysql --features duckdb
 cargo build --release -p polar-mysql --features duckdb -j 2
 ```
 
-Default features already include Oracle (`oracle-rs` + native fallback) and GaussDB. Oracle 11g connections fall back to the `oracle` crate and need [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) on the PATH.
+Default features include Oracle (`oracle-rs` + native fallback), GaussDB, and synthetic data generation (`synth`). Prebuilt GitHub Release binaries match that set from **0.5.0**. Oracle 11g connections fall back to the `oracle` crate and need [Oracle Instant Client](https://www.oracle.com/database/technologies/instant-client.html) on the PATH.
 
-Optional features: add `--features synth` for synthetic data generation.
+To omit synth: `cargo build --release -p polar-mysql --no-default-features --features "oracle-rs,oracle,gaussdb"`.
 
 DuckDB notes: the `bundled` feature compiles DuckDB from source (C++ toolchain required) and statically links it. The bundled build excludes the ICU extension — date arithmetic like `now() - interval '1 day'` needs `INSTALL icu; LOAD icu;` at runtime (`TIMESTAMPTZ - INTERVAL` fails without it; the delta-diff incremental window casts `NOW()` to naive `TIMESTAMP` first, which yields **UTC wall-clock** in bundled builds — both sides of a diff use the same cutoff, so results stay self-consistent). A `.duckdb` file allows one writer at a time; concurrent readers require `?mode=ro`. delta-diff supports DuckDB on both sides (`BLOB`/`JSON`/`TEXT` columns are excluded from row hashing, and `TIMESTAMPTZ` normalizes to UTC text without ICU). Cross-backend caveat: UUID/BLOB/non-finite-float values may normalize differently than GaussDB/Oracle — such columns are either excluded loudly or may report diffs; verify when comparing across engines.
 
@@ -289,13 +289,13 @@ Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dr
 
 See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--rtrim-char-columns`.
 
-### Synthetic data generation (`--features synth`)
+### Synthetic data generation
 
-Sample-based generation: train per-column marginals (Gaussian copula sampling with an identity correlation matrix) from real tables, then generate look-alike data with cross-table foreign-key integrity. CLI-only; build with `--features synth`.
+Sample-based generation: train per-column marginals plus a Gaussian copula correlation matrix from real tables, then generate look-alike data with cross-table foreign-key integrity. CLI-only; included in default features since **0.5.0** (prebuilt Release binaries include it). MCP does not expose synth.
 
 ```bash
-# 1. Train table models (samples tables, fits per-column marginals;
-#    copula correlation is an identity matrix — independent columns)
+# 1. Train table models (samples tables, fits per-column marginals
+#    and the copula correlation matrix)
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
 # 2. Draft a rules YAML from the database's foreign keys
@@ -333,7 +333,7 @@ Incremental (`--update-column` / `--update-since`), `--checkpoint`, `--export` (
 ## Development
 
 ```bash
-# Release (default features: oracle-rs + oracle + gaussdb)
+# Release (default features: oracle-rs + oracle + gaussdb + synth)
 cargo build --release -p polar-mysql
 
 # Format check
@@ -345,8 +345,8 @@ cargo clippy --all --all-targets
 # Unit tests
 cargo test --all
 
-# Synth unit tests (no DB needed)
-cargo test --all --features synth
+# Synth unit tests (included in default features since 0.5.0)
+cargo test --all
 
 # Integration tests — see tests/README.md
 # MySQL
