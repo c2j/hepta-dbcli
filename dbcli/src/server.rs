@@ -850,6 +850,9 @@ fn parse_mcp_export_format(
     path: Option<&str>,
     format: Option<&str>,
 ) -> Result<Option<crate::delta_diff::cmd::ExportFormat>, String> {
+    if format.is_some() && path.is_none() {
+        return Err("export_format requires export path".into());
+    }
     if path.is_none() && format.is_none() {
         return Ok(None);
     }
@@ -1025,6 +1028,24 @@ mod delta_diff_mcp_plan_tests {
         assert_eq!(
             parse_mcp_export_format(Some("out.csv"), None).unwrap(),
             Some(ExportFormat::Csv)
+        );
+    }
+
+    #[test]
+    fn export_format_without_path_is_rejected() {
+        for fmt in ["csv", "jsonl", "json"] {
+            assert!(
+                parse_mcp_export_format(None, Some(fmt)).is_err(),
+                "export_format '{fmt}' without export path must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn export_format_overrides_path_inference() {
+        assert_eq!(
+            parse_mcp_export_format(Some("out.csv"), Some("jsonl")).unwrap(),
+            Some(ExportFormat::Jsonl)
         );
     }
 }
