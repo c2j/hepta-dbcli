@@ -63,6 +63,53 @@ fn oracle_result_to_query_result(result: oracle_rs::connection::QueryResult) -> 
     }
 }
 
+// oracle-rs 只回首个 prefetch 批（固定 100 行）；必须沿游标续取到尽，
+// 否则任何超过 prefetch 的查询都被静默截断（cli/MCP/synth train 全部受影响）
+const ORACLE_FETCH_SIZE: u32 = 100;
+
+async fn drain_result(
+    conn: &oracle_rs::Connection,
+    mut result: oracle_rs::connection::QueryResult,
+) -> Result<QueryResult, DbError> {
+    if result.rows.is_empty() && !result.has_more_rows {
+        return Ok(QueryResult::empty());
+    }
+
+    let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    let col_count = columns.len();
+
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        rows.push(types::format_oracle_row(row, col_count));
+    }
+
+    // oracle-rs 0.1.7 缺陷：execute 硬编码 prefetch=100 且从不置 has_more_rows，
+    // fetch_more 亦协议损坏（返回空批并使后续请求被服务器断连——见
+    // regress_oracle::oracle_query_fetches_beyond_prefetch_batch 的 ignore 原因）。
+    // 此循环按 has_more_rows 契约编写，驱动修复后 >100 行查询自动生效，
+    // 当前版本为无害空转。
+    while result.has_more_rows {
+        let more = conn
+            .fetch_more(result.cursor_id, &result.columns, ORACLE_FETCH_SIZE)
+            .await
+            .map_err(|e| DbError::query_with_source("Oracle fetch_more failed", e))?;
+        if more.rows.is_empty() {
+            break;
+        }
+        for row in &more.rows {
+            rows.push(types::format_oracle_row(row, col_count));
+        }
+        result = more;
+    }
+
+    let row_count = rows.len();
+    Ok(QueryResult {
+        columns,
+        rows,
+        row_count,
+    })
+}
+
 #[async_trait]
 impl DbConn for OracleConn {
     async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
@@ -71,7 +118,7 @@ impl DbConn for OracleConn {
             .query(sql, &[])
             .await
             .map_err(|e| DbError::query_with_source("Oracle query failed", e))?;
-        Ok(oracle_result_to_query_result(result))
+        drain_result(&self.conn, result).await
     }
 
     async fn exec(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
@@ -93,7 +140,7 @@ impl DbConn for OracleConn {
             .query(sql, &param_refs)
             .await
             .map_err(|e| DbError::query_with_source("Oracle exec failed", e))?;
-        Ok(oracle_result_to_query_result(result))
+        drain_result(&self.conn, result).await
     }
 
     async fn query_drop(&mut self, sql: &str) -> Result<(), DbError> {

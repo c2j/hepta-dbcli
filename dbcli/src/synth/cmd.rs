@@ -1,6 +1,8 @@
 use crate::synth::export::{export, ExportFormat};
 use crate::synth::generator::{generate, GeneratorConfig};
-use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
+use crate::synth::marginal::{
+    compute_gaussian_correlation, CategoricalParams, Marginal, NormalParams,
+};
 use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
 use crate::synth::profile::TableProfile;
 use crate::synth::rules::SynthRules;
@@ -90,6 +92,16 @@ pub enum SynthCommand {
         /// Output format: csv, jsonl, json, sql
         #[arg(short, long, default_value = "csv")]
         format: String,
+
+        /// Clip generated values to training min/max
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = true
+        )]
+        enforce_min_max_values: bool,
     },
 
     /// Validate a trained model file
@@ -106,6 +118,7 @@ pub(crate) fn build_model(
     table: &str,
     dialect: &str,
     profile: &TableProfile,
+    rows: &[Vec<serde_json::Value>],
 ) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
@@ -131,6 +144,8 @@ pub(crate) fn build_model(
                         logical_type,
                         rounding,
                         datetime_epoch: None,
+                        min: col_profile.min.as_ref().and_then(|v| v.as_f64()),
+                        max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
                         marginal,
                     },
                 );
@@ -157,6 +172,32 @@ pub(crate) fn build_model(
     }
     let n = column_order.len();
 
+    // Compute correlation matrix from training rows
+    let correlation = if rows.len() >= 2 && n > 0 {
+        // rows 是全宽（含被跳过的列），先按过滤后的 column_order 投影，
+        // 否则 compute_gaussian_correlation 的列索引会错位
+        let col_pos: HashMap<&str, usize> = profile
+            .column_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        let projected: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|row| {
+                column_order
+                    .iter()
+                    .filter_map(|c| col_pos.get(c.as_str()).and_then(|&i| row.get(i).cloned()))
+                    .collect()
+            })
+            .collect();
+        compute_gaussian_correlation(&projected, &column_order, &columns)
+    } else {
+        (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect()
+    };
+
     let model = TableModel {
         version: 1,
         table: table.to_string(),
@@ -170,13 +211,7 @@ pub(crate) fn build_model(
         columns,
         copula: CopulaInfo {
             column_order,
-            correlation: (0..n)
-                .map(|i| {
-                    let mut row = vec![0.0; n];
-                    row[i] = 1.0;
-                    row
-                })
-                .collect(),
+            correlation,
         },
     };
     Ok((model, skipped))
@@ -239,6 +274,7 @@ pub fn run_generate(
     rows_per_table: Option<usize>,
     seed: Option<u64>,
     format: &str,
+    enforce_min_max_values: bool,
 ) -> Result<(), String> {
     let models_dir = Path::new(models_dir);
     let rules_path = Path::new(rules_path);
@@ -272,6 +308,7 @@ pub fn run_generate(
     let config = GeneratorConfig {
         rows_per_table: rows_map,
         seed,
+        enforce_min_max_values,
     };
 
     let data = generate(&models, &rules, &config)?;
@@ -446,7 +483,7 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
         assert!(skipped.is_empty());
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
@@ -463,7 +500,7 @@ mod tests {
     #[test]
     fn build_model_rejects_empty_profile() {
         let profile = TableProfile::from_rows("t", &[], &[]);
-        assert!(build_model("t", "mysql", &profile).is_err());
+        assert!(build_model("t", "mysql", &profile, &[]).is_err());
     }
 
     #[test]
@@ -478,7 +515,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("status").unwrap();
         match &col.marginal {
@@ -503,7 +540,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("flag").unwrap();
         let generated = col.marginal.inverse_cdf(0.01);
@@ -528,7 +565,7 @@ mod tests {
         )]);
         profile.save(&dir.join("users.profile.json")).unwrap();
 
-        let (model, _) = build_model("users", "mysql", &profile).unwrap();
+        let (model, _) = build_model("users", "mysql", &profile, &[]).unwrap();
         model.save(&dir.join("users.model.json")).unwrap();
 
         let loaded = load_profiles(&dir).unwrap();
@@ -562,10 +599,41 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
+    }
+
+    #[test]
+    fn build_model_correlation_ignores_skipped_columns() {
+        // 中间列是驱动占位串会被跳过；id 与 v3 完全线性相关。
+        // 回归：投影前用全宽行索引取数会导致 v3 读到占位串 → 相关性恒 0。
+        let rows: Vec<Vec<Value>> = (0..10)
+            .map(|i| {
+                vec![
+                    Value::from(i),
+                    Value::from("<unsupported type timestamptz>: \\x00"),
+                    Value::from(3 * i),
+                ]
+            })
+            .collect();
+        let columns = vec![
+            "id".to_string(),
+            "last_update".to_string(),
+            "v3".to_string(),
+        ];
+        let profile = TableProfile::from_rows("t", &columns, &rows);
+
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows).unwrap();
+        assert_eq!(skipped, vec!["last_update".to_string()]);
+        assert_eq!(model.copula.column_order, vec!["id", "v3"]);
+        let r = model.copula.correlation[0][1];
+        assert!(
+            r > 0.9,
+            "id–v3 correlation must survive the skipped column, got {}",
+            r
+        );
     }
 
     #[test]
@@ -580,7 +648,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[]).unwrap();
         let col = model.columns.get("id").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -597,7 +665,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[]).unwrap();
         let col = model.columns.get("v").unwrap();
         assert_eq!(col.rounding, Some(0));
     }

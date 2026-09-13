@@ -396,6 +396,47 @@ mod tests {
         drop_table_named(&mut *conn, TABLE).await;
     }
 
+    // oracle-rs 0.1.7：execute 硬编码 prefetch=100、has_more_rows 恒 false、
+    // fetch_more 协议损坏（空批 + 服务器断连）。驱动修复后移除 ignore。
+    #[tokio::test]
+    #[ignore = "oracle-rs 0.1.7 truncates queries at the 100-row prefetch batch; fetch_more is protocol-broken"]
+    async fn oracle_query_fetches_beyond_prefetch_batch() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        const TABLE: &str = "DD_FETCH_MANY";
+        let _ = conn
+            .query_drop(&format!(
+                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {TABLE}'; EXCEPTION WHEN OTHERS THEN NULL; END;"
+            ))
+            .await;
+        conn.query_drop(&format!("CREATE TABLE {TABLE} (id NUMBER PRIMARY KEY)"))
+            .await
+            .expect("create table");
+        for base in (0..250).step_by(50) {
+            let values: String = (base..base + 50)
+                .map(|i| format!("SELECT {i} FROM dual"))
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            conn.query_drop(&format!("INSERT INTO {TABLE} SELECT * FROM ({values})"))
+                .await
+                .expect("insert batch");
+        }
+        let result =
+            polar_mysql::backend::DbConn::query(&mut *conn, &format!("SELECT id FROM {TABLE}"))
+                .await
+                .expect("select all");
+        assert_eq!(
+            result.row_count, 250,
+            "query must drain all fetch batches, not stop at the driver prefetch size"
+        );
+        let _ = conn
+            .query_drop(&format!(
+                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {TABLE}'; EXCEPTION WHEN OTHERS THEN NULL; END;"
+            ))
+            .await;
+    }
+
     #[tokio::test]
     async fn oracle_native_varchar_digit_stays_json_string() {
         let Some(mut conn) = try_connect_native().await else {

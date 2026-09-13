@@ -900,9 +900,12 @@ tables:
 - 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
 - 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
 - 数值列拟合 Normal 分布（整数列生成取整值），字符串列拟合分类分布，分类列输出原始字符串值
-- Copula 相关矩阵恒为单位阵（列间独立）；从数据估计相关性尚未实现
+- Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码），PSD 修正用对角占优近似
 - `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位、时间戳等非数值非字符串）在训练时跳过并打印警告，生成的数据不含这些列
+- 全部样本都可解析为数字的字符串列按**数值**训练（DECIMAL/NUMBER 常被驱动序列化为字符串）。注意：这是纯启发式、不感知 schema——邮编、零填充 SKU、纯数字类别码会被误判为数值；此类列请勿用于 synth 或先在库内转型
+- 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
+- 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断，`synth train` 在 Oracle 上最多采样 100 行，保真度相应下降（见 `tests/benchmark/REPORT.md`）；native OCI 后端不受影响但当前无法从配置强制选择
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写；导出语句**不带 schema 限定**，灌库前请确认目标 schema 在 search_path 中（或手工补前缀）
 - `train` / `rules-draft` 的 `--schema` 显式指定表所在 schema；缺省时 train 依赖连接默认 schema，rules-draft 取 `current_schema`，两者可能不同——跨 schema 场景请两侧都显式传 `--schema`
 

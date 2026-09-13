@@ -49,10 +49,24 @@ impl ColumnProfile {
             .collect::<std::collections::HashSet<_>>()
             .len();
 
+        let numeric_strings: Option<Vec<f64>> = if !non_null.is_empty() && non_null[0].is_string() {
+            let parsed: Option<Vec<f64>> = non_null
+                .iter()
+                .map(|v| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                .collect();
+            parsed.filter(|nums| !nums.is_empty())
+        } else {
+            None
+        };
+
         let (logical_type, min, max, mean, std_dev) = if non_null.is_empty() {
             ("unknown".to_string(), None, None, None, None)
-        } else if non_null[0].is_number() {
-            let nums: Vec<f64> = non_null.iter().filter_map(|v| v.as_f64()).collect();
+        } else if non_null[0].is_number() || numeric_strings.is_some() {
+            let nums: Vec<f64> = if non_null[0].is_number() {
+                non_null.iter().filter_map(|v| v.as_f64()).collect()
+            } else {
+                numeric_strings.clone().unwrap()
+            };
             let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let mean = nums.iter().sum::<f64>() / nums.len() as f64;
@@ -82,7 +96,10 @@ impl ColumnProfile {
         let is_integer = logical_type == "numerical"
             && non_null
                 .iter()
-                .filter_map(|v| v.as_f64())
+                .filter_map(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                })
                 .all(|f| f.fract() == 0.0);
 
         let top_values = if logical_type == "categorical" {
@@ -218,6 +235,41 @@ mod tests {
         let samples = vec![serde_json::json!(1.5), serde_json::json!(2.0)];
         let profile = ColumnProfile::from_samples(&samples);
         assert!(!profile.is_integer);
+    }
+
+    #[test]
+    fn column_profile_detects_numeric_strings_as_numerical() {
+        // DECIMAL/NUMBER 经常见驱动反序列化为字符串，须按数值训练
+        let samples: Vec<Value> = ["44.40", "31.70", "40.72", "39.73"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(!profile.is_integer);
+        assert!((profile.mean.unwrap() - 39.1375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn column_profile_detects_integer_strings_as_integer() {
+        let samples: Vec<Value> = ["1", "2", "3", "4"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(profile.is_integer);
+    }
+
+    #[test]
+    fn column_profile_stays_categorical_when_strings_unparseable() {
+        let samples: Vec<Value> = ["A", "B", "C", "A"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "categorical");
     }
 
     #[test]

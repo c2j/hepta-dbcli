@@ -1,4 +1,6 @@
+use crate::synth::model::ColumnModel;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "name")]
@@ -95,14 +97,34 @@ fn normal_cdf(x: f64, loc: f64, scale: f64) -> f64 {
     0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2))
 }
 
+/// Inverse normal CDF via binary search on the CDF.
+/// Guarantees correct roundtrip; fast enough for synth workloads.
 fn normal_ppf(loc: f64, scale: f64, p: f64) -> f64 {
-    let a = -8.0 * (2.0 * p - 1.0).abs().ln();
-    let t = (a.sqrt() - 2.685_924_321_146_84) / 2.729_082_346_098_76;
-    let x = t
-        - (2.515_517 + 0.802_853 * t + 0.010_328 * t * t)
-            / (1.0 + 1.432_788 * t + 0.189_269 * t * t + 0.001_308 * t * t * t);
-    let x = if p < 0.5 { -x } else { x };
-    loc + scale * x
+    const EPS: f64 = 1e-15;
+    let p = p.clamp(EPS, 1.0 - EPS);
+
+    // Quick return for p=0.5
+    if (p - 0.5).abs() < 1e-15 {
+        return loc;
+    }
+
+    // Binary search bounds: normal is effectively bounded at ±10 σ
+    let mut lo = loc - 10.0 * scale;
+    let mut hi = loc + 10.0 * scale;
+
+    for _ in 0..50 {
+        let mid = (lo + hi) * 0.5;
+        let cdf = normal_cdf(mid, loc, scale);
+        if cdf < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo < 1e-12 {
+            break;
+        }
+    }
+    (lo + hi) * 0.5
 }
 
 fn beta_cdf(x: f64, a: f64, b: f64) -> f64 {
@@ -442,6 +464,113 @@ impl MarginalFitter for UniformFitter {
     }
 }
 
+/// Compute Gaussian-space correlation matrix from training rows using PIT.
+/// For each column: apply marginal CDF (PIT) → Φ⁻¹ (normal_ppf) → Pearson correlation.
+/// Categorical columns use SDV-style UniformEncoder: map to cumulative frequency intervals.
+pub fn compute_gaussian_correlation(
+    rows: &[Vec<serde_json::Value>],
+    column_order: &[String],
+    columns: &HashMap<String, ColumnModel>,
+) -> Vec<Vec<f64>> {
+    let n_cols = column_order.len();
+    let n_rows = rows.len();
+    if n_rows < 2 || n_cols == 0 {
+        return (0..n_cols)
+            .map(|i| {
+                (0..n_cols)
+                    .map(|j| if i == j { 1.0 } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+    }
+
+    // Transform each column to standard normal space
+    let mut gaussian_data = vec![vec![0.0f64; n_rows]; n_cols];
+
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let col_model = columns.get(col_name);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let val = row.get(col_idx).cloned().unwrap_or(serde_json::Value::Null);
+            let u = if let Some(model) = col_model {
+                match &model.marginal {
+                    crate::synth::marginal::Marginal::Normal(p) => {
+                        // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
+                        let x = val
+                            .as_f64()
+                            .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                            .unwrap_or(p.loc);
+                        let cdf = normal_cdf(x, p.loc, p.scale);
+                        // Clamp to avoid ppf at exactly 0 or 1
+                        cdf.clamp(1e-12, 1.0 - 1e-12)
+                    }
+                    crate::synth::marginal::Marginal::Categorical(p) => {
+                        // SDV UniformEncoder: map category to mid-point of its cumulative interval
+                        if let Some(idx) = p
+                            .values
+                            .iter()
+                            .position(|v| v == &val.as_str().unwrap_or("").to_string())
+                        {
+                            let total: f64 = p.weights.iter().sum();
+                            let cum_before: f64 = p.weights[..idx].iter().sum();
+                            (cum_before + p.weights[idx] / 2.0) / total
+                        } else {
+                            0.5
+                        }
+                    }
+                    _ => 0.5,
+                }
+            } else {
+                0.5
+            };
+            gaussian_data[col_idx][row_idx] = normal_ppf(0.0, 1.0, u);
+        }
+    }
+
+    // Compute Pearson correlation
+    let mut corr = vec![vec![0.0f64; n_cols]; n_cols];
+    for i in 0..n_cols {
+        corr[i][i] = 1.0;
+        for j in (i + 1)..n_cols {
+            let xi = &gaussian_data[i];
+            let xj = &gaussian_data[j];
+            let mean_i = xi.iter().sum::<f64>() / n_rows as f64;
+            let mean_j = xj.iter().sum::<f64>() / n_rows as f64;
+            let mut cov = 0.0;
+            let mut var_i = 0.0;
+            let mut var_j = 0.0;
+            for k in 0..n_rows {
+                let di = xi[k] - mean_i;
+                let dj = xj[k] - mean_j;
+                cov += di * dj;
+                var_i += di * di;
+                var_j += dj * dj;
+            }
+            let r = if var_i > 0.0 && var_j > 0.0 {
+                cov / (var_i * var_j).sqrt()
+            } else {
+                0.0
+            };
+            corr[i][j] = r;
+            corr[j][i] = r;
+        }
+    }
+
+    // Ensure PSD by adding small epsilon to diagonal if needed
+    for (i, row) in corr.iter_mut().enumerate() {
+        let row_sum: f64 = row
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, &v)| v.abs())
+            .sum();
+        if row[i] < row_sum {
+            row[i] = row_sum + 1e-6;
+        }
+    }
+
+    corr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,13 +783,106 @@ mod tests {
     }
 
     #[test]
-    fn normal_cdf_roundtrip() {
-        let params = NormalParams {
-            loc: 0.0,
-            scale: 1.0,
-        };
-        let x = 0.5;
-        let cdf_val = normal_cdf(x, params.loc, params.scale);
-        assert!(cdf_val > 0.0 && cdf_val < 1.0);
+    fn normal_ppf_roundtrip_over_two_sigma() {
+        let mut x = -2.0;
+        while x <= 2.0 {
+            let p = normal_cdf(x, 0.0, 1.0);
+            let back = normal_ppf(0.0, 1.0, p);
+            assert!(
+                (back - x).abs() < 1e-8,
+                "ppf(cdf({})) = {}, drift too large",
+                x,
+                back
+            );
+            x += 0.1;
+        }
+    }
+
+    #[test]
+    fn normal_ppf_median_is_loc() {
+        assert!((normal_ppf(5.0, 2.0, 0.5) - 5.0).abs() < 1e-12);
+    }
+
+    fn normal_column_model(loc: f64, scale: f64) -> ColumnModel {
+        ColumnModel {
+            logical_type: crate::synth::model::LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            min: None,
+            max: None,
+            marginal: Marginal::Normal(NormalParams { loc, scale }),
+        }
+    }
+
+    #[test]
+    fn correlation_detects_strong_linear_relationship() {
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| vec![serde_json::Value::from(i), serde_json::Value::from(3 * i)])
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string()];
+        // 边际参数须与数据分布一致（真实 train 由数据拟合），否则 PIT 饱和
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(73.5, 45.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1] > 0.99,
+            "linear columns must correlate strongly, got {}",
+            corr[0][1]
+        );
+        assert_eq!(corr[0][0], 1.0);
+        assert_eq!(corr[1][1], 1.0);
+        assert!((corr[1][0] - corr[0][1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn correlation_handles_numeric_strings_from_drivers() {
+        // DECIMAL/NUMBER 常被驱动序列化为 JSON 字符串；相关性不得因此静默归零
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i),
+                    serde_json::Value::from(format!("{:.2}", 3.0 * i as f64)),
+                ]
+            })
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(73.5, 45.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1] > 0.99,
+            "numeric strings must still correlate, got {}",
+            corr[0][1]
+        );
+    }
+
+    #[test]
+    fn correlation_near_zero_for_uncorrelated_columns() {
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i),
+                    serde_json::Value::from((i % 2) * 100),
+                ]
+            })
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(50.0, 1.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1].abs() < 0.2,
+            "alternating column must be ~uncorrelated, got {}",
+            corr[0][1]
+        );
     }
 }

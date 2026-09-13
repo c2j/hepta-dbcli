@@ -9,6 +9,17 @@ use std::collections::HashMap;
 pub struct GeneratorConfig {
     pub rows_per_table: HashMap<String, usize>,
     pub seed: Option<u64>,
+    pub enforce_min_max_values: bool,
+}
+
+impl Default for GeneratorConfig {
+    fn default() -> Self {
+        Self {
+            rows_per_table: HashMap::new(),
+            seed: None,
+            enforce_min_max_values: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,6 +132,10 @@ pub fn generate(
                     .copied()
                     .unwrap_or(0.5);
 
+                // Clip uniform to (ε, 1-ε) to avoid ppf at extremes
+                const EPS: f64 = 1e-12;
+                let uniform_val = uniform_val.clamp(EPS, 1.0 - EPS);
+
                 let column_model = model.columns.get(col_name);
                 match column_model.map(|c| &c.marginal) {
                     Some(crate::synth::marginal::Marginal::Categorical(p)) => {
@@ -130,7 +145,18 @@ pub fn generate(
                         ));
                     }
                     Some(marginal) => {
-                        let generated = marginal.inverse_cdf(uniform_val);
+                        let mut generated = marginal.inverse_cdf(uniform_val);
+                        // Clip to min/max if enabled
+                        if config.enforce_min_max_values {
+                            if let Some(col_model) = column_model {
+                                if let Some(min) = col_model.min {
+                                    generated = generated.max(min);
+                                }
+                                if let Some(max) = col_model.max {
+                                    generated = generated.min(max);
+                                }
+                            }
+                        }
                         if column_model.and_then(|c| c.rounding) == Some(0) {
                             row.push(Value::from(generated.round() as i64));
                         } else {
@@ -262,6 +288,7 @@ mod tests {
                 rounding: None,
                 datetime_epoch: None,
                 marginal: Marginal::Normal(NormalParams { loc, scale }),
+                ..Default::default()
             },
         );
         TableModel {
@@ -294,6 +321,7 @@ mod tests {
         GeneratorConfig {
             rows_per_table: tables.iter().map(|t| (t.to_string(), rows)).collect(),
             seed: Some(42),
+            enforce_min_max_values: true,
         }
     }
 
@@ -336,6 +364,7 @@ mod tests {
                     loc: 10.0,
                     scale: 2.0,
                 }),
+                ..Default::default()
             },
         );
         order_columns.insert(
@@ -348,6 +377,7 @@ mod tests {
                     loc: 0.0,
                     scale: 1.0,
                 }),
+                ..Default::default()
             },
         );
         models.insert(
@@ -514,6 +544,7 @@ mod tests {
                     values: vec!["open".to_string(), "closed".to_string()],
                     weights: vec![0.5, 0.5],
                 }),
+                ..Default::default()
             },
         );
         let mut models = HashMap::new();
@@ -735,6 +766,7 @@ mod tests {
                     loc: 100.0,
                     scale: 15.0,
                 }),
+                ..Default::default()
             },
         );
         let mut models = HashMap::new();
@@ -787,6 +819,7 @@ mod tests {
                     loc: 100.0,
                     scale: 15.0,
                 }),
+                ..Default::default()
             },
         );
         let mut models = HashMap::new();
@@ -839,6 +872,113 @@ mod tests {
                 row[0]
             );
         }
+    }
+
+    #[test]
+    fn clipping_enforces_min_max_bounds() {
+        let mut models = HashMap::new();
+        models.insert(
+            "metrics".to_string(),
+            TableModel {
+                version: 1,
+                table: "metrics".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns: HashMap::from([(
+                    "value".to_string(),
+                    ColumnModel {
+                        logical_type: LogicalType::Numerical,
+                        rounding: None,
+                        datetime_epoch: None,
+                        min: Some(0.0),
+                        max: Some(120.0),
+                        marginal: Marginal::Normal(NormalParams {
+                            loc: 100.0,
+                            scale: 50.0,
+                        }),
+                    },
+                )]),
+                copula: CopulaInfo {
+                    column_order: vec!["value".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("metrics", vec![])],
+        };
+
+        let mut config = config(&["metrics"], 200);
+        config.enforce_min_max_values = true;
+        let result = generate(&models, &rules, &config).unwrap();
+        for row in result.tables.get("metrics").unwrap() {
+            let v = row[0].as_f64().unwrap();
+            assert!(
+                (0.0..=120.0).contains(&v),
+                "clipped value {} out of [0, 120]",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn clipping_disabled_allows_out_of_range_values() {
+        let mut models = HashMap::new();
+        models.insert(
+            "metrics".to_string(),
+            TableModel {
+                version: 1,
+                table: "metrics".to_string(),
+                dialect: "mysql".to_string(),
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                },
+                pk: vec![],
+                columns: HashMap::from([(
+                    "value".to_string(),
+                    ColumnModel {
+                        logical_type: LogicalType::Numerical,
+                        rounding: None,
+                        datetime_epoch: None,
+                        min: Some(0.0),
+                        max: Some(101.0),
+                        marginal: Marginal::Normal(NormalParams {
+                            loc: 100.0,
+                            scale: 50.0,
+                        }),
+                    },
+                )]),
+                copula: CopulaInfo {
+                    column_order: vec!["value".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("metrics", vec![])],
+        };
+
+        let mut config = config(&["metrics"], 200);
+        config.enforce_min_max_values = false;
+        let result = generate(&models, &rules, &config).unwrap();
+        let any_over = result
+            .tables
+            .get("metrics")
+            .unwrap()
+            .iter()
+            .any(|row| row[0].as_f64().unwrap() > 101.0);
+        assert!(any_over, "with clipping disabled the tail must exceed max");
     }
 
     #[test]
