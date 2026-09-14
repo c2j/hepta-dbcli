@@ -1,5 +1,9 @@
 # CLI `--allow-write` Implementation Plan (issue #58)
 
+> **Status: implemented** in PR #61 (`feat/issue-58-allow-write`), stacked on #59.
+> This document is kept as the design rationale; the "Open decisions" section
+> below records what was actually shipped and why.
+
 **Goal:** Let a human at the terminal run data-changing statements (`INSERT` / `UPDATE` / `DELETE` and explicitly allowed `CALL`) on MySQL, Oracle and GaussDB, while MCP stays read-only and destructive DDL stays rejected. Every write goes through the audit ledger first.
 
 **Depends on:** #57 (client audit log). Landed in PR #59. Provided seams:
@@ -35,16 +39,28 @@ MCP keeps the L1 prefix gate and a read-only session; `--allow-write` is a CLI/R
 
 ---
 
-## Open decisions (need an answer before coding)
+## Decisions taken
 
-| # | Question | Recommendation |
+All six open questions were resolved during implementation; the reasoning is
+kept here because the code alone does not record *why*.
+
+| # | Question | Shipped |
 |---|---|---|
-| 1 | Is `--allow-write` a **global** clap flag (like `--name`) or a `cli` subcommand flag? | global `flag = true`, then **explicitly reject** it in the `mcp` arm with a clear error. Issue §4 wants it not hidden in a subcommand, and §5 wants `mcp --allow-write` to fail. The rejection is the only way to satisfy both |
-| 2 | Does `--allow-write` apply to DuckDB (embedded)? | Yes for parity, but DuckDB has no session GUC — the gate is the statement classifier plus the existing `?mode=ro`. Document that `mode=ro` still wins |
-| 3 | `CALL` / `DO` / Oracle anonymous `BEGIN…END` | allow explicit `CALL` (class `call`); keep anonymous blocks rejected — the body is not auditable |
-| 4 | `deny_reason` values | add `read_only_tx` only where the **client** refuses before sending. For today's GaussDB behaviour the engine rejects and the event is `decision=error` with SQLSTATE `25006`, which is already what #57 produces |
-| 5 | Output contract for DML | table/vertical: `N rows affected`; json: `{"rows_affected": N}`. Do not reuse the `columns/rows/row_count` shape — an empty `columns` is what produces the fake `(0 rows)` |
-| 6 | Audit failure while writing | fail closed: `record()` error aborts the statement with a clear message. `--no-audit` + `--allow-write` must be refused at startup |
+| 1 | Scope of `--allow-write` | global clap flag; the `mcp` arm rejects it with exit code 2. A global flag is the only shape that keeps it out of a subcommand while still refusing it for MCP |
+| 2 | DuckDB | covered by the same classifier; DuckDB has no session GUC, so its `?mode=ro` still wins at the driver level |
+| 3 | `CALL` / `DO` / anonymous blocks | explicit `CALL`/`EXEC`/`DO`/`DECLARE` and `BEGIN … END;` are L2 (need the flag); a bare `BEGIN` stays transaction control and is untouched |
+| 4 | `deny_reason` | no new value. Client-side refusals never execute, so they are not audited as statements at all; engine rejections stay `decision=error` with SQLSTATE (e.g. GaussDB `25006`) |
+| 5 | DML output | `N rows affected` for table/vertical/csv, `{"rows_affected": n}` for json; `QueryResult::empty()` keeps `(0 rows)` |
+| 6 | Audit failure while writing | fail closed — the intent event is written before execution via `AuditSession::record`, and `--no-audit --allow-write` is refused at startup |
+
+### One interpretation still open
+
+Issue §4 says the default is "behaviour unchanged (… MySQL/Oracle CLI can still
+write)" while D4 says L2 requires `--allow-write`. PR #61 implements D4
+uniformly, so a bare MySQL/Oracle CLI `INSERT` is now refused. If the intent was
+to keep MySQL/Oracle L2 ungated, only `cli.rs::write_gate` changes.
+
+---
 
 ---
 
