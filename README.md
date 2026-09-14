@@ -200,7 +200,7 @@ hepta_dbcli cli --name prod --sql "SELECT count(*) FROM orders"
 hepta_dbcli cli --name gauss --sql "SELECT version()"
 ```
 
-Read-only statements (`SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`, transaction control) run as before. Data changes need `--allow-write`:
+Read-only statements (`SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`, transaction control) run as before. Data changes need `--allow-write`, **on every dialect**: MySQL and Oracle CLI sessions used to accept a bare `INSERT` and no longer do.
 
 ```bash
 hepta_dbcli cli --sql "INSERT INTO t VALUES (1)"                 # refused
