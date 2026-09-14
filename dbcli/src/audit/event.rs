@@ -268,10 +268,13 @@ pub(crate) struct DraftEvent {
     pub redacted: bool,
     /// execute_query: whether `add_limit` changed the executed SQL.
     pub limit_applied: Option<bool>,
-    /// cli_sql: how the SQL was supplied (`argv` | file path | `stdin`).
+    /// cli_sql: how the SQL was supplied (`argv` | `file` | `stdin`).
     pub source: Option<String>,
     /// get_execution_plan: the EXPLAIN ANALYZE flag.
     pub analyze: Option<bool>,
+    /// Action-specific context for events that carry no SQL (delta_diff,
+    /// synth). Never contains result rows.
+    pub detail: Option<serde_json::Value>,
 }
 
 impl DraftEvent {
@@ -296,6 +299,7 @@ impl DraftEvent {
             limit_applied: None,
             source: None,
             analyze: None,
+            detail: None,
         }
     }
 
@@ -338,6 +342,11 @@ impl DraftEvent {
         self.analyze = Some(analyze);
         self
     }
+
+    pub(crate) fn with_detail(mut self, detail: serde_json::Value) -> Self {
+        self.detail = Some(detail);
+        self
+    }
 }
 
 // ─── Stamped event (envelope) ───────────────────────────────────────
@@ -368,6 +377,8 @@ pub(crate) struct AuditEvent {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analyze: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 impl AuditEvent {
@@ -397,6 +408,7 @@ impl AuditEvent {
             limit_applied: draft.limit_applied,
             source: draft.source,
             analyze: draft.analyze,
+            detail: draft.detail,
         }
     }
 

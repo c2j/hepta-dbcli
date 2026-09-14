@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "synth")]
 use crate::audit::event::{
-    ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent, SqlInfo,
+    ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent,
 };
 
 #[cfg(feature = "synth")]
@@ -156,6 +156,14 @@ fn synth_connection() -> ConnectionInfo {
     }
 }
 
+/// Action-specific context for a `synth` event: the subcommand plus metadata
+/// only (table names / rules path / model name). Generated rows are never
+/// recorded.
+#[cfg(feature = "synth")]
+fn synth_detail(subcommand: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({ "subcommand": subcommand, "detail": detail })
+}
+
 #[cfg(feature = "synth")]
 fn synth_start_event(subcommand: &str, detail: &str) -> DraftEvent {
     DraftEvent::new(
@@ -165,19 +173,24 @@ fn synth_start_event(subcommand: &str, detail: &str) -> DraftEvent {
         ActionClass::Meta,
         Decision::Allow,
     )
-    .with_sql(SqlInfo::new(&format!("subcommand={subcommand}; {detail}")))
+    .with_detail(synth_detail(subcommand, detail))
 }
 
 #[cfg(feature = "synth")]
 fn synth_outcome_event(subcommand: &str, detail: &str, outcome: AuditOutcome) -> DraftEvent {
+    let decision = if outcome.ok {
+        Decision::Allow
+    } else {
+        Decision::Error
+    };
     DraftEvent::new(
         Channel::Synth,
         synth_connection(),
         "synth",
         ActionClass::Meta,
-        Decision::Allow,
+        decision,
     )
-    .with_sql(SqlInfo::new(&format!("subcommand={subcommand}; {detail}")))
+    .with_detail(synth_detail(subcommand, detail))
     .with_outcome(outcome)
 }
 
@@ -427,9 +440,10 @@ mod tests {
     #[test]
     fn synth_start_event_records_subcommand_and_detail() {
         let e = synth_start_event("generate", "models=m; rules=r.yaml");
-        let sql = e.sql.expect("detail sql");
-        assert!(sql.text.contains("subcommand=generate"), "{}", sql.text);
-        assert!(sql.text.contains("models=m; rules=r.yaml"), "{}", sql.text);
+        assert!(e.sql.is_none(), "synth has no SQL text");
+        let v = e.detail.expect("detail");
+        assert_eq!(v["subcommand"], "generate");
+        assert_eq!(v["detail"], "models=m; rules=r.yaml");
     }
 
     #[test]
@@ -445,8 +459,15 @@ mod tests {
     #[test]
     fn synth_events_never_record_generated_rows() {
         let start = synth_start_event("generate", "models=m; rules=r.yaml");
-        let sql = start.sql.expect("detail sql");
-        assert!(sql.text.len() < 512, "detail must stay metadata-only");
-        assert!(!sql.text.contains("row"), "must not record generated rows");
+        let v = start.detail.expect("detail");
+        let text = v.to_string();
+        assert!(text.len() < 512, "detail must stay metadata-only");
+        assert!(!text.contains("row"), "must not record generated rows");
+    }
+
+    #[test]
+    fn synth_error_outcome_marks_decision_error() {
+        let e = synth_outcome_event("train", "tables=users", AuditOutcome::error(3, "synth"));
+        assert_eq!(e.decision, Decision::Error);
     }
 }

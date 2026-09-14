@@ -425,11 +425,18 @@ impl DbMcp {
 // ─── Audit event builders (pure, unit-tested without a database) ─────
 
 fn execute_query_denied_event(conn_name: &str, url: &str, sql: &str) -> DraftEvent {
+    // The gate rejects anything that is not read-only, so the denied statement
+    // is normally DML/DDL; classify it instead of claiming it was a query.
+    let class = if crate::cli::is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
     DraftEvent::new(
         Channel::Mcp,
         ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
         "execute_query",
-        ActionClass::Dql,
+        class,
         Decision::Deny,
     )
     .with_sql(SqlInfo::new(sql))
@@ -1012,7 +1019,47 @@ impl DbMcp {
                 .unwrap_or_else(|| params.table.clone()),
             connection_url: rurl,
         };
-        match crate::delta_diff::api::run_diff(left, right, opts).await {
+        let left_info = ConnectionInfo::from_url(
+            &left.name,
+            &left.connection_url,
+            read_only_session_for(&left.connection_url),
+        );
+        let right_info = ConnectionInfo::from_url(
+            &right.name,
+            &right.connection_url,
+            read_only_session_for(&right.connection_url),
+        );
+        let tables = vec![left.table.clone(), right.table.clone()];
+        let strategy = params
+            .strategy
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        self.audit
+            .record_best_effort(crate::delta_diff::delta_diff_start_event(
+                &left_info,
+                &right_info,
+                &tables,
+                &strategy,
+            ));
+
+        let started = Instant::now();
+        let diff_result = crate::delta_diff::api::run_diff(left, right, opts).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let outcome = if diff_result.is_ok() {
+            AuditOutcome::ok(duration_ms)
+        } else {
+            AuditOutcome::error(duration_ms, "delta_diff")
+        };
+        self.audit
+            .record_best_effort(crate::delta_diff::delta_diff_outcome_event(
+                &left_info,
+                &right_info,
+                &tables,
+                &strategy,
+                outcome,
+            ));
+
+        match diff_result {
             Ok(mut report) => {
                 let mut export_path = None;
                 if let (Some(path), Some(fmt)) = (params.export.as_deref(), export_plan) {
@@ -1318,7 +1365,7 @@ mod audit_event_builder_tests {
         assert_eq!(ev.decision, Decision::Deny);
         assert_eq!(ev.deny_reason.as_deref(), Some("prefix"));
         assert_eq!(ev.action, "execute_query");
-        assert_eq!(ev.class, ActionClass::Dql);
+        assert_eq!(ev.class, ActionClass::Dml, "denied INSERT is not a query");
         let info = ev.sql.as_ref().unwrap();
         assert!(!info.truncated);
         assert_eq!(info.text.as_str(), sql.as_str());

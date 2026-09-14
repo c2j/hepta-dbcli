@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use crate::audit::event::{
-    ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent, SqlInfo,
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent,
 };
 use crate::config;
 
@@ -92,8 +92,16 @@ pub(crate) async fn run(
         }
     };
 
-    let left_info = ConnectionInfo::from_url(&left.name, &left.connection_url, true);
-    let right_info = ConnectionInfo::from_url(&right.name, &right.connection_url, true);
+    let left_info = ConnectionInfo::from_url(
+        &left.name,
+        &left.connection_url,
+        read_only_session_for(&left.connection_url),
+    );
+    let right_info = ConnectionInfo::from_url(
+        &right.name,
+        &right.connection_url,
+        read_only_session_for(&right.connection_url),
+    );
     let tables: Vec<String> = [args.left_table_name(), args.right_table_name()]
         .into_iter()
         .flatten()
@@ -134,26 +142,22 @@ pub(crate) async fn run(
 
 // ─── Audit event builders (issue #57) ────────────────────────────────────
 
-#[derive(serde::Serialize)]
-struct DeltaDiffAuditContext<'a> {
-    right: &'a ConnectionInfo,
-    tables: &'a [String],
-    strategy: &'a str,
+/// Action-specific context for a `delta_diff` event. The left side is the
+/// event's `connection`; the right side, tables and strategy go into `detail`.
+/// Diff rows are never included.
+pub(crate) fn delta_diff_detail(
+    right: &ConnectionInfo,
+    tables: &[String],
+    strategy: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "right": right,
+        "tables": tables,
+        "strategy": strategy,
+    })
 }
 
-/// The right connection, table list, and strategy are folded into the event's
-/// SQL-text slot as a compact JSON object. Diff row data is never included.
-fn delta_diff_context_sql(right: &ConnectionInfo, tables: &[String], strategy: &str) -> SqlInfo {
-    let context = DeltaDiffAuditContext {
-        right,
-        tables,
-        strategy,
-    };
-    let text = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
-    SqlInfo::new(&text)
-}
-
-fn delta_diff_start_event(
+pub(crate) fn delta_diff_start_event(
     left: &ConnectionInfo,
     right: &ConnectionInfo,
     tables: &[String],
@@ -166,24 +170,29 @@ fn delta_diff_start_event(
         ActionClass::Meta,
         Decision::Allow,
     )
-    .with_sql(delta_diff_context_sql(right, tables, strategy))
+    .with_detail(delta_diff_detail(right, tables, strategy))
 }
 
-fn delta_diff_outcome_event(
+pub(crate) fn delta_diff_outcome_event(
     left: &ConnectionInfo,
     right: &ConnectionInfo,
     tables: &[String],
     strategy: &str,
     outcome: AuditOutcome,
 ) -> DraftEvent {
+    let decision = if outcome.ok {
+        Decision::Allow
+    } else {
+        Decision::Error
+    };
     DraftEvent::new(
         Channel::DeltaDiff,
         left.clone(),
         "delta_diff",
         ActionClass::Meta,
-        Decision::Allow,
+        decision,
     )
-    .with_sql(delta_diff_context_sql(right, tables, strategy))
+    .with_detail(delta_diff_detail(right, tables, strategy))
     .with_outcome(outcome)
 }
 
@@ -849,8 +858,8 @@ mod audit_event_tests {
     #[test]
     fn start_event_records_right_connection_tables_and_strategy() {
         let e = delta_diff_start_event(&left(), &right(), &["orders".into()], "keyeddiff");
-        let sql = e.sql.expect("context sql");
-        let v: serde_json::Value = serde_json::from_str(&sql.text).expect("valid json");
+        assert!(e.sql.is_none(), "delta_diff has no SQL text");
+        let v = e.detail.expect("detail");
         assert_eq!(v["right"]["name"], "prod");
         assert_eq!(v["right"]["driver"], "oracle");
         assert_eq!(v["right"]["database"], "FREEPDB1");
@@ -865,8 +874,7 @@ mod audit_event_tests {
         let outcome =
             delta_diff_outcome_event(&left(), &right(), &tables, "hashdiff", AuditOutcome::ok(42));
 
-        let sql = start.sql.as_ref().expect("start sql");
-        let v: serde_json::Value = serde_json::from_str(&sql.text).unwrap();
+        let v = start.detail.as_ref().expect("start detail");
         assert!(v.get("rows").is_none(), "must not record row payloads");
         assert!(v.get("diffs").is_none(), "must not record diff rows");
 
@@ -878,15 +886,16 @@ mod audit_event_tests {
     }
 
     #[test]
-    fn error_outcome_is_not_ok_but_has_duration() {
-        let outcome = delta_diff_outcome_event(
+    fn error_outcome_is_not_ok_and_marks_decision_error() {
+        let event = delta_diff_outcome_event(
             &left(),
             &right(),
             &["orders".into()],
             "auto",
             AuditOutcome::error(7, "delta_diff"),
         );
-        let o = outcome.outcome.expect("outcome");
+        assert_eq!(event.decision, Decision::Error);
+        let o = event.outcome.expect("outcome");
         assert!(!o.ok);
         assert_eq!(o.duration_ms, 7);
         assert_eq!(o.error_kind.as_deref(), Some("delta_diff"));
