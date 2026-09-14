@@ -631,6 +631,7 @@ mod tests {
             columns: vec![],
             row_count: rows.len(),
             rows,
+            rows_affected: None,
         }
     }
 

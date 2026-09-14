@@ -185,6 +185,7 @@ mod tests {
                 ],
                 rows: vec![self.row.clone()],
                 row_count: 1,
+                rows_affected: None,
             })
         }
 
@@ -444,7 +445,10 @@ mod integration_tests {
 
     async fn connect(env: &str, scheme: &str) -> Option<Box<dyn DbConn + Send>> {
         let url = std::env::var(env).ok()?;
-        let pool = match registry().connect_with_fallback(scheme, &url, None).await {
+        let pool = match registry()
+            .connect_with_fallback(scheme, &url, None, false)
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("delta-diff integration: skip {scheme} ({env}): {e}");

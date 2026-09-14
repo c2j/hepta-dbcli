@@ -381,7 +381,7 @@ impl DbMcp {
         let scheme = url.find("://").map(|i| &url[..i]).unwrap_or("mysql");
         let pool = self
             .registry
-            .connect_with_fallback(scheme, url, None)
+            .connect_with_fallback(scheme, url, None, false)
             .await
             .map_err(|e| {
                 self.audit

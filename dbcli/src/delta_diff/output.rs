@@ -33,6 +33,7 @@ pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
         columns: vec!["key".into(), "status".into(), "left".into(), "right".into()],
         rows,
         row_count: n,
+        rows_affected: None,
     }
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
     QueryResult {
         columns: vec!["metric".into(), "value".into()],
         row_count: rows.len(),
+        rows_affected: None,
         rows,
     }
 }

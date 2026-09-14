@@ -362,6 +362,7 @@ mod tests {
                 columns: vec!["id".into(), "v".into()],
                 row_count: rows.len(),
                 rows,
+                rows_affected: None,
             })
         }
         async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {

@@ -236,7 +236,12 @@ async fn connect(
         .unwrap_or("mysql");
     let registry = crate::create_registry();
     let pool = registry
-        .connect_with_fallback(scheme, &side.connection_url, Some(&side.timeout_config))
+        .connect_with_fallback(
+            scheme,
+            &side.connection_url,
+            Some(&side.timeout_config),
+            false,
+        )
         .await
         .map_err(|e| format!("connect '{}': {}", side.name, e))?;
     pool.acquire().await.map_err(|e| e.to_string())

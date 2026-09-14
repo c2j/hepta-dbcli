@@ -54,6 +54,8 @@ pub(crate) struct CliArgs {
     pub connection_max_lifetime: Option<String>,
     pub no_history: bool,
     pub timeout_action: Option<String>,
+    /// `--allow-write`: permit L2 data changes (issue #58).
+    pub allow_write: bool,
 }
 
 fn value_to_compact_string(v: &Value) -> String {
@@ -253,7 +255,26 @@ pub(crate) fn render_result(
     format: OutputFormat,
 ) -> Result<(), String> {
     if result.columns.is_empty() {
-        writeln!(writer, "(0 rows)").map_err(|e| format!("write error: {}", e))?;
+        match result.rows_affected {
+            Some(n) => match format {
+                OutputFormat::Json => {
+                    let v = serde_json::json!({ "rows_affected": n });
+                    writeln!(
+                        writer,
+                        "{}",
+                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+                    )
+                    .map_err(|e| format!("write error: {}", e))?;
+                }
+                _ => {
+                    writeln!(writer, "{} rows affected", n)
+                        .map_err(|e| format!("write error: {}", e))?;
+                }
+            },
+            None => {
+                writeln!(writer, "(0 rows)").map_err(|e| format!("write error: {}", e))?;
+            }
+        }
         return Ok(());
     }
 
@@ -330,12 +351,54 @@ pub(crate) fn cli_source_label(sql: Option<&str>, file: Option<&str>) -> String 
     }
 }
 
-fn cli_sql_class(sql: &str) -> ActionClass {
-    if is_read_only_query(sql) {
-        ActionClass::Dql
-    } else {
-        ActionClass::Dml
+/// Map the statement class onto the audit `class` enum.
+pub(crate) fn action_class(class: StatementClass) -> ActionClass {
+    match class {
+        StatementClass::ReadOnly | StatementClass::Other => ActionClass::Dql,
+        StatementClass::DataChange => ActionClass::Dml,
+        StatementClass::Call => ActionClass::Call,
+        StatementClass::Destructive => ActionClass::Ddl,
     }
+}
+
+/// Human-readable refusal for a gate that did not pass.
+pub(crate) fn write_gate_message(gate: WriteGate) -> String {
+    match gate {
+        WriteGate::Allow => String::new(),
+        WriteGate::Destructive => {
+            "refusing destructive DDL: --allow-write covers INSERT/UPDATE/DELETE \
+and CALL, not DROP/TRUNCATE/ALTER/CREATE/GRANT"
+                .to_string()
+        }
+        WriteGate::NeedsFlag(StatementClass::Call) => {
+            "CALL / DO / anonymous blocks require --allow-write".to_string()
+        }
+        WriteGate::NeedsFlag(_) => {
+            "data changes require --allow-write (INSERT/UPDATE/DELETE are refused by default); \
+re-run with --allow-write to execute them"
+                .to_string()
+        }
+    }
+}
+
+fn cli_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    source: &str,
+    class: StatementClass,
+    allow_write: bool,
+    decision: Decision,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Cli,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url) && !allow_write),
+        "cli_sql",
+        action_class(class),
+        decision,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_source(source)
 }
 
 fn cli_sql_event(
@@ -343,19 +406,42 @@ fn cli_sql_event(
     url: &str,
     sql: &str,
     source: &str,
+    class: StatementClass,
+    allow_write: bool,
     duration_ms: u64,
-    row_count: u64,
+    rows: u64,
+    rows_affected: bool,
 ) -> DraftEvent {
-    DraftEvent::new(
-        Channel::Cli,
-        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
-        "cli_sql",
-        cli_sql_class(sql),
+    let outcome = if rows_affected {
+        AuditOutcome::ok(duration_ms).with_rows_affected(rows)
+    } else {
+        AuditOutcome::ok(duration_ms).with_row_count(rows)
+    };
+    cli_event(
+        conn_name,
+        url,
+        sql,
+        source,
+        class,
+        allow_write,
         Decision::Allow,
     )
-    .with_sql(SqlInfo::new(sql))
-    .with_source(source)
-    .with_outcome(AuditOutcome::ok(duration_ms).with_row_count(row_count))
+    .with_outcome(outcome)
+}
+
+/// Emitted once when a CLI/REPL session is opened with `--allow-write`, before
+/// any statement runs (issue #58 CLI contract).
+pub(crate) fn session_mode_event(conn_name: &str, url: &str, allow_write: bool) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Cli,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url) && !allow_write),
+        "session_mode",
+        ActionClass::Admin,
+        Decision::Allow,
+    )
+    .with_detail(serde_json::json!({
+        "mode": if allow_write { "allow_write" } else { "read_only" }
+    }))
 }
 
 fn cli_sql_error_event(
@@ -363,18 +449,20 @@ fn cli_sql_error_event(
     url: &str,
     sql: &str,
     source: &str,
+    class: StatementClass,
+    allow_write: bool,
     duration_ms: u64,
     error: &str,
 ) -> DraftEvent {
-    DraftEvent::new(
-        Channel::Cli,
-        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
-        "cli_sql",
-        cli_sql_class(sql),
+    cli_event(
+        conn_name,
+        url,
+        sql,
+        source,
+        class,
+        allow_write,
         Decision::Error,
     )
-    .with_sql(SqlInfo::new(sql))
-    .with_source(source)
     .with_outcome(AuditOutcome::error(duration_ms, error))
 }
 
@@ -398,6 +486,17 @@ pub(crate) async fn run_cli(
     if sql.is_empty() {
         return Err("No SQL provided. Use -c/--sql, -f/--file, or pipe SQL to stdin.".to_string());
     }
+
+    // Refuse before touching the engine (issue #58 acceptance 4).
+    let gate = write_gate(&sql, args.allow_write);
+    if gate != WriteGate::Allow {
+        return Err(write_gate_message(gate));
+    }
+    let statement_class = classify_statement(&sql);
+    let is_write = matches!(
+        statement_class,
+        StatementClass::DataChange | StatementClass::Call
+    );
 
     let config_path = args.config_path.map(PathBuf::from);
     let raw = read_config(config_path)?;
@@ -438,7 +537,12 @@ pub(crate) async fn run_cli(
         .map(|i| &target.connection_url[..i])
         .unwrap_or("mysql");
     let pool = registry
-        .connect_with_fallback(scheme, &target.connection_url, Some(&effective_timeout))
+        .connect_with_fallback(
+            scheme,
+            &target.connection_url,
+            Some(&effective_timeout),
+            args.allow_write,
+        )
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -473,23 +577,66 @@ pub(crate) async fn run_cli(
     }
 
     let source_label = cli_source_label(args.sql.as_deref(), args.file.as_deref());
-    let start = Instant::now();
-    let result = execute_query(&mut *conn, &sql).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-    match &result {
-        Ok(qr) => audit.record_best_effort(cli_sql_event(
+
+    if args.allow_write {
+        audit.record_best_effort(session_mode_event(
+            &target.name,
+            &target.connection_url,
+            true,
+        ));
+    }
+
+    // Writes are fail-closed (issue #58): the intent must be on disk before the
+    // statement reaches the engine, otherwise a mutation would be unaudited.
+    if is_write {
+        let intent = cli_event(
             &target.name,
             &target.connection_url,
             &sql,
             &source_label,
-            duration_ms,
-            qr.row_count as u64,
-        )),
+            statement_class,
+            args.allow_write,
+            Decision::Allow,
+        );
+        if let Err(e) = audit.record(intent) {
+            return Err(format!(
+                "refusing to execute a data change without an audit record: {e}"
+            ));
+        }
+    }
+
+    let start = Instant::now();
+    let result: Result<QueryResult, String> = if is_write {
+        conn.execute_write(&sql)
+            .await
+            .map_err(|e| format!("Query failed: {}", e))
+    } else {
+        execute_query(&mut *conn, &sql).await
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match &result {
+        Ok(qr) => {
+            let event = cli_sql_event(
+                &target.name,
+                &target.connection_url,
+                &sql,
+                &source_label,
+                statement_class,
+                args.allow_write,
+                duration_ms,
+                qr.rows_affected.unwrap_or(qr.row_count as u64),
+                is_write,
+            );
+            audit.record_best_effort(event);
+        }
         Err(e) => audit.record_best_effort(cli_sql_error_event(
             &target.name,
             &target.connection_url,
             &sql,
             &source_label,
+            statement_class,
+            args.allow_write,
             duration_ms,
             e,
         )),
@@ -639,6 +786,7 @@ mod tests {
             columns: vec!["a".into(), "b".into()],
             rows: vec![vec![Value::String("1".into()), Value::String("2".into())]],
             row_count: 1,
+            rows_affected: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         render_result(&result, &mut buf, OutputFormat::Table).unwrap();
@@ -653,6 +801,7 @@ mod tests {
             columns: vec!["a".into(), "b".into()],
             rows: vec![vec![Value::String("1".into()), Value::String("2".into())]],
             row_count: 1,
+            rows_affected: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         render_result(&result, &mut buf, OutputFormat::Csv).unwrap();
@@ -670,6 +819,7 @@ mod tests {
             columns: vec!["col".into()],
             rows: vec![vec![Value::String("val".into())]],
             row_count: 1,
+            rows_affected: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         render_result(&result, &mut buf, OutputFormat::Vertical).unwrap();
@@ -820,11 +970,22 @@ mod tests {
 
     #[test]
     fn cli_sql_event_records_source_and_class() {
-        let ev = cli_sql_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", "argv", 5, 3);
+        let ev = cli_sql_event(
+            "dev",
+            "mysql://u:p@h:3306/db",
+            "SELECT 1",
+            "argv",
+            StatementClass::ReadOnly,
+            false,
+            5,
+            3,
+            false,
+        );
         assert_eq!(ev.channel, Channel::Cli);
         assert_eq!(ev.action, "cli_sql");
         assert_eq!(ev.class, ActionClass::Dql);
         assert_eq!(ev.source.as_deref(), Some("argv"));
+        assert!(!ev.connection.read_only_session);
         let outcome = ev.outcome.as_ref().unwrap();
         assert!(outcome.ok);
         assert_eq!(outcome.row_count, Some(3));
@@ -834,9 +995,66 @@ mod tests {
             "mysql://u:p@h:3306/db",
             "UPDATE t SET a=1",
             "stdin",
+            StatementClass::DataChange,
+            true,
             5,
-            0,
+            7,
+            true,
         );
         assert_eq!(dml.class, ActionClass::Dml);
+        assert_eq!(dml.outcome.as_ref().unwrap().rows_affected, Some(7));
+    }
+
+    #[test]
+    fn write_mode_marks_gaussdb_session_as_not_read_only() {
+        let ro = cli_event(
+            "g",
+            "gaussdb://u:p@h:5432/db",
+            "INSERT INTO t VALUES (1)",
+            "argv",
+            StatementClass::DataChange,
+            false,
+            Decision::Allow,
+        );
+        assert!(ro.connection.read_only_session);
+
+        let rw = cli_event(
+            "g",
+            "gaussdb://u:p@h:5432/db",
+            "INSERT INTO t VALUES (1)",
+            "argv",
+            StatementClass::DataChange,
+            true,
+            Decision::Allow,
+        );
+        assert!(!rw.connection.read_only_session);
+    }
+
+    #[test]
+    fn session_mode_event_records_the_mode() {
+        let ro = session_mode_event("g", "gaussdb://u:p@h:5432/db", false);
+        assert_eq!(ro.action, "session_mode");
+        assert_eq!(ro.detail.as_ref().unwrap()["mode"], "read_only");
+        assert!(ro.connection.read_only_session);
+
+        let rw = session_mode_event("g", "gaussdb://u:p@h:5432/db", true);
+        assert_eq!(rw.detail.as_ref().unwrap()["mode"], "allow_write");
+        assert!(!rw.connection.read_only_session);
+    }
+
+    #[test]
+    fn render_result_reports_rows_affected_for_writes() {
+        let mut out: Vec<u8> = Vec::new();
+        render_result(&QueryResult::affected(3), &mut out, OutputFormat::Table).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "3 rows affected\n");
+
+        let mut out: Vec<u8> = Vec::new();
+        render_result(&QueryResult::affected(0), &mut out, OutputFormat::Json).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["rows_affected"], 0);
+
+        let mut out: Vec<u8> = Vec::new();
+        render_result(&QueryResult::empty(), &mut out, OutputFormat::Table).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "(0 rows)\n");
     }
 }

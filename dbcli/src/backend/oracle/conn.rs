@@ -60,6 +60,7 @@ fn oracle_result_to_query_result(result: oracle_rs::connection::QueryResult) -> 
         columns,
         rows,
         row_count,
+        rows_affected: None,
     }
 }
 
@@ -107,6 +108,7 @@ async fn drain_result(
         columns,
         rows,
         row_count,
+        rows_affected: None,
     })
 }
 
@@ -149,6 +151,15 @@ impl DbConn for OracleConn {
             Err(e) if is_alter_session_decode_error(sql, &e.to_string()) => Ok(()),
             Err(e) => Err(DbError::query_with_source("Oracle query_drop failed", e)),
         }
+    }
+
+    async fn execute_write(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let affected = self
+            .conn
+            .execute_dml_sql(sql, &[])
+            .await
+            .map_err(|e| DbError::query_with_source("Oracle execute_write failed", e))?;
+        Ok(QueryResult::affected(affected))
     }
 
     fn dialect(&self) -> &dyn Dialect {

@@ -43,6 +43,7 @@ impl MySqlConn {
             columns,
             rows: result_rows,
             row_count: rows.len(),
+            rows_affected: None,
         }
     }
 }
@@ -101,6 +102,14 @@ impl DbConn for MySqlConn {
             .query_drop(sql)
             .await
             .map_err(|e| DbError::query_with_source("Query drop failed", e))
+    }
+
+    async fn execute_write(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        self.conn
+            .query_drop(sql)
+            .await
+            .map_err(|e| DbError::query_with_source("Query drop failed", e))?;
+        Ok(QueryResult::affected(self.conn.affected_rows()))
     }
 
     fn dialect(&self) -> &dyn Dialect {

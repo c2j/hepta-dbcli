@@ -36,7 +36,19 @@ impl BackendFactory for GaussdbFactory {
         url: &str,
         _timeout_config: Option<&TimeoutConfig>,
     ) -> Result<Arc<dyn DbPool>, DbError> {
-        let pool = create_gaussdb_pool(url).await?;
+        let pool = create_gaussdb_pool(url, true).await?;
+        Ok(Arc::new(pool))
+    }
+
+    /// GaussDB has a session-level read-only guard, so the write flag must
+    /// reach pool creation (issue #58 D5).
+    async fn connect_with_mode(
+        &self,
+        url: &str,
+        _timeout_config: Option<&TimeoutConfig>,
+        allow_write: bool,
+    ) -> Result<Arc<dyn DbPool>, DbError> {
+        let pool = create_gaussdb_pool(url, !allow_write).await?;
         Ok(Arc::new(pool))
     }
 }

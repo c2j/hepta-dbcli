@@ -61,6 +61,7 @@ fn result_set_to_query_result(
         columns,
         rows,
         row_count,
+        rows_affected: None,
     })
 }
 
@@ -99,6 +100,17 @@ impl DbConn for OracleConn {
             .execute(sql, &[] as &[&dyn oracle::sql_type::ToSql])
             .map(|_| ())
             .map_err(|e| DbError::query_with_source("Oracle query_drop failed", e))
+    }
+
+    async fn execute_write(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let stmt = self
+            .conn
+            .execute(sql, &[] as &[&dyn oracle::sql_type::ToSql])
+            .map_err(|e| DbError::query_with_source("Oracle execute_write failed", e))?;
+        let affected = stmt
+            .row_count()
+            .map_err(|e| DbError::query_with_source("Oracle row_count failed", e))?;
+        Ok(QueryResult::affected(affected))
     }
 
     fn dialect(&self) -> &dyn Dialect {
