@@ -27,6 +27,7 @@ pub struct ColumnProfile {
 }
 
 const TOP_VALUES_CAP: usize = 50;
+const NUMERIC_TOP_VALUES_MAX: usize = 50;
 
 fn is_unsupported_placeholder(s: &str) -> bool {
     s.starts_with("<unsupported type")
@@ -102,11 +103,22 @@ impl ColumnProfile {
                 })
                 .all(|f| f.fract() == 0.0);
 
-        let top_values = if logical_type == "categorical" {
+        let is_repeated_low_cardinality_numeric = logical_type == "numerical"
+            && cardinality > 1
+            && cardinality < non_null.len()
+            && cardinality <= NUMERIC_TOP_VALUES_MAX;
+        let top_values = if logical_type == "categorical" || is_repeated_low_cardinality_numeric {
             let mut counts: HashMap<String, usize> = HashMap::new();
             for v in &non_null {
-                if let Some(s) = v.as_str() {
-                    *counts.entry(s.to_string()).or_insert(0) += 1;
+                let key = if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if v.is_number() {
+                    Some(v.to_string())
+                } else {
+                    None
+                };
+                if let Some(key) = key {
+                    *counts.entry(key).or_insert(0) += 1;
                 }
             }
             let mut entries: Vec<(String, f64)> = counts
@@ -203,6 +215,21 @@ mod tests {
         assert_eq!(top[0], ("a".to_string(), 0.5));
         assert_eq!(top[1], ("b".to_string(), 1.0 / 3.0));
         assert_eq!(top[2], ("c".to_string(), 1.0 / 6.0));
+    }
+
+    #[test]
+    fn should_capture_top_values_for_low_cardinality_numeric() {
+        let samples: Vec<Value> = (0..190).map(|i| Value::from((i % 19) as i64)).collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        let top = profile.top_values.expect("top_values captured");
+
+        assert_eq!(profile.logical_type, "numerical");
+        assert_eq!(top.len(), 19);
+        assert!(top.len() <= NUMERIC_TOP_VALUES_MAX);
+        assert!(top
+            .iter()
+            .all(|(_, weight)| (*weight - 1.0 / 19.0).abs() < 1e-12));
     }
 
     #[test]

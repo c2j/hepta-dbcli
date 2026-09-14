@@ -222,10 +222,19 @@ fn fit_marginal(
     col: &crate::synth::profile::ColumnProfile,
 ) -> Result<Marginal, String> {
     match col.logical_type.as_str() {
-        "numerical" => Ok(Marginal::Normal(NormalParams {
-            loc: col.mean.unwrap_or(0.0),
-            scale: col.std_dev.unwrap_or(0.0),
-        })),
+        "numerical" => {
+            if let Some(top) = col.top_values.as_deref() {
+                Ok(Marginal::Categorical(CategoricalParams {
+                    values: top.iter().map(|(v, _)| v.clone()).collect(),
+                    weights: top.iter().map(|(_, w)| *w).collect(),
+                }))
+            } else {
+                Ok(Marginal::Normal(NormalParams {
+                    loc: col.mean.unwrap_or(0.0),
+                    scale: col.std_dev.unwrap_or(0.0),
+                }))
+            }
+        }
         "categorical" => {
             let top = col.top_values.as_deref().ok_or_else(|| {
                 format!(
@@ -298,12 +307,7 @@ pub fn run_generate(
         }
     }
 
-    let mut rows_map = HashMap::new();
-    if let Some(rows) = rows_per_table {
-        for table in &rules.tables {
-            rows_map.insert(table.name.clone(), rows);
-        }
-    }
+    let rows_map = rows_map_for_rules(&rules, rows_per_table);
 
     let config = GeneratorConfig {
         rows_per_table: rows_map,
@@ -333,6 +337,14 @@ pub fn run_generate(
         output_dir.display()
     );
     Ok(())
+}
+
+fn rows_map_for_rules(rules: &SynthRules, cli_rows: Option<usize>) -> HashMap<String, usize> {
+    rules
+        .tables
+        .iter()
+        .map(|table| (table.name.clone(), cli_rows.or(table.rows).unwrap_or(100)))
+        .collect()
 }
 
 pub fn run_validate(model_path: &str) -> Result<(), String> {
@@ -443,6 +455,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn should_prefer_cli_rows_over_rules() {
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![crate::synth::rules::TableRule {
+                name: "orders".to_string(),
+                rows: Some(2),
+                relationships: vec![],
+                strategy: crate::synth::rules::TableStrategy::default(),
+            }],
+        };
+
+        let rows = rows_map_for_rules(&rules, Some(42));
+
+        assert_eq!(rows.get("orders"), Some(&42));
+    }
+
     fn profile_from(columns: &[(&str, Vec<Value>)]) -> TableProfile {
         let names: Vec<String> = columns.iter().map(|(n, _)| n.to_string()).collect();
         let rows: Vec<Vec<Value>> = (0..4)
@@ -526,6 +555,29 @@ mod tests {
             }
             other => panic!("expected Categorical, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_fit_low_cardinality_numeric_as_categorical() {
+        let samples: Vec<Value> = (0..190).map(|i| Value::from((i % 19) as i64)).collect();
+        let profile = crate::synth::profile::ColumnProfile::from_samples(&samples);
+
+        let marginal = fit_marginal("amount", &profile).unwrap();
+
+        match marginal {
+            Marginal::Categorical(params) => assert_eq!(params.values.len(), 19),
+            other => panic!("expected Categorical, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn should_still_fit_high_cardinality_numeric_as_normal() {
+        let samples: Vec<Value> = (0..1000).map(Value::from).collect();
+        let profile = crate::synth::profile::ColumnProfile::from_samples(&samples);
+
+        let marginal = fit_marginal("amount", &profile).unwrap();
+
+        assert!(matches!(marginal, Marginal::Normal(_)));
     }
 
     #[test]
