@@ -402,6 +402,17 @@ pub(crate) fn action_class(class: StatementClass) -> ActionClass {
     }
 }
 
+/// Machine-readable reason for a gate that did not pass, recorded as
+/// `deny_reason` so an attempted write is visible in the ledger even though it
+/// never reached the engine (issue #57 §5 "deny_reason").
+pub(crate) fn write_gate_reason(gate: WriteGate) -> &'static str {
+    match gate {
+        WriteGate::Destructive => "destructive_ddl",
+        WriteGate::NeedsFlag(_) => "write_flag_required",
+        WriteGate::Allow => "",
+    }
+}
+
 /// Human-readable refusal for a gate that did not pass.
 pub(crate) fn write_gate_message(gate: WriteGate) -> String {
     match gate {
@@ -578,17 +589,6 @@ pub(crate) async fn run_cli(
         return Err("No SQL provided. Use -c/--sql, -f/--file, or pipe SQL to stdin.".to_string());
     }
 
-    // Refuse before touching the engine (issue #58 acceptance 4).
-    let gate = write_gate(&sql, args.allow_write);
-    if gate != WriteGate::Allow {
-        return Err(write_gate_message(gate));
-    }
-    let statement_class = classify_statement(&sql);
-    let is_write = matches!(
-        statement_class,
-        StatementClass::DataChange | StatementClass::Call
-    );
-
     let config_path = args.config_path.map(PathBuf::from);
     let raw = read_config(config_path)?;
 
@@ -683,15 +683,7 @@ pub(crate) async fn run_cli(
     }
 
     let source_label = cli_source_label(args.sql.as_deref(), args.file.as_deref());
-
-    if args.allow_write {
-        audit.record_best_effort(session_mode_event(
-            &target.name,
-            &target.connection_url,
-            true,
-        ));
-    }
-
+    let statement_class = classify_statement(&sql);
     let ctx = StmtAudit::cli(
         &target.name,
         &target.connection_url,
@@ -700,6 +692,28 @@ pub(crate) async fn run_cli(
         statement_class,
         args.allow_write,
     );
+
+    // Refuse before touching the engine (issue #58 acceptance 4). A refusal is
+    // still an auditable fact: it answers "who tried to write" (issue #57 §5).
+    let gate = write_gate(&sql, args.allow_write);
+    if gate != WriteGate::Allow {
+        audit.record_best_effort(
+            stmt_event(&ctx, Decision::Deny).with_deny_reason(write_gate_reason(gate)),
+        );
+        return Err(write_gate_message(gate));
+    }
+    let is_write = matches!(
+        statement_class,
+        StatementClass::DataChange | StatementClass::Call
+    );
+
+    // One marker per session, so the ledger states whether it could write
+    // (issue #57 CLI contract: read_only -> allow_write).
+    audit.record_best_effort(session_mode_event(
+        &target.name,
+        &target.connection_url,
+        args.allow_write,
+    ));
 
     // Writes are fail-closed (issue #58): the intent must be on disk before the
     // statement reaches the engine, otherwise a mutation would be unaudited.
@@ -1053,6 +1067,22 @@ mod tests {
         assert_eq!(
             write_gate("ALTER TABLE t ADD c INT", true),
             WriteGate::Destructive
+        );
+    }
+
+    #[test]
+    fn write_gate_reason_names_each_refusal() {
+        assert_eq!(
+            write_gate_reason(write_gate("DROP TABLE t", true)),
+            "destructive_ddl"
+        );
+        assert_eq!(
+            write_gate_reason(write_gate("INSERT INTO t VALUES (1)", false)),
+            "write_flag_required"
+        );
+        assert_eq!(
+            write_gate_reason(write_gate("CALL p()", false)),
+            "write_flag_required"
         );
     }
 

@@ -265,10 +265,21 @@ async fn insert_without_the_flag_is_refused_and_never_reaches_the_engine() {
     );
 
     assert_eq!(count_rows(name).await, 0, "refused INSERT must not run");
+
+    // The refusal itself is audited (issue #57 §5 deny_reason): "who tried to
+    // write" is visible even though the engine was never reached.
     let events = audit_events(&audit_dir);
+    let denied = only(&events, "cli_sql");
+    assert_eq!(denied["decision"], "deny");
+    assert_eq!(denied["deny_reason"], "write_flag_required");
+    assert_eq!(denied["class"], "dml");
+    assert_eq!(
+        denied["sql"]["text"],
+        format!("INSERT INTO {name} VALUES (1,'a')")
+    );
     assert!(
-        events.iter().all(|e| e["action"] != "cli_sql"),
-        "a refused statement must not be audited as executed: {events:?}"
+        denied.get("outcome").is_none(),
+        "nothing ran, so no outcome"
     );
 
     drop_table(name).await;
@@ -347,5 +358,12 @@ async fn destructive_ddl_is_refused_even_with_the_flag() {
 
     // The table survived, proving the statement never reached the engine.
     count_rows(name).await;
+
+    let events = audit_events(&audit_dir);
+    let denied = only(&events, "cli_sql");
+    assert_eq!(denied["decision"], "deny");
+    assert_eq!(denied["deny_reason"], "destructive_ddl");
+    assert_eq!(denied["class"], "ddl");
+
     drop_table(name).await;
 }

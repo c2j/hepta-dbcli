@@ -432,9 +432,38 @@ Options:
           Also audit high-noise meta actions (list_tables, check, ...)
       --audit-retention-days <DAYS>
           Audit log retention in days (0 = keep forever) [default: 30]
+      --allow-write
+          Allow CLI/REPL data changes (INSERT/UPDATE/DELETE and CALL);
+          destructive DDL stays refused, MCP stays read-only
 ```
 
-审计账本默认开启且无法关闭：`--audit-dir` 只改变写入位置，`--audit-meta` 只增加低价值元数据动作。审计目录不可写时降级并在 stderr 警告，只读查询照常执行；写路径（后续 `--allow-write` 提案，见 #58）则 fail-closed。
+审计账本默认开启且无法关闭：`--audit-dir` 只改变写入位置，`--audit-meta` 只增加低价值元数据动作。审计目录不可写时降级并在 stderr 警告，只读查询照常执行；写路径（见 §4.6）则 fail-closed。
+
+### 4.6 写入模式（`--allow-write`）
+
+> ⚠️ **破坏性变更**：MySQL / Oracle 的 CLI 会话以前接受裸 `INSERT`，现在与 GaussDB 一样先被客户端拒绝。这是刻意的分层设计，不是回归。
+
+| 层 | 语句 | CLI / REPL | MCP |
+|---|---|---|---|
+| L1 只读 | `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `SET` / 事务控制 | 直接执行 | 允许 |
+| L2 数据变更 | `INSERT` / `UPDATE` / `DELETE` / `REPLACE` / `MERGE` / `CALL` | 需要 `--allow-write` | 拒绝 |
+| L3 破坏性 | `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `GRANT` / `REVOKE` / `RENAME` | **始终拒绝** | 拒绝 |
+
+```bash
+hepta_dbcli cli --sql "INSERT INTO t VALUES (1)"                 # 被拒
+hepta_dbcli cli --allow-write --sql "INSERT INTO t VALUES (1)"   # 执行，输出 "1 rows affected"
+hepta_dbcli cli --allow-write --sql "CALL foo(1)"                # 执行
+hepta_dbcli cli --allow-write --sql "DROP TABLE t"               # 仍被拒
+hepta_dbcli --allow-write mcp                                    # 退出码 2（MCP 只读）
+```
+
+要点：
+
+- **分类是启发式**（`cli.rs::classify_statement`），定位是 UX 门而非安全边界；真正的边界是数据库账号，写模式请配低权限用户。
+- **拒绝也留痕**：被拒语句在账本里记 `decision=deny` + `deny_reason`（`write_flag_required` / `destructive_ddl`），且**不连接引擎**，所以「谁试图写」事后可查。
+- **写路径 fail-closed**：写之前先落一条无 `outcome` 的 intent 事件，写不进去就拒绝执行；执行后再落一条带 `rows_affected` 的 outcome。查询账本时不要把 intent 当成已执行。
+- **GaussDB**：该进程新建连接用显式 `SET default_transaction_read_only = OFF`；MCP 连接始终带只读护栏，不受影响。
+- 每个会话开始会记一条 `session_mode`（`read_only` / `allow_write`）。
 
 ---
 

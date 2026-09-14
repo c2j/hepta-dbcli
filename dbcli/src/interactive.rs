@@ -21,7 +21,8 @@ use crate::cli::QueryResult;
 use crate::cli::{
     classify_query_error, classify_statement, execute_query_typed, render_result,
     session_mode_event, stmt_error_event, stmt_event, stmt_ok_event, write_gate,
-    write_gate_message, CliArgs, OutputFormat, StatementClass, StmtAudit, WriteGate,
+    write_gate_message, write_gate_reason, CliArgs, OutputFormat, StatementClass, StmtAudit,
+    WriteGate,
 };
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
@@ -575,13 +576,12 @@ pub(crate) async fn run_interactive(
         audit,
     )
     .await?;
-    if args.allow_write {
-        audit.record_best_effort(session_mode_event(
-            &target.name,
-            &target.connection_url,
-            true,
-        ));
-    }
+    // One marker per session, so the ledger states whether it could write.
+    audit.record_best_effort(session_mode_event(
+        &target.name,
+        &target.connection_url,
+        args.allow_write,
+    ));
 
     let mut rl = Editor::<SqlHelper, DefaultHistory>::new()
         .map_err(|e| format!("failed to init editor: {}", e))?;
@@ -725,22 +725,26 @@ pub(crate) async fn run_interactive(
         );
         for stmt in &split.complete {
             // Issue #58: same gate as the one-shot CLI, surfaced per statement.
-            let gate = write_gate(stmt, args.allow_write);
-            if gate != WriteGate::Allow {
-                eprintln!("error: {}", write_gate_message(gate));
-                continue;
-            }
             let statement_class = classify_statement(stmt);
-            let is_write = matches!(
-                statement_class,
-                StatementClass::DataChange | StatementClass::Call
-            );
             let ctx = StmtAudit::repl(
                 &target.name,
                 &target.connection_url,
                 stmt,
                 statement_class,
                 args.allow_write,
+            );
+
+            let gate = write_gate(stmt, args.allow_write);
+            if gate != WriteGate::Allow {
+                eprintln!("error: {}", write_gate_message(gate));
+                audit.record_best_effort(
+                    stmt_event(&ctx, Decision::Deny).with_deny_reason(write_gate_reason(gate)),
+                );
+                continue;
+            }
+            let is_write = matches!(
+                statement_class,
+                StatementClass::DataChange | StatementClass::Call
             );
             if is_write {
                 if let Err(e) = audit.record(stmt_event(&ctx, Decision::Allow)) {

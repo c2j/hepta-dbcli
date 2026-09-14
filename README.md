@@ -270,7 +270,7 @@ $XDG_DATA_HOME/hepta-dbcli/audit/hepta-dbcli-audit.YYYY-MM-DD.jsonl
 - One JSON object per line (schema `v: 1`): envelope (`ts`, `event_id`, `session_id`, `seq`, `channel`, `actor`, `connection`, `action`, `class`, `decision`) plus action detail (`sql`, `outcome`, `deny_reason`, `detail`).
 - `channel` is one of `mcp`, `cli`, `repl`, `delta_diff`, `synth`.
 - Enabled by default; the directory and files are created `0700` / `0600`. Passwords and DSN userinfo are stripped, and result rows / EXPLAIN bodies are never written.
-- A statement rejected by the MCP read-only gate is recorded (`decision: "deny"`, `deny_reason: "prefix"`); query errors are recorded as `decision: "error"`.
+- A rejected statement is recorded even though it never reached the engine: MCP's read-only gate as `deny_reason: "prefix"`, the CLI write gate as `write_flag_required` / `destructive_ddl`. Query errors are `decision: "error"` with `error_kind` + `sqlstate`.
 
 Global flags:
 
