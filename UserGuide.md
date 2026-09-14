@@ -860,7 +860,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 |--------|------|------|
 | `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000） |
 | `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
-| `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql |
+| `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100） |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |
 
 未指定 `--name` 时使用配置的 `default_connection`，与 `check` / MCP 行为一致。
@@ -872,6 +872,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 version: "1"
 tables:
   - name: users
+    rows: 599                    # 可选：本表生成行数（CLI --rows 优先于它）
     strategy: uniform            # uniform | zipf（weighted 暂不支持，会报错）
     relationships: []
   - name: orders
@@ -894,7 +895,8 @@ tables:
 
 - 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
 - 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
-- 数值列拟合 Normal 分布（整数列生成取整值），字符串列拟合分类分布，分类列输出原始字符串值
+- 数值列：高基数或值无重复的列拟合 Normal 分布（整数列生成取整值）；**低基数且值重复出现**的数值列（如 19 档离散价格）自动按观测档位拟合分类分布，生成值保持在观测档位上并保留数值类型
+- 字符串列拟合分类分布，分类列输出原始字符串值
 - Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码），PSD 修正用对角占优近似
 - `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位、时间戳等非数值非字符串）在训练时跳过并打印警告，生成的数据不含这些列
@@ -903,6 +905,18 @@ tables:
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断，`synth train` 在 Oracle 上最多采样 100 行，保真度相应下降（见 `tests/benchmark/REPORT.md`）；native OCI 后端不受影响但当前无法从配置强制选择
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写；导出语句**不带 schema 限定**，灌库前请确认目标 schema 在 search_path 中（或手工补前缀）
 - `train` / `rules-draft` 的 `--schema` 显式指定表所在 schema；缺省时 train 依赖连接默认 schema，rules-draft 取 `current_schema`，两者可能不同——跨 schema 场景请两侧都显式传 `--schema`
+
+### 10.6 基准测试与评测
+
+| 基准 | 内容 | 报告 | 复现入口 |
+|------|------|------|----------|
+| Case A | 合成 4 列高斯 Copula，对标 SDV `GaussianCopulaSynthesizer(norm)` | [tests/benchmark/REPORT.md](../tests/benchmark/REPORT.md) | `tests/benchmark/run_case_a.sh` |
+| P1 | SynMeter 真实单表（Adult + ogagila `payment`/`film`）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15）+ `amount` on-grid ≥ 0.95 | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
+| P2 | ogagila 多表 FK（customer–rental–payment）：staging 可插入 0 错误、孤儿 FK = 0、每 customer 扇出 KS < 0.15；1-way 边际与 1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
+
+CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。
+
+范围声明：Case B（vs CTGAN / TVAE / TabDDPM / GReaT）与 Case C（vs SDV HMA / ClavaDDPM / REaLTabFormer）**不在本里程碑**；SynMeter / torch / SDV 仅存在于 benchmark venv（`tests/benchmark/requirements.txt`），不进入 `Cargo.toml`。
 
 ---
 
