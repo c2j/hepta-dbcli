@@ -63,8 +63,4 @@ for model in hepta sdv_gc; do
         --output-dir "${RESULTS_DIR}"
 done
 
-gate_args=(--results-dir "${RESULTS_DIR}" --output-dir "${ROOT}")
-if [[ -n "${P1_AMOUNT_GRID_JSON:-}" ]]; then
-    gate_args+=(--amount-grid-json "${P1_AMOUNT_GRID_JSON}")
-fi
-"${VENV}/bin/python" "${ROOT}/gates.py" "${gate_args[@]}"
+"${VENV}/bin/python" "${ROOT}/gates.py" --results-dir "${RESULTS_DIR}" --output-dir "${ROOT}"

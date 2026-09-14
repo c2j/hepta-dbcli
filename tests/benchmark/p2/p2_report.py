@@ -28,7 +28,7 @@ ORPHAN_SQL = {
 FANOUT_SQL = "SELECT count(*) FROM {schema}.rental GROUP BY customer_id ORDER BY customer_id;"
 COLUMNS_SQL = """SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = '{schema}' AND table_name IN ('customer','rental','payment') ORDER BY table_name, ordinal_position;"""
 COLUMN_SQL = 'SELECT "{column}" FROM "{schema}"."{table}" WHERE "{column}" IS NOT NULL;'
-HOP_SQL = """SELECT c.customer_id, r.rental_id FROM {schema}.customer c JOIN {schema}.rental r ON r.customer_id = c.customer_id ORDER BY r.rental_id;"""
+STORE_SPEND_SQL = """SELECT c.store_id, avg(p.amount) FROM {schema}.payment p JOIN {schema}.customer c ON p.customer_id = c.customer_id GROUP BY c.customer_id, c.store_id;"""
 AMOUNT_LEVELS_SQL = "SELECT DISTINCT amount FROM {schema}.payment WHERE amount IS NOT NULL;"
 AMOUNT_VALUES_SQL = "SELECT amount FROM staging.payment WHERE amount IS NOT NULL;"
 TABLE_SQL = 'SELECT * FROM "{schema}"."{table}";'
@@ -100,6 +100,7 @@ def collect_gate_inputs(generated_dir: Path, source_schema: str, load_succeeded:
         "orphans": {name: scalar(sql) for name, sql in ORPHAN_SQL.items()},
         "real_fanout": floats(FANOUT_SQL.format(schema=source_schema)),
         "synthetic_fanout": floats(FANOUT_SQL.format(schema="staging")),
+        "amount_on_grid_ratio": amount_on_grid(source_schema),
     }
 
 
@@ -118,12 +119,16 @@ def evaluate_gates(inputs):
 
     orphan_passed = all(value == 0 for value in inputs["orphans"].values())
     ks = ks_statistic(inputs["real_fanout"], inputs["synthetic_fanout"])
-    p22 = ks < 0.15
+    ratio = inputs["amount_on_grid_ratio"]
+    ongrid_passed = ratio >= 0.95
+    # P2-2 is recorded, not gated (#55 review adjudication): uniform/zipf FK
+    # pools are not empirical fan-out, so the KS value is informational.
     return {
-        "passed": bool(p20 and orphan_passed and p22),
+        "passed": bool(p20 and orphan_passed and ongrid_passed),
         "P2-0": {"passed": bool(p20), "load_succeeded": bool(inputs["load_succeeded"]), "tables": count_details},
         "P2-1": {"passed": orphan_passed, "orphan_counts": inputs["orphans"]},
-        "P2-2": {"passed": p22, "ks_statistic": ks, "threshold": 0.15},
+        "on_grid": {"passed": bool(ongrid_passed), "ratio": ratio, "threshold": 0.95},
+        "P2-2": {"gate": False, "ks_statistic": ks, "within_threshold": bool(ks < 0.15), "threshold": 0.15},
     }
 
 
@@ -156,12 +161,9 @@ def marginal_metrics(source_schema: str):
     return metrics
 
 
-def pearson_pairs(schema: str):
-    pairs = gsql(HOP_SQL.format(schema=schema))
-    if len(pairs) < 2:
+def pearson(left, right):
+    if len(left) != len(right) or len(left) < 2:
         return None
-    left = [float(row[0]) for row in pairs]
-    right = [float(row[1]) for row in pairs]
     left_mean = sum(left) / len(left)
     right_mean = sum(right) / len(right)
     numerator = sum((x - left_mean) * (y - right_mean) for x, y in zip(left, right))
@@ -171,6 +173,15 @@ def pearson_pairs(schema: str):
     )
     value = numerator / denominator if denominator else float("nan")
     return None if math.isnan(value) else value
+
+
+def store_spend_pearson(schema):
+    """Pearson(customer.store_id, per-customer average payment.amount):
+    a business-meaningful 1-hop signal, unlike surrogate-key co-monotonicity."""
+    pairs = gsql(STORE_SPEND_SQL.format(schema=schema))
+    if len(pairs) < 2:
+        return None
+    return pearson([float(row[0]) for row in pairs], [float(row[1]) for row in pairs])
 
 
 def amount_on_grid(source_schema: str):
@@ -227,15 +238,20 @@ def self_test_inputs():
         },
         "real_fanout": [0.0] * 100,
         "synthetic_fanout": [1.0] * 100,
+        "amount_on_grid_ratio": 0.9,
     }
 
 
 def write_report(report, output_json: Path, output_md: Path):
     output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = ["# P2 Multi-table FK Benchmark", "", f"Overall: **{'PASS' if report['passed'] else 'FAIL'}**", ""]
-    for gate in ("P2-0", "P2-1", "P2-2"):
+    for gate in ("P2-0", "P2-1", "on_grid"):
         lines.extend([f"## {gate}: {'PASS' if report[gate]['passed'] else 'FAIL'}", "", "```json", json.dumps(report[gate], indent=2, sort_keys=True), "```", ""])
-    lines.extend(["## P2-3 (record only)", "", "```json", json.dumps(report.get("P2-3", {}), indent=2, sort_keys=True), "```", "", "## P2-4 (record only)", "", "```json", json.dumps(report.get("P2-4", {}), indent=2, sort_keys=True), "```", ""])
+    lines.extend([
+        "## P2-2 fan-out KS (record only, not gated)", "", "```json", json.dumps(report.get("P2-2", {}), indent=2, sort_keys=True), "```", "",
+        "## P2-3 (record only)", "", "```json", json.dumps(report.get("P2-3", {}), indent=2, sort_keys=True), "```", "",
+        "## P2-4 (record only)", "", "```json", json.dumps(report.get("P2-4", {}), indent=2, sort_keys=True), "```", "",
+    ])
     output_md.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -267,16 +283,15 @@ def main() -> int:
         "marginals": marginal_metrics(args.schema),
         "sdv_gc_reference": optional_sdv_reference(args.schema),
     }
-    real_corr = pearson_pairs(args.schema)
-    synthetic_corr = pearson_pairs("staging")
+    real_corr = store_spend_pearson(args.schema)
+    synthetic_corr = store_spend_pearson("staging")
     report["P2-4"] = {
         "gate": False,
-        "one_hop_customer_id_rental_id_pearson": {
+        "store_id_vs_per_customer_avg_amount_pearson": {
             "real": real_corr,
             "synthetic": synthetic_corr,
             "absolute_error": abs(real_corr - synthetic_corr) if real_corr is not None and synthetic_corr is not None else None,
         },
-        "payment_amount_on_grid": {"ratio": amount_on_grid(args.schema), "reference_threshold": 0.95, "gate": False},
     }
 
     attempts = []
@@ -289,8 +304,9 @@ def main() -> int:
     args.attempts_file.write_text(json.dumps(attempts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     report["attempts"] = attempts
     write_report(report, args.output_json, args.output_md)
-    for gate in ("P2-0", "P2-1", "P2-2"):
+    for gate in ("P2-0", "P2-1", "on_grid"):
         print(f"{gate} {'PASS' if report[gate]['passed'] else 'FAIL'}")
+    print(f"P2-2 recorded: KS {report['P2-2']['ks_statistic']:.4f} (not gated)")
     return 0 if report["passed"] else 1
 
 

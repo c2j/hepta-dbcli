@@ -67,7 +67,7 @@ jobs:
     name: case-a-pagila
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: vars.OGAGILA_DIR != ''
+    if: github.event_name == 'workflow_dispatch' && vars.OGAGILA_DIR != ''
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -115,7 +115,7 @@ jobs:
     name: p2-fk-pagila
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: vars.OGAGILA_DIR != ''
+    if: github.event_name == 'workflow_dispatch' && vars.OGAGILA_DIR != ''
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

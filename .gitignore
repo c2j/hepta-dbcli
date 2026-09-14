@@ -12,3 +12,4 @@ tests/benchmark/p2/generated/
 tests/benchmark/p2/models/
 tests/benchmark/p2/staging.sql
 tests/benchmark/p2/p2_attempts.json
+tests/benchmark/p2/p2_rules.yaml

@@ -72,8 +72,18 @@ class ReportGateTests(unittest.TestCase):
         report = p2_report.evaluate_gates(inputs)
         self.assertFalse(report["passed"])
         self.assertFalse(report["P2-1"]["passed"])
-        self.assertFalse(report["P2-2"]["passed"])
+        self.assertFalse(report["on_grid"]["passed"])
+        self.assertFalse(report["P2-2"]["within_threshold"])
+        self.assertFalse(report["P2-2"]["gate"])
         self.assertGreaterEqual(report["P2-2"]["ks_statistic"], 0.15)
+
+    def test_ks_record_only_does_not_gate_overall(self):
+        inputs = p2_report.self_test_inputs()
+        inputs["orphans"] = {name: 0 for name in inputs["orphans"]}
+        inputs["amount_on_grid_ratio"] = 1.0
+        report = p2_report.evaluate_gates(inputs)
+        self.assertTrue(report["passed"], "P2-2 must not gate overall")
+        self.assertFalse(report["P2-2"]["within_threshold"])
 
 
 class StagingDdlTests(unittest.TestCase):

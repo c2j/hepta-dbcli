@@ -73,17 +73,22 @@ load_generated() {
 
 load_status=0
 load_generated || load_status=$?
-if "${PY}" "${ROOT}/p2_report.py" --generated-dir "${GENERATED}" --schema "${SCHEMA}" --load-status "${load_status}" --attempt uniform; then
-    exit 0
+uniform_exit=0
+"${PY}" "${ROOT}/p2_report.py" --generated-dir "${GENERATED}" --schema "${SCHEMA}" --load-status "${load_status}" --attempt uniform || uniform_exit=$?
+
+# Zipf retry is data enrichment only: rerun when every gate is green but the
+# recorded KS is high. Overall = P2-0 ∧ P2-1 ∧ on_grid; P2-2 never gates it.
+gates_green_ks_high() {
+    "${PY}" -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["P2-0"]["passed"] and r["P2-1"]["passed"] and r["on_grid"]["passed"] and r["P2-2"]["ks_statistic"] >= 0.15 else 1)' "${ROOT}/p2_report.json"
+}
+
+if gates_green_ks_high; then
+    echo "All gates green; P2-2 KS above threshold (record only); retrying with Zipf for data enrichment"
+    "${PY}" "${ROOT}/p2_patch_rules.py" "${RULES}" "${ROWS_ARGS[@]}" --zipf
+    load_status=0
+    load_generated || load_status=$?
+    "${PY}" "${ROOT}/p2_report.py" --generated-dir "${GENERATED}" --schema "${SCHEMA}" --load-status "${load_status}" --attempt zipf
+    exit $?
 fi
 
-if ! "${PY}" -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["P2-0"]["passed"] and r["P2-1"]["passed"] and not r["P2-2"]["passed"] else 1)' "${ROOT}/p2_report.json"; then
-    echo "P2 failed outside the KS gate; Zipf retry is not applicable" >&2
-    exit 1
-fi
-
-echo "P2-2 failed on uniform strategy; retrying child tables with Zipf"
-"${PY}" "${ROOT}/p2_patch_rules.py" "${RULES}" "${ROWS_ARGS[@]}" --zipf
-load_status=0
-load_generated || load_status=$?
-"${PY}" "${ROOT}/p2_report.py" --generated-dir "${GENERATED}" --schema "${SCHEMA}" --load-status "${load_status}" --attempt zipf
+exit "${uniform_exit}"

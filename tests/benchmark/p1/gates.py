@@ -47,18 +47,7 @@ def _relative_gate(gate_id, metric, hepta, sdv):
     }
 
 
-def on_grid_ratio(path):
-    """Return fraction of generated payment amounts on the observed amount grid."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    observed = payload.get("observed") or payload.get("grid")
-    generated = payload.get("generated") or payload.get("values")
-    if not observed or not generated:
-        raise ValueError("amount-grid JSON needs non-empty observed/grid and generated/values")
-    grid = {str(value) for value in observed}
-    return sum(str(value) in grid for value in generated) / len(generated)
-
-
-def evaluate(fidelity, utility, amount_grid_path=None):
+def evaluate(fidelity, utility):
     hf, sf = fidelity["hepta"], fidelity["sdv_gc"]
     hu, su = utility["hepta"], utility["sdv_gc"]
     gates = [
@@ -83,31 +72,8 @@ def evaluate(fidelity, utility, amount_grid_path=None):
             _metric_mean(su["range_query"]["3_way_range"]),
         ),
     ]
-    if amount_grid_path:
-        value = on_grid_ratio(amount_grid_path)
-        gates.append(
-            {
-                "id": "G6",
-                "metric": "payment_amount_on_grid_ratio",
-                "hepta_mean": value,
-                "sdv_mean": None,
-                "ratio": value,
-                "threshold": 0.95,
-                "passed": value >= 0.95,
-            }
-        )
-    else:
-        gates.append(
-            {
-                "id": "G6",
-                "metric": "payment_amount_on_grid_ratio",
-                "hepta_mean": None,
-                "sdv_mean": None,
-                "ratio": None,
-                "threshold": 0.95,
-                "skipped": True,
-            }
-        )
+    # P1 is Adult-only; the payment.amount on-grid gate lives in the P2
+    # harness (run_p2.sh), the only place payment flows end to end.
     return {"gates": gates}
 
 
@@ -122,16 +88,13 @@ def _markdown(report):
         "|---|---|---:|---:|---:|---:|---|",
     ]
     for gate in report["gates"]:
-        if gate.get("skipped"):
-            values = ("—", "—", "—", f">= {gate['threshold']:.2f}", "SKIPPED")
-        else:
-            values = (
-                f"{gate['hepta_mean']:.6g}",
-                "—" if gate["sdv_mean"] is None else f"{gate['sdv_mean']:.6g}",
-                f"{gate['ratio']:.6g}",
-                (f">= {gate['threshold']:.2f}" if gate["id"] == "G6" else f"<= {gate['threshold']:.2f}"),
-                "PASS" if gate["passed"] else "FAIL",
-            )
+        values = (
+            f"{gate['hepta_mean']:.6g}",
+            f"{gate['sdv_mean']:.6g}",
+            f"{gate['ratio']:.6g}",
+            f"<= {gate['threshold']:.2f}",
+            "PASS" if gate["passed"] else "FAIL",
+        )
         lines.append(f"| {gate['id']} | {gate['metric']} | " + " | ".join(values) + " |")
     return "\n".join(lines) + "\n"
 
@@ -139,11 +102,8 @@ def _markdown(report):
 def _print_table(report):
     print("gate metric                              ratio threshold result")
     for gate in report["gates"]:
-        if gate.get("skipped"):
-            print(f"{gate['id']:<4} {gate['metric']:<35} {'-':>6} {gate['threshold']:>9.2f} SKIP")
-        else:
-            result = "PASS" if gate["passed"] else "FAIL"
-            print(f"{gate['id']:<4} {gate['metric']:<35} {gate['ratio']:>6.3f} {gate['threshold']:>9.2f} {result}")
+        result = "PASS" if gate["passed"] else "FAIL"
+        print(f"{gate['id']:<4} {gate['metric']:<35} {gate['ratio']:>6.3f} {gate['threshold']:>9.2f} {result}")
 
 
 def _self_test(expect):
@@ -163,14 +123,13 @@ def _self_test(expect):
         {"hepta": candidate_utility, "sdv_gc": baseline_utility},
     )
     _print_table(report)
-    return 0 if all(g.get("passed", True) for g in report["gates"]) else 1
+    return 0 if all(g["passed"] for g in report["gates"]) else 1
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent)
-    parser.add_argument("--amount-grid-json", type=Path)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-good", action="store_true")
     args = parser.parse_args()
@@ -187,7 +146,7 @@ def main():
         model: json.loads((results / f"utility_{model}.json").read_text(encoding="utf-8"))
         for model in ("hepta", "sdv_gc")
     }
-    report = evaluate(fidelity, utility, args.amount_grid_json)
+    report = evaluate(fidelity, utility)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "report.json").write_text(
@@ -195,7 +154,7 @@ def main():
     )
     (output / "REPORT.md").write_text(_markdown(report), encoding="utf-8")
     _print_table(report)
-    return 0 if all(gate.get("passed", True) for gate in report["gates"]) else 1
+    return 0 if all(gate["passed"] for gate in report["gates"]) else 1
 
 
 if __name__ == "__main__":
