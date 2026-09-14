@@ -124,6 +124,7 @@ fn run_query(
         columns,
         rows: out,
         row_count,
+        rows_affected: None,
     })
 }
 
@@ -159,6 +160,21 @@ impl DbConn for DuckDbConn {
         tokio::task::spawn_blocking(move || run_drop(&conn, &sql))
             .await
             .map_err(|e| DbError::query(format!("DuckDB execute task failed: {e}")))?
+    }
+
+    async fn execute_write(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let sql = sql.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let guard = lock(&conn)?;
+            let no_params: [&dyn ToSql; 0] = [];
+            guard
+                .execute(&sql, no_params)
+                .map(|n| QueryResult::affected(n as u64))
+                .map_err(|e| DbError::query_with_source("DuckDB execute failed", e))
+        })
+        .await
+        .map_err(|e| DbError::query(format!("DuckDB execute task failed: {e}")))?
     }
 
     fn dialect(&self) -> &dyn Dialect {

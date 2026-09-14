@@ -633,6 +633,7 @@ mod tests {
             columns: vec!["cnt".into()],
             rows: vec![vec![json!("nope")]],
             row_count: 1,
+            rows_affected: None,
         };
         assert!(parse_count(&r).is_err());
     }

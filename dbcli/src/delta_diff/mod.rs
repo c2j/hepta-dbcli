@@ -560,7 +560,12 @@ async fn connect_side(
         .map(|i| &side.connection_url[..i])
         .unwrap_or("mysql");
     let pool = registry
-        .connect_with_fallback(scheme, &side.connection_url, Some(&side.timeout_config))
+        .connect_with_fallback(
+            scheme,
+            &side.connection_url,
+            Some(&side.timeout_config),
+            false,
+        )
         .await
         .map_err(|e| format!("connect '{}': {}", side.name, e))?;
     let conn = pool.acquire().await.map_err(|e| e.to_string())?;

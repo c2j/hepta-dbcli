@@ -343,6 +343,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - MySQL integration tests require `HEPTA_DBCLI_TEST_URL` env var and a running MySQL instance.
 - Oracle integration tests require `POLARDB_ORACLE_TEST_URL` env var and a running Oracle instance (Docker: `gvenzl/oracle-free:23-slim`).
 - DuckDB integration tests are **embedded** — no external service, no env var; they use `tempfile` fixtures (`cargo test --features "duckdb,integration" --test regress_duckdb`).
+- CI has a dedicated **`duckdb` job** (`cargo clippy --all --all-targets --features duckdb`, `cargo test --all --features duckdb`, `cargo test --features "duckdb,integration" --test regress_duckdb`). It is slow (bundled C++ core), so run the same commands locally when touching `backend/mod.rs` traits (`DbConn`, `QueryResult`, `BackendFactory`) instead of waiting for CI.
 
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
@@ -352,9 +353,11 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).
 - Connection pooling: connections are reused and recycled based on `connection_max_lifetime`.
+- Write control is layered (issue #58): MCP stays read-only; **CLI/REPL data changes require `--allow-write`** (`INSERT`/`UPDATE`/`DELETE`/`CALL`), destructive DDL (`DROP`/`TRUNCATE`/`ALTER`/`CREATE`/`GRANT`) is always refused client-side. Classification lives in `cli.rs::classify_statement` / `write_gate` (UX gate, not a security boundary). `--allow-write mcp` exits 2. The audit ledger is not optional (no `--no-audit`); an unusable audit directory degrades with a warning for reads and fails closed for writes. The gate runs after connection resolution and before connecting, and a refusal is audited (`decision=deny`, `deny_reason` = `write_flag_required` / `destructive_ddl`) without touching the engine. Each CLI/REPL session records a `session_mode` event (`read_only` / `allow_write`); writes record an intent before execution and an outcome after, so an intent event must not be read as "executed".
 
 ### CI
 - `libdbus-1-dev` and `pkg-config` are system dependencies for `clippy` and `test`. Without them, `cargo clippy` will fail on the `keyring` crate.
+- Jobs: `rustfmt`, `clippy`, `duckdb`, `test`. The `test` job runs a MySQL service and `HEPTA_DBCLI_TEST_URL`; the `duckdb` job runs the feature-gated clippy + unit + embedded DuckDB suites.
 - Release builds on Windows link statically (`-C target-feature=+crt-static`).
 - Release tags: `v*` (e.g. `v0.2.1`).
 - Release binaries are built with `--features oracle-rs,oracle,gaussdb,synth` (not `--all-features`; `integration` and `duckdb` stay out).

@@ -11,8 +11,21 @@ use super::conn::GaussdbConn;
 use super::error;
 use super::GaussdbDialect;
 
-fn pool_init_sql() -> Vec<String> {
-    GaussdbDialect.session_pin_sql()
+/// Session SQL sent on every new GaussDB connection.
+///
+/// `read_only` is the default; `--allow-write` (issue #58) turns the engine
+/// guard off for that process. The dialect's own session pins (timezone,
+/// float digits) always apply.
+pub(crate) fn connect_init_sql(read_only: bool) -> Vec<String> {
+    let guard = if read_only {
+        "SET default_transaction_read_only = ON"
+    } else {
+        // Explicit OFF: the server or role may default to read-only.
+        "SET default_transaction_read_only = OFF"
+    };
+    let mut sql = vec![guard.to_string()];
+    sql.extend(GaussdbDialect.session_pin_sql());
+    sql
 }
 
 /// 真多连接池（delta-diff Phase 2 重构）：每次 acquire() 建立独立 TCP 连接，
@@ -22,6 +35,8 @@ fn pool_init_sql() -> Vec<String> {
 pub(crate) struct GaussdbPool {
     conn_str: String,
     tls: Option<gaussdb::native_tls::MakeTlsConnector>,
+    /// Session-level engine read-only guard; false only under `--allow-write`.
+    read_only: bool,
 }
 
 impl std::fmt::Debug for GaussdbPool {
@@ -29,17 +44,25 @@ impl std::fmt::Debug for GaussdbPool {
         f.debug_struct("GaussdbPool")
             .field("conn_str", &redact_password(&self.conn_str))
             .field("tls", &self.tls.is_some())
+            .field("read_only", &self.read_only)
             .finish()
     }
 }
 
-pub(crate) async fn create_gaussdb_pool(url: &str) -> Result<GaussdbPool, DbError> {
+pub(crate) async fn create_gaussdb_pool(
+    url: &str,
+    read_only: bool,
+) -> Result<GaussdbPool, DbError> {
     let conn_str = normalize_gaussdb_url(url);
     let tls = match parse_sslmode(&conn_str) {
         Some(sslmode) => Some(build_tls(sslmode)?),
         None => None,
     };
-    let pool = GaussdbPool { conn_str, tls };
+    let pool = GaussdbPool {
+        conn_str,
+        tls,
+        read_only,
+    };
     // 建池即验证连通性（对齐 connect_with_fallback 的 acquire 验证语义）
     let _ = pool.connect_one().await?;
     Ok(pool)
@@ -70,16 +93,13 @@ impl GaussdbPool {
                 client
             }
         };
-        let _ = client
-            .simple_query("SET default_transaction_read_only = ON")
-            .await;
         // 防御性兜底（issue #27）：驱动启动握手已协商 client_encoding=UTF8
         // （rust-opengauss connect_raw.rs），此处再显式 SET，防止未来驱动行为
         // 变化时服务端回落到库默认编码，误读本驱动按 UTF-8 发送的字面量。
         if let Err(e) = client.simple_query("SET client_encoding = 'UTF8'").await {
             tracing::warn!("failed to set client_encoding=UTF8: {e}");
         }
-        for sql in pool_init_sql() {
+        for sql in connect_init_sql(self.read_only) {
             client
                 .simple_query(&sql)
                 .await
@@ -171,6 +191,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_pin_read_only_session_by_default() {
+        let sql = connect_init_sql(true);
+        assert!(
+            sql.iter()
+                .any(|s| s == "SET default_transaction_read_only = ON"),
+            "expected the engine guard: {sql:?}"
+        );
+    }
+
+    #[test]
+    fn should_explicitly_disable_the_guard_when_writes_are_allowed() {
+        // Issue #58 D5: an explicit OFF, not merely omitting the SET, because
+        // the role or server may default to read-only.
+        let sql = connect_init_sql(false);
+        assert!(
+            sql.iter()
+                .any(|s| s == "SET default_transaction_read_only = OFF"),
+            "expected an explicit OFF: {sql:?}"
+        );
+        assert!(
+            !sql.iter()
+                .any(|s| s.contains("default_transaction_read_only = ON")),
+            "write mode must not keep the guard: {sql:?}"
+        );
+    }
+
+    #[test]
+    fn should_always_keep_the_dialect_session_pins() {
+        for read_only in [true, false] {
+            let sql = connect_init_sql(read_only);
+            for pin in GaussdbDialect.session_pin_sql() {
+                assert!(sql.contains(&pin), "missing session pin {pin:?}");
+            }
+        }
+    }
+
+    #[test]
     fn test_normalize_gaussdb_url_rewrites_scheme() {
         assert_eq!(
             normalize_gaussdb_url("gaussdb://u:p@h:5432/db"),
@@ -210,7 +267,7 @@ mod tests {
 
     #[test]
     fn pooled_connection_init_includes_dialect_pins() {
-        let sql = pool_init_sql();
+        let sql = connect_init_sql(true);
         assert!(sql.iter().any(|stmt| stmt.contains("TimeZone")), "{sql:?}");
         assert!(
             sql.iter().any(|stmt| stmt.contains("extra_float_digits")),

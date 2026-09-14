@@ -51,6 +51,7 @@ impl DbConn for GaussdbConn {
             columns,
             rows: result_rows,
             row_count,
+            rows_affected: None,
         })
     }
 
@@ -93,6 +94,7 @@ impl DbConn for GaussdbConn {
             columns,
             rows: result_rows,
             row_count,
+            rows_affected: None,
         })
     }
 
@@ -102,6 +104,15 @@ impl DbConn for GaussdbConn {
             .await
             .map_err(|e| error::wrap_gaussdb_error("query_drop", e))?;
         Ok(())
+    }
+
+    async fn execute_write(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let affected = self
+            .client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| error::wrap_gaussdb_error("execute_write", e))?;
+        Ok(QueryResult::affected(affected))
     }
 
     fn dialect(&self) -> &dyn Dialect {

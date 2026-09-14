@@ -36,7 +36,19 @@ impl BackendFactory for GaussdbFactory {
         url: &str,
         _timeout_config: Option<&TimeoutConfig>,
     ) -> Result<Arc<dyn DbPool>, DbError> {
-        let pool = create_gaussdb_pool(url).await?;
+        let pool = create_gaussdb_pool(url, true).await?;
+        Ok(Arc::new(pool))
+    }
+
+    /// GaussDB has a session-level read-only guard, so the write flag must
+    /// reach pool creation (issue #58 D5).
+    async fn connect_with_mode(
+        &self,
+        url: &str,
+        _timeout_config: Option<&TimeoutConfig>,
+        allow_write: bool,
+    ) -> Result<Arc<dyn DbPool>, DbError> {
+        let pool = create_gaussdb_pool(url, !allow_write).await?;
         Ok(Arc::new(pool))
     }
 }
@@ -611,7 +623,7 @@ mod integration_tests {
         let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
             return;
         };
-        let pool = super::pool::create_gaussdb_pool(&url)
+        let pool = super::pool::create_gaussdb_pool(&url, true)
             .await
             .expect("pool creation failed");
         let mut c1 = pool.acquire().await.expect("acquire c1");
@@ -709,7 +721,9 @@ mod integration_tests {
             .map(|i| value_start + i)
             .unwrap_or(url.len());
         let bad = format!("{}__wrong__{}", &url[..value_start], &url[value_end..]);
-        let err = super::pool::create_gaussdb_pool(&bad).await.unwrap_err();
+        let err = super::pool::create_gaussdb_pool(&bad, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SQLSTATE") || msg.contains("password authentication failed"),

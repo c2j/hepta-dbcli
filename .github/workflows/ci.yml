@@ -52,6 +52,49 @@ jobs:
       - run: cargo clippy --all --all-targets
       - run: cargo clippy --all --all-targets --features synth
 
+  duckdb:
+    name: duckdb
+    # The DuckDB backend is only compiled under `--features duckdb`, and its
+    # bundled C++ core is heavy, so it gets its own job instead of slowing the
+    # default clippy/test matrix. Without this job a change to the backend
+    # traits (DbConn / QueryResult / BackendFactory) can break the DuckDB
+    # backend while every other check stays green.
+    runs-on: ubuntu-latest
+    # A cold cache has to build the bundled DuckDB C++ core and takes ~30 min;
+    # warm runs (same rustc + Cargo.lock, restored from `duckdb-target-*`) are
+    # a few minutes. The headroom matters because a cold run otherwise lands
+    # within seconds of the limit.
+    timeout-minutes: 60
+    env:
+      # The bundled DuckDB C++ build is memory hungry; keep parallelism low.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: echo "version=$(rustc --version)" >> $GITHUB_OUTPUT
+        id: rust-version
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index
+          key: index-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            index-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fetch
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: duckdb-target-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo clippy --all --all-targets --features duckdb
+      - run: cargo test --all --features duckdb
+      - run: cargo test --features "duckdb,integration" --test regress_duckdb
+
   test:
     name: test
     runs-on: ubuntu-latest

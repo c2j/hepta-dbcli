@@ -45,11 +45,14 @@ impl BackendRegistry {
     /// Try all registered factories for a scheme, returning the first successful connection.
     /// For Oracle, tries oracle-rs first (12c+, pure Rust), then falls back to
     /// oracle-native (11g+, needs Instant Client).
+    /// `allow_write` is the process-level CLI flag; backends with a
+    /// session-level read-only guard (GaussDB) honour it, others ignore it.
     pub async fn connect_with_fallback(
         &self,
         scheme: &str,
         url: &str,
         timeout: Option<&TimeoutConfig>,
+        allow_write: bool,
     ) -> Result<Arc<dyn DbPool>, String> {
         let factories = self.get_by_scheme_all(scheme);
         if factories.is_empty() {
@@ -58,7 +61,7 @@ impl BackendRegistry {
 
         let mut errors: Vec<String> = Vec::new();
         for factory in factories {
-            match factory.connect(url, timeout).await {
+            match factory.connect_with_mode(url, timeout, allow_write).await {
                 Ok(pool) => {
                     // Validate by acquiring a real connection, then drop it.
                     // This ensures the backend actually works — needed for

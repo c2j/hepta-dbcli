@@ -34,6 +34,9 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub row_count: usize,
+    /// Rows changed by a data-change statement, when the backend reports it.
+    /// `None` for statements that return a result set (issue #58 D6).
+    pub rows_affected: Option<u64>,
 }
 
 impl QueryResult {
@@ -42,6 +45,17 @@ impl QueryResult {
             columns: vec![],
             rows: vec![],
             row_count: 0,
+            rows_affected: None,
+        }
+    }
+
+    /// Result of a data-change statement: no result set, `n` rows changed.
+    pub fn affected(n: u64) -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            rows_affected: Some(n),
         }
     }
 }
@@ -50,8 +64,8 @@ impl fmt::Display for QueryResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "QueryResult {{ columns: {:?}, row_count: {} }}",
-            self.columns, self.row_count
+            "QueryResult {{ columns: {:?}, row_count: {}, rows_affected: {:?} }}",
+            self.columns, self.row_count, self.rows_affected
         )
     }
 }
@@ -73,6 +87,15 @@ pub trait DbConn: Send {
 
     /// Execute a SQL statement that returns no rows (SET, ALTER SESSION, etc.).
     async fn query_drop(&mut self, sql: &str) -> Result<(), DbError>;
+
+    /// Execute a data-change statement and report the number of affected rows
+    /// (issue #58 D6). Backends that cannot report a count must not pretend:
+    /// the default errors instead of returning a fake zero.
+    async fn execute_write(&mut self, _sql: &str) -> Result<QueryResult, DbError> {
+        Err(DbError::query(
+            "this backend does not support data-change execution",
+        ))
+    }
 
     /// Return a reference to the dialect associated with this connection.
     fn dialect(&self) -> &dyn Dialect;
@@ -512,6 +535,19 @@ pub trait BackendFactory: Send + Sync {
         url: &str,
         timeout_config: Option<&TimeoutConfig>,
     ) -> Result<Arc<dyn DbPool>, DbError>;
+
+    /// Like [`connect`], but tells the backend whether this process may
+    /// execute data changes. Backends without a session-level read-only
+    /// switch ignore the flag.
+    async fn connect_with_mode(
+        &self,
+        url: &str,
+        timeout_config: Option<&TimeoutConfig>,
+        allow_write: bool,
+    ) -> Result<Arc<dyn DbPool>, DbError> {
+        let _ = allow_write;
+        self.connect(url, timeout_config).await
+    }
 }
 
 // ─── Scheme-level Defaults (pre-connection lookups) ──────────────────

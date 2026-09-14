@@ -80,6 +80,12 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 30)]
     audit_retention_days: u32,
 
+    /// Allow CLI/REPL data changes (INSERT/UPDATE/DELETE and CALL).
+    /// Destructive DDL stays refused; MCP is unaffected and stays read-only.
+    /// Pair this with a low-privilege database account.
+    #[arg(long, global = true)]
+    allow_write: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -426,7 +432,7 @@ async fn do_oracle_check(resolved: &ResolvedConnection, registry: &BackendRegist
     eprintln!("[1/1] Connecting to Oracle ...");
     let start = Instant::now();
     match registry
-        .connect_with_fallback("oracle", base_url, None)
+        .connect_with_fallback("oracle", base_url, None, false)
         .await
     {
         Ok(pool) => {
@@ -566,7 +572,7 @@ async fn do_gaussdb_check(
     eprintln!("[1/1] Connecting to GaussDB ...");
     let start = Instant::now();
     match registry
-        .connect_with_fallback("gaussdb", base_url, None)
+        .connect_with_fallback("gaussdb", base_url, None, false)
         .await
     {
         Ok(pool) => {
@@ -677,7 +683,7 @@ async fn do_duckdb_check(resolved: &ResolvedConnection, registry: &BackendRegist
     eprintln!("[1/1] Opening DuckDB database ...");
     let start = Instant::now();
     match registry
-        .connect_with_fallback("duckdb", base_url, None)
+        .connect_with_fallback("duckdb", base_url, None, false)
         .await
     {
         Ok(pool) => {
@@ -1175,6 +1181,12 @@ async fn main() {
 
     match cli.command {
         None | Some(Commands::Mcp) => {
+            if cli.allow_write {
+                eprintln!(
+                    "error: --allow-write is not valid for the MCP server; MCP execute_query stays read-only"
+                );
+                std::process::exit(2);
+            }
             let audit = Arc::new(audit::AuditSession::new(&audit_config));
             run_mcp_server(cli.config, Arc::clone(&registry), audit).await;
         }
@@ -1227,6 +1239,7 @@ async fn main() {
                     connection_max_lifetime,
                     no_history,
                     timeout_action,
+                    allow_write: cli.allow_write,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = interactive::run_interactive(args, &registry, &audit).await {
@@ -1245,6 +1258,7 @@ async fn main() {
                     connection_max_lifetime,
                     no_history,
                     timeout_action,
+                    allow_write: cli.allow_write,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = cli::run_cli(args, &registry, &audit).await {

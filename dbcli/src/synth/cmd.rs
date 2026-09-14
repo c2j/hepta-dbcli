@@ -738,6 +738,7 @@ mod tests {
                 Value::from("id"),
             ]],
             row_count: 1,
+            rows_affected: None,
         };
 
         let fks = parse_foreign_keys(&result).unwrap();
@@ -752,6 +753,7 @@ mod tests {
             columns: vec!["table_name".to_string()],
             rows: vec![vec![Value::from("orders")]],
             row_count: 1,
+            rows_affected: None,
         };
         assert!(parse_foreign_keys(&result).is_err());
     }
@@ -775,6 +777,7 @@ mod tests {
             ],
             rows: vec![],
             row_count: 0,
+            rows_affected: None,
         };
         assert_eq!(parse_foreign_keys(&result).unwrap(), vec![]);
     }

@@ -384,7 +384,7 @@ impl DbMcp {
         let scheme = url.find("://").map(|i| &url[..i]).unwrap_or("mysql");
         let pool = self
             .registry
-            .connect_with_fallback(scheme, url, None)
+            .connect_with_fallback(scheme, url, None, false)
             .await
             .map_err(|e| {
                 self.audit
@@ -544,8 +544,6 @@ fn meta_event(conn_name: &str, url: &str, action: &str, decision: Decision) -> D
     )
 }
 
-/// Map a [`DbError`] to `(error_kind, sqlstate)`. SQLSTATE is only available
-/// when the driver surfaces one (e.g. GaussDB's `[SQLSTATE 42P01]` message).
 // ─── Tool Implementations ───────────────────────────────────────────
 
 #[tool_router]

@@ -129,7 +129,7 @@ mod tests {
         let mut registry = polar_mysql::backend::factory::BackendRegistry::new();
         registry.register(factory);
         let pool = registry
-            .connect_with_fallback("gaussdb", &url, None)
+            .connect_with_fallback("gaussdb", &url, None, false)
             .await
             .expect("connect");
         let conn = pool.acquire().await.expect("acquire");

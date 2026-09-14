@@ -86,6 +86,7 @@ mod tests {
                 columns: vec!["id".into(), "v".into()],
                 row_count: self.rows.len(),
                 rows: self.rows.clone(),
+                rows_affected: None,
             })
         }
         async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {

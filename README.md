@@ -10,6 +10,7 @@ Current version: **0.5.1**.
 - **Multi-database** — MySQL, PolarDB-X, Oracle, GaussDB (default features: `oracle-rs`, `oracle`, `gaussdb`, `synth`) and DuckDB (optional feature `duckdb`)
 - **One-shot CLI** — execute SQL from command line, file, or stdin with `table` / `json` / `csv` / `vertical` output
 - **Interactive REPL** — database-aware SQL prompt with multi-line editing, history, and dot commands
+- **Layered write control** — CLI/REPL data changes require `--allow-write`; destructive DDL is always refused; MCP stays read-only
 - **Cross-DB delta-diff** — compare table data across two named connections (`hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`); CLI + MCP
 - **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`synth` CLI; in default features since 0.5.0, MCP does not expose it)
 - **Multi-connection** — `~/.hepta-dbcli.toml` with per-connection timeouts
@@ -199,7 +200,21 @@ hepta_dbcli cli --name prod --sql "SELECT count(*) FROM orders"
 hepta_dbcli cli --name gauss --sql "SELECT version()"
 ```
 
-CLI mode is **not** read-only (unlike MCP).
+Read-only statements (`SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`, transaction control) run as before. Data changes need `--allow-write`, **on every dialect**: MySQL and Oracle CLI sessions used to accept a bare `INSERT` and no longer do.
+
+```bash
+hepta_dbcli cli --sql "INSERT INTO t VALUES (1)"                 # refused
+hepta_dbcli cli --allow-write --sql "INSERT INTO t VALUES (1)"   # runs, prints "1 rows affected"
+hepta_dbcli cli --allow-write --sql "DROP TABLE t"               # always refused
+```
+
+| Layer | Statements | CLI/REPL | MCP |
+|-------|-----------|----------|-----|
+| L1 read-only | `SELECT` / `SHOW` / `EXPLAIN` / `DESCRIBE` | allowed | allowed |
+| L2 data change | `INSERT` / `UPDATE` / `DELETE` / `CALL` | needs `--allow-write` | refused |
+| L3 destructive | `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `GRANT` | always refused | refused |
+
+`--allow-write` is a global flag and applies only to the CLI and REPL — `hepta_dbcli --allow-write mcp` exits with an error. It is a guard rail, not a security boundary: pair it with a low-privilege database account. On GaussDB the flag drops the `default_transaction_read_only` session guard; on MySQL/Oracle it opens the client-side gate. Writes are audited fail-closed: if the audit record cannot be written, the statement is refused before it reaches the engine.
 
 ### Interactive REPL
 
@@ -255,7 +270,7 @@ $XDG_DATA_HOME/hepta-dbcli/audit/hepta-dbcli-audit.YYYY-MM-DD.jsonl
 - One JSON object per line (schema `v: 1`): envelope (`ts`, `event_id`, `session_id`, `seq`, `channel`, `actor`, `connection`, `action`, `class`, `decision`) plus action detail (`sql`, `outcome`, `deny_reason`, `detail`).
 - `channel` is one of `mcp`, `cli`, `repl`, `delta_diff`, `synth`.
 - Enabled by default; the directory and files are created `0700` / `0600`. Passwords and DSN userinfo are stripped, and result rows / EXPLAIN bodies are never written.
-- A statement rejected by the MCP read-only gate is recorded (`decision: "deny"`, `deny_reason: "prefix"`); query errors are recorded as `decision: "error"`.
+- A rejected statement is recorded even though it never reached the engine: MCP's read-only gate as `deny_reason: "prefix"`, the CLI write gate as `write_flag_required` / `destructive_ddl`. Query errors are `decision: "error"` with `error_kind` + `sqlstate`.
 
 Global flags:
 
