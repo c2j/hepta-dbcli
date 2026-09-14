@@ -54,12 +54,12 @@ kept here because the code alone does not record *why*.
 | 5 | DML output | `N rows affected` for table/vertical/csv, `{"rows_affected": n}` for json; `QueryResult::empty()` keeps `(0 rows)` |
 | 6 | Audit failure while writing | fail closed — the intent event is written before execution via `AuditSession::record`, and `--no-audit --allow-write` is refused at startup |
 
-### One interpretation still open
+### Resolved: uniform strict gating
 
-Issue §4 says the default is "behaviour unchanged (… MySQL/Oracle CLI can still
-write)" while D4 says L2 requires `--allow-write`. PR #61 implements D4
-uniformly, so a bare MySQL/Oracle CLI `INSERT` is now refused. If the intent was
-to keep MySQL/Oracle L2 ungated, only `cli.rs::write_gate` changes.
+Issue §4 said the default is "behaviour unchanged (… MySQL/Oracle CLI can still
+write)" while D4 said L2 requires `--allow-write`. **Decided: D4, uniformly.**
+A bare MySQL/Oracle CLI `INSERT` is refused, exactly like GaussDB; `write_gate`
+is dialect-agnostic and the README states the behaviour change explicitly.
 
 ---
 
