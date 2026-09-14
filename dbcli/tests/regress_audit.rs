@@ -216,6 +216,7 @@ async fn count_rows(name: &str) -> i64 {
         .query(&format!("SELECT COUNT(*) AS n FROM {name}"))
         .await
         .expect("count");
+    common::assert_columns(&result.columns, &["n"]);
     result.rows[0][0].as_i64().unwrap_or(-1)
 }
 
