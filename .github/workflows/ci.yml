@@ -60,7 +60,11 @@ jobs:
     # traits (DbConn / QueryResult / BackendFactory) can break the DuckDB
     # backend while every other check stays green.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold cache has to build the bundled DuckDB C++ core and takes ~30 min;
+    # warm runs (same rustc + Cargo.lock, restored from `duckdb-target-*`) are
+    # a few minutes. The headroom matters because a cold run otherwise lands
+    # within seconds of the limit.
+    timeout-minutes: 60
     env:
       # The bundled DuckDB C++ build is memory hungry; keep parallelism low.
       CARGO_BUILD_JOBS: 2
