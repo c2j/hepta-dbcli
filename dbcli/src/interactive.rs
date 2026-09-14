@@ -488,7 +488,18 @@ async fn connect(
     effective_timeout: &TimeoutConfig,
     registry: &BackendRegistry,
     allow_write: bool,
+    audit: &crate::audit::AuditSession,
 ) -> Result<Box<dyn DbConn + Send>, String> {
+    let connect_event = |decision: crate::audit::event::Decision| {
+        crate::cli::action_event(
+            crate::audit::event::Channel::Repl,
+            "connect",
+            &target.name,
+            &target.connection_url,
+            crate::audit::event::ActionClass::Admin,
+            decision,
+        )
+    };
     let scheme = target
         .connection_url
         .find("://")
@@ -502,12 +513,16 @@ async fn connect(
             allow_write,
         )
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        .map_err(|e| {
+            audit.record_best_effort(connect_event(crate::audit::event::Decision::Error));
+            format!("Connection failed: {}", e)
+        })?;
 
-    let conn = pool
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire connection: {}", e))?;
+    let conn = pool.acquire().await.map_err(|e| {
+        audit.record_best_effort(connect_event(crate::audit::event::Decision::Error));
+        format!("Failed to acquire connection: {}", e)
+    })?;
+    audit.record_best_effort(connect_event(crate::audit::event::Decision::Allow));
 
     if let (Some(path), Some(plaintext)) = (&target.config_path, &target.plaintext_password) {
         info!(
@@ -552,7 +567,14 @@ pub(crate) async fn run_interactive(
         args.statement_timeout.as_deref(),
         args.connection_max_lifetime.as_deref(),
     )?;
-    let mut conn = connect(&target, &effective_timeout, registry, args.allow_write).await?;
+    let mut conn = connect(
+        &target,
+        &effective_timeout,
+        registry,
+        args.allow_write,
+        audit,
+    )
+    .await?;
     if args.allow_write {
         audit.record_best_effort(session_mode_event(
             &target.name,
@@ -638,7 +660,9 @@ pub(crate) async fn run_interactive(
                 args.connection_max_lifetime.as_deref(),
             ) {
                 Ok((new_target, new_timeout)) => {
-                    match connect(&new_target, &new_timeout, registry, args.allow_write).await {
+                    match connect(&new_target, &new_timeout, registry, args.allow_write, audit)
+                        .await
+                    {
                         Ok(new_conn) => {
                             // Save history for old connection
                             if target.name != new_target.name {
@@ -771,7 +795,14 @@ pub(crate) async fn run_interactive(
                         if let Some(kill_sql) = conn.dialect().kill_own_connection_sql() {
                             let _ = conn.query_drop(&kill_sql).await;
                         }
-                        match connect(&target, &effective_timeout, registry, args.allow_write).await
+                        match connect(
+                            &target,
+                            &effective_timeout,
+                            registry,
+                            args.allow_write,
+                            audit,
+                        )
+                        .await
                         {
                             Ok(new_conn) => {
                                 conn = new_conn;

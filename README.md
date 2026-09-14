@@ -214,7 +214,7 @@ hepta_dbcli cli --allow-write --sql "DROP TABLE t"               # always refuse
 | L2 data change | `INSERT` / `UPDATE` / `DELETE` / `CALL` | needs `--allow-write` | refused |
 | L3 destructive | `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `GRANT` | always refused | refused |
 
-`--allow-write` is a global flag and applies only to the CLI and REPL — `hepta_dbcli --allow-write mcp` exits with an error. It is a guard rail, not a security boundary: pair it with a low-privilege database account. On GaussDB the flag drops the `default_transaction_read_only` session guard; on MySQL/Oracle it opens the client-side gate. Writes are audited fail-closed: if the audit record cannot be written, the statement is refused before it reaches the engine. `--allow-write` with `--no-audit` is rejected at startup.
+`--allow-write` is a global flag and applies only to the CLI and REPL — `hepta_dbcli --allow-write mcp` exits with an error. It is a guard rail, not a security boundary: pair it with a low-privilege database account. On GaussDB the flag drops the `default_transaction_read_only` session guard; on MySQL/Oracle it opens the client-side gate. Writes are audited fail-closed: if the audit record cannot be written, the statement is refused before it reaches the engine.
 
 ### Interactive REPL
 
@@ -277,11 +277,10 @@ Global flags:
 | Flag | Meaning |
 |------|---------|
 | `--audit-dir <path>` | Write the ledger under `<path>` (CI / log shipping) |
-| `--no-audit` | Disable the ledger. Dangerous: no record of executed SQL remains |
 | `--audit-meta` | Also record high-noise meta tools (`list_tables`, `get_table_metadata`, `get_database_info`, `list_connections`) |
 | `--audit-retention-days <n>` | Delete audit files older than `n` days on startup (default `30`, `0` = keep forever) |
 
-Audit write failures never fail a read-only query; they print a warning to stderr.
+The ledger cannot be switched off: `--audit-dir` only changes where it is written. If the audit directory is unusable (permissions, read-only filesystem) the failure is reported on stderr and read-only queries still run; writes fail closed.
 
 ### Cross-database delta-diff
 

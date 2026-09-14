@@ -72,10 +72,6 @@ struct Cli {
     #[arg(long, global = true)]
     audit_dir: Option<String>,
 
-    /// Disable the audit log. Dangerous: no ledger of executed SQL remains.
-    #[arg(long, global = true)]
-    no_audit: bool,
-
     /// Also audit high-noise meta tools (list_tables, get_table_metadata, ...)
     #[arg(long, global = true)]
     audit_meta: bool,
@@ -212,7 +208,11 @@ fn read_password_secure() -> Result<String, String> {
     }
 }
 
-fn handle_store_password(name: Option<String>, config_path: Option<String>) {
+fn handle_store_password(
+    name: Option<String>,
+    config_path: Option<String>,
+    audit: &audit::AuditSession,
+) {
     let password = read_password_secure().unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -277,10 +277,26 @@ fn handle_store_password(name: Option<String>, config_path: Option<String>) {
 
     let keyring_user = target.keyring_username(Some(&config_path));
 
+    // `--audit-meta`: record the action, never the password (issue #57 §5).
+    let record = |decision| {
+        if audit.meta_enabled() {
+            audit.record_best_effort(cli::action_event(
+                audit::event::Channel::Cli,
+                "store_password",
+                &target.name,
+                "",
+                audit::event::ActionClass::Meta,
+                decision,
+            ));
+        }
+    };
+
     if let Err(e) = store_keyring_password(&keyring_user, &password) {
+        record(audit::event::Decision::Error);
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
+    record(audit::event::Decision::Allow);
 
     println!(
         "Password stored in OS keychain for '{}' (connection: '{}').",
@@ -927,6 +943,7 @@ async fn handle_check_connection_cmd(
     verbose: bool,
     config_path: Option<PathBuf>,
     registry: &BackendRegistry,
+    audit: &audit::AuditSession,
 ) {
     let raw = read_config(config_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
@@ -960,6 +977,19 @@ async fn handle_check_connection_cmd(
             std::process::exit(1);
         })
     };
+
+    // `--audit-meta`: record the action (issue #57 §5). `check` never carries
+    // credentials; the probe output itself stays on the terminal.
+    if audit.meta_enabled() {
+        audit.record_best_effort(cli::action_event(
+            audit::event::Channel::Cli,
+            "check",
+            &resolved.name,
+            &resolved.connection_url,
+            audit::event::ActionClass::Meta,
+            audit::event::Decision::Allow,
+        ));
+    }
 
     handle_check_connection(&resolved, verbose, registry).await;
 }
@@ -1139,14 +1169,11 @@ async fn main() {
     let cli = Cli::parse();
     let registry = Arc::new(create_registry());
 
-    if cli.allow_write && cli.no_audit {
-        eprintln!("error: --allow-write requires the audit log; remove --no-audit");
-        std::process::exit(2);
-    }
-
     let audit_config = audit::AuditConfig {
         dir: cli.audit_dir.as_deref().map(PathBuf::from),
-        enabled: !cli.no_audit,
+        // The ledger is not optional (issue #57 review). An unwritable
+        // directory degrades with a stderr warning; it is never switched off.
+        enabled: true,
         fsync: false,
         meta: cli.audit_meta,
         retention_days: cli.audit_retention_days,
@@ -1165,10 +1192,12 @@ async fn main() {
         }
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);
-            handle_check_connection_cmd(cli.name, verbose, config_path, &registry).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit).await;
         }
         Some(Commands::StorePassword {}) => {
-            handle_store_password(cli.name, cli.config);
+            let audit = audit::AuditSession::new(&audit_config);
+            handle_store_password(cli.name, cli.config, &audit);
         }
         Some(Commands::DeltaDiff { args }) => {
             let audit = audit::AuditSession::new(&audit_config);
@@ -1195,7 +1224,9 @@ async fn main() {
         }) => {
             if check_connection {
                 let config_path = cli.config.map(PathBuf::from);
-                handle_check_connection_cmd(cli.name, verbose, config_path, &registry).await;
+                let audit = audit::AuditSession::new(&audit_config);
+                handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit)
+                    .await;
             } else if interactive {
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {

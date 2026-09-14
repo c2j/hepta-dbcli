@@ -354,7 +354,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).
 - Connection pooling: connections are reused and recycled based on `connection_max_lifetime`.
-- Write control is layered (issue #58): MCP stays read-only; **CLI/REPL data changes require `--allow-write`** (`INSERT`/`UPDATE`/`DELETE`/`CALL`), destructive DDL (`DROP`/`TRUNCATE`/`ALTER`/`CREATE`/`GRANT`) is always refused client-side. Classification lives in `cli.rs::classify_statement` / `write_gate` (UX gate, not a security boundary). `--allow-write mcp` exits 2, and `--allow-write --no-audit` is rejected at startup. Writes audit fail-closed via `AuditSession::record`; reads keep using `record_best_effort`.
+- Write control is layered (issue #58): MCP stays read-only; **CLI/REPL data changes require `--allow-write`** (`INSERT`/`UPDATE`/`DELETE`/`CALL`), destructive DDL (`DROP`/`TRUNCATE`/`ALTER`/`CREATE`/`GRANT`) is always refused client-side. Classification lives in `cli.rs::classify_statement` / `write_gate` (UX gate, not a security boundary). `--allow-write mcp` exits 2. The audit ledger is not optional (no `--no-audit`); an unusable audit directory degrades with a warning for reads and fails closed for writes. Writes audit fail-closed via `AuditSession::record`; reads keep using `record_best_effort`.
 
 ### CI
 - `libdbus-1-dev` and `pkg-config` are system dependencies for `clippy` and `test`. Without them, `cargo clippy` will fail on the `keyring` crate.

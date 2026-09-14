@@ -13,7 +13,9 @@ pub(crate) const AUDIT_FILE_PREFIX: &str = "hepta-dbcli-audit";
 pub(crate) struct AuditConfig {
     /// Overrides the default directory (`<data>/hepta-dbcli/audit`).
     pub dir: Option<PathBuf>,
-    /// `--no-audit` sets this to false.
+    /// Whether a writer is opened at all. Production always passes `true`
+    /// (the ledger is not optional); tests use it to simulate an unavailable
+    /// audit directory.
     pub enabled: bool,
     /// Extra `fsync` after each event. Off by default: `flush` already
     /// survives process kill, and fsync only matters for power loss.
