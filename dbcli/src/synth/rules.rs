@@ -9,6 +9,8 @@ pub struct SynthRules {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableRule {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
     pub relationships: Vec<Relationship>,
     #[serde(default)]
     pub strategy: TableStrategy,
@@ -114,6 +116,26 @@ tables:
     }
 
     #[test]
+    fn should_parse_per_table_rows() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: customer
+    rows: 599
+    relationships: []
+  - name: rental
+    relationships: []
+"#;
+
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(rules.tables[0].rows, Some(599));
+        assert_eq!(rules.tables[1].rows, None);
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert_eq!(serialized.matches("rows:").count(), 1);
+    }
+
+    #[test]
     fn rules_reject_invalid_version() {
         let yaml = r#"
 version: "2"
@@ -133,6 +155,7 @@ tables: []
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "t".to_string(),
+                rows: None,
                 relationships: vec![Relationship {
                     pk: "id".to_string(),
                     references: vec![],

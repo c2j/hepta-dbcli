@@ -504,12 +504,14 @@ pub fn compute_gaussian_correlation(
                         cdf.clamp(1e-12, 1.0 - 1e-12)
                     }
                     crate::synth::marginal::Marginal::Categorical(p) => {
-                        // SDV UniformEncoder: map category to mid-point of its cumulative interval
-                        if let Some(idx) = p
-                            .values
-                            .iter()
-                            .position(|v| v == &val.as_str().unwrap_or("").to_string())
-                        {
+                        // SDV UniformEncoder: map category to mid-point of its cumulative interval.
+                        // top_values keys are stringified (numeric levels → "1"), so numeric
+                        // row values must be matched through their string form too.
+                        let key = val
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| val.to_string());
+                        if let Some(idx) = p.values.iter().position(|v| v == &key) {
                             let total: f64 = p.weights.iter().sum();
                             let cum_before: f64 = p.weights[..idx].iter().sum();
                             (cum_before + p.weights[idx] / 2.0) / total
@@ -835,6 +837,48 @@ mod tests {
         assert_eq!(corr[0][0], 1.0);
         assert_eq!(corr[1][1], 1.0);
         assert!((corr[1][0] - corr[0][1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn correlation_encodes_numeric_categorical_levels() {
+        // 低基数值列按 Categorical 拟合后，top_values 键是数字的字符串形式
+        // （"1"/"2"/"3"）；训练行里仍是 JSON 数值。相关矩阵不得因
+        // as_str() 匹配失败而整列退化为 0.5 中点、相关系数静默归零。
+        fn categorical_int_model() -> ColumnModel {
+            ColumnModel {
+                logical_type: crate::synth::model::LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                min: None,
+                max: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
+                    weights: vec![1.0 / 3.0; 3],
+                }),
+            }
+        }
+
+        let rows: Vec<Vec<serde_json::Value>> = (0..60)
+            .map(|i| {
+                let level = (i % 3 + 1) as i64;
+                vec![
+                    serde_json::Value::from(level),
+                    serde_json::Value::from(level as f64 * 10.0),
+                ]
+            })
+            .collect();
+        let order = vec!["lvl".to_string(), "amt".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("lvl".to_string(), categorical_int_model()),
+            ("amt".to_string(), normal_column_model(20.0, 8.2)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1] > 0.5,
+            "numeric-categorical column must correlate with its numeric partner, got {}",
+            corr[0][1]
+        );
     }
 
     #[test]

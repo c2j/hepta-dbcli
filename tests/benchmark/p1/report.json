@@ -1,0 +1,49 @@
+{
+  "gates": [
+    {
+      "hepta_mean": 0.03250911772484265,
+      "id": "G1",
+      "metric": "cont_error",
+      "passed": true,
+      "ratio": 1.0158156384184363,
+      "sdv_mean": 0.032002970317977567,
+      "threshold": 1.15
+    },
+    {
+      "hepta_mean": 0.06286666666666665,
+      "id": "G2",
+      "metric": "cat_error",
+      "passed": true,
+      "ratio": 0.6393701973783333,
+      "sdv_mean": 0.09832592592592594,
+      "threshold": 1.15
+    },
+    {
+      "hepta_mean": 0.0836425944126223,
+      "id": "G3",
+      "metric": "fidelity_5_key_mean",
+      "passed": true,
+      "ratio": 0.8038697577378855,
+      "sdv_mean": 0.1040499329742111,
+      "threshold": 1.15
+    },
+    {
+      "hepta_mean": 0.1790583939929014,
+      "id": "G4",
+      "metric": "mla_7_model_relative_loss_mean",
+      "passed": true,
+      "ratio": 1.095261905983832,
+      "sdv_mean": 0.16348454466884801,
+      "threshold": 1.15
+    },
+    {
+      "hepta_mean": 0.002383343160377359,
+      "id": "G5",
+      "metric": "query_error_3_way",
+      "passed": true,
+      "ratio": 0.900687411566786,
+      "sdv_mean": 0.0026461379716981133,
+      "threshold": 1.15
+    }
+  ]
+}

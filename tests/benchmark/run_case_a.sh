@@ -22,6 +22,8 @@ echo "hepta: ${HEPTA_BIN}"
 
 # 2. 启动 pagila
 OGAGILA_DIR="${OGAGILA_DIR:?set OGAGILA_DIR to the ogagila checkout (docker-compose.yml with the pagila service)}"
+# Security: pagila.toml intentionally has no `password` field; credential comes from env (container default below).
+export HEPTA_DBCLI_PASSWORD="${HEPTA_DBCLI_PASSWORD:-Enmo@123}"
 echo "Starting pagila from ${OGAGILA_DIR}..."
 (cd "${OGAGILA_DIR}" && docker-compose up -d)
 echo "Waiting for pagila..."
@@ -63,7 +65,7 @@ cd "${ROOT}"
 
 # 7. 展示报告
 echo "=== Report ==="
-cat /tmp/case_a_report.md
+cat "${ROOT}/case_a_report.md"
 
 echo "=== Done ==="
-echo "Artifacts in /tmp/: case_a_report.json, case_a_report.md, *_metrics.json"
+echo "Artifacts in ${ROOT}/: case_a_report.json, case_a_report.md (metrics fallback: /tmp/)"

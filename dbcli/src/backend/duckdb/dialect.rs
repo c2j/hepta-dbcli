@@ -57,6 +57,29 @@ impl Dialect for DuckDbDialect {
          ORDER BY index_name"
     }
 
+    fn foreign_keys_sql(&self, schema: &str) -> String {
+        // Standard information_schema triple join: the FK side of
+        // key_column_usage pairs with the referenced (unique) side via
+        // referential_constraints; POSITION_IN_UNIQUE_CONSTRAINT keeps
+        // composite FKs row-aligned. Column aliases match
+        // synth::cmd::parse_foreign_keys.
+        format!(
+            "SELECT ku.TABLE_NAME AS table_name, ku.COLUMN_NAME AS column_name, \
+             refku.TABLE_NAME AS referenced_table, refku.COLUMN_NAME AS referenced_column \
+             FROM information_schema.referential_constraints rc \
+             JOIN information_schema.key_column_usage ku \
+               ON ku.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA \
+              AND ku.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
+             JOIN information_schema.key_column_usage refku \
+               ON refku.CONSTRAINT_SCHEMA = rc.UNIQUE_CONSTRAINT_SCHEMA \
+              AND refku.CONSTRAINT_NAME = rc.UNIQUE_CONSTRAINT_NAME \
+              AND refku.ORDINAL_POSITION = ku.POSITION_IN_UNIQUE_CONSTRAINT \
+             WHERE rc.CONSTRAINT_SCHEMA = '{schema}' \
+             ORDER BY ku.TABLE_NAME, refku.TABLE_NAME, ku.ORDINAL_POSITION",
+            schema = crate::backend::escape_sql_string(schema, true)
+        )
+    }
+
     fn read_only_prefixes(&self) -> &[&str] {
         // PRAGMA is excluded: some PRAGMAs (e.g. force_checkpoint) have
         // write side effects.
@@ -876,6 +899,63 @@ mod live_tests {
             .await
             .expect("interval predicate must execute");
         assert_eq!(r.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_sql_maps_child_to_parent_columns() {
+        let pool = memory_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query_drop("CREATE TABLE fk_parent (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create parent");
+        conn.query_drop(
+            "CREATE TABLE fk_child (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES fk_parent(id))",
+        )
+        .await
+        .expect("create child");
+
+        let sql = DuckDbDialect.foreign_keys_sql("main");
+        let r = conn
+            .query(&sql)
+            .await
+            .expect("foreign_keys_sql must execute");
+
+        for expected in [
+            "table_name",
+            "column_name",
+            "referenced_table",
+            "referenced_column",
+        ] {
+            assert!(
+                r.columns.iter().any(|c| c == expected),
+                "missing column {expected}: {:?}",
+                r.columns
+            );
+        }
+        let pos = |name: &str| {
+            r.columns
+                .iter()
+                .position(|c| c == name)
+                .expect("column position")
+        };
+        let child_rows: Vec<&Vec<serde_json::Value>> = r
+            .rows
+            .iter()
+            .filter(|row| row[pos("table_name")] == serde_json::json!("fk_child"))
+            .collect();
+        assert_eq!(child_rows.len(), 1, "rows={:?}", r.rows);
+        assert_eq!(
+            child_rows[0][pos("column_name")],
+            serde_json::json!("parent_id")
+        );
+        assert_eq!(
+            child_rows[0][pos("referenced_table")],
+            serde_json::json!("fk_parent")
+        );
+        assert_eq!(
+            child_rows[0][pos("referenced_column")],
+            serde_json::json!("id")
+        );
     }
 
     #[tokio::test]

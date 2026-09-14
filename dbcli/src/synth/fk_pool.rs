@@ -22,6 +22,14 @@ impl FkPool {
         self.values.len()
     }
 
+    pub fn distinct_len(&self) -> usize {
+        self.values
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }

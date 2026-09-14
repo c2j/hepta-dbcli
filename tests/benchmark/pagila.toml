@@ -1,10 +1,11 @@
 default_connection = "pagila"
 
+# Security: no plaintext password in git. run_case_a.sh / run_p2.sh export
+# HEPTA_DBCLI_PASSWORD; omitting `password` routes the lookup to that env var.
 [connections.pagila]
 driver = "gaussdb"
 host = "127.0.0.1"
 port = 5432
 user = "gaussdb"
-password = "Enmo@123"
 database = "pagila"
 sslmode = "disable"
