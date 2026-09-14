@@ -13,16 +13,15 @@ use rustyline_derive::{Completer, Helper, Hinter};
 
 use tracing::{info, warn};
 
-use crate::audit::event::{
-    read_only_session_for, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent, SqlInfo,
-};
+use crate::audit::event::Decision;
 use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 use crate::cli::QueryResult;
 use crate::cli::{
-    action_class, classify_statement, execute_query, render_result, session_mode_event, write_gate,
-    write_gate_message, CliArgs, OutputFormat, StatementClass, WriteGate,
+    classify_statement, execute_query, render_result, session_mode_event, stmt_error_event,
+    stmt_event, stmt_ok_event, write_gate, write_gate_message, CliArgs, OutputFormat,
+    StatementClass, StmtAudit, WriteGate,
 };
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
@@ -540,55 +539,6 @@ async fn connect(
 
 // ─── REPL audit helpers (pure, unit-tested) ─────────────────────────
 
-fn repl_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    class: StatementClass,
-    allow_write: bool,
-    decision: Decision,
-) -> DraftEvent {
-    DraftEvent::new(
-        Channel::Repl,
-        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url) && !allow_write),
-        "repl_sql",
-        action_class(class),
-        decision,
-    )
-    .with_sql(SqlInfo::new(sql))
-}
-
-fn repl_sql_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    class: StatementClass,
-    allow_write: bool,
-    duration_ms: u64,
-    rows: u64,
-    rows_affected: bool,
-) -> DraftEvent {
-    let outcome = if rows_affected {
-        AuditOutcome::ok(duration_ms).with_rows_affected(rows)
-    } else {
-        AuditOutcome::ok(duration_ms).with_row_count(rows)
-    };
-    repl_event(conn_name, url, sql, class, allow_write, Decision::Allow).with_outcome(outcome)
-}
-
-fn repl_sql_error_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    class: StatementClass,
-    allow_write: bool,
-    duration_ms: u64,
-    error: &str,
-) -> DraftEvent {
-    repl_event(conn_name, url, sql, class, allow_write, Decision::Error)
-        .with_outcome(AuditOutcome::error(duration_ms, error))
-}
-
 pub(crate) async fn run_interactive(
     args: CliArgs,
     registry: &BackendRegistry,
@@ -761,16 +711,15 @@ pub(crate) async fn run_interactive(
                 statement_class,
                 StatementClass::DataChange | StatementClass::Call
             );
+            let ctx = StmtAudit::repl(
+                &target.name,
+                &target.connection_url,
+                stmt,
+                statement_class,
+                args.allow_write,
+            );
             if is_write {
-                let intent = repl_event(
-                    &target.name,
-                    &target.connection_url,
-                    stmt,
-                    statement_class,
-                    args.allow_write,
-                    Decision::Allow,
-                );
-                if let Err(e) = audit.record(intent) {
+                if let Err(e) = audit.record(stmt_event(&ctx, Decision::Allow)) {
                     eprintln!(
                         "error: refusing to execute a data change without an audit record: {e}"
                     );
@@ -788,25 +737,13 @@ pub(crate) async fn run_interactive(
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             match &query_result {
-                Ok(qr) => audit.record_best_effort(repl_sql_event(
-                    &target.name,
-                    &target.connection_url,
-                    stmt,
-                    statement_class,
-                    args.allow_write,
+                Ok(qr) => audit.record_best_effort(stmt_ok_event(
+                    &ctx,
                     duration_ms,
                     qr.rows_affected.unwrap_or(qr.row_count as u64),
                     is_write,
                 )),
-                Err(e) => audit.record_best_effort(repl_sql_error_event(
-                    &target.name,
-                    &target.connection_url,
-                    stmt,
-                    statement_class,
-                    args.allow_write,
-                    duration_ms,
-                    e,
-                )),
+                Err(e) => audit.record_best_effort(stmt_error_event(&ctx, duration_ms, e)),
             }
             match query_result {
                 Ok(query_result) => {
@@ -993,32 +930,22 @@ mod tests {
 
     #[test]
     fn repl_sql_event_records_channel_and_outcome() {
-        let ev = repl_sql_event(
+        let ctx = StmtAudit::repl(
             "dev",
             "mysql://u:p@h:3306/db",
             "SELECT 1",
             StatementClass::ReadOnly,
             false,
-            5,
-            3,
-            false,
         );
-        assert_eq!(ev.channel, Channel::Repl);
+        let ev = stmt_ok_event(&ctx, 5, 3, false);
+        assert_eq!(ev.channel, crate::audit::event::Channel::Repl);
         assert_eq!(ev.action, "repl_sql");
         assert_eq!(ev.class, crate::audit::event::ActionClass::Dql);
         let outcome = ev.outcome.as_ref().unwrap();
         assert!(outcome.ok);
         assert_eq!(outcome.row_count, Some(3));
 
-        let err = repl_sql_error_event(
-            "dev",
-            "mysql://u:p@h:3306/db",
-            "SELECT 1",
-            StatementClass::ReadOnly,
-            false,
-            5,
-            "boom",
-        );
+        let err = stmt_error_event(&ctx, 5, "boom");
         assert_eq!(err.decision, Decision::Error);
         assert_eq!(
             err.outcome.as_ref().unwrap().error_kind.as_deref(),

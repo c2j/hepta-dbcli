@@ -381,33 +381,82 @@ re-run with --allow-write to execute them"
     }
 }
 
-fn cli_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    source: &str,
-    class: StatementClass,
-    allow_write: bool,
-    decision: Decision,
-) -> DraftEvent {
-    DraftEvent::new(
-        Channel::Cli,
-        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url) && !allow_write),
-        "cli_sql",
-        action_class(class),
-        decision,
-    )
-    .with_sql(SqlInfo::new(sql))
-    .with_source(source)
+/// Shared context for auditing one executed statement (CLI and REPL).
+pub(crate) struct StmtAudit<'a> {
+    pub channel: Channel,
+    pub action: &'a str,
+    pub conn_name: &'a str,
+    pub url: &'a str,
+    pub sql: &'a str,
+    pub source: Option<&'a str>,
+    pub class: StatementClass,
+    pub allow_write: bool,
 }
 
-fn cli_sql_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    source: &str,
-    class: StatementClass,
-    allow_write: bool,
+impl<'a> StmtAudit<'a> {
+    pub(crate) fn cli(
+        conn_name: &'a str,
+        url: &'a str,
+        sql: &'a str,
+        source: &'a str,
+        class: StatementClass,
+        allow_write: bool,
+    ) -> Self {
+        Self {
+            channel: Channel::Cli,
+            action: "cli_sql",
+            conn_name,
+            url,
+            sql,
+            source: Some(source),
+            class,
+            allow_write,
+        }
+    }
+
+    pub(crate) fn repl(
+        conn_name: &'a str,
+        url: &'a str,
+        sql: &'a str,
+        class: StatementClass,
+        allow_write: bool,
+    ) -> Self {
+        Self {
+            channel: Channel::Repl,
+            action: "repl_sql",
+            conn_name,
+            url,
+            sql,
+            source: None,
+            class,
+            allow_write,
+        }
+    }
+}
+
+/// A statement event without an outcome (used for the fail-closed intent
+/// record, and for session-level markers).
+pub(crate) fn stmt_event(ctx: &StmtAudit<'_>, decision: Decision) -> DraftEvent {
+    let mut event = DraftEvent::new(
+        ctx.channel,
+        ConnectionInfo::from_url(
+            ctx.conn_name,
+            ctx.url,
+            read_only_session_for(ctx.url) && !ctx.allow_write,
+        ),
+        ctx.action,
+        action_class(ctx.class),
+        decision,
+    )
+    .with_sql(SqlInfo::new(ctx.sql));
+    if let Some(source) = ctx.source {
+        event = event.with_source(source);
+    }
+    event
+}
+
+pub(crate) fn stmt_ok_event(
+    ctx: &StmtAudit<'_>,
     duration_ms: u64,
     rows: u64,
     rows_affected: bool,
@@ -417,16 +466,11 @@ fn cli_sql_event(
     } else {
         AuditOutcome::ok(duration_ms).with_row_count(rows)
     };
-    cli_event(
-        conn_name,
-        url,
-        sql,
-        source,
-        class,
-        allow_write,
-        Decision::Allow,
-    )
-    .with_outcome(outcome)
+    stmt_event(ctx, Decision::Allow).with_outcome(outcome)
+}
+
+pub(crate) fn stmt_error_event(ctx: &StmtAudit<'_>, duration_ms: u64, error: &str) -> DraftEvent {
+    stmt_event(ctx, Decision::Error).with_outcome(AuditOutcome::error(duration_ms, error))
 }
 
 /// Emitted once when a CLI/REPL session is opened with `--allow-write`, before
@@ -442,28 +486,6 @@ pub(crate) fn session_mode_event(conn_name: &str, url: &str, allow_write: bool) 
     .with_detail(serde_json::json!({
         "mode": if allow_write { "allow_write" } else { "read_only" }
     }))
-}
-
-fn cli_sql_error_event(
-    conn_name: &str,
-    url: &str,
-    sql: &str,
-    source: &str,
-    class: StatementClass,
-    allow_write: bool,
-    duration_ms: u64,
-    error: &str,
-) -> DraftEvent {
-    cli_event(
-        conn_name,
-        url,
-        sql,
-        source,
-        class,
-        allow_write,
-        Decision::Error,
-    )
-    .with_outcome(AuditOutcome::error(duration_ms, error))
 }
 
 pub(crate) async fn run_cli(
@@ -586,19 +608,19 @@ pub(crate) async fn run_cli(
         ));
     }
 
+    let ctx = StmtAudit::cli(
+        &target.name,
+        &target.connection_url,
+        &sql,
+        &source_label,
+        statement_class,
+        args.allow_write,
+    );
+
     // Writes are fail-closed (issue #58): the intent must be on disk before the
     // statement reaches the engine, otherwise a mutation would be unaudited.
     if is_write {
-        let intent = cli_event(
-            &target.name,
-            &target.connection_url,
-            &sql,
-            &source_label,
-            statement_class,
-            args.allow_write,
-            Decision::Allow,
-        );
-        if let Err(e) = audit.record(intent) {
+        if let Err(e) = audit.record(stmt_event(&ctx, Decision::Allow)) {
             return Err(format!(
                 "refusing to execute a data change without an audit record: {e}"
             ));
@@ -616,30 +638,13 @@ pub(crate) async fn run_cli(
     let duration_ms = start.elapsed().as_millis() as u64;
 
     match &result {
-        Ok(qr) => {
-            let event = cli_sql_event(
-                &target.name,
-                &target.connection_url,
-                &sql,
-                &source_label,
-                statement_class,
-                args.allow_write,
-                duration_ms,
-                qr.rows_affected.unwrap_or(qr.row_count as u64),
-                is_write,
-            );
-            audit.record_best_effort(event);
-        }
-        Err(e) => audit.record_best_effort(cli_sql_error_event(
-            &target.name,
-            &target.connection_url,
-            &sql,
-            &source_label,
-            statement_class,
-            args.allow_write,
+        Ok(qr) => audit.record_best_effort(stmt_ok_event(
+            &ctx,
             duration_ms,
-            e,
+            qr.rows_affected.unwrap_or(qr.row_count as u64),
+            is_write,
         )),
+        Err(e) => audit.record_best_effort(stmt_error_event(&ctx, duration_ms, e)),
     }
     let result = result?;
     render_result(&result, &mut std::io::stdout(), args.format)?;
@@ -970,17 +975,15 @@ mod tests {
 
     #[test]
     fn cli_sql_event_records_source_and_class() {
-        let ev = cli_sql_event(
+        let ctx = StmtAudit::cli(
             "dev",
             "mysql://u:p@h:3306/db",
             "SELECT 1",
             "argv",
             StatementClass::ReadOnly,
             false,
-            5,
-            3,
-            false,
         );
+        let ev = stmt_ok_event(&ctx, 5, 3, false);
         assert_eq!(ev.channel, Channel::Cli);
         assert_eq!(ev.action, "cli_sql");
         assert_eq!(ev.class, ActionClass::Dql);
@@ -990,44 +993,40 @@ mod tests {
         assert!(outcome.ok);
         assert_eq!(outcome.row_count, Some(3));
 
-        let dml = cli_sql_event(
+        let dml_ctx = StmtAudit::cli(
             "dev",
             "mysql://u:p@h:3306/db",
             "UPDATE t SET a=1",
             "stdin",
             StatementClass::DataChange,
             true,
-            5,
-            7,
-            true,
         );
+        let dml = stmt_ok_event(&dml_ctx, 5, 7, true);
         assert_eq!(dml.class, ActionClass::Dml);
         assert_eq!(dml.outcome.as_ref().unwrap().rows_affected, Some(7));
     }
 
     #[test]
     fn write_mode_marks_gaussdb_session_as_not_read_only() {
-        let ro = cli_event(
+        let c = StmtAudit::cli(
             "g",
             "gaussdb://u:p@h:5432/db",
             "INSERT INTO t VALUES (1)",
             "argv",
             StatementClass::DataChange,
             false,
-            Decision::Allow,
         );
-        assert!(ro.connection.read_only_session);
+        assert!(stmt_event(&c, Decision::Allow).connection.read_only_session);
 
-        let rw = cli_event(
+        let c = StmtAudit::cli(
             "g",
             "gaussdb://u:p@h:5432/db",
             "INSERT INTO t VALUES (1)",
             "argv",
             StatementClass::DataChange,
             true,
-            Decision::Allow,
         );
-        assert!(!rw.connection.read_only_session);
+        assert!(!stmt_event(&c, Decision::Allow).connection.read_only_session);
     }
 
     #[test]
