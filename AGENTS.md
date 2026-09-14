@@ -343,6 +343,8 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - MySQL integration tests require `HEPTA_DBCLI_TEST_URL` env var and a running MySQL instance.
 - Oracle integration tests require `POLARDB_ORACLE_TEST_URL` env var and a running Oracle instance (Docker: `gvenzl/oracle-free:23-slim`).
 - DuckDB integration tests are **embedded** — no external service, no env var; they use `tempfile` fixtures (`cargo test --features "duckdb,integration" --test regress_duckdb`).
+- **CI never builds the `duckdb` feature** (no clippy, no test, no release job). Any change to `backend/mod.rs` traits (`DbConn`, `QueryResult`, `BackendFactory`) can therefore break the DuckDB backend while CI stays green. Whenever you touch those, run locally:
+  `cargo clippy --all --all-targets --features duckdb` and `cargo test --all --features "duckdb,integration"`.
 
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
