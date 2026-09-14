@@ -39,7 +39,9 @@ pub(crate) enum AuditError {
     Io(std::io::Error),
     /// The event could not be serialized (should not happen).
     Serialize(serde_json::Error),
-    /// Audit is turned off (`--no-audit`), so nothing was written.
+    /// No writer is attached: the audit directory could not be opened
+    /// (permissions, read-only filesystem, ...). This is a failure, not a
+    /// user-selected mode — there is no way to switch the ledger off.
     Disabled,
 }
 
@@ -110,7 +112,8 @@ impl AuditSession {
         }
     }
 
-    /// `--no-audit`: nothing is ever written.
+    /// Session without a writer. Used by tests, and as the degradation path
+    /// when the audit directory cannot be opened.
     pub(crate) fn disabled() -> Self {
         Self::new(&AuditConfig {
             enabled: false,
@@ -133,6 +136,12 @@ impl AuditSession {
     /// True when `--audit-meta` was passed, so high-noise meta tools are recorded.
     pub(crate) fn meta_enabled(&self) -> bool {
         self.meta_enabled
+    }
+
+    /// Number of events dropped because the writer was unavailable. Exposed so
+    /// tests can prove an unavailable ledger warns instead of going silent.
+    pub(crate) fn dropped_events(&self) -> u64 {
+        self.warn_count.load(Ordering::Relaxed)
     }
 
     /// Advance the sequence counter without emitting an event.
@@ -301,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn should_write_nothing_when_disabled_and_report_disabled_error() {
+    fn should_write_nothing_without_a_writer_and_report_the_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session = AuditSession::disabled();
         let err = session.record(draft()).expect_err("must report disabled");
@@ -311,14 +320,26 @@ mod tests {
     }
 
     #[test]
-    fn should_not_panic_on_best_effort_when_disabled() {
+    fn should_not_panic_on_best_effort_without_a_writer() {
         let session = AuditSession::disabled();
         session.record_best_effort(draft());
         assert!(!session.is_enabled());
     }
 
     #[test]
-    fn should_still_advance_seq_when_disabled() {
+    fn should_warn_rather_than_silently_drop_when_the_writer_is_unavailable() {
+        // Issue #57 review: an unusable ledger must be visible. The warning
+        // itself goes to stderr; the counter is the testable seam.
+        let session = AuditSession::disabled();
+        assert_eq!(session.dropped_events(), 0);
+        session.record_best_effort(draft());
+        assert_eq!(session.dropped_events(), 1);
+        session.record_best_effort(draft());
+        assert_eq!(session.dropped_events(), 2);
+    }
+
+    #[test]
+    fn should_still_advance_seq_without_a_writer() {
         let session = AuditSession::disabled();
         assert_eq!(session.next_seq(), 0);
         // `record` consumes the next seq even though nothing is written.

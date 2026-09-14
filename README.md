@@ -262,11 +262,10 @@ Global flags:
 | Flag | Meaning |
 |------|---------|
 | `--audit-dir <path>` | Write the ledger under `<path>` (CI / log shipping) |
-| `--no-audit` | Disable the ledger. Dangerous: no record of executed SQL remains |
 | `--audit-meta` | Also record high-noise meta tools (`list_tables`, `get_table_metadata`, `get_database_info`, `list_connections`) |
 | `--audit-retention-days <n>` | Delete audit files older than `n` days on startup (default `30`, `0` = keep forever) |
 
-Audit write failures never fail a read-only query; they print a warning to stderr.
+The ledger cannot be switched off: `--audit-dir` only changes where it is written. If the audit directory is unusable (permissions, read-only filesystem) the failure is reported on stderr and read-only queries still run; writes fail closed.
 
 ### Cross-database delta-diff
 

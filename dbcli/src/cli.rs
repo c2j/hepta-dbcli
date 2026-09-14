@@ -258,6 +258,25 @@ fn cli_sql_error_event(
     .with_outcome(AuditOutcome::error(duration_ms, error))
 }
 
+/// Event for an action that is not a SQL statement (connect, check,
+/// store-password). Keeps one construction site for those actions.
+pub(crate) fn action_event(
+    channel: Channel,
+    action: &str,
+    conn_name: &str,
+    url: &str,
+    class: ActionClass,
+    decision: Decision,
+) -> DraftEvent {
+    DraftEvent::new(
+        channel,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        action,
+        class,
+        decision,
+    )
+}
+
 pub(crate) async fn run_cli(
     args: CliArgs,
     registry: &BackendRegistry,
@@ -317,15 +336,30 @@ pub(crate) async fn run_cli(
         .find("://")
         .map(|i| &target.connection_url[..i])
         .unwrap_or("mysql");
+    let connect_event = |decision: Decision| {
+        action_event(
+            Channel::Cli,
+            "connect",
+            &target.name,
+            &target.connection_url,
+            ActionClass::Admin,
+            decision,
+        )
+    };
+
     let pool = registry
         .connect_with_fallback(scheme, &target.connection_url, Some(&effective_timeout))
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        .map_err(|e| {
+            audit.record_best_effort(connect_event(Decision::Error));
+            format!("Connection failed: {}", e)
+        })?;
 
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire connection: {}", e))?;
+    let mut conn = pool.acquire().await.map_err(|e| {
+        audit.record_best_effort(connect_event(Decision::Error));
+        format!("Failed to acquire connection: {}", e)
+    })?;
+    audit.record_best_effort(connect_event(Decision::Allow));
 
     if let (Some(path), Some(plaintext)) = (&target.config_path, &target.plaintext_password) {
         info!(

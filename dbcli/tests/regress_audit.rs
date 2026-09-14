@@ -160,30 +160,21 @@ fn mcp_insert_is_denied_and_still_audited() {
 }
 
 #[test]
-fn no_audit_flag_writes_nothing() {
-    let Some(url) = test_url() else {
-        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
-        return;
-    };
+fn audit_cannot_be_switched_off() {
+    // Issue #57 review: the ledger is not optional, so the flag must not exist.
     let home = tempfile::tempdir().expect("tempdir");
-    let audit_dir = home.path().join("audit");
-
     let output = Command::new(BIN)
-        .env("HEPTA_DBCLI_URL", &url)
         .env("HOME", home.path())
-        .args([
-            "--no-audit",
-            "--audit-dir",
-            audit_dir.to_str().unwrap(),
-            "cli",
-            "--sql",
-            "SELECT 1",
-        ])
+        .args(["--no-audit", "cli", "--sql", "SELECT 1"])
         .output()
         .expect("run hepta_dbcli");
-    assert!(output.status.success());
     assert!(
-        !audit_dir.exists(),
-        "--no-audit must not create the audit dir"
+        !output.status.success(),
+        "--no-audit must be rejected, not honoured"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--no-audit"),
+        "clap should name the unknown argument: {stderr}"
     );
 }
