@@ -721,7 +721,9 @@ mod integration_tests {
             .map(|i| value_start + i)
             .unwrap_or(url.len());
         let bad = format!("{}__wrong__{}", &url[..value_start], &url[value_end..]);
-        let err = super::pool::create_gaussdb_pool(&bad, true).await.unwrap_err();
+        let err = super::pool::create_gaussdb_pool(&bad, true)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SQLSTATE") || msg.contains("password authentication failed"),
