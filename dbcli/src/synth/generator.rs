@@ -227,13 +227,12 @@ pub fn generate(
                         break;
                     }
                     if attempts >= 10_000 {
-                        eprintln!(
-                            "warning: referenced column '{}.{}' could not reach unique values \
-                             after {attempts} redraws (degenerate marginal?); \
-                             leaving duplicates in place",
+                        return Err(format!(
+                            "referenced column '{}.{}' exhausted its value space after \
+                             {attempts} redraws (degenerate marginal?); duplicated parent \
+                             keys cannot satisfy an FK-enforced load",
                             table_name, col_name
-                        );
-                        break;
+                        ));
                     }
                 }
             }
@@ -793,6 +792,68 @@ mod tests {
         let err = generate(&models, &rules, &GeneratorConfig::default())
             .expect_err("pool smaller than row count must error");
         assert!(err.contains("b.a_id"), "error must name the column: {err}");
+    }
+
+    #[test]
+    fn should_error_when_referenced_column_value_space_is_exhausted() {
+        // 值域塌缩（σ=0.01 取整后只剩 {0}）的被引用列：10k 次重抽也造不出
+        // 第二个值，warn+留重复等于静默产出无法 FK 装载的数据，必须报错。
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 0.01,
+                }),
+                ..Default::default()
+            },
+        );
+        let parent = TableModel {
+            version: 1,
+            table: "parent".to_string(),
+            dialect: "mysql".to_string(),
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+            },
+            pk: vec!["id".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let mut models = HashMap::new();
+        models.insert("parent".to_string(), parent);
+        models.insert("child".to_string(), int_key_model("child", "id", 0.0));
+
+        let mut parent_rule = single_rule("parent", vec![]);
+        parent_rule.rows = Some(200);
+        let child_rule = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "id".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+            }],
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let err = generate(&models, &rules, &GeneratorConfig::default())
+            .expect_err("exhausted value space must error");
+        assert!(
+            err.contains("parent.id"),
+            "error must name the column: {err}"
+        );
     }
 
     #[test]
