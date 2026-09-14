@@ -8,7 +8,7 @@ mod common;
 mod tests {
     use crate::common::assert_columns;
     use polar_mysql::backend::duckdb::DuckDbFactory;
-    use polar_mysql::backend::{BackendFactory, DbConn, DbPool};
+    use polar_mysql::backend::{BackendFactory, DbPool};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -171,5 +171,69 @@ mod tests {
             .expect("query");
         assert_eq!(r.rows[0][0], json!(2));
         assert_eq!(r.rows[0][1], json!("duck"));
+    }
+
+    #[tokio::test]
+    async fn duckdb_execute_write_reports_rows_affected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("write.duckdb");
+        {
+            let boot = duckdb::Connection::open(&path).expect("bootstrap create");
+            boot.execute_batch(&format!("CREATE TABLE {TABLE} (id BIGINT)"))
+                .expect("bootstrap table");
+        }
+
+        let pool = file_pool(&path, "")
+            .await
+            .unwrap_or_else(|e| panic!("connect failed: {e}"));
+        let mut conn = pool.acquire().await.expect("acquire");
+
+        let inserted = conn
+            .execute_write(&format!("INSERT INTO {TABLE} VALUES (1), (2), (3)"))
+            .await
+            .expect("insert");
+        assert_eq!(
+            inserted.rows_affected,
+            Some(3),
+            "a data change must report the affected rows (issue #58 D6)"
+        );
+        assert!(
+            inserted.columns.is_empty() && inserted.rows.is_empty(),
+            "a data change returns no result set"
+        );
+
+        let deleted = conn
+            .execute_write(&format!("DELETE FROM {TABLE} WHERE id <= 2"))
+            .await
+            .expect("delete");
+        assert_eq!(deleted.rows_affected, Some(2));
+    }
+
+    #[tokio::test]
+    async fn duckdb_execute_write_is_refused_in_read_only_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ro_write.duckdb");
+        {
+            let boot = duckdb::Connection::open(&path).expect("bootstrap create");
+            boot.execute_batch(&format!("CREATE TABLE {TABLE} (id BIGINT)"))
+                .expect("bootstrap table");
+        }
+
+        let ro = file_pool(&path, "?mode=ro").await.expect("ro pool");
+        let mut conn = ro.acquire().await.expect("ro acquire");
+        let write = conn
+            .execute_write(&format!("INSERT INTO {TABLE} VALUES (1)"))
+            .await;
+        assert!(
+            write.is_err(),
+            "the driver-level ?mode=ro guard must also cover execute_write"
+        );
+        assert_eq!(
+            conn.query(&format!("SELECT COUNT(*) FROM {TABLE}"))
+                .await
+                .expect("read still works")
+                .rows[0][0],
+            json!(0)
+        );
     }
 }

@@ -124,6 +124,7 @@ fn run_query(
         columns,
         rows: out,
         row_count,
+        rows_affected: None,
     })
 }
 
