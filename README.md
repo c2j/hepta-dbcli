@@ -312,7 +312,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 Tables are generated in FK topological order (cycles rejected). Child FK values are drawn from the parent's generated keys; `pool_strategy: !projection { unique: true }` samples them without replacement. `--seed` derives a stable per-table RNG stream. See [UserGuide.md](UserGuide.md) §10 for the rules YAML reference.
 
-Benchmarks: Case A (synthetic 4-column vs SDV-GC, [report](tests/benchmark/REPORT.md)), P1 (SynMeter real single-table: Wasserstein / MLA / QueryError gates, [report](tests/benchmark/p1/REPORT.md)) and P2 (ogagila multi-table FK integrity + fan-out, [report](tests/benchmark/p2/REPORT.md)) live under `tests/benchmark/` with gates enforced by the `synth-benchmark` CI workflow. Case B (CTGAN/TabDDPM/GReaT) and Case C (HMA/ClavaDDPM) comparisons are out of scope for this milestone; SynMeter/torch/SDV exist only in the benchmark venv, never in `Cargo.toml`.
+Benchmarks: Case A (synthetic 4-column vs SDV-GC, [report](tests/benchmark/REPORT.md)), P1 (SynMeter real single-table, Adult-only: Wasserstein / MLA / QueryError gates, [report](tests/benchmark/p1/REPORT.md)) and P2 (ogagila multi-table FK: insert/orphan/amount-on-grid gated; fan-out KS recorded, [report](tests/benchmark/p2/REPORT.md)) live under `tests/benchmark/` with gates enforced by the `synth-benchmark` CI workflow (P2 is dispatch-only). Case B (CTGAN/TabDDPM/GReaT) and Case C (HMA/ClavaDDPM) comparisons are out of scope for this milestone; SynMeter/torch/SDV exist only in the benchmark venv, never in `Cargo.toml`.
 
 ### Cross-database delta-diff
 

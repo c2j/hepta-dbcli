@@ -911,10 +911,10 @@ tables:
 | 基准 | 内容 | 报告 | 复现入口 |
 |------|------|------|----------|
 | Case A | 合成 4 列高斯 Copula，对标 SDV `GaussianCopulaSynthesizer(norm)` | [tests/benchmark/REPORT.md](../tests/benchmark/REPORT.md) | `tests/benchmark/run_case_a.sh` |
-| P1 | SynMeter 真实单表（Adult + ogagila `payment`/`film`）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15）+ `amount` on-grid ≥ 0.95 | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
-| P2 | ogagila 多表 FK（customer–rental–payment）：staging 可插入 0 错误、孤儿 FK = 0、每 customer 扇出 KS < 0.15；1-way 边际与 1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
+| P1 | SynMeter 真实单表（**仅 Adult**）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15） | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
+| P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
 
-CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。
+CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 
 范围声明：Case B（vs CTGAN / TVAE / TabDDPM / GReaT）与 Case C（vs SDV HMA / ClavaDDPM / REaLTabFormer）**不在本里程碑**；SynMeter / torch / SDV 仅存在于 benchmark venv（`tests/benchmark/requirements.txt`），不进入 `Cargo.toml`。
 
