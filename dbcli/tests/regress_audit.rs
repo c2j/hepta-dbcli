@@ -9,6 +9,8 @@
 
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -186,4 +188,172 @@ fn no_audit_flag_writes_nothing() {
         !audit_dir.exists(),
         "--no-audit must not create the audit dir"
     );
+}
+
+// ─── Issue #58: the CLI write gate ──────────────────────────────────
+
+/// Create a throwaway table through the library so the binary can exercise
+/// the write path against a real table.
+async fn create_table(name: &str) {
+    let url = std::env::var("HEPTA_DBCLI_TEST_URL").expect("HEPTA_DBCLI_TEST_URL");
+    let pool = common::connect_pool(polar_mysql::backend::mysql::MySqlFactory, &url).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.query_drop(&format!("DROP TABLE IF EXISTS {name}"))
+        .await
+        .ok();
+    conn.query_drop(&format!(
+        "CREATE TABLE {name} (id INT PRIMARY KEY, v VARCHAR(16))"
+    ))
+    .await
+    .expect("create table");
+}
+
+async fn count_rows(name: &str) -> i64 {
+    let url = std::env::var("HEPTA_DBCLI_TEST_URL").expect("HEPTA_DBCLI_TEST_URL");
+    let pool = common::connect_pool(polar_mysql::backend::mysql::MySqlFactory, &url).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let result = conn
+        .query(&format!("SELECT COUNT(*) AS n FROM {name}"))
+        .await
+        .expect("count");
+    result.rows[0][0].as_i64().unwrap_or(-1)
+}
+
+async fn drop_table(name: &str) {
+    let url = std::env::var("HEPTA_DBCLI_TEST_URL").expect("HEPTA_DBCLI_TEST_URL");
+    let pool = common::connect_pool(polar_mysql::backend::mysql::MySqlFactory, &url).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.query_drop(&format!("DROP TABLE IF EXISTS {name}"))
+        .await
+        .ok();
+}
+
+fn run_cli_sql(
+    home: &Path,
+    audit_dir: &Path,
+    allow_write: bool,
+    sql: &str,
+) -> std::process::Output {
+    let url = std::env::var("HEPTA_DBCLI_TEST_URL").expect("HEPTA_DBCLI_TEST_URL");
+    let mut cmd = Command::new(BIN);
+    cmd.env("HEPTA_DBCLI_URL", url)
+        .env("HOME", home)
+        .arg("--audit-dir")
+        .arg(audit_dir)
+        .arg("cli");
+    if allow_write {
+        cmd.arg("--allow-write");
+    }
+    cmd.arg("--sql").arg(sql);
+    cmd.output().expect("run hepta_dbcli")
+}
+
+#[tokio::test]
+async fn insert_without_the_flag_is_refused_and_never_reaches_the_engine() {
+    let Some(_) = test_url() else {
+        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
+        return;
+    };
+    let name = "regress_audit_gate_no_flag";
+    create_table(name).await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let audit_dir = home.path().join("audit");
+    let out = run_cli_sql(
+        home.path(),
+        &audit_dir,
+        false,
+        &format!("INSERT INTO {name} VALUES (1,'a')"),
+    );
+    assert!(!out.status.success(), "must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-write"),
+        "refusal must point at the flag: {stderr}"
+    );
+
+    assert_eq!(count_rows(name).await, 0, "refused INSERT must not run");
+    let events = audit_events(&audit_dir);
+    assert!(
+        events.iter().all(|e| e["action"] != "cli_sql"),
+        "a refused statement must not be audited as executed: {events:?}"
+    );
+
+    drop_table(name).await;
+}
+
+#[tokio::test]
+async fn insert_with_the_flag_reports_rows_affected_and_is_audited() {
+    let Some(_) = test_url() else {
+        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
+        return;
+    };
+    let name = "regress_audit_gate_write";
+    create_table(name).await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let audit_dir = home.path().join("audit");
+    let out = run_cli_sql(
+        home.path(),
+        &audit_dir,
+        true,
+        &format!("INSERT INTO {name} VALUES (1,'a')"),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 rows affected"),
+        "expected an affected-row count, got: {stdout}"
+    );
+    assert_eq!(count_rows(name).await, 1);
+
+    let events = audit_events(&audit_dir);
+    let mode = only(&events, "session_mode");
+    assert_eq!(mode["detail"]["mode"], "allow_write");
+    assert_eq!(mode["connection"]["read_only_session"], false);
+
+    // Writes are audited twice: a fail-closed intent before execution and an
+    // outcome after it.
+    let writes: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["action"] == "cli_sql").collect();
+    assert_eq!(writes.len(), 2, "expected intent + outcome: {events:?}");
+    assert!(
+        writes[0].get("outcome").is_none(),
+        "intent has no outcome yet"
+    );
+    let write = writes[1];
+    assert_eq!(write["class"], "dml");
+    assert_eq!(write["decision"], "allow");
+    assert_eq!(write["outcome"]["rows_affected"], 1);
+    assert_eq!(write["connection"]["read_only_session"], false);
+
+    drop_table(name).await;
+}
+
+#[tokio::test]
+async fn destructive_ddl_is_refused_even_with_the_flag() {
+    let Some(_) = test_url() else {
+        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
+        return;
+    };
+    let name = "regress_audit_gate_ddl";
+    create_table(name).await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let audit_dir = home.path().join("audit");
+    let out = run_cli_sql(home.path(), &audit_dir, true, &format!("DROP TABLE {name}"));
+    assert!(!out.status.success(), "destructive DDL must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("destructive DDL"),
+        "refusal must name the reason: {stderr}"
+    );
+
+    // The table survived, proving the statement never reached the engine.
+    count_rows(name).await;
+    drop_table(name).await;
 }

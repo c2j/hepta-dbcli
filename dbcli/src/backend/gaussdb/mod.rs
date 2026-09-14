@@ -623,7 +623,7 @@ mod integration_tests {
         let Ok(url) = std::env::var("GAUSSDB_TEST_URL") else {
             return;
         };
-        let pool = super::pool::create_gaussdb_pool(&url)
+        let pool = super::pool::create_gaussdb_pool(&url, true)
             .await
             .expect("pool creation failed");
         let mut c1 = pool.acquire().await.expect("acquire c1");
@@ -721,7 +721,7 @@ mod integration_tests {
             .map(|i| value_start + i)
             .unwrap_or(url.len());
         let bad = format!("{}__wrong__{}", &url[..value_start], &url[value_end..]);
-        let err = super::pool::create_gaussdb_pool(&bad).await.unwrap_err();
+        let err = super::pool::create_gaussdb_pool(&bad, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SQLSTATE") || msg.contains("password authentication failed"),

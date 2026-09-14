@@ -38,7 +38,7 @@ where
     let mut registry = polar_mysql::backend::factory::BackendRegistry::new();
     registry.register(factory);
     registry
-        .connect_with_fallback(&url[..url.find("://").unwrap_or(0)], url, None)
+        .connect_with_fallback(&url[..url.find("://").unwrap_or(0)], url, None, false)
         .await
         .expect("failed to connect")
 }

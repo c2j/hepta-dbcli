@@ -1154,6 +1154,12 @@ async fn main() {
 
     match cli.command {
         None | Some(Commands::Mcp) => {
+            if cli.allow_write {
+                eprintln!(
+                    "error: --allow-write is not valid for the MCP server; MCP execute_query stays read-only"
+                );
+                std::process::exit(2);
+            }
             let audit = Arc::new(audit::AuditSession::new(&audit_config));
             run_mcp_server(cli.config, Arc::clone(&registry), audit).await;
         }

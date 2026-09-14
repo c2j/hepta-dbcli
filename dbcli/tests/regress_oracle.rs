@@ -27,7 +27,7 @@ mod tests {
         let mut registry = polar_mysql::backend::factory::BackendRegistry::new();
         registry.register(factory);
         let pool = registry
-            .connect_with_fallback("oracle", &url, None)
+            .connect_with_fallback("oracle", &url, None, false)
             .await
             .ok()?;
         pool.acquire().await.ok()
