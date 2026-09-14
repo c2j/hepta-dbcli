@@ -239,6 +239,47 @@ pub(crate) fn write_gate(sql: &str, allow_write: bool) -> WriteGate {
     }
 }
 
+// ─── Driver error classification (shared with MCP) ──────────────────
+
+/// Map a [`DbError`](crate::backend::DbError) to the audit `error_kind` plus
+/// the SQLSTATE the driver embedded in its message, if any. MCP and the
+/// CLI/REPL must agree here so the ledger reads the same whichever channel
+/// ran the statement (issue #57 review).
+pub(crate) fn classify_query_error(err: &crate::backend::DbError) -> (String, Option<String>) {
+    let kind = format!("{:?}", err.kind);
+    let sqlstate = extract_sqlstate(&err.to_string());
+    (kind, sqlstate)
+}
+
+/// Extract a 5-character SQLSTATE code from an error message, if present.
+pub(crate) fn extract_sqlstate(msg: &str) -> Option<String> {
+    let idx = msg.to_ascii_uppercase().find("SQLSTATE")?;
+    let tail = &msg[idx + "SQLSTATE".len()..];
+    let code: String = tail
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(5)
+        .collect();
+    if code.len() == 5 {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+/// Execute a statement and hand back the driver error untouched, so callers
+/// can classify it for the ledger.
+pub(crate) async fn execute_query_typed(
+    conn: &mut dyn DbConn,
+    sql: &str,
+) -> Result<QueryResult, crate::backend::DbError> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(crate::backend::DbError::query("Empty SQL statement"));
+    }
+    conn.query(trimmed).await
+}
+
 pub(crate) async fn execute_query(conn: &mut dyn DbConn, sql: &str) -> Result<QueryResult, String> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -469,8 +510,17 @@ pub(crate) fn stmt_ok_event(
     stmt_event(ctx, Decision::Allow).with_outcome(outcome)
 }
 
-pub(crate) fn stmt_error_event(ctx: &StmtAudit<'_>, duration_ms: u64, error: &str) -> DraftEvent {
-    stmt_event(ctx, Decision::Error).with_outcome(AuditOutcome::error(duration_ms, error))
+pub(crate) fn stmt_error_event(
+    ctx: &StmtAudit<'_>,
+    duration_ms: u64,
+    error_kind: &str,
+    sqlstate: Option<&str>,
+) -> DraftEvent {
+    let mut outcome = AuditOutcome::error(duration_ms, error_kind);
+    if let Some(state) = sqlstate {
+        outcome = outcome.with_sqlstate(state);
+    }
+    stmt_event(ctx, Decision::Error).with_outcome(outcome)
 }
 
 /// Emitted once when a CLI/REPL session is opened with `--allow-write`, before
@@ -662,12 +712,10 @@ pub(crate) async fn run_cli(
     }
 
     let start = Instant::now();
-    let result: Result<QueryResult, String> = if is_write {
-        conn.execute_write(&sql)
-            .await
-            .map_err(|e| format!("Query failed: {}", e))
+    let result: Result<QueryResult, crate::backend::DbError> = if is_write {
+        conn.execute_write(&sql).await
     } else {
-        execute_query(&mut *conn, &sql).await
+        execute_query_typed(&mut *conn, &sql).await
     };
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -678,9 +726,17 @@ pub(crate) async fn run_cli(
             qr.rows_affected.unwrap_or(qr.row_count as u64),
             is_write,
         )),
-        Err(e) => audit.record_best_effort(stmt_error_event(&ctx, duration_ms, e)),
+        Err(e) => {
+            let (error_kind, sqlstate) = classify_query_error(e);
+            audit.record_best_effort(stmt_error_event(
+                &ctx,
+                duration_ms,
+                &error_kind,
+                sqlstate.as_deref(),
+            ))
+        }
     }
-    let result = result?;
+    let result = result.map_err(|e| format!("Query failed: {}", e))?;
     render_result(&result, &mut std::io::stdout(), args.format)?;
 
     if let Some(action) = args.timeout_action.as_deref() {
@@ -998,6 +1054,26 @@ mod tests {
             write_gate("ALTER TABLE t ADD c INT", true),
             WriteGate::Destructive
         );
+    }
+
+    #[test]
+    fn error_events_record_kind_and_sqlstate() {
+        let ctx = StmtAudit::cli(
+            "dev",
+            "gaussdb://u:p@h:5432/db",
+            "CREATE TABLE t (id INT)",
+            "argv",
+            StatementClass::Destructive,
+            true,
+        );
+        let ev = stmt_error_event(&ctx, 7, "QueryFailed", Some("25006"));
+        assert_eq!(ev.decision, Decision::Error);
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert_eq!(outcome.error_kind.as_deref(), Some("QueryFailed"));
+        assert_eq!(outcome.sqlstate.as_deref(), Some("25006"));
+
+        let plain = stmt_error_event(&ctx, 1, "QueryFailed", None);
+        assert!(plain.outcome.as_ref().unwrap().sqlstate.is_none());
     }
 
     #[test]

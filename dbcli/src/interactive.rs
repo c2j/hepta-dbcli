@@ -19,9 +19,9 @@ use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 use crate::cli::QueryResult;
 use crate::cli::{
-    classify_statement, execute_query, render_result, session_mode_event, stmt_error_event,
-    stmt_event, stmt_ok_event, write_gate, write_gate_message, CliArgs, OutputFormat,
-    StatementClass, StmtAudit, WriteGate,
+    classify_query_error, classify_statement, execute_query_typed, render_result,
+    session_mode_event, stmt_error_event, stmt_event, stmt_ok_event, write_gate,
+    write_gate_message, CliArgs, OutputFormat, StatementClass, StmtAudit, WriteGate,
 };
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
@@ -752,12 +752,10 @@ pub(crate) async fn run_interactive(
             }
 
             let start = Instant::now();
-            let query_result: Result<QueryResult, String> = if is_write {
-                conn.execute_write(stmt)
-                    .await
-                    .map_err(|e| format!("Query failed: {}", e))
+            let query_result: Result<QueryResult, crate::backend::DbError> = if is_write {
+                conn.execute_write(stmt).await
             } else {
-                execute_query(&mut *conn, stmt).await
+                execute_query_typed(&mut *conn, stmt).await
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             match &query_result {
@@ -767,9 +765,17 @@ pub(crate) async fn run_interactive(
                     qr.rows_affected.unwrap_or(qr.row_count as u64),
                     is_write,
                 )),
-                Err(e) => audit.record_best_effort(stmt_error_event(&ctx, duration_ms, e)),
+                Err(e) => {
+                    let (error_kind, sqlstate) = classify_query_error(e);
+                    audit.record_best_effort(stmt_error_event(
+                        &ctx,
+                        duration_ms,
+                        &error_kind,
+                        sqlstate.as_deref(),
+                    ))
+                }
             }
-            match query_result {
+            match query_result.map_err(|e| format!("Query failed: {}", e)) {
                 Ok(query_result) => {
                     last_result = Some(query_result.clone());
                     match &mut output_target {
@@ -976,11 +982,10 @@ mod tests {
         assert!(outcome.ok);
         assert_eq!(outcome.row_count, Some(3));
 
-        let err = stmt_error_event(&ctx, 5, "boom");
+        let err = stmt_error_event(&ctx, 5, "QueryFailed", Some("25006"));
         assert_eq!(err.decision, Decision::Error);
-        assert_eq!(
-            err.outcome.as_ref().unwrap().error_kind.as_deref(),
-            Some("boom")
-        );
+        let outcome = err.outcome.as_ref().unwrap();
+        assert_eq!(outcome.error_kind.as_deref(), Some("QueryFailed"));
+        assert_eq!(outcome.sqlstate.as_deref(), Some("25006"));
     }
 }

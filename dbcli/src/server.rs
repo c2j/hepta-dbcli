@@ -1,6 +1,7 @@
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ErrorData as McpError},
+    service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router, ServerHandler,
 };
 use serde_json::{json, Value};
@@ -16,7 +17,8 @@ use crate::audit::event::{
 };
 use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
-use crate::backend::{BackendFactory, DbConn, DbError, DbPool};
+use crate::backend::{BackendFactory, DbConn, DbPool};
+use crate::cli::classify_query_error;
 
 pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
@@ -203,6 +205,8 @@ pub struct DbMcp {
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     default_name: String,
     audit: Arc<AuditSession>,
+    /// MCP client name reported by `initialize`, when the client sent one.
+    client: std::sync::Mutex<Option<String>>,
 }
 
 impl DbMcp {
@@ -223,6 +227,7 @@ impl DbMcp {
             connections: Arc::new(Mutex::new(connections)),
             default_name,
             audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -245,6 +250,7 @@ impl DbMcp {
             connections: Arc::new(Mutex::new(connections)),
             default_name,
             audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -258,6 +264,7 @@ impl DbMcp {
             connections: Arc::new(Mutex::new(HashMap::new())),
             default_name,
             audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -312,11 +319,7 @@ impl DbMcp {
                         Ok(conn) => Ok((pool, conn)),
                         Err(e) => {
                             error!("failed to get connection from pool for '{}': {}", name, e);
-                            self.audit.record_best_effort(connect_event(
-                                &name,
-                                &url,
-                                Decision::Error,
-                            ));
+                            self.record(connect_event(&name, &url, Decision::Error));
                             Err(connection_error(&url, &e.to_string()))
                         }
                     };
@@ -411,6 +414,23 @@ impl DbMcp {
             .record_best_effort(connect_event(name, url, Decision::Allow));
 
         Ok((pool, conn))
+    }
+
+    /// Record an audit event, stamped with the MCP client name when the
+    /// client reported one (issue #57 §5 `actor.client`).
+    fn record(&self, event: DraftEvent) {
+        let event = match self.client_name() {
+            Some(name) => event.with_client(name),
+            None => event,
+        };
+        self.audit.record_best_effort(event);
+    }
+
+    fn client_name(&self) -> Option<String> {
+        match self.client.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Record a meta tool event only when `--audit-meta` is on.
@@ -522,30 +542,6 @@ fn meta_event(conn_name: &str, url: &str, action: &str, decision: Decision) -> D
         ActionClass::Meta,
         decision,
     )
-}
-
-/// Map a [`DbError`] to `(error_kind, sqlstate)`. SQLSTATE is only available
-/// when the driver surfaces one (e.g. GaussDB's `[SQLSTATE 42P01]` message).
-fn classify_query_error(err: &DbError) -> (String, Option<String>) {
-    let kind = format!("{:?}", err.kind);
-    let sqlstate = extract_sqlstate(&err.to_string());
-    (kind, sqlstate)
-}
-
-/// Extract a 5-character SQLSTATE code from an error message, if present.
-fn extract_sqlstate(msg: &str) -> Option<String> {
-    let idx = msg.to_ascii_uppercase().find("SQLSTATE")?;
-    let tail = &msg[idx + "SQLSTATE".len()..];
-    let code: String = tail
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(5)
-        .collect();
-    if code.len() == 5 {
-        Some(code)
-    } else {
-        None
-    }
 }
 
 // ─── Tool Implementations ───────────────────────────────────────────
@@ -810,7 +806,7 @@ impl DbMcp {
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let (error_kind, sqlstate) = classify_query_error(&e);
-                self.audit.record_best_effort(execute_query_error_event(
+                self.record(execute_query_error_event(
                     &name,
                     &url,
                     trimmed,
@@ -822,7 +818,7 @@ impl DbMcp {
             }
         };
         let duration_ms = start.elapsed().as_millis() as u64;
-        self.audit.record_best_effort(execute_query_allowed_event(
+        self.record(execute_query_allowed_event(
             &name,
             &url,
             trimmed,
@@ -894,7 +890,7 @@ impl DbMcp {
         let result = match conn.query(&explain_sql).await {
             Ok(result) => result,
             Err(e) => {
-                self.audit.record_best_effort(get_execution_plan_event(
+                self.record(get_execution_plan_event(
                     &name,
                     &url,
                     &params.sql,
@@ -909,7 +905,7 @@ impl DbMcp {
             }
         };
 
-        self.audit.record_best_effort(get_execution_plan_event(
+        self.record(get_execution_plan_event(
             &name,
             &url,
             &params.sql,
@@ -1116,7 +1112,21 @@ impl DbMcp {
     version = "0.5.0",
     instructions = "MCP server for MySQL/PolarDB-X/Oracle/GaussDB/DuckDB database introspection with multi-connection support"
 )]
-impl ServerHandler for DbMcp {}
+impl ServerHandler for DbMcp {
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Some(info) = context.peer.peer_info() {
+            debug!(
+                "MCP client initialized: {} {}",
+                info.client_info.name, info.client_info.version
+            );
+            let name = info.client_info.name.clone();
+            match self.client.lock() {
+                Ok(mut guard) => *guard = Some(name),
+                Err(poisoned) => *poisoned.into_inner() = Some(name),
+            }
+        }
+    }
+}
 
 fn parse_delta_diff_strategy(
     raw: Option<&str>,
@@ -1355,8 +1365,66 @@ mod delta_diff_mcp_plan_tests {
 }
 
 #[cfg(test)]
+mod client_stamp_tests {
+    use super::*;
+    use crate::audit::{AuditConfig, AuditSession};
+
+    fn session(dir: &std::path::Path) -> Arc<AuditSession> {
+        Arc::new(AuditSession::new(&AuditConfig {
+            dir: Some(dir.to_path_buf()),
+            enabled: true,
+            fsync: false,
+            meta: false,
+            retention_days: 0,
+        }))
+    }
+
+    fn recorded(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("audit dir") {
+            let path = entry.expect("entry").path();
+            let contents = std::fs::read_to_string(path).expect("read audit file");
+            for line in contents.lines() {
+                events.push(serde_json::from_str::<serde_json::Value>(line).expect("json line"));
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn should_stamp_actor_client_from_the_mcp_client_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = session(&dir.path().join("audit"));
+        let server = DbMcp::new_empty(
+            Arc::new(BackendRegistry::new()),
+            "default".to_string(),
+            Arc::clone(&audit),
+        );
+
+        // Before initialize: no client to report, so the field is omitted.
+        server.record(connect_event("c", "mysql://u:p@h:3306/db", Decision::Allow));
+
+        match server.client.lock() {
+            Ok(mut guard) => *guard = Some("opencode".to_string()),
+            Err(poisoned) => *poisoned.into_inner() = Some("opencode".to_string()),
+        }
+        server.record(connect_event("c", "mysql://u:p@h:3306/db", Decision::Allow));
+
+        let events = recorded(&dir.path().join("audit"));
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0]["actor"].get("client").is_none(),
+            "unknown client must be omitted, not invented"
+        );
+        assert_eq!(events[1]["actor"]["client"], "opencode");
+    }
+}
+
+#[cfg(test)]
 mod audit_event_builder_tests {
     use super::*;
+    use crate::backend::DbError;
+    use crate::cli::extract_sqlstate;
 
     #[test]
     fn deny_event_carries_full_multi_kb_sql_and_prefix_reason() {
