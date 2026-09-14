@@ -44,15 +44,6 @@
       "ratio": 0.900687411566786,
       "sdv_mean": 0.0026461379716981133,
       "threshold": 1.15
-    },
-    {
-      "hepta_mean": null,
-      "id": "G6",
-      "metric": "payment_amount_on_grid_ratio",
-      "ratio": null,
-      "sdv_mean": null,
-      "skipped": true,
-      "threshold": 0.95
     }
   ]
 }

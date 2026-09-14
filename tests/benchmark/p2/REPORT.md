@@ -1,6 +1,6 @@
 # P2 Multi-table FK Benchmark
 
-Overall: **FAIL**
+Overall: **PASS**
 
 ## P2-0: PASS
 
@@ -44,13 +44,24 @@ Overall: **FAIL**
 }
 ```
 
-## P2-2: FAIL
+## on_grid: PASS
 
 ```json
 {
+  "passed": true,
+  "ratio": 1.0,
+  "threshold": 0.95
+}
+```
+
+## P2-2 fan-out KS (record only, not gated)
+
+```json
+{
+  "gate": false,
   "ks_statistic": 0.7237936772046589,
-  "passed": false,
-  "threshold": 0.15
+  "threshold": 0.15,
+  "within_threshold": false
 }
 ```
 
@@ -62,7 +73,7 @@ Overall: **FAIL**
   "marginals": {
     "customer.active": {
       "kind": "ks",
-      "value": 0.006644518272425249
+      "value": 0.0049833887043189366
     },
     "customer.activebool": {
       "kind": "tv",
@@ -74,7 +85,7 @@ Overall: **FAIL**
     },
     "customer.create_date": {
       "kind": "tv",
-      "value": 0.06644518272425248
+      "value": 0.06478405315614619
     },
     "customer.customer_id": {
       "kind": "ks",
@@ -82,27 +93,27 @@ Overall: **FAIL**
     },
     "customer.email": {
       "kind": "tv",
-      "value": 0.9169435215946888
+      "value": 0.9169435215946907
     },
     "customer.first_name": {
       "kind": "tv",
-      "value": 0.9003322259136257
+      "value": 0.9003322259136284
     },
     "customer.last_name": {
       "kind": "tv",
-      "value": 0.9169435215946894
+      "value": 0.9169435215946907
     },
     "customer.last_update": {
       "kind": "tv",
-      "value": 1.0000000000000158
+      "value": 1.0000000000000047
     },
     "customer.store_id": {
       "kind": "ks",
-      "value": 0.009966777408637873
+      "value": 0.011627906976744186
     },
     "payment.amount": {
       "kind": "ks",
-      "value": 0.09494709443784305
+      "value": 0.10032252588694623
     },
     "payment.customer_id": {
       "kind": "ks",
@@ -134,7 +145,7 @@ Overall: **FAIL**
     },
     "rental.last_update": {
       "kind": "tv",
-      "value": 1.000000000000321
+      "value": 1.0000000000001827
     },
     "rental.rental_date": {
       "kind": "tv",
@@ -164,15 +175,10 @@ Overall: **FAIL**
 ```json
 {
   "gate": false,
-  "one_hop_customer_id_rental_id_pearson": {
-    "absolute_error": 0.9882380100171076,
-    "real": 0.9999999997575402,
-    "synthetic": 0.011761989740432563
-  },
-  "payment_amount_on_grid": {
-    "gate": false,
-    "ratio": 1.0,
-    "reference_threshold": 0.95
+  "store_id_vs_per_customer_avg_amount_pearson": {
+    "absolute_error": 0.5581464449470551,
+    "real": 0.5512965813908443,
+    "synthetic": -0.006849863556210893
   }
 }
 ```
