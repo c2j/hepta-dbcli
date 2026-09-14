@@ -1,6 +1,7 @@
 # CLI `--allow-write` Implementation Plan (issue #58)
 
-> **Status: implemented** in PR #61 (`feat/issue-58-allow-write`), stacked on #59.
+> **Status: implemented** in PR #61 (`feat/issue-58-allow-write`). That branch is based on
+> `main`, so it also carries the #57 commits until #59 merges.
 > This document is kept as the design rationale; the "Open decisions" section
 > below records what was actually shipped and why.
 
