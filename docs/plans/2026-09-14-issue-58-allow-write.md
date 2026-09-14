@@ -52,7 +52,7 @@ kept here because the code alone does not record *why*.
 | 3 | `CALL` / `DO` / anonymous blocks | explicit `CALL`/`EXEC`/`DO`/`DECLARE` and `BEGIN … END;` are L2 (need the flag); a bare `BEGIN` stays transaction control and is untouched |
 | 4 | `deny_reason` | no new value. Client-side refusals never execute, so they are not audited as statements at all; engine rejections stay `decision=error` with SQLSTATE (e.g. GaussDB `25006`) |
 | 5 | DML output | `N rows affected` for table/vertical/csv, `{"rows_affected": n}` for json; `QueryResult::empty()` keeps `(0 rows)` |
-| 6 | Audit failure while writing | fail closed — the intent event is written before execution via `AuditSession::record`, and `--no-audit --allow-write` is refused at startup |
+| 6 | Audit failure while writing | fail closed — the intent event is written before execution via `AuditSession::record`. The ledger cannot be switched off (`--no-audit` was removed in #59), so a "ledger off + write" combination does not exist |
 
 ### Resolved: uniform strict gating
 
