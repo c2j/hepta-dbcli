@@ -266,6 +266,12 @@ pub(crate) struct DraftEvent {
     pub outcome: Option<AuditOutcome>,
     pub deny_reason: Option<String>,
     pub redacted: bool,
+    /// execute_query: whether `add_limit` changed the executed SQL.
+    pub limit_applied: Option<bool>,
+    /// cli_sql: how the SQL was supplied (`argv` | file path | `stdin`).
+    pub source: Option<String>,
+    /// get_execution_plan: the EXPLAIN ANALYZE flag.
+    pub analyze: Option<bool>,
 }
 
 impl DraftEvent {
@@ -287,6 +293,9 @@ impl DraftEvent {
             outcome: None,
             deny_reason: None,
             redacted: false,
+            limit_applied: None,
+            source: None,
+            analyze: None,
         }
     }
 
@@ -314,6 +323,21 @@ impl DraftEvent {
         self.redacted = true;
         self
     }
+
+    pub(crate) fn with_limit_applied(mut self, applied: bool) -> Self {
+        self.limit_applied = Some(applied);
+        self
+    }
+
+    pub(crate) fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub(crate) fn with_analyze(mut self, analyze: bool) -> Self {
+        self.analyze = Some(analyze);
+        self
+    }
 }
 
 // ─── Stamped event (envelope) ───────────────────────────────────────
@@ -338,6 +362,12 @@ pub(crate) struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_reason: Option<String>,
     pub redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analyze: Option<bool>,
 }
 
 impl AuditEvent {
@@ -364,6 +394,9 @@ impl AuditEvent {
             outcome: draft.outcome,
             deny_reason: draft.deny_reason,
             redacted: draft.redacted,
+            limit_applied: draft.limit_applied,
+            source: draft.source,
+            analyze: draft.analyze,
         }
     }
 
@@ -376,6 +409,24 @@ pub(crate) fn now_rfc3339_millis() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
+}
+
+/// Whether a session opened with `url` is read-only.
+///
+/// GaussDB always pins `default_transaction_read_only=ON` at connect, so it is
+/// always read-only. DuckDB is read-only only when the URL carries `mode=ro`.
+/// MySQL and Oracle are read-write sessions.
+pub(crate) fn read_only_session_for(url: &str) -> bool {
+    let driver = url.find("://").map(|i| &url[..i]).unwrap_or("");
+    match driver {
+        "gaussdb" => true,
+        "duckdb" => url
+            .split('?')
+            .nth(1)
+            .map(|qs| qs.split('&').any(|p| p.eq_ignore_ascii_case("mode=ro")))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +589,58 @@ mod tests {
         assert!(!info.truncated);
         assert_eq!(info.text, "SELECT 1");
         assert_eq!(info.sha256.len(), 64);
+    }
+
+    #[test]
+    fn read_only_session_per_driver() {
+        assert!(read_only_session_for("gaussdb://u:p@h:5432/db"));
+        assert!(!read_only_session_for("mysql://u:p@h:3306/db"));
+        assert!(!read_only_session_for("oracle://u:p@h:1521/FREEPDB1"));
+        assert!(read_only_session_for("duckdb:///tmp/shop.duckdb?mode=ro"));
+        assert!(!read_only_session_for("duckdb:///tmp/shop.duckdb"));
+        assert!(!read_only_session_for(""));
+    }
+
+    #[test]
+    fn new_event_fields_serialize_and_skip_when_absent() {
+        let conn = ConnectionInfo::from_url("n", "mysql://u:p@h:3306/db", false);
+        let with_flags = AuditEvent::stamp(
+            DraftEvent::new(
+                Channel::Mcp,
+                conn.clone(),
+                "execute_query",
+                ActionClass::Dql,
+                Decision::Allow,
+            )
+            .with_limit_applied(true)
+            .with_source("/tmp/x.sql")
+            .with_analyze(false),
+            "s",
+            1,
+            "id".into(),
+            "t".into(),
+        );
+        let v = serde_json::to_value(&with_flags).unwrap();
+        assert_eq!(v["limit_applied"], true);
+        assert_eq!(v["source"], "/tmp/x.sql");
+        assert_eq!(v["analyze"], false);
+
+        let without = AuditEvent::stamp(
+            DraftEvent::new(
+                Channel::Cli,
+                conn,
+                "cli_sql",
+                ActionClass::Dql,
+                Decision::Allow,
+            ),
+            "s",
+            2,
+            "id".into(),
+            "t".into(),
+        );
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.get("limit_applied").is_none());
+        assert!(v.get("source").is_none());
+        assert!(v.get("analyze").is_none());
     }
 }

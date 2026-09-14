@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Instant;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::audit::event::{
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision,
+    DraftEvent, SqlInfo,
+};
+use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 pub(crate) use crate::backend::QueryResult;
@@ -92,8 +98,7 @@ fn strip_leading_comments(sql: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
-fn is_read_only_query(sql: &str) -> bool {
+pub(crate) fn is_read_only_query(sql: &str) -> bool {
     let trimmed = sql.trim();
     let stripped = strip_leading_comments(trimmed);
     let upper = stripped.to_uppercase();
@@ -192,10 +197,71 @@ pub(crate) fn render_result(
     Ok(())
 }
 
+// ─── CLI audit helpers (pure, unit-tested) ──────────────────────────
+
+/// Classify how the CLI SQL was supplied: `argv` | file path | `stdin`.
+pub(crate) fn cli_source_label(sql: Option<&str>, file: Option<&str>) -> String {
+    if sql.is_some() {
+        "argv".to_string()
+    } else if let Some(path) = file {
+        path.to_string()
+    } else {
+        "stdin".to_string()
+    }
+}
+
+fn cli_sql_class(sql: &str) -> ActionClass {
+    if is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    }
+}
+
+fn cli_sql_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    source: &str,
+    duration_ms: u64,
+    row_count: u64,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Cli,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "cli_sql",
+        cli_sql_class(sql),
+        Decision::Allow,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_source(source)
+    .with_outcome(AuditOutcome::ok(duration_ms).with_row_count(row_count))
+}
+
+fn cli_sql_error_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    source: &str,
+    duration_ms: u64,
+    error: &str,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Cli,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "cli_sql",
+        cli_sql_class(sql),
+        Decision::Error,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_source(source)
+    .with_outcome(AuditOutcome::error(duration_ms, error))
+}
+
 pub(crate) async fn run_cli(
     args: CliArgs,
     registry: &BackendRegistry,
-    _audit: &crate::audit::AuditSession,
+    audit: &AuditSession,
 ) -> Result<(), String> {
     let sql = if let Some(s) = &args.sql {
         s.clone()
@@ -286,7 +352,29 @@ pub(crate) async fn run_cli(
         }
     }
 
-    let result = execute_query(&mut *conn, &sql).await?;
+    let source_label = cli_source_label(args.sql.as_deref(), args.file.as_deref());
+    let start = Instant::now();
+    let result = execute_query(&mut *conn, &sql).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    match &result {
+        Ok(qr) => audit.record_best_effort(cli_sql_event(
+            &target.name,
+            &target.connection_url,
+            &sql,
+            &source_label,
+            duration_ms,
+            qr.row_count as u64,
+        )),
+        Err(e) => audit.record_best_effort(cli_sql_error_event(
+            &target.name,
+            &target.connection_url,
+            &sql,
+            &source_label,
+            duration_ms,
+            e,
+        )),
+    }
+    let result = result?;
     render_result(&result, &mut std::io::stdout(), args.format)?;
 
     if let Some(action) = args.timeout_action.as_deref() {
@@ -490,5 +578,34 @@ mod tests {
             OutputFormat::Csv
         ));
         assert!("invalid".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn cli_source_classifies_argv_file_stdin() {
+        assert_eq!(cli_source_label(Some("SELECT 1"), None), "argv");
+        assert_eq!(cli_source_label(None, Some("/tmp/q.sql")), "/tmp/q.sql");
+        assert_eq!(cli_source_label(None, None), "stdin");
+    }
+
+    #[test]
+    fn cli_sql_event_records_source_and_class() {
+        let ev = cli_sql_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", "argv", 5, 3);
+        assert_eq!(ev.channel, Channel::Cli);
+        assert_eq!(ev.action, "cli_sql");
+        assert_eq!(ev.class, ActionClass::Dql);
+        assert_eq!(ev.source.as_deref(), Some("argv"));
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.row_count, Some(3));
+
+        let dml = cli_sql_event(
+            "dev",
+            "mysql://u:p@h:3306/db",
+            "UPDATE t SET a=1",
+            "stdin",
+            5,
+            0,
+        );
+        assert_eq!(dml.class, ActionClass::Dml);
     }
 }
