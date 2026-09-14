@@ -117,6 +117,126 @@ pub(crate) fn is_read_only_mcp(sql: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| upper.starts_with(p))
 }
 
+// ─── Statement classification for the CLI write gate (#58) ──────────
+
+/// How a statement may be executed from the CLI/REPL.
+///
+/// This is a UX gate, not a security boundary — the real boundary is the
+/// database account (issue #58 D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementClass {
+    /// `SELECT` / `EXPLAIN` / `SHOW` / `DESCRIBE` / a plain CTE.
+    ReadOnly,
+    /// `INSERT` / `UPDATE` / `DELETE` / ... — needs `--allow-write`.
+    DataChange,
+    /// `CALL` / `EXEC` / `DO` / an anonymous block — needs `--allow-write`.
+    Call,
+    /// `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `GRANT` / ... — always refused.
+    Destructive,
+    /// Transaction control and anything unrecognised: unchanged behaviour.
+    Other,
+}
+
+/// What the gate decided for one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteGate {
+    /// Execute as-is.
+    Allow,
+    /// Refused: a data change without `--allow-write`.
+    NeedsFlag(StatementClass),
+    /// Refused: destructive DDL is out of scope even with `--allow-write`.
+    Destructive,
+}
+
+const DESTRUCTIVE_KEYWORDS: &[&str] = &[
+    "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE", "RENAME",
+];
+const DATA_CHANGE_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "UPSERT", "LOAD", "IMPORT",
+];
+const CALL_KEYWORDS: &[&str] = &["CALL", "EXEC", "EXECUTE", "DO", "DECLARE", "PERFORM"];
+const READ_ONLY_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "EXPLAIN",
+    "SHOW",
+    "DESC",
+    "DESCRIBE",
+    "TABLE",
+    "VALUES",
+    "SUMMARIZE",
+];
+
+/// Split into SQL-ish words so a keyword inside a literal does not match by
+/// accident (still a heuristic; classification is UX, not security).
+fn is_keyword(upper: &str, keyword: &str) -> bool {
+    upper
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == keyword)
+}
+
+pub(crate) fn classify_statement(sql: &str) -> StatementClass {
+    let stripped = strip_leading_comments(sql.trim());
+    let upper = stripped.to_uppercase();
+    let first = upper
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .to_string();
+
+    if DESTRUCTIVE_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::Destructive;
+    }
+    if DATA_CHANGE_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::DataChange;
+    }
+    if CALL_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::Call;
+    }
+    if first == "WITH" {
+        // A CTE can carry a data change (`WITH x AS (...) INSERT ...`).
+        if DESTRUCTIVE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+            return StatementClass::Destructive;
+        }
+        if DATA_CHANGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+            return StatementClass::DataChange;
+        }
+        if CALL_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+            return StatementClass::Call;
+        }
+        return StatementClass::ReadOnly;
+    }
+    if first == "BEGIN" {
+        // `BEGIN ... END;` is an anonymous block (not auditable, stays behind
+        // the flag); a bare `BEGIN` is transaction control.
+        let tail = upper.trim_end().trim_end_matches(';').trim_end();
+        if tail.ends_with("END") {
+            return StatementClass::Call;
+        }
+        return StatementClass::Other;
+    }
+    if READ_ONLY_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::ReadOnly;
+    }
+    StatementClass::Other
+}
+
+/// Apply the CLI write policy (issue #58 D4): L1 read-only and transaction
+/// control pass, L2 data changes need the flag, L3 destructive never passes.
+pub(crate) fn write_gate(sql: &str, allow_write: bool) -> WriteGate {
+    match classify_statement(sql) {
+        StatementClass::Destructive => WriteGate::Destructive,
+        class @ (StatementClass::DataChange | StatementClass::Call) => {
+            if allow_write {
+                WriteGate::Allow
+            } else {
+                WriteGate::NeedsFlag(class)
+            }
+        }
+        _ => WriteGate::Allow,
+    }
+}
+
 pub(crate) async fn execute_query(conn: &mut dyn DbConn, sql: &str) -> Result<QueryResult, String> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -578,6 +698,117 @@ mod tests {
             OutputFormat::Csv
         ));
         assert!("invalid".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn should_classify_read_only_statements() {
+        for sql in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::ReadOnly,
+                "expected ReadOnly for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_classify_transaction_control_as_other() {
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK", "START TRANSACTION"] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Other,
+                "expected Other for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_classify_data_changes() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "insert into t values (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "REPLACE INTO t VALUES (1)",
+            "MERGE INTO t USING s ON (1=1)",
+            "  /* hint */ INSERT INTO t VALUES (1)",
+            "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::DataChange,
+                "expected DataChange for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_classify_calls_and_anonymous_blocks() {
+        for sql in [
+            "CALL foo(1)",
+            "EXEC proc",
+            "EXECUTE proc",
+            "DO $$ BEGIN END $$",
+            "DECLARE x NUMBER; BEGIN NULL; END;",
+            "BEGIN INSERT INTO t VALUES (1); END;",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Call,
+                "expected Call for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_classify_destructive_statements() {
+        for sql in [
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "CREATE TABLE t (id INT)",
+            "GRANT SELECT ON t TO u",
+            "REVOKE SELECT ON t FROM u",
+            "RENAME TABLE a TO b",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Destructive,
+                "expected Destructive for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_refuse_data_changes_without_the_flag() {
+        assert_eq!(
+            write_gate("INSERT INTO t VALUES (1)", false),
+            WriteGate::NeedsFlag(StatementClass::DataChange)
+        );
+        assert_eq!(
+            write_gate("CALL foo()", false),
+            WriteGate::NeedsFlag(StatementClass::Call)
+        );
+        assert_eq!(write_gate("SELECT 1", false), WriteGate::Allow);
+    }
+
+    #[test]
+    fn should_allow_data_changes_with_the_flag_but_never_destructive() {
+        assert_eq!(
+            write_gate("INSERT INTO t VALUES (1)", true),
+            WriteGate::Allow
+        );
+        assert_eq!(write_gate("CALL foo()", true), WriteGate::Allow);
+        assert_eq!(write_gate("DROP TABLE t", true), WriteGate::Destructive);
+        assert_eq!(write_gate("TRUNCATE TABLE t", true), WriteGate::Destructive);
+        assert_eq!(
+            write_gate("ALTER TABLE t ADD c INT", true),
+            WriteGate::Destructive
+        );
     }
 
     #[test]
