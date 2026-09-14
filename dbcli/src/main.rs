@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod audit;
 mod backend;
 mod cli;
 mod config;
