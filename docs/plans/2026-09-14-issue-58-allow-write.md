@@ -50,8 +50,9 @@ kept here because the code alone does not record *why*.
 | 1 | Scope of `--allow-write` | global clap flag; the `mcp` arm rejects it with exit code 2. A global flag is the only shape that keeps it out of a subcommand while still refusing it for MCP |
 | 2 | DuckDB | covered by the same classifier; DuckDB has no session GUC, so its `?mode=ro` still wins at the driver level |
 | 3 | `CALL` / `DO` / anonymous blocks | explicit `CALL`/`EXEC`/`DO`/`DECLARE` and `BEGIN … END;` are L2 (need the flag); a bare `BEGIN` stays transaction control and is untouched |
-| 4 | `deny_reason` | no new value. Client-side refusals never execute, so they are not audited as statements at all; engine rejections stay `decision=error` with SQLSTATE (e.g. GaussDB `25006`) |
+| 4 | `deny_reason` | **revised after the #61 review**: client-side refusals are audited too, with `deny_reason` = `write_flag_required` / `destructive_ddl` (issue #57 §5 wants denials recorded, so "who tried to write" is visible). Engine rejections stay `decision=error` with SQLSTATE (e.g. GaussDB `25006`); MCP keeps `prefix` |
 | 5 | DML output | `N rows affected` for table/vertical/csv, `{"rows_affected": n}` for json; `QueryResult::empty()` keeps `(0 rows)` |
+| 6 | Session marker | one `session_mode` per CLI/REPL process, recording `read_only` or `allow_write` (issue #57 CLI contract) |
 | 6 | Audit failure while writing | fail closed — the intent event is written before execution via `AuditSession::record`. The ledger cannot be switched off (`--no-audit` was removed in #59), so a "ledger off + write" combination does not exist |
 
 ### Resolved: uniform strict gating
