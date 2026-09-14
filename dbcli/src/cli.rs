@@ -117,6 +117,47 @@ pub(crate) fn is_read_only_mcp(sql: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| upper.starts_with(p))
 }
 
+// ─── Driver error classification (shared with MCP) ──────────────────
+
+/// Map a [`DbError`](crate::backend::DbError) to the audit `error_kind` plus
+/// the SQLSTATE the driver embedded in its message, if any. MCP and the
+/// CLI/REPL must agree here so the ledger reads the same whichever channel
+/// ran the statement (issue #57 review).
+pub(crate) fn classify_query_error(err: &crate::backend::DbError) -> (String, Option<String>) {
+    let kind = format!("{:?}", err.kind);
+    let sqlstate = extract_sqlstate(&err.to_string());
+    (kind, sqlstate)
+}
+
+/// Extract a 5-character SQLSTATE code from an error message, if present.
+pub(crate) fn extract_sqlstate(msg: &str) -> Option<String> {
+    let idx = msg.to_ascii_uppercase().find("SQLSTATE")?;
+    let tail = &msg[idx + "SQLSTATE".len()..];
+    let code: String = tail
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(5)
+        .collect();
+    if code.len() == 5 {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+/// Execute a statement and hand back the driver error untouched, so callers
+/// can classify it for the ledger.
+pub(crate) async fn execute_query_typed(
+    conn: &mut dyn DbConn,
+    sql: &str,
+) -> Result<QueryResult, crate::backend::DbError> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(crate::backend::DbError::query("Empty SQL statement"));
+    }
+    conn.query(trimmed).await
+}
+
 pub(crate) async fn execute_query(conn: &mut dyn DbConn, sql: &str) -> Result<QueryResult, String> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -244,8 +285,13 @@ fn cli_sql_error_event(
     sql: &str,
     source: &str,
     duration_ms: u64,
-    error: &str,
+    error_kind: &str,
+    sqlstate: Option<&str>,
 ) -> DraftEvent {
+    let mut outcome = AuditOutcome::error(duration_ms, error_kind);
+    if let Some(state) = sqlstate {
+        outcome = outcome.with_sqlstate(state);
+    }
     DraftEvent::new(
         Channel::Cli,
         ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
@@ -255,7 +301,7 @@ fn cli_sql_error_event(
     )
     .with_sql(SqlInfo::new(sql))
     .with_source(source)
-    .with_outcome(AuditOutcome::error(duration_ms, error))
+    .with_outcome(outcome)
 }
 
 /// Event for an action that is not a SQL statement (connect, check,
@@ -388,7 +434,7 @@ pub(crate) async fn run_cli(
 
     let source_label = cli_source_label(args.sql.as_deref(), args.file.as_deref());
     let start = Instant::now();
-    let result = execute_query(&mut *conn, &sql).await;
+    let result = execute_query_typed(&mut *conn, &sql).await;
     let duration_ms = start.elapsed().as_millis() as u64;
     match &result {
         Ok(qr) => audit.record_best_effort(cli_sql_event(
@@ -399,16 +445,20 @@ pub(crate) async fn run_cli(
             duration_ms,
             qr.row_count as u64,
         )),
-        Err(e) => audit.record_best_effort(cli_sql_error_event(
-            &target.name,
-            &target.connection_url,
-            &sql,
-            &source_label,
-            duration_ms,
-            e,
-        )),
+        Err(e) => {
+            let (error_kind, sqlstate) = classify_query_error(e);
+            audit.record_best_effort(cli_sql_error_event(
+                &target.name,
+                &target.connection_url,
+                &sql,
+                &source_label,
+                duration_ms,
+                &error_kind,
+                sqlstate.as_deref(),
+            ))
+        }
     }
-    let result = result?;
+    let result = result.map_err(|e| format!("Query failed: {}", e))?;
     render_result(&result, &mut std::io::stdout(), args.format)?;
 
     if let Some(action) = args.timeout_action.as_deref() {
@@ -612,6 +662,34 @@ mod tests {
             OutputFormat::Csv
         ));
         assert!("invalid".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn cli_error_event_records_kind_and_sqlstate() {
+        let ev = cli_sql_error_event(
+            "dev",
+            "gaussdb://u:p@h:5432/db",
+            "CREATE TABLE t (id INT)",
+            "argv",
+            7,
+            "QueryFailed",
+            Some("25006"),
+        );
+        assert_eq!(ev.decision, Decision::Error);
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert_eq!(outcome.error_kind.as_deref(), Some("QueryFailed"));
+        assert_eq!(outcome.sqlstate.as_deref(), Some("25006"));
+
+        let no_state = cli_sql_error_event(
+            "dev",
+            "mysql://u:p@h:3306/db",
+            "SELECT 1",
+            "argv",
+            1,
+            "QueryFailed",
+            None,
+        );
+        assert!(no_state.outcome.as_ref().unwrap().sqlstate.is_none());
     }
 
     #[test]

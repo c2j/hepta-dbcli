@@ -21,7 +21,10 @@ use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 use crate::cli::QueryResult;
-use crate::cli::{execute_query, is_read_only_query, render_result, CliArgs, OutputFormat};
+use crate::cli::{
+    classify_query_error, execute_query_typed, is_read_only_query, render_result, CliArgs,
+    OutputFormat,
+};
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
     rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
@@ -575,7 +578,8 @@ fn repl_sql_error_event(
     url: &str,
     sql: &str,
     duration_ms: u64,
-    error: &str,
+    error_kind: &str,
+    sqlstate: Option<&str>,
 ) -> DraftEvent {
     let class = if is_read_only_query(sql) {
         ActionClass::Dql
@@ -590,7 +594,10 @@ fn repl_sql_error_event(
         Decision::Error,
     )
     .with_sql(SqlInfo::new(sql))
-    .with_outcome(AuditOutcome::error(duration_ms, error))
+    .with_outcome(match sqlstate {
+        Some(state) => AuditOutcome::error(duration_ms, error_kind).with_sqlstate(state),
+        None => AuditOutcome::error(duration_ms, error_kind),
+    })
 }
 
 pub(crate) async fn run_interactive(
@@ -748,7 +755,7 @@ pub(crate) async fn run_interactive(
         );
         for stmt in &split.complete {
             let start = Instant::now();
-            let query_result = execute_query(&mut *conn, stmt).await;
+            let query_result = execute_query_typed(&mut *conn, stmt).await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match &query_result {
                 Ok(qr) => audit.record_best_effort(repl_sql_event(
@@ -758,13 +765,17 @@ pub(crate) async fn run_interactive(
                     duration_ms,
                     qr.row_count as u64,
                 )),
-                Err(e) => audit.record_best_effort(repl_sql_error_event(
-                    &target.name,
-                    &target.connection_url,
-                    stmt,
-                    duration_ms,
-                    e,
-                )),
+                Err(e) => {
+                    let (error_kind, sqlstate) = classify_query_error(e);
+                    audit.record_best_effort(repl_sql_error_event(
+                        &target.name,
+                        &target.connection_url,
+                        stmt,
+                        duration_ms,
+                        &error_kind,
+                        sqlstate.as_deref(),
+                    ))
+                }
             }
             match query_result {
                 Ok(query_result) => {
@@ -958,11 +969,17 @@ mod tests {
         assert!(outcome.ok);
         assert_eq!(outcome.row_count, Some(3));
 
-        let err = repl_sql_error_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", 5, "boom");
-        assert_eq!(err.decision, Decision::Error);
-        assert_eq!(
-            err.outcome.as_ref().unwrap().error_kind.as_deref(),
-            Some("boom")
+        let err = repl_sql_error_event(
+            "dev",
+            "mysql://u:p@h:3306/db",
+            "SELECT 1",
+            5,
+            "QueryFailed",
+            Some("25006"),
         );
+        assert_eq!(err.decision, Decision::Error);
+        let outcome = err.outcome.as_ref().unwrap();
+        assert_eq!(outcome.error_kind.as_deref(), Some("QueryFailed"));
+        assert_eq!(outcome.sqlstate.as_deref(), Some("25006"));
     }
 }
