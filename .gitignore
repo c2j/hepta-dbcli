@@ -1,3 +1,14 @@
 /target/
 .sisyphus/
 tests/benchmark/*.csv
+.venv-*/
+catboost_info/
+*.pkl
+*.duckdb
+tests/benchmark/p1/work/
+tests/benchmark/p1/results/
+tests/benchmark/p1/data/
+tests/benchmark/p2/generated/
+tests/benchmark/p2/models/
+tests/benchmark/p2/staging.sql
+tests/benchmark/p2/p2_attempts.json

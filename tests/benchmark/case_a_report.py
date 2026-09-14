@@ -2,14 +2,11 @@
 """
 聚合双边指标，输出 JSON + Markdown 报告
 """
+import argparse
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-SDV_M = ROOT / "sdv_metrics.json"
-HEPTA_M = ROOT / "hepta_metrics.json"
-OUT_JSON = ROOT / "case_a_report.json"
-OUT_MD = ROOT / "case_a_report.md"
 
 def load(p):
     if p.exists():
@@ -17,6 +14,19 @@ def load(p):
     return {}
 
 def main():
+    parser = argparse.ArgumentParser(description="Aggregate Case A metrics into JSON + Markdown report")
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=ROOT,
+        help="Output directory for case_a_report.json/.md (default: this script's directory)",
+    )
+    args = parser.parse_args()
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json = out_dir / "case_a_report.json"
+    out_md = out_dir / "case_a_report.md"
+
     sdv = load(Path("/tmp/sdv_metrics.json"))
     hepta = load(Path("/tmp/hepta_metrics.json"))
 
@@ -47,8 +57,8 @@ def main():
         }
 
     # 写 JSON
-    Path("/tmp/case_a_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    print("Report JSON saved to /tmp/case_a_report.json")
+    out_json.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    print(f"Report JSON saved to {out_json}")
 
     # 生成 Markdown
     md = []
@@ -75,8 +85,8 @@ def main():
         for k, v in report["comparison"].items():
             md.append(f"- **{k}**: {v:+.4f}")
 
-    Path("/tmp/case_a_report.md").write_text("\n".join(md))
-    print("Report MD saved to /tmp/case_a_report.md")
+    out_md.write_text("\n".join(md))
+    print(f"Report MD saved to {out_md}")
 
 if __name__ == "__main__":
     main()
