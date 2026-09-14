@@ -25,7 +25,7 @@ mod sha256;
 pub(crate) mod writer;
 
 use event::{now_rfc3339_millis, AuditEvent, DraftEvent};
-use writer::{AuditConfig, AuditWriter};
+pub(crate) use writer::{AuditConfig, AuditWriter};
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,6 +200,7 @@ mod tests {
             dir: Some(dir.to_path_buf()),
             enabled: true,
             fsync: false,
+            meta: false,
         }
     }
 
@@ -321,6 +322,7 @@ mod tests {
             dir: Some(blocker.join("audit")),
             enabled: true,
             fsync: false,
+            meta: false,
         });
         assert!(!session.is_enabled(), "must degrade, not panic");
         session.record_best_effort(draft());

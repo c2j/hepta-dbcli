@@ -18,6 +18,8 @@ pub(crate) struct AuditConfig {
     /// Extra `fsync` after each event. Off by default: `flush` already
     /// survives process kill, and fsync only matters for power loss.
     pub fsync: bool,
+    /// `--audit-meta`: also record high-noise meta tools (list_tables, ...).
+    pub meta: bool,
 }
 
 impl Default for AuditConfig {
@@ -26,6 +28,7 @@ impl Default for AuditConfig {
             dir: None,
             enabled: true,
             fsync: false,
+            meta: false,
         }
     }
 }

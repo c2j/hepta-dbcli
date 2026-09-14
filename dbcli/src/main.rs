@@ -68,6 +68,18 @@ struct Cli {
     #[arg(long, global = true)]
     name: Option<String>,
 
+    /// Directory for the JSONL audit log (default: <data-dir>/hepta-dbcli/audit)
+    #[arg(long, global = true)]
+    audit_dir: Option<String>,
+
+    /// Disable the audit log. Dangerous: no ledger of executed SQL remains.
+    #[arg(long, global = true)]
+    no_audit: bool,
+
+    /// Also audit high-noise meta tools (list_tables, get_table_metadata, ...)
+    #[arg(long, global = true)]
+    audit_meta: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1012,7 +1024,11 @@ fn create_registry() -> BackendRegistry {
 
 // ─── MCP Server ────────────────────────────────────────────────────────
 
-async fn run_mcp_server(config_path: Option<String>, registry: Arc<BackendRegistry>) {
+async fn run_mcp_server(
+    config_path: Option<String>,
+    registry: Arc<BackendRegistry>,
+    _audit: &audit::AuditSession,
+) {
     let config_path_buf = config_path.map(PathBuf::from);
 
     let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
@@ -1102,9 +1118,17 @@ async fn main() {
     let cli = Cli::parse();
     let registry = Arc::new(create_registry());
 
+    let audit_config = audit::AuditConfig {
+        dir: cli.audit_dir.as_deref().map(PathBuf::from),
+        enabled: !cli.no_audit,
+        fsync: false,
+        meta: cli.audit_meta,
+    };
+
     match cli.command {
         None | Some(Commands::Mcp) => {
-            run_mcp_server(cli.config, Arc::clone(&registry)).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            run_mcp_server(cli.config, Arc::clone(&registry), &audit).await;
         }
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);
@@ -1114,12 +1138,14 @@ async fn main() {
             handle_store_password(cli.name, cli.config);
         }
         Some(Commands::DeltaDiff { args }) => {
-            let code = delta_diff::run(*args, cli.config).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            let code = delta_diff::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]
         Some(Commands::Synth { args }) => {
-            let code = synth::run(*args, cli.config).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            let code = synth::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         Some(Commands::Cli {
@@ -1150,7 +1176,8 @@ async fn main() {
                     no_history,
                     timeout_action,
                 };
-                if let Err(e) = interactive::run_interactive(args, &registry).await {
+                let audit = audit::AuditSession::new(&audit_config);
+                if let Err(e) = interactive::run_interactive(args, &registry, &audit).await {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
@@ -1167,7 +1194,8 @@ async fn main() {
                     no_history,
                     timeout_action,
                 };
-                if let Err(e) = cli::run_cli(args, &registry).await {
+                let audit = audit::AuditSession::new(&audit_config);
+                if let Err(e) = cli::run_cli(args, &registry, &audit).await {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }

@@ -527,6 +527,7 @@ async fn connect(
 pub(crate) async fn run_interactive(
     args: CliArgs,
     registry: &BackendRegistry,
+    _audit: &crate::audit::AuditSession,
 ) -> Result<(), String> {
     let raw = read_config(args.config_path.map(PathBuf::from))?;
 

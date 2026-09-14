@@ -34,7 +34,11 @@ const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 
 #[cfg(feature = "synth")]
-pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
+pub async fn run(
+    args: cmd::SynthArgs,
+    config_path: Option<String>,
+    _audit: &crate::audit::AuditSession,
+) -> i32 {
     let code = match args.command {
         cmd::SynthCommand::Train {
             name,

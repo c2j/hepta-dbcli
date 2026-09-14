@@ -192,7 +192,11 @@ pub(crate) fn render_result(
     Ok(())
 }
 
-pub(crate) async fn run_cli(args: CliArgs, registry: &BackendRegistry) -> Result<(), String> {
+pub(crate) async fn run_cli(
+    args: CliArgs,
+    registry: &BackendRegistry,
+    _audit: &crate::audit::AuditSession,
+) -> Result<(), String> {
     let sql = if let Some(s) = &args.sql {
         s.clone()
     } else if let Some(f) = &args.file {

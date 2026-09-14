@@ -56,7 +56,11 @@ fn paired_side_keys(
 
 // ─── Entry Point ───────────────────────────────────────────────────────
 
-pub(crate) async fn run(args: cmd::DeltaDiffArgs, config_path: Option<String>) -> i32 {
+pub(crate) async fn run(
+    args: cmd::DeltaDiffArgs,
+    config_path: Option<String>,
+    _audit: &crate::audit::AuditSession,
+) -> i32 {
     if let Err(e) = args.validate() {
         eprintln!("error: {}", e);
         return EXIT_ERROR;
