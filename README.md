@@ -14,6 +14,7 @@ Current version: **0.5.1**.
 - **Synthetic data generation** — train per-column statistical models from real tables, then generate look-alike data with FK integrity (`synth` CLI; in default features since 0.5.0, MCP does not expose it)
 - **Multi-connection** — `~/.hepta-dbcli.toml` with per-connection timeouts
 - **OS keychain** — passwords stored in macOS Keychain or Linux Secret Service, with automatic migration from plaintext config files
+- **Audit log** — separate local JSONL ledger of every executed statement, connection and outcome (independent of `RUST_LOG`)
 
 ## Installation
 
@@ -241,6 +242,30 @@ hepta_dbcli store-password --name prod
 ```
 
 Prompts for password and stores it in the OS keychain under service `hepta-dbcli`, account `{connection_name}#{8_hex_chars}`.
+
+### Audit log
+
+Every executed statement is written to a local JSONL ledger that is independent of the `tracing` troubleshooting log and unaffected by `RUST_LOG`. It records who ran what, on which connection, with what outcome.
+
+```
+$XDG_DATA_HOME/hepta-dbcli/audit/hepta-dbcli-audit.YYYY-MM-DD.jsonl
+# macOS: ~/Library/Application Support/hepta-dbcli/audit/
+```
+
+- One JSON object per line (schema `v: 1`): envelope (`ts`, `event_id`, `session_id`, `seq`, `channel`, `actor`, `connection`, `action`, `class`, `decision`) plus action detail (`sql`, `outcome`, `deny_reason`, `detail`).
+- `channel` is one of `mcp`, `cli`, `repl`, `delta_diff`, `synth`.
+- Enabled by default; the directory and files are created `0700` / `0600`. Passwords and DSN userinfo are stripped, and result rows / EXPLAIN bodies are never written.
+- A statement rejected by the MCP read-only gate is recorded (`decision: "deny"`, `deny_reason: "prefix"`); query errors are recorded as `decision: "error"`.
+
+Global flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--audit-dir <path>` | Write the ledger under `<path>` (CI / log shipping) |
+| `--audit-meta` | Also record high-noise meta tools (`list_tables`, `get_table_metadata`, `get_database_info`, `list_connections`) |
+| `--audit-retention-days <n>` | Delete audit files older than `n` days on startup (default `30`, `0` = keep forever) |
+
+The ledger cannot be switched off: `--audit-dir` only changes where it is written. If the audit directory is unusable (permissions, read-only filesystem) the failure is reported on stderr and read-only queries still run; writes fail closed.
 
 ### Cross-database delta-diff
 

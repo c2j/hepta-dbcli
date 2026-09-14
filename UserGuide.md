@@ -418,6 +418,24 @@ Options:
           Print help
 ```
 
+全局旗标（`hepta_dbcli --help` 可见，子命令前后都可以给）：
+
+```bash
+      --config <CONFIG>
+          Path to config file
+      --name <NAME>
+          Target connection name
+      --audit-dir <AUDIT_DIR>
+          Directory for the JSONL audit log
+          (default: <data-dir>/hepta-dbcli/audit)
+      --audit-meta
+          Also audit high-noise meta actions (list_tables, check, ...)
+      --audit-retention-days <DAYS>
+          Audit log retention in days (0 = keep forever) [default: 30]
+```
+
+审计账本默认开启且无法关闭：`--audit-dir` 只改变写入位置，`--audit-meta` 只增加低价值元数据动作。审计目录不可写时降级并在 stderr 警告，只读查询照常执行；写路径（后续 `--allow-write` 提案，见 #58）则 fail-closed。
+
 ---
 
 ## 5. 交互模式 (REPL)

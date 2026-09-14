@@ -5,6 +5,9 @@
 
 use std::path::PathBuf;
 
+use crate::audit::event::{
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent,
+};
 use crate::config;
 
 pub(crate) mod api;
@@ -56,7 +59,11 @@ fn paired_side_keys(
 
 // ─── Entry Point ───────────────────────────────────────────────────────
 
-pub(crate) async fn run(args: cmd::DeltaDiffArgs, config_path: Option<String>) -> i32 {
+pub(crate) async fn run(
+    args: cmd::DeltaDiffArgs,
+    config_path: Option<String>,
+    audit: &crate::audit::AuditSession,
+) -> i32 {
     if let Err(e) = args.validate() {
         eprintln!("error: {}", e);
         return EXIT_ERROR;
@@ -85,11 +92,108 @@ pub(crate) async fn run(args: cmd::DeltaDiffArgs, config_path: Option<String>) -
         }
     };
 
-    if args.dry_run {
-        return dry_run_enhanced(&args, &left, &right).await;
-    }
+    let left_info = ConnectionInfo::from_url(
+        &left.name,
+        &left.connection_url,
+        read_only_session_for(&left.connection_url),
+    );
+    let right_info = ConnectionInfo::from_url(
+        &right.name,
+        &right.connection_url,
+        read_only_session_for(&right.connection_url),
+    );
+    let tables: Vec<String> = [args.left_table_name(), args.right_table_name()]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    let strategy = args.strategy.to_string();
 
-    execute_diff(&args, &left, &right).await
+    audit.record_best_effort(delta_diff_start_event(
+        &left_info,
+        &right_info,
+        &tables,
+        &strategy,
+    ));
+
+    let started = std::time::Instant::now();
+    let code = if args.dry_run {
+        dry_run_enhanced(&args, &left, &right).await
+    } else {
+        execute_diff(&args, &left, &right).await
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let outcome = if code == EXIT_ERROR {
+        AuditOutcome::error(duration_ms, "delta_diff")
+    } else {
+        AuditOutcome::ok(duration_ms)
+    };
+    audit.record_best_effort(delta_diff_outcome_event(
+        &left_info,
+        &right_info,
+        &tables,
+        &strategy,
+        outcome,
+    ));
+
+    code
+}
+
+// ─── Audit event builders (issue #57) ────────────────────────────────────
+
+/// Action-specific context for a `delta_diff` event. The left side is the
+/// event's `connection`; the right side, tables and strategy go into `detail`.
+/// Diff rows are never included.
+pub(crate) fn delta_diff_detail(
+    right: &ConnectionInfo,
+    tables: &[String],
+    strategy: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "right": right,
+        "tables": tables,
+        "strategy": strategy,
+    })
+}
+
+pub(crate) fn delta_diff_start_event(
+    left: &ConnectionInfo,
+    right: &ConnectionInfo,
+    tables: &[String],
+    strategy: &str,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::DeltaDiff,
+        left.clone(),
+        "delta_diff",
+        ActionClass::Meta,
+        Decision::Allow,
+    )
+    .with_detail(delta_diff_detail(right, tables, strategy))
+}
+
+pub(crate) fn delta_diff_outcome_event(
+    left: &ConnectionInfo,
+    right: &ConnectionInfo,
+    tables: &[String],
+    strategy: &str,
+    outcome: AuditOutcome,
+) -> DraftEvent {
+    let decision = if outcome.ok {
+        Decision::Allow
+    } else {
+        Decision::Error
+    };
+    DraftEvent::new(
+        Channel::DeltaDiff,
+        left.clone(),
+        "delta_diff",
+        ActionClass::Meta,
+        decision,
+    )
+    .with_detail(delta_diff_detail(right, tables, strategy))
+    .with_outcome(outcome)
 }
 
 // ─── dry-run 预检（§2.2/§12.2：仅元数据与键域探查，不执行比对）────────
@@ -708,6 +812,93 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
             Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
             None => "  key domain       : (unavailable)".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod audit_event_tests {
+    use super::{
+        delta_diff_outcome_event, delta_diff_start_event, ActionClass, AuditOutcome, Channel,
+        ConnectionInfo, Decision,
+    };
+
+    fn left() -> ConnectionInfo {
+        ConnectionInfo::from_url("dev", "mysql://u:p@127.0.0.1:3306/testdb", true)
+    }
+
+    fn right() -> ConnectionInfo {
+        ConnectionInfo::from_url(
+            "prod",
+            "oracle://scott:tiger@oracle.internal:1521/FREEPDB1",
+            true,
+        )
+    }
+
+    #[test]
+    fn start_event_has_delta_diff_channel_action_and_decision() {
+        let e = delta_diff_start_event(&left(), &right(), &["orders".into()], "hashdiff");
+        assert_eq!(e.channel, Channel::DeltaDiff);
+        assert_eq!(e.action, "delta_diff");
+        assert_eq!(e.class, ActionClass::Meta);
+        assert_eq!(e.decision, Decision::Allow);
+        assert!(e.outcome.is_none());
+    }
+
+    #[test]
+    fn start_event_records_left_connection_metadata() {
+        let e = delta_diff_start_event(&left(), &right(), &["orders".into()], "hashdiff");
+        assert_eq!(e.connection.name, "dev");
+        assert_eq!(e.connection.driver, "mysql");
+        assert_eq!(e.connection.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(e.connection.port, Some(3306));
+        assert_eq!(e.connection.database.as_deref(), Some("testdb"));
+        assert!(e.connection.read_only_session);
+    }
+
+    #[test]
+    fn start_event_records_right_connection_tables_and_strategy() {
+        let e = delta_diff_start_event(&left(), &right(), &["orders".into()], "keyeddiff");
+        assert!(e.sql.is_none(), "delta_diff has no SQL text");
+        let v = e.detail.expect("detail");
+        assert_eq!(v["right"]["name"], "prod");
+        assert_eq!(v["right"]["driver"], "oracle");
+        assert_eq!(v["right"]["database"], "FREEPDB1");
+        assert_eq!(v["tables"], serde_json::json!(["orders"]));
+        assert_eq!(v["strategy"], "keyeddiff");
+    }
+
+    #[test]
+    fn events_carry_no_diff_row_data() {
+        let tables = ["orders".to_string(), "items".to_string()];
+        let start = delta_diff_start_event(&left(), &right(), &tables, "hashdiff");
+        let outcome =
+            delta_diff_outcome_event(&left(), &right(), &tables, "hashdiff", AuditOutcome::ok(42));
+
+        let v = start.detail.as_ref().expect("start detail");
+        assert!(v.get("rows").is_none(), "must not record row payloads");
+        assert!(v.get("diffs").is_none(), "must not record diff rows");
+
+        let o = outcome.outcome.as_ref().expect("outcome");
+        assert!(o.ok);
+        assert_eq!(o.duration_ms, 42);
+        assert!(o.row_count.is_none());
+        assert!(o.rows_affected.is_none());
+    }
+
+    #[test]
+    fn error_outcome_is_not_ok_and_marks_decision_error() {
+        let event = delta_diff_outcome_event(
+            &left(),
+            &right(),
+            &["orders".into()],
+            "auto",
+            AuditOutcome::error(7, "delta_diff"),
+        );
+        assert_eq!(event.decision, Decision::Error);
+        let o = event.outcome.expect("outcome");
+        assert!(!o.ok);
+        assert_eq!(o.duration_ms, 7);
+        assert_eq!(o.error_kind.as_deref(), Some("delta_diff"));
     }
 }
 

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod audit;
 mod backend;
 mod cli;
 mod config;
@@ -66,6 +67,18 @@ struct Cli {
     /// Target connection name
     #[arg(long, global = true)]
     name: Option<String>,
+
+    /// Directory for the JSONL audit log (default: <data-dir>/hepta-dbcli/audit)
+    #[arg(long, global = true)]
+    audit_dir: Option<String>,
+
+    /// Also audit high-noise meta tools (list_tables, get_table_metadata, ...)
+    #[arg(long, global = true)]
+    audit_meta: bool,
+
+    /// Audit log retention in days (0 = keep forever)
+    #[arg(long, global = true, default_value_t = 30)]
+    audit_retention_days: u32,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -189,7 +202,11 @@ fn read_password_secure() -> Result<String, String> {
     }
 }
 
-fn handle_store_password(name: Option<String>, config_path: Option<String>) {
+fn handle_store_password(
+    name: Option<String>,
+    config_path: Option<String>,
+    audit: &audit::AuditSession,
+) {
     let password = read_password_secure().unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -254,10 +271,26 @@ fn handle_store_password(name: Option<String>, config_path: Option<String>) {
 
     let keyring_user = target.keyring_username(Some(&config_path));
 
+    // `--audit-meta`: record the action, never the password (issue #57 §5).
+    let record = |decision| {
+        if audit.meta_enabled() {
+            audit.record_best_effort(cli::action_event(
+                audit::event::Channel::Cli,
+                "store_password",
+                &target.name,
+                "",
+                audit::event::ActionClass::Meta,
+                decision,
+            ));
+        }
+    };
+
     if let Err(e) = store_keyring_password(&keyring_user, &password) {
+        record(audit::event::Decision::Error);
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
+    record(audit::event::Decision::Allow);
 
     println!(
         "Password stored in OS keychain for '{}' (connection: '{}').",
@@ -904,6 +937,7 @@ async fn handle_check_connection_cmd(
     verbose: bool,
     config_path: Option<PathBuf>,
     registry: &BackendRegistry,
+    audit: &audit::AuditSession,
 ) {
     let raw = read_config(config_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
@@ -937,6 +971,19 @@ async fn handle_check_connection_cmd(
             std::process::exit(1);
         })
     };
+
+    // `--audit-meta`: record the action (issue #57 §5). `check` never carries
+    // credentials; the probe output itself stays on the terminal.
+    if audit.meta_enabled() {
+        audit.record_best_effort(cli::action_event(
+            audit::event::Channel::Cli,
+            "check",
+            &resolved.name,
+            &resolved.connection_url,
+            audit::event::ActionClass::Meta,
+            audit::event::Decision::Allow,
+        ));
+    }
 
     handle_check_connection(&resolved, verbose, registry).await;
 }
@@ -1011,7 +1058,11 @@ fn create_registry() -> BackendRegistry {
 
 // ─── MCP Server ────────────────────────────────────────────────────────
 
-async fn run_mcp_server(config_path: Option<String>, registry: Arc<BackendRegistry>) {
+async fn run_mcp_server(
+    config_path: Option<String>,
+    registry: Arc<BackendRegistry>,
+    audit: Arc<audit::AuditSession>,
+) {
     let config_path_buf = config_path.map(PathBuf::from);
 
     let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
@@ -1035,7 +1086,12 @@ async fn run_mcp_server(config_path: Option<String>, registry: Arc<BackendRegist
     }
 
     let server = if !eager_entries.is_empty() && lazy_resolvers.is_empty() {
-        DbMcp::new(Arc::clone(&registry), eager_entries, default_name)
+        DbMcp::new(
+            Arc::clone(&registry),
+            eager_entries,
+            default_name,
+            Arc::clone(&audit),
+        )
     } else if !lazy_resolvers.is_empty() {
         let all_lazy = eager_entries
             .into_iter()
@@ -1049,9 +1105,15 @@ async fn run_mcp_server(config_path: Option<String>, registry: Arc<BackendRegist
             })
             .chain(lazy_resolvers)
             .collect();
-        DbMcp::new_with_lazy(Arc::clone(&registry), Vec::new(), all_lazy, default_name)
+        DbMcp::new_with_lazy(
+            Arc::clone(&registry),
+            Vec::new(),
+            all_lazy,
+            default_name,
+            Arc::clone(&audit),
+        )
     } else {
-        DbMcp::new_empty(Arc::clone(&registry), default_name)
+        DbMcp::new_empty(Arc::clone(&registry), default_name, Arc::clone(&audit))
     };
 
     let server = Arc::new(server);
@@ -1101,24 +1163,39 @@ async fn main() {
     let cli = Cli::parse();
     let registry = Arc::new(create_registry());
 
+    let audit_config = audit::AuditConfig {
+        dir: cli.audit_dir.as_deref().map(PathBuf::from),
+        // The ledger is not optional (issue #57 review). An unwritable
+        // directory degrades with a stderr warning; it is never switched off.
+        enabled: true,
+        fsync: false,
+        meta: cli.audit_meta,
+        retention_days: cli.audit_retention_days,
+    };
+
     match cli.command {
         None | Some(Commands::Mcp) => {
-            run_mcp_server(cli.config, Arc::clone(&registry)).await;
+            let audit = Arc::new(audit::AuditSession::new(&audit_config));
+            run_mcp_server(cli.config, Arc::clone(&registry), audit).await;
         }
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);
-            handle_check_connection_cmd(cli.name, verbose, config_path, &registry).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit).await;
         }
         Some(Commands::StorePassword {}) => {
-            handle_store_password(cli.name, cli.config);
+            let audit = audit::AuditSession::new(&audit_config);
+            handle_store_password(cli.name, cli.config, &audit);
         }
         Some(Commands::DeltaDiff { args }) => {
-            let code = delta_diff::run(*args, cli.config).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            let code = delta_diff::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]
         Some(Commands::Synth { args }) => {
-            let code = synth::run(*args, cli.config).await;
+            let audit = audit::AuditSession::new(&audit_config);
+            let code = synth::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         Some(Commands::Cli {
@@ -1135,7 +1212,9 @@ async fn main() {
         }) => {
             if check_connection {
                 let config_path = cli.config.map(PathBuf::from);
-                handle_check_connection_cmd(cli.name, verbose, config_path, &registry).await;
+                let audit = audit::AuditSession::new(&audit_config);
+                handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit)
+                    .await;
             } else if interactive {
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {
@@ -1149,7 +1228,8 @@ async fn main() {
                     no_history,
                     timeout_action,
                 };
-                if let Err(e) = interactive::run_interactive(args, &registry).await {
+                let audit = audit::AuditSession::new(&audit_config);
+                if let Err(e) = interactive::run_interactive(args, &registry, &audit).await {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
@@ -1166,7 +1246,8 @@ async fn main() {
                     no_history,
                     timeout_action,
                 };
-                if let Err(e) = cli::run_cli(args, &registry).await {
+                let audit = audit::AuditSession::new(&audit_config);
+                if let Err(e) = cli::run_cli(args, &registry, &audit).await {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }

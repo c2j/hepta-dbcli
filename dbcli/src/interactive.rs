@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
@@ -12,10 +13,18 @@ use rustyline_derive::{Completer, Helper, Hinter};
 
 use tracing::{info, warn};
 
+use crate::audit::event::{
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision,
+    DraftEvent, SqlInfo,
+};
+use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 use crate::cli::QueryResult;
-use crate::cli::{execute_query, render_result, CliArgs, OutputFormat};
+use crate::cli::{
+    classify_query_error, execute_query_typed, is_read_only_query, render_result, CliArgs,
+    OutputFormat,
+};
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
     rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
@@ -480,7 +489,18 @@ async fn connect(
     target: &crate::config::ResolvedConnection,
     effective_timeout: &TimeoutConfig,
     registry: &BackendRegistry,
+    audit: &crate::audit::AuditSession,
 ) -> Result<Box<dyn DbConn + Send>, String> {
+    let connect_event = |decision: crate::audit::event::Decision| {
+        crate::cli::action_event(
+            crate::audit::event::Channel::Repl,
+            "connect",
+            &target.name,
+            &target.connection_url,
+            crate::audit::event::ActionClass::Admin,
+            decision,
+        )
+    };
     let scheme = target
         .connection_url
         .find("://")
@@ -489,12 +509,16 @@ async fn connect(
     let pool = registry
         .connect_with_fallback(scheme, &target.connection_url, Some(effective_timeout))
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        .map_err(|e| {
+            audit.record_best_effort(connect_event(crate::audit::event::Decision::Error));
+            format!("Connection failed: {}", e)
+        })?;
 
-    let conn = pool
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire connection: {}", e))?;
+    let conn = pool.acquire().await.map_err(|e| {
+        audit.record_best_effort(connect_event(crate::audit::event::Decision::Error));
+        format!("Failed to acquire connection: {}", e)
+    })?;
+    audit.record_best_effort(connect_event(crate::audit::event::Decision::Allow));
 
     if let (Some(path), Some(plaintext)) = (&target.config_path, &target.plaintext_password) {
         info!(
@@ -524,9 +548,62 @@ async fn connect(
     Ok(conn)
 }
 
+// ─── REPL audit helpers (pure, unit-tested) ─────────────────────────
+
+fn repl_sql_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    row_count: u64,
+) -> DraftEvent {
+    let class = if is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
+    DraftEvent::new(
+        Channel::Repl,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "repl_sql",
+        class,
+        Decision::Allow,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(AuditOutcome::ok(duration_ms).with_row_count(row_count))
+}
+
+fn repl_sql_error_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    error_kind: &str,
+    sqlstate: Option<&str>,
+) -> DraftEvent {
+    let class = if is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
+    DraftEvent::new(
+        Channel::Repl,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "repl_sql",
+        class,
+        Decision::Error,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(match sqlstate {
+        Some(state) => AuditOutcome::error(duration_ms, error_kind).with_sqlstate(state),
+        None => AuditOutcome::error(duration_ms, error_kind),
+    })
+}
+
 pub(crate) async fn run_interactive(
     args: CliArgs,
     registry: &BackendRegistry,
+    audit: &AuditSession,
 ) -> Result<(), String> {
     let raw = read_config(args.config_path.map(PathBuf::from))?;
 
@@ -536,7 +613,7 @@ pub(crate) async fn run_interactive(
         args.statement_timeout.as_deref(),
         args.connection_max_lifetime.as_deref(),
     )?;
-    let mut conn = connect(&target, &effective_timeout, registry).await?;
+    let mut conn = connect(&target, &effective_timeout, registry, audit).await?;
 
     let mut rl = Editor::<SqlHelper, DefaultHistory>::new()
         .map_err(|e| format!("failed to init editor: {}", e))?;
@@ -615,7 +692,7 @@ pub(crate) async fn run_interactive(
                 args.connection_max_lifetime.as_deref(),
             ) {
                 Ok((new_target, new_timeout)) => {
-                    match connect(&new_target, &new_timeout, registry).await {
+                    match connect(&new_target, &new_timeout, registry, audit).await {
                         Ok(new_conn) => {
                             // Save history for old connection
                             if target.name != new_target.name {
@@ -677,7 +754,29 @@ pub(crate) async fn run_interactive(
             conn.dialect().supports_dollar_quote(),
         );
         for stmt in &split.complete {
-            let query_result = execute_query(&mut *conn, stmt).await;
+            let start = Instant::now();
+            let query_result = execute_query_typed(&mut *conn, stmt).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &query_result {
+                Ok(qr) => audit.record_best_effort(repl_sql_event(
+                    &target.name,
+                    &target.connection_url,
+                    stmt,
+                    duration_ms,
+                    qr.row_count as u64,
+                )),
+                Err(e) => {
+                    let (error_kind, sqlstate) = classify_query_error(e);
+                    audit.record_best_effort(repl_sql_error_event(
+                        &target.name,
+                        &target.connection_url,
+                        stmt,
+                        duration_ms,
+                        &error_kind,
+                        sqlstate.as_deref(),
+                    ))
+                }
+            }
             match query_result {
                 Ok(query_result) => {
                     last_result = Some(query_result.clone());
@@ -704,7 +803,7 @@ pub(crate) async fn run_interactive(
                         if let Some(kill_sql) = conn.dialect().kill_own_connection_sql() {
                             let _ = conn.query_drop(&kill_sql).await;
                         }
-                        match connect(&target, &effective_timeout, registry).await {
+                        match connect(&target, &effective_timeout, registry, audit).await {
                             Ok(new_conn) => {
                                 conn = new_conn;
                             }
@@ -858,5 +957,29 @@ mod tests {
         let r = SqlTokenizer::split_statements(sql, '`', true, false);
         assert_eq!(r.complete, vec!["SELECT $1, $2"]);
         assert_eq!(r.remainder, "");
+    }
+
+    #[test]
+    fn repl_sql_event_records_channel_and_outcome() {
+        let ev = repl_sql_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", 5, 3);
+        assert_eq!(ev.channel, Channel::Repl);
+        assert_eq!(ev.action, "repl_sql");
+        assert_eq!(ev.class, ActionClass::Dql);
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.row_count, Some(3));
+
+        let err = repl_sql_error_event(
+            "dev",
+            "mysql://u:p@h:3306/db",
+            "SELECT 1",
+            5,
+            "QueryFailed",
+            Some("25006"),
+        );
+        assert_eq!(err.decision, Decision::Error);
+        let outcome = err.outcome.as_ref().unwrap();
+        assert_eq!(outcome.error_kind.as_deref(), Some("QueryFailed"));
+        assert_eq!(outcome.sqlstate.as_deref(), Some("25006"));
     }
 }

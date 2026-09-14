@@ -1,6 +1,7 @@
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ErrorData as McpError},
+    service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router, ServerHandler,
 };
 use serde_json::{json, Value};
@@ -10,8 +11,14 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
+use crate::audit::event::{
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision,
+    DraftEvent, SqlInfo,
+};
+use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::{BackendFactory, DbConn, DbPool};
+use crate::cli::classify_query_error;
 
 pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
@@ -197,6 +204,9 @@ pub struct DbMcp {
     registry: Arc<BackendRegistry>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     default_name: String,
+    audit: Arc<AuditSession>,
+    /// MCP client name reported by `initialize`, when the client sent one.
+    client: std::sync::Mutex<Option<String>>,
 }
 
 impl DbMcp {
@@ -204,6 +214,7 @@ impl DbMcp {
         registry: Arc<BackendRegistry>,
         entries: Vec<(String, Option<String>)>,
         default_name: String,
+        audit: Arc<AuditSession>,
     ) -> Self {
         let mut connections = HashMap::new();
         for (name, url_opt) in entries {
@@ -215,6 +226,8 @@ impl DbMcp {
             registry,
             connections: Arc::new(Mutex::new(connections)),
             default_name,
+            audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -223,6 +236,7 @@ impl DbMcp {
         eager: Vec<(String, String)>,
         lazy: Vec<(String, ResolveFn)>,
         default_name: String,
+        audit: Arc<AuditSession>,
     ) -> Self {
         let mut connections = HashMap::new();
         for (name, url) in eager {
@@ -235,14 +249,22 @@ impl DbMcp {
             registry,
             connections: Arc::new(Mutex::new(connections)),
             default_name,
+            audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
-    pub fn new_empty(registry: Arc<BackendRegistry>, default_name: String) -> Self {
+    pub fn new_empty(
+        registry: Arc<BackendRegistry>,
+        default_name: String,
+        audit: Arc<AuditSession>,
+    ) -> Self {
         Self {
             registry,
             connections: Arc::new(Mutex::new(HashMap::new())),
             default_name,
+            audit,
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -297,6 +319,7 @@ impl DbMcp {
                         Ok(conn) => Ok((pool, conn)),
                         Err(e) => {
                             error!("failed to get connection from pool for '{}': {}", name, e);
+                            self.record(connect_event(&name, &url, Decision::Error));
                             Err(connection_error(&url, &e.to_string()))
                         }
                     };
@@ -305,6 +328,8 @@ impl DbMcp {
                     let resolver = Arc::clone(resolver);
                     drop(conns);
                     let url = resolver().map_err(|e| {
+                        self.audit
+                            .record_best_effort(connect_event(&name, "", Decision::Error));
                         McpError::internal_error(
                             format!(
                                 "Failed to resolve database credentials for '{}': {}",
@@ -326,6 +351,8 @@ impl DbMcp {
                 | Some(ConnectionState::Unavailable(url)) => (url.clone(), true),
                 None => {
                     let available: Vec<&String> = conns.keys().collect();
+                    self.audit
+                        .record_best_effort(connect_event(&name, "", Decision::Error));
                     return Err(McpError::invalid_request(
                         "unknown_connection",
                         Some(json!({
@@ -359,10 +386,16 @@ impl DbMcp {
             .registry
             .connect_with_fallback(scheme, url, None)
             .await
-            .map_err(|e| connection_error(url, &e))?;
+            .map_err(|e| {
+                self.audit
+                    .record_best_effort(connect_event(name, url, Decision::Error));
+                connection_error(url, &e)
+            })?;
 
         let conn = pool.acquire().await.map_err(|e| {
             let chain = format_error_chain(&e);
+            self.audit
+                .record_best_effort(connect_event(name, url, Decision::Error));
             connection_error(url, &chain)
         })?;
 
@@ -377,10 +410,142 @@ impl DbMcp {
         let mut conns = self.connections.lock().await;
         conns.insert(name.to_string(), ConnectionState::Connected(active));
 
+        self.audit
+            .record_best_effort(connect_event(name, url, Decision::Allow));
+
         Ok((pool, conn))
+    }
+
+    /// Record an audit event, stamped with the MCP client name when the
+    /// client reported one (issue #57 §5 `actor.client`).
+    fn record(&self, event: DraftEvent) {
+        let event = match self.client_name() {
+            Some(name) => event.with_client(name),
+            None => event,
+        };
+        self.audit.record_best_effort(event);
+    }
+
+    fn client_name(&self) -> Option<String> {
+        match self.client.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Record a meta tool event only when `--audit-meta` is on.
+    fn record_meta(&self, name: &str, url: &str, action: &str, decision: Decision) {
+        if self.audit.meta_enabled() {
+            self.audit
+                .record_best_effort(meta_event(name, url, action, decision));
+        }
     }
 }
 
+// ─── Audit event builders (pure, unit-tested without a database) ─────
+
+fn execute_query_denied_event(conn_name: &str, url: &str, sql: &str) -> DraftEvent {
+    // The gate rejects anything that is not read-only, so the denied statement
+    // is normally DML/DDL; classify it instead of claiming it was a query.
+    let class = if crate::cli::is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "execute_query",
+        class,
+        Decision::Deny,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_deny_reason("prefix")
+}
+
+fn execute_query_allowed_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    row_count: u64,
+    limit_applied: bool,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "execute_query",
+        ActionClass::Dql,
+        Decision::Allow,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(AuditOutcome::ok(duration_ms).with_row_count(row_count))
+    .with_limit_applied(limit_applied)
+}
+
+fn execute_query_error_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    error_kind: &str,
+    sqlstate: Option<&str>,
+) -> DraftEvent {
+    let mut outcome = AuditOutcome::error(duration_ms, error_kind);
+    if let Some(state) = sqlstate {
+        outcome = outcome.with_sqlstate(state);
+    }
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "execute_query",
+        ActionClass::Dql,
+        Decision::Error,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(outcome)
+}
+
+fn get_execution_plan_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    analyze: bool,
+    decision: Decision,
+) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "get_execution_plan",
+        ActionClass::Dql,
+        decision,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_analyze(analyze)
+}
+
+fn connect_event(conn_name: &str, url: &str, decision: Decision) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "connect",
+        ActionClass::Admin,
+        decision,
+    )
+}
+
+fn meta_event(conn_name: &str, url: &str, action: &str, decision: Decision) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Mcp,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        action,
+        ActionClass::Meta,
+        decision,
+    )
+}
+
+/// Map a [`DbError`] to `(error_kind, sqlstate)`. SQLSTATE is only available
+/// when the driver surfaces one (e.g. GaussDB's `[SQLSTATE 42P01]` message).
 // ─── Tool Implementations ───────────────────────────────────────────
 
 #[tool_router]
@@ -394,17 +559,25 @@ impl DbMcp {
             "tool called: get_database_info connection={}",
             params.connection_name.as_deref().unwrap_or("(default)")
         );
-        let (_pool, mut conn) = self
-            .get_connection(params.connection_name.as_deref())
-            .await?;
+        let name = params
+            .connection_name
+            .as_deref()
+            .unwrap_or(&self.default_name)
+            .to_string();
+        let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
+        let url = self.connection_url_of(&name).await;
 
         let sql = { conn.dialect().database_info().to_string() };
-        let result = conn
-            .query(&sql)
-            .await
-            .map_err(|e| query_error("get_database_info", &sql, &e.to_string()))?;
+        let result = match conn.query(&sql).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_meta(&name, &url, "get_database_info", Decision::Error);
+                return Err(query_error("get_database_info", &sql, &e.to_string()));
+            }
+        };
 
         if result.rows.is_empty() {
+            self.record_meta(&name, &url, "get_database_info", Decision::Error);
             return Err(McpError::internal_error(
                 "get_database_info returned no rows",
                 None,
@@ -424,6 +597,7 @@ impl DbMcp {
             "version_comment": col_str(row, 8),
         });
 
+        self.record_meta(&name, &url, "get_database_info", Decision::Allow);
         Ok(CallToolResult::success(vec![Content::text(
             output.to_string(),
         )]))
@@ -438,15 +612,22 @@ impl DbMcp {
             "tool called: list_tables connection={}",
             params.connection_name.as_deref().unwrap_or("(default)")
         );
-        let (_pool, mut conn) = self
-            .get_connection(params.connection_name.as_deref())
-            .await?;
+        let name = params
+            .connection_name
+            .as_deref()
+            .unwrap_or(&self.default_name)
+            .to_string();
+        let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
+        let url = self.connection_url_of(&name).await;
 
         let sql = { conn.dialect().list_tables().to_string() };
-        let result = conn
-            .query(&sql)
-            .await
-            .map_err(|e| query_error("list_tables", &sql, &e.to_string()))?;
+        let result = match conn.query(&sql).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_meta(&name, &url, "list_tables", Decision::Error);
+                return Err(query_error("list_tables", &sql, &e.to_string()));
+            }
+        };
 
         let tables: Vec<serde_json::Value> = result
             .rows
@@ -464,6 +645,7 @@ impl DbMcp {
             })
             .collect();
 
+        self.record_meta(&name, &url, "list_tables", Decision::Allow);
         Ok(CallToolResult::success(vec![Content::text(
             json!(tables).to_string(),
         )]))
@@ -482,12 +664,16 @@ impl DbMcp {
             table,
             params.connection_name.as_deref().unwrap_or("(default)")
         );
-        let (_pool, mut conn) = self
-            .get_connection(params.connection_name.as_deref())
-            .await?;
+        let name = params
+            .connection_name
+            .as_deref()
+            .unwrap_or(&self.default_name)
+            .to_string();
+        let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
+        let url = self.connection_url_of(&name).await;
 
         let sql = { conn.dialect().table_columns().to_string() };
-        let col_result = conn
+        let col_result = match conn
             .exec(
                 &sql,
                 &[
@@ -496,7 +682,17 @@ impl DbMcp {
                 ],
             )
             .await
-            .map_err(|e| query_error("get_table_metadata (columns)", &sql, &e.to_string()))?;
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_meta(&name, &url, "get_table_metadata", Decision::Error);
+                return Err(query_error(
+                    "get_table_metadata (columns)",
+                    &sql,
+                    &e.to_string(),
+                ));
+            }
+        };
 
         let columns: Vec<serde_json::Value> = col_result
             .rows
@@ -515,7 +711,7 @@ impl DbMcp {
             .collect();
 
         let idx_sql = { conn.dialect().table_indexes().to_string() };
-        let idx_result = conn
+        let idx_result = match conn
             .exec(
                 &idx_sql,
                 &[
@@ -524,7 +720,17 @@ impl DbMcp {
                 ],
             )
             .await
-            .map_err(|e| query_error("get_table_metadata (indexes)", &idx_sql, &e.to_string()))?;
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_meta(&name, &url, "get_table_metadata", Decision::Error);
+                return Err(query_error(
+                    "get_table_metadata (indexes)",
+                    &idx_sql,
+                    &e.to_string(),
+                ));
+            }
+        };
 
         let indexes: Vec<serde_json::Value> = idx_result
             .rows
@@ -541,6 +747,7 @@ impl DbMcp {
             .collect();
 
         let result = json!({ "columns": columns, "indexes": indexes });
+        self.record_meta(&name, &url, "get_table_metadata", Decision::Allow);
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),
         )]))
@@ -558,9 +765,13 @@ impl DbMcp {
             params.connection_name.as_deref().unwrap_or("(default)")
         );
 
-        let (_pool, mut conn) = self
-            .get_connection(params.connection_name.as_deref())
-            .await?;
+        let name = params
+            .connection_name
+            .as_deref()
+            .unwrap_or(&self.default_name)
+            .to_string();
+        let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
+        let url = self.connection_url_of(&name).await;
 
         let read_only_prefixes = conn.dialect().read_only_prefixes();
         if !crate::cli::is_read_only_mcp(trimmed, read_only_prefixes) {
@@ -568,6 +779,8 @@ impl DbMcp {
                 "execute_query rejected non-SELECT query: {:?}",
                 &trimmed[..trimmed.len().min(80)]
             );
+            self.audit
+                .record_best_effort(execute_query_denied_event(&name, &url, trimmed));
             return Err(McpError::invalid_request(
                 "invalid_query",
                 Some(json!({
@@ -587,11 +800,34 @@ impl DbMcp {
 
         let max_rows = params.max_rows.unwrap_or(1000).clamp(1, 10000);
         let sql_to_execute = conn.dialect().add_limit(trimmed, max_rows);
+        let limit_applied = sql_to_execute != trimmed;
 
-        let result = conn
-            .query(&sql_to_execute)
-            .await
-            .map_err(|e| query_error("execute_query", trimmed, &e.to_string()))?;
+        let start = Instant::now();
+        let result = match conn.query(&sql_to_execute).await {
+            Ok(result) => result,
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let (error_kind, sqlstate) = classify_query_error(&e);
+                self.record(execute_query_error_event(
+                    &name,
+                    &url,
+                    trimmed,
+                    duration_ms,
+                    &error_kind,
+                    sqlstate.as_deref(),
+                ));
+                return Err(query_error("execute_query", trimmed, &e.to_string()));
+            }
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        self.record(execute_query_allowed_event(
+            &name,
+            &url,
+            trimmed,
+            duration_ms,
+            result.row_count as u64,
+            limit_applied,
+        ));
 
         if result.rows.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -635,9 +871,13 @@ impl DbMcp {
             params.connection_name.as_deref().unwrap_or("(default)")
         );
 
-        let (_pool, mut conn) = self
-            .get_connection(params.connection_name.as_deref())
-            .await?;
+        let name = params
+            .connection_name
+            .as_deref()
+            .unwrap_or(&self.default_name)
+            .to_string();
+        let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
+        let url = self.connection_url_of(&name).await;
 
         if let Some(timeout_ms) = params.timeout_ms {
             if let Some(set_sql) = conn.dialect().set_statement_timeout_sql(timeout_ms) {
@@ -649,10 +889,31 @@ impl DbMcp {
         let fmt = params.format.as_deref().unwrap_or("TEXT");
         let explain_sql = conn.dialect().build_explain(&params.sql, analyze, fmt);
 
-        let result = conn
-            .query(&explain_sql)
-            .await
-            .map_err(|e| query_error("get_execution_plan", &explain_sql, &e.to_string()))?;
+        let result = match conn.query(&explain_sql).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.record(get_execution_plan_event(
+                    &name,
+                    &url,
+                    &params.sql,
+                    analyze,
+                    Decision::Error,
+                ));
+                return Err(query_error(
+                    "get_execution_plan",
+                    &explain_sql,
+                    &e.to_string(),
+                ));
+            }
+        };
+
+        self.record(get_execution_plan_event(
+            &name,
+            &url,
+            &params.sql,
+            analyze,
+            Decision::Allow,
+        ));
 
         let plan: String = result
             .rows
@@ -697,6 +958,7 @@ impl DbMcp {
             "default_connection": self.default_name,
         });
 
+        self.record_meta(&self.default_name, "", "list_connections", Decision::Allow);
         Ok(CallToolResult::success(vec![Content::text(
             result.to_string(),
         )]))
@@ -755,7 +1017,47 @@ impl DbMcp {
                 .unwrap_or_else(|| params.table.clone()),
             connection_url: rurl,
         };
-        match crate::delta_diff::api::run_diff(left, right, opts).await {
+        let left_info = ConnectionInfo::from_url(
+            &left.name,
+            &left.connection_url,
+            read_only_session_for(&left.connection_url),
+        );
+        let right_info = ConnectionInfo::from_url(
+            &right.name,
+            &right.connection_url,
+            read_only_session_for(&right.connection_url),
+        );
+        let tables = vec![left.table.clone(), right.table.clone()];
+        let strategy = params
+            .strategy
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        self.audit
+            .record_best_effort(crate::delta_diff::delta_diff_start_event(
+                &left_info,
+                &right_info,
+                &tables,
+                &strategy,
+            ));
+
+        let started = Instant::now();
+        let diff_result = crate::delta_diff::api::run_diff(left, right, opts).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let outcome = if diff_result.is_ok() {
+            AuditOutcome::ok(duration_ms)
+        } else {
+            AuditOutcome::error(duration_ms, "delta_diff")
+        };
+        self.audit
+            .record_best_effort(crate::delta_diff::delta_diff_outcome_event(
+                &left_info,
+                &right_info,
+                &tables,
+                &strategy,
+                outcome,
+            ));
+
+        match diff_result {
             Ok(mut report) => {
                 let mut export_path = None;
                 if let (Some(path), Some(fmt)) = (params.export.as_deref(), export_plan) {
@@ -812,7 +1114,21 @@ impl DbMcp {
     version = "0.5.0",
     instructions = "MCP server for MySQL/PolarDB-X/Oracle/GaussDB/DuckDB database introspection with multi-connection support"
 )]
-impl ServerHandler for DbMcp {}
+impl ServerHandler for DbMcp {
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Some(info) = context.peer.peer_info() {
+            debug!(
+                "MCP client initialized: {} {}",
+                info.client_info.name, info.client_info.version
+            );
+            let name = info.client_info.name.clone();
+            match self.client.lock() {
+                Ok(mut guard) => *guard = Some(name),
+                Err(poisoned) => *poisoned.into_inner() = Some(name),
+            }
+        }
+    }
+}
 
 fn parse_delta_diff_strategy(
     raw: Option<&str>,
@@ -1047,5 +1363,140 @@ mod delta_diff_mcp_plan_tests {
             parse_mcp_export_format(Some("out.csv"), Some("jsonl")).unwrap(),
             Some(ExportFormat::Jsonl)
         );
+    }
+}
+
+#[cfg(test)]
+mod client_stamp_tests {
+    use super::*;
+    use crate::audit::{AuditConfig, AuditSession};
+
+    fn session(dir: &std::path::Path) -> Arc<AuditSession> {
+        Arc::new(AuditSession::new(&AuditConfig {
+            dir: Some(dir.to_path_buf()),
+            enabled: true,
+            fsync: false,
+            meta: false,
+            retention_days: 0,
+        }))
+    }
+
+    fn recorded(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("audit dir") {
+            let path = entry.expect("entry").path();
+            let contents = std::fs::read_to_string(path).expect("read audit file");
+            for line in contents.lines() {
+                events.push(serde_json::from_str::<serde_json::Value>(line).expect("json line"));
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn should_stamp_actor_client_from_the_mcp_client_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = session(&dir.path().join("audit"));
+        let server = DbMcp::new_empty(
+            Arc::new(BackendRegistry::new()),
+            "default".to_string(),
+            Arc::clone(&audit),
+        );
+
+        // Before initialize: no client to report, so the field is omitted.
+        server.record(connect_event("c", "mysql://u:p@h:3306/db", Decision::Allow));
+
+        match server.client.lock() {
+            Ok(mut guard) => *guard = Some("opencode".to_string()),
+            Err(poisoned) => *poisoned.into_inner() = Some("opencode".to_string()),
+        }
+        server.record(connect_event("c", "mysql://u:p@h:3306/db", Decision::Allow));
+
+        let events = recorded(&dir.path().join("audit"));
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0]["actor"].get("client").is_none(),
+            "unknown client must be omitted, not invented"
+        );
+        assert_eq!(events[1]["actor"]["client"], "opencode");
+    }
+}
+
+#[cfg(test)]
+mod audit_event_builder_tests {
+    use super::*;
+    use crate::backend::DbError;
+    use crate::cli::extract_sqlstate;
+
+    #[test]
+    fn deny_event_carries_full_multi_kb_sql_and_prefix_reason() {
+        let sql = format!("INSERT INTO t VALUES ('{}')", "x".repeat(5000));
+        let ev = execute_query_denied_event("dev", "mysql://u:p@h:3306/db", &sql);
+        assert_eq!(ev.decision, Decision::Deny);
+        assert_eq!(ev.deny_reason.as_deref(), Some("prefix"));
+        assert_eq!(ev.action, "execute_query");
+        assert_eq!(ev.class, ActionClass::Dml, "denied INSERT is not a query");
+        let info = ev.sql.as_ref().unwrap();
+        assert!(!info.truncated);
+        assert_eq!(info.text.as_str(), sql.as_str());
+        assert!(
+            info.text.len() > 80,
+            "must carry full SQL, not an 80-char preview"
+        );
+    }
+
+    #[test]
+    fn allow_event_has_outcome_row_count_and_limit_flag() {
+        let ev =
+            execute_query_allowed_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", 42, 7, true);
+        assert_eq!(ev.decision, Decision::Allow);
+        assert_eq!(ev.class, ActionClass::Dql);
+        assert_eq!(ev.limit_applied, Some(true));
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.duration_ms, 42);
+        assert_eq!(outcome.row_count, Some(7));
+    }
+
+    #[test]
+    fn connect_event_read_only_session_per_driver() {
+        assert!(
+            connect_event("g", "gaussdb://u:p@h:5432/db", Decision::Allow)
+                .connection
+                .read_only_session
+        );
+        assert!(
+            !connect_event("m", "mysql://u:p@h:3306/db", Decision::Allow)
+                .connection
+                .read_only_session
+        );
+        assert!(
+            !connect_event("o", "oracle://u:p@h:1521/F", Decision::Allow)
+                .connection
+                .read_only_session
+        );
+        assert!(
+            connect_event("d", "duckdb:///x.db?mode=ro", Decision::Allow)
+                .connection
+                .read_only_session
+        );
+    }
+
+    #[test]
+    fn extract_sqlstate_parses_driver_code() {
+        assert_eq!(
+            extract_sqlstate("GaussDB query failed: [SQLSTATE 42P01] relation does not exist")
+                .as_deref(),
+            Some("42P01")
+        );
+        assert_eq!(extract_sqlstate("no code here"), None);
+    }
+
+    #[test]
+    fn classify_query_error_returns_kind_and_sqlstate() {
+        let err = DbError::query("boom [SQLSTATE 23505]");
+        let (kind, sqlstate) = classify_query_error(&err);
+        assert_eq!(kind, "QueryFailed");
+        assert_eq!(sqlstate.as_deref(), Some("23505"));
     }
 }

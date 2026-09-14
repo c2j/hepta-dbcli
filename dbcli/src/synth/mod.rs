@@ -29,12 +29,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "synth")]
+use crate::audit::event::{
+    ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision, DraftEvent,
+};
+
+#[cfg(feature = "synth")]
 const EXIT_OK: i32 = 0;
 #[cfg(feature = "synth")]
 const EXIT_ERROR: i32 = 1;
 
 #[cfg(feature = "synth")]
-pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
+pub async fn run(
+    args: cmd::SynthArgs,
+    config_path: Option<String>,
+    audit: &crate::audit::AuditSession,
+) -> i32 {
+    let (subcommand, detail) = synth_subcommand_detail(&args.command);
+    audit.record_best_effort(synth_start_event(&subcommand, &detail));
+
+    let started = std::time::Instant::now();
     let code = match args.command {
         cmd::SynthCommand::Train {
             name,
@@ -89,6 +102,13 @@ pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
         ),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let outcome = match &code {
+        Ok(()) => AuditOutcome::ok(duration_ms),
+        Err(_) => AuditOutcome::error(duration_ms, "synth"),
+    };
+    audit.record_best_effort(synth_outcome_event(&subcommand, &detail, outcome));
 
     match code {
         Ok(()) => EXIT_OK,
@@ -97,6 +117,81 @@ pub async fn run(args: cmd::SynthArgs, config_path: Option<String>) -> i32 {
             EXIT_ERROR
         }
     }
+}
+
+// ─── Audit event builders (issue #57) ────────────────────────────────────
+
+/// Map a subcommand to its audit (subcommand, detail) pair. The detail holds
+/// only metadata (table names / rules path / model name); generated rows are
+/// never recorded.
+#[cfg(feature = "synth")]
+fn synth_subcommand_detail(command: &cmd::SynthCommand) -> (String, String) {
+    match command {
+        cmd::SynthCommand::Train { tables, .. } => {
+            ("train".to_string(), format!("tables={tables}"))
+        }
+        cmd::SynthCommand::RulesDraft { tables, output, .. } => (
+            "rules-draft".to_string(),
+            format!("rules={output}; tables={tables}"),
+        ),
+        cmd::SynthCommand::Generate { models, rules, .. } => (
+            "generate".to_string(),
+            format!("models={models}; rules={rules}"),
+        ),
+        cmd::SynthCommand::Validate { model } => ("validate".to_string(), format!("model={model}")),
+    }
+}
+
+/// Synth operates on local files/models, not a database session.
+#[cfg(feature = "synth")]
+fn synth_connection() -> ConnectionInfo {
+    ConnectionInfo {
+        name: "(local)".to_string(),
+        driver: "none".to_string(),
+        user: None,
+        host: None,
+        port: None,
+        database: None,
+        read_only_session: true,
+    }
+}
+
+/// Action-specific context for a `synth` event: the subcommand plus metadata
+/// only (table names / rules path / model name). Generated rows are never
+/// recorded.
+#[cfg(feature = "synth")]
+fn synth_detail(subcommand: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({ "subcommand": subcommand, "detail": detail })
+}
+
+#[cfg(feature = "synth")]
+fn synth_start_event(subcommand: &str, detail: &str) -> DraftEvent {
+    DraftEvent::new(
+        Channel::Synth,
+        synth_connection(),
+        "synth",
+        ActionClass::Meta,
+        Decision::Allow,
+    )
+    .with_detail(synth_detail(subcommand, detail))
+}
+
+#[cfg(feature = "synth")]
+fn synth_outcome_event(subcommand: &str, detail: &str, outcome: AuditOutcome) -> DraftEvent {
+    let decision = if outcome.ok {
+        Decision::Allow
+    } else {
+        Decision::Error
+    };
+    DraftEvent::new(
+        Channel::Synth,
+        synth_connection(),
+        "synth",
+        ActionClass::Meta,
+        decision,
+    )
+    .with_detail(synth_detail(subcommand, detail))
+    .with_outcome(outcome)
 }
 
 #[cfg(feature = "synth")]
@@ -283,5 +378,96 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert!(split_tables(" , ").is_empty());
+    }
+
+    #[test]
+    fn synth_subcommand_detail_maps_every_variant() {
+        use cmd::SynthCommand;
+        assert_eq!(
+            synth_subcommand_detail(&SynthCommand::Train {
+                name: None,
+                tables: "users,orders".to_string(),
+                schema: None,
+                output: ".synth".to_string(),
+                sample: 1000,
+            }),
+            ("train".to_string(), "tables=users,orders".to_string())
+        );
+        assert_eq!(
+            synth_subcommand_detail(&SynthCommand::RulesDraft {
+                name: None,
+                tables: "orders".to_string(),
+                schema: None,
+                output: "rules.yaml".to_string(),
+                models: ".synth".to_string(),
+            }),
+            (
+                "rules-draft".to_string(),
+                "rules=rules.yaml; tables=orders".to_string()
+            )
+        );
+        assert_eq!(
+            synth_subcommand_detail(&SynthCommand::Generate {
+                models: "m".to_string(),
+                rules: "r.yaml".to_string(),
+                output: "out".to_string(),
+                rows: None,
+                seed: None,
+                format: "csv".to_string(),
+                enforce_min_max_values: true,
+            }),
+            ("generate".to_string(), "models=m; rules=r.yaml".to_string())
+        );
+        assert_eq!(
+            synth_subcommand_detail(&SynthCommand::Validate {
+                model: "m.model.json".to_string()
+            }),
+            ("validate".to_string(), "model=m.model.json".to_string())
+        );
+    }
+
+    #[test]
+    fn synth_start_event_has_channel_action_and_decision() {
+        let e = synth_start_event("train", "tables=users");
+        assert_eq!(e.channel, Channel::Synth);
+        assert_eq!(e.action, "synth");
+        assert_eq!(e.class, ActionClass::Meta);
+        assert_eq!(e.decision, Decision::Allow);
+        assert_eq!(e.connection.name, "(local)");
+        assert!(e.outcome.is_none());
+    }
+
+    #[test]
+    fn synth_start_event_records_subcommand_and_detail() {
+        let e = synth_start_event("generate", "models=m; rules=r.yaml");
+        assert!(e.sql.is_none(), "synth has no SQL text");
+        let v = e.detail.expect("detail");
+        assert_eq!(v["subcommand"], "generate");
+        assert_eq!(v["detail"], "models=m; rules=r.yaml");
+    }
+
+    #[test]
+    fn synth_outcome_records_duration_without_rows() {
+        let e = synth_outcome_event("generate", "models=m; rules=r.yaml", AuditOutcome::ok(7));
+        let o = e.outcome.expect("outcome");
+        assert!(o.ok);
+        assert_eq!(o.duration_ms, 7);
+        assert!(o.row_count.is_none());
+        assert!(o.rows_affected.is_none());
+    }
+
+    #[test]
+    fn synth_events_never_record_generated_rows() {
+        let start = synth_start_event("generate", "models=m; rules=r.yaml");
+        let v = start.detail.expect("detail");
+        let text = v.to_string();
+        assert!(text.len() < 512, "detail must stay metadata-only");
+        assert!(!text.contains("row"), "must not record generated rows");
+    }
+
+    #[test]
+    fn synth_error_outcome_marks_decision_error() {
+        let e = synth_outcome_event("train", "tables=users", AuditOutcome::error(3, "synth"));
+        assert_eq!(e.decision, Decision::Error);
     }
 }
