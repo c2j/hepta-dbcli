@@ -76,6 +76,7 @@ pub(crate) struct AuditSession {
     seq: AtomicU64,
     writer: Mutex<Option<AuditWriter>>,
     warn_count: AtomicU64,
+    meta_enabled: bool,
 }
 
 impl AuditSession {
@@ -83,7 +84,14 @@ impl AuditSession {
         let writer = if config.enabled {
             let dir = config.resolved_dir();
             match AuditWriter::open(&dir, config.fsync) {
-                Ok(writer) => Some(writer),
+                Ok(writer) => {
+                    if config.retention_days > 0 {
+                        if let Err(e) = writer::apply_retention(&dir, config.retention_days) {
+                            eprintln!("warning: audit retention failed at {}: {e}", dir.display());
+                        }
+                    }
+                    Some(writer)
+                }
                 Err(e) => {
                     eprintln!("warning: audit log unavailable at {}: {e}", dir.display());
                     None
@@ -98,6 +106,7 @@ impl AuditSession {
             seq: AtomicU64::new(0),
             writer: Mutex::new(writer),
             warn_count: AtomicU64::new(0),
+            meta_enabled: config.meta,
         }
     }
 
@@ -119,6 +128,11 @@ impl AuditSession {
             Ok(guard) => guard.is_some(),
             Err(poisoned) => poisoned.into_inner().is_some(),
         }
+    }
+
+    /// True when `--audit-meta` was passed, so high-noise meta tools are recorded.
+    pub(crate) fn meta_enabled(&self) -> bool {
+        self.meta_enabled
     }
 
     /// Advance the sequence counter without emitting an event.
@@ -201,6 +215,7 @@ mod tests {
             enabled: true,
             fsync: false,
             meta: false,
+            retention_days: 30,
         }
     }
 
@@ -323,6 +338,7 @@ mod tests {
             enabled: true,
             fsync: false,
             meta: false,
+            retention_days: 30,
         });
         assert!(!session.is_enabled(), "must degrade, not panic");
         session.record_best_effort(draft());

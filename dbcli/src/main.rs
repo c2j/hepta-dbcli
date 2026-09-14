@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long, global = true)]
     audit_meta: bool,
 
+    /// Audit log retention in days (0 = keep forever)
+    #[arg(long, global = true, default_value_t = 30)]
+    audit_retention_days: u32,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1027,7 +1031,7 @@ fn create_registry() -> BackendRegistry {
 async fn run_mcp_server(
     config_path: Option<String>,
     registry: Arc<BackendRegistry>,
-    _audit: &audit::AuditSession,
+    audit: Arc<audit::AuditSession>,
 ) {
     let config_path_buf = config_path.map(PathBuf::from);
 
@@ -1052,7 +1056,12 @@ async fn run_mcp_server(
     }
 
     let server = if !eager_entries.is_empty() && lazy_resolvers.is_empty() {
-        DbMcp::new(Arc::clone(&registry), eager_entries, default_name)
+        DbMcp::new(
+            Arc::clone(&registry),
+            eager_entries,
+            default_name,
+            Arc::clone(&audit),
+        )
     } else if !lazy_resolvers.is_empty() {
         let all_lazy = eager_entries
             .into_iter()
@@ -1066,9 +1075,15 @@ async fn run_mcp_server(
             })
             .chain(lazy_resolvers)
             .collect();
-        DbMcp::new_with_lazy(Arc::clone(&registry), Vec::new(), all_lazy, default_name)
+        DbMcp::new_with_lazy(
+            Arc::clone(&registry),
+            Vec::new(),
+            all_lazy,
+            default_name,
+            Arc::clone(&audit),
+        )
     } else {
-        DbMcp::new_empty(Arc::clone(&registry), default_name)
+        DbMcp::new_empty(Arc::clone(&registry), default_name, Arc::clone(&audit))
     };
 
     let server = Arc::new(server);
@@ -1123,12 +1138,13 @@ async fn main() {
         enabled: !cli.no_audit,
         fsync: false,
         meta: cli.audit_meta,
+        retention_days: cli.audit_retention_days,
     };
 
     match cli.command {
         None | Some(Commands::Mcp) => {
-            let audit = audit::AuditSession::new(&audit_config);
-            run_mcp_server(cli.config, Arc::clone(&registry), &audit).await;
+            let audit = Arc::new(audit::AuditSession::new(&audit_config));
+            run_mcp_server(cli.config, Arc::clone(&registry), audit).await;
         }
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);

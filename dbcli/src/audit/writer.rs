@@ -20,6 +20,8 @@ pub(crate) struct AuditConfig {
     pub fsync: bool,
     /// `--audit-meta`: also record high-noise meta tools (list_tables, ...).
     pub meta: bool,
+    /// Keep audit files for this many days (0 = keep forever).
+    pub retention_days: u32,
 }
 
 impl Default for AuditConfig {
@@ -29,6 +31,7 @@ impl Default for AuditConfig {
             enabled: true,
             fsync: false,
             meta: false,
+            retention_days: 30,
         }
     }
 }
@@ -125,6 +128,54 @@ fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Delete audit files whose date is older than `retention_days` days.
+/// Returns the number of files removed. `retention_days == 0` keeps everything.
+pub(crate) fn apply_retention(dir: &Path, retention_days: u32) -> std::io::Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let today = today_utc();
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(date) = date_from_file_name(&name) {
+            if is_expired(&date, &today, retention_days) {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Extract the `YYYY-MM-DD` date from a `hepta-dbcli-audit.<date>.jsonl` name.
+fn date_from_file_name(name: &str) -> Option<String> {
+    let stem = name.strip_prefix(AUDIT_FILE_PREFIX)?.strip_prefix('.')?;
+    let stem = stem.strip_suffix(".jsonl")?;
+    let bytes = stem.as_bytes();
+    if stem.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-' {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+/// A file is expired when its age in days reaches `retention_days`.
+fn is_expired(file_date: &str, today: &str, retention_days: u32) -> bool {
+    if retention_days == 0 {
+        return false;
+    }
+    let Ok(file) = chrono::NaiveDate::parse_from_str(file_date, "%Y-%m-%d") else {
+        return false;
+    };
+    let Ok(today) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return false;
+    };
+    (today - file).num_days() >= retention_days as i64
 }
 
 #[cfg(test)]
@@ -233,5 +284,67 @@ mod tests {
         }
         let contents = read_all(dir.path());
         assert_eq!(contents, "first\nsecond\n");
+    }
+
+    fn touch(dir: &Path, date: &str) {
+        std::fs::write(dir.join(file_name(date)), "{}").expect("write fixture");
+    }
+
+    fn has_file(dir: &Path, date: &str) -> bool {
+        dir.join(file_name(date)).exists()
+    }
+
+    #[test]
+    fn retention_deletes_old_files_and_keeps_recent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(dir.path(), "2020-01-01"); // far in the past
+        touch(dir.path(), "2020-06-15"); // far in the past
+        let today = today_utc();
+        touch(dir.path(), &today);
+
+        let removed = apply_retention(dir.path(), 30).expect("retention");
+        assert_eq!(removed, 2);
+        assert!(!has_file(dir.path(), "2020-01-01"));
+        assert!(!has_file(dir.path(), "2020-06-15"));
+        assert!(has_file(dir.path(), &today));
+    }
+
+    #[test]
+    fn retention_respects_zero_keep_forever() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(dir.path(), "2020-01-01");
+
+        let removed = apply_retention(dir.path(), 0).expect("retention");
+        assert_eq!(removed, 0);
+        assert!(has_file(dir.path(), "2020-01-01"));
+    }
+
+    #[test]
+    fn retention_ignores_non_audit_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("unrelated.txt"), "x").expect("write");
+        touch(dir.path(), "2020-01-01");
+
+        let removed = apply_retention(dir.path(), 30).expect("retention");
+        assert_eq!(removed, 1);
+        assert!(dir.path().join("unrelated.txt").exists());
+    }
+
+    #[test]
+    fn is_expired_uses_age_threshold() {
+        assert!(!is_expired("2026-09-01", "2026-09-14", 30)); // 13 days old
+        assert!(is_expired("2026-08-15", "2026-09-14", 30)); // 30 days old
+        assert!(!is_expired("2026-09-14", "2026-09-14", 30)); // today
+        assert!(!is_expired("2020-01-01", "2026-09-14", 0)); // keep forever
+    }
+
+    #[test]
+    fn date_from_file_name_parses_and_rejects_garbage() {
+        assert_eq!(
+            date_from_file_name("hepta-dbcli-audit.2026-09-14.jsonl").as_deref(),
+            Some("2026-09-14")
+        );
+        assert_eq!(date_from_file_name("hepta-dbcli-audit.garbage.jsonl"), None);
+        assert_eq!(date_from_file_name("other.txt"), None);
     }
 }

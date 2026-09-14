@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
@@ -12,10 +13,15 @@ use rustyline_derive::{Completer, Helper, Hinter};
 
 use tracing::{info, warn};
 
+use crate::audit::event::{
+    read_only_session_for, ActionClass, AuditOutcome, Channel, ConnectionInfo, Decision,
+    DraftEvent, SqlInfo,
+};
+use crate::audit::AuditSession;
 use crate::backend::factory::BackendRegistry;
 use crate::backend::DbConn;
 use crate::cli::QueryResult;
-use crate::cli::{execute_query, render_result, CliArgs, OutputFormat};
+use crate::cli::{execute_query, is_read_only_query, render_result, CliArgs, OutputFormat};
 use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
     rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
@@ -524,10 +530,58 @@ async fn connect(
     Ok(conn)
 }
 
+// ─── REPL audit helpers (pure, unit-tested) ─────────────────────────
+
+fn repl_sql_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    row_count: u64,
+) -> DraftEvent {
+    let class = if is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
+    DraftEvent::new(
+        Channel::Repl,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "repl_sql",
+        class,
+        Decision::Allow,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(AuditOutcome::ok(duration_ms).with_row_count(row_count))
+}
+
+fn repl_sql_error_event(
+    conn_name: &str,
+    url: &str,
+    sql: &str,
+    duration_ms: u64,
+    error: &str,
+) -> DraftEvent {
+    let class = if is_read_only_query(sql) {
+        ActionClass::Dql
+    } else {
+        ActionClass::Dml
+    };
+    DraftEvent::new(
+        Channel::Repl,
+        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url)),
+        "repl_sql",
+        class,
+        Decision::Error,
+    )
+    .with_sql(SqlInfo::new(sql))
+    .with_outcome(AuditOutcome::error(duration_ms, error))
+}
+
 pub(crate) async fn run_interactive(
     args: CliArgs,
     registry: &BackendRegistry,
-    _audit: &crate::audit::AuditSession,
+    audit: &AuditSession,
 ) -> Result<(), String> {
     let raw = read_config(args.config_path.map(PathBuf::from))?;
 
@@ -678,7 +732,25 @@ pub(crate) async fn run_interactive(
             conn.dialect().supports_dollar_quote(),
         );
         for stmt in &split.complete {
+            let start = Instant::now();
             let query_result = execute_query(&mut *conn, stmt).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &query_result {
+                Ok(qr) => audit.record_best_effort(repl_sql_event(
+                    &target.name,
+                    &target.connection_url,
+                    stmt,
+                    duration_ms,
+                    qr.row_count as u64,
+                )),
+                Err(e) => audit.record_best_effort(repl_sql_error_event(
+                    &target.name,
+                    &target.connection_url,
+                    stmt,
+                    duration_ms,
+                    e,
+                )),
+            }
             match query_result {
                 Ok(query_result) => {
                     last_result = Some(query_result.clone());
@@ -859,5 +931,23 @@ mod tests {
         let r = SqlTokenizer::split_statements(sql, '`', true, false);
         assert_eq!(r.complete, vec!["SELECT $1, $2"]);
         assert_eq!(r.remainder, "");
+    }
+
+    #[test]
+    fn repl_sql_event_records_channel_and_outcome() {
+        let ev = repl_sql_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", 5, 3);
+        assert_eq!(ev.channel, Channel::Repl);
+        assert_eq!(ev.action, "repl_sql");
+        assert_eq!(ev.class, ActionClass::Dql);
+        let outcome = ev.outcome.as_ref().unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.row_count, Some(3));
+
+        let err = repl_sql_error_event("dev", "mysql://u:p@h:3306/db", "SELECT 1", 5, "boom");
+        assert_eq!(err.decision, Decision::Error);
+        assert_eq!(
+            err.outcome.as_ref().unwrap().error_kind.as_deref(),
+            Some("boom")
+        );
     }
 }
