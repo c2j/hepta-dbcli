@@ -343,8 +343,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - MySQL integration tests require `HEPTA_DBCLI_TEST_URL` env var and a running MySQL instance.
 - Oracle integration tests require `POLARDB_ORACLE_TEST_URL` env var and a running Oracle instance (Docker: `gvenzl/oracle-free:23-slim`).
 - DuckDB integration tests are **embedded** — no external service, no env var; they use `tempfile` fixtures (`cargo test --features "duckdb,integration" --test regress_duckdb`).
-- **CI never builds the `duckdb` feature** (no clippy, no test, no release job). Any change to `backend/mod.rs` traits (`DbConn`, `QueryResult`, `BackendFactory`) can therefore break the DuckDB backend while CI stays green. Whenever you touch those, run locally:
-  `cargo clippy --all --all-targets --features duckdb` and `cargo test --all --features "duckdb,integration"`.
+- CI has a dedicated **`duckdb` job** (`cargo clippy --all --all-targets --features duckdb`, `cargo test --all --features duckdb`, `cargo test --features "duckdb,integration" --test regress_duckdb`). It is slow (bundled C++ core), so run the same commands locally when touching `backend/mod.rs` traits (`DbConn`, `QueryResult`, `BackendFactory`) instead of waiting for CI.
 
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
@@ -358,6 +357,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 
 ### CI
 - `libdbus-1-dev` and `pkg-config` are system dependencies for `clippy` and `test`. Without them, `cargo clippy` will fail on the `keyring` crate.
+- Jobs: `rustfmt`, `clippy`, `duckdb`, `test`. The `test` job runs a MySQL service and `HEPTA_DBCLI_TEST_URL`; the `duckdb` job runs the feature-gated clippy + unit + embedded DuckDB suites.
 - Release builds on Windows link statically (`-C target-feature=+crt-static`).
 - Release tags: `v*` (e.g. `v0.2.1`).
 - Release binaries are built with `--features oracle-rs,oracle,gaussdb,synth` (not `--all-features`; `integration` and `duckdb` stay out).
