@@ -724,7 +724,8 @@ fn render_stdout(
             if !args.summary_only && !report.sample_diffs.is_empty() {
                 buf.push(b'\n');
                 buf.extend_from_slice(
-                    output::render_compact_sample(report, args.sample, args.wide).as_bytes(),
+                    output::render_compact_sample(report, args.sample, args.wide, args.sample_mode)
+                        .as_bytes(),
                 );
             }
         }
