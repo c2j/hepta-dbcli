@@ -269,6 +269,15 @@ fn gen_column_value(
     const EPS: f64 = 1e-12;
     let uniform_val = uniform_val.clamp(EPS, 1.0 - EPS);
 
+    // A column whose training sample held only NULLs is kept in the model so
+    // the generated table keeps the column, but there is nothing to sample:
+    // emit NULL rather than a constant fabricated by a degenerate marginal.
+    if let Some(column_model) = column_model {
+        if column_model.null_rate.is_some_and(|rate| rate >= 1.0) {
+            return Value::Null;
+        }
+    }
+
     match column_model.map(|c| &c.marginal) {
         Some(crate::synth::marginal::Marginal::Categorical(p)) => {
             let idx = p.sample_index(uniform_val);
@@ -530,6 +539,47 @@ mod tests {
 
         assert_eq!(result.tables.get("parent").unwrap().len(), 2);
         assert_eq!(result.tables.get("child").unwrap().len(), 5);
+    }
+
+    #[test]
+    fn should_generate_null_for_all_null_column() {
+        // An all-null training sample is kept in the model (so the generated
+        // table keeps the column) but must emit NULL, not a degenerate constant.
+        let mut model = numerical_model("t", "empty_num", 0.0, 0.0);
+        model.columns.get_mut("empty_num").unwrap().null_rate = Some(1.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 6)).unwrap();
+        let rows = result.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows.iter().all(|row| row[0].is_null()),
+            "all-null column should generate NULL, got {:?}",
+            rows.iter().map(|r| &r[0]).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn should_not_null_out_a_zero_variance_column_with_values() {
+        // A normal column whose sampled values are all identical has scale 0
+        // but observed min/max: it must still emit that value, not NULL.
+        let mut model = numerical_model("t", "constant", 5.0, 0.0);
+        model.columns.get_mut("constant").unwrap().null_rate = Some(0.0);
+        model.columns.get_mut("constant").unwrap().min = Some(5.0);
+        model.columns.get_mut("constant").unwrap().max = Some(5.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 4)).unwrap();
+        let rows = result.tables.get("t").unwrap();
+        assert!(rows.iter().all(|row| row[0] == 5.0));
     }
 
     #[test]
@@ -1209,6 +1259,7 @@ mod tests {
                         datetime_epoch: None,
                         min: Some(1.0),
                         max: Some(19.0),
+                        null_rate: None,
                         marginal: Marginal::Categorical(CategoricalParams {
                             values: levels.clone(),
                             weights: vec![1.0 / 19.0; 19],
@@ -1556,6 +1607,7 @@ mod tests {
                         datetime_epoch: None,
                         min: Some(0.0),
                         max: Some(120.0),
+                        null_rate: None,
                         marginal: Marginal::Normal(NormalParams {
                             loc: 100.0,
                             scale: 50.0,
@@ -1610,6 +1662,7 @@ mod tests {
                         datetime_epoch: None,
                         min: Some(0.0),
                         max: Some(101.0),
+                        null_rate: None,
                         marginal: Marginal::Normal(NormalParams {
                             loc: 100.0,
                             scale: 50.0,

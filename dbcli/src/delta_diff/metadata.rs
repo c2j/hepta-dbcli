@@ -317,7 +317,7 @@ fn push_key_shape_warnings(
 /// 优先 exec 预编译绑定；PolarDB-X 对 information_schema 的预编译查询报
 /// "unknown NPE"（CN 缺陷）时回退为内联字面量的文本查询。
 /// schema/table 经单引号转义（'' 规则），与 --where 的原样拼接语义不同。
-async fn exec_or_inline(
+pub(crate) async fn exec_or_inline(
     conn: &mut dyn DbConn,
     sql: &str,
     schema: &str,
@@ -384,13 +384,28 @@ fn parse_column_row(row: &[Value]) -> ColumnRow {
     }
 }
 
+/// Map column_name → data_type from a table_columns result.
+pub(crate) fn column_name_and_type(
+    result: &QueryResult,
+) -> std::collections::HashMap<String, String> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let parsed = parse_column_row(row);
+            (parsed.name, parsed.data_type)
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
 fn find_column_ci<'a>(columns: &'a [ColumnRow], name: &str) -> Option<&'a ColumnRow> {
     find_unique_ci(columns, name, |column| &column.name)
 }
 
 /// Extract primary key columns from a table_indexes result: the
 /// is_primary=true row's columns field, CSV-parsed.
-fn primary_key_columns(result: &QueryResult) -> Vec<String> {
+pub(crate) fn primary_key_columns(result: &QueryResult) -> Vec<String> {
     result
         .rows
         .iter()

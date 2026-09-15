@@ -119,6 +119,7 @@ pub(crate) fn build_model(
     dialect: &str,
     profile: &TableProfile,
     rows: &[Vec<serde_json::Value>],
+    pk: Vec<String>,
 ) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
@@ -131,6 +132,7 @@ pub(crate) fn build_model(
             Ok(marginal) => {
                 let logical_type = match col_profile.logical_type.as_str() {
                     "categorical" => LogicalType::Categorical,
+                    "datetime" => LogicalType::Datetime,
                     _ => LogicalType::Numerical,
                 };
                 let rounding = if col_profile.is_integer {
@@ -146,6 +148,7 @@ pub(crate) fn build_model(
                         datetime_epoch: None,
                         min: col_profile.min.as_ref().and_then(|v| v.as_f64()),
                         max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
+                        null_rate: Some(col_profile.null_rate),
                         marginal,
                     },
                 );
@@ -160,6 +163,10 @@ pub(crate) fn build_model(
             table
         ));
     }
+
+    // A key column that did not survive training (unsupported type) cannot be
+    // part of the generated table, so drop it from the recorded key too.
+    let pk: Vec<String> = pk.into_iter().filter(|k| columns.contains_key(k)).collect();
 
     let mut column_order: Vec<String> = profile
         .column_order
@@ -207,7 +214,7 @@ pub(crate) fn build_model(
             converter_version: None,
             sdv_version: None,
         },
-        pk: vec![],
+        pk,
         columns,
         copula: CopulaInfo {
             column_order,
@@ -235,11 +242,24 @@ fn fit_marginal(
                 }))
             }
         }
-        "categorical" => {
+        // Numeric-encoded datetimes (compact YYYYMMDD, epoch integers) fit a
+        // Normal; date/timestamp strings fall through to the frequency path.
+        "datetime" if col.mean.is_some() => Ok(Marginal::Normal(NormalParams {
+            loc: col.mean.unwrap_or(0.0),
+            scale: col.std_dev.unwrap_or(0.0),
+        })),
+        // A datetime column with no observed value (all NULL) has no
+        // distribution to fit: keep it in the model so generated data keeps
+        // the column, and let the recorded null_rate drive NULL emission.
+        "datetime" if col.top_values.is_none() => Ok(Marginal::Normal(NormalParams {
+            loc: 0.0,
+            scale: 0.0,
+        })),
+        "categorical" | "datetime" => {
             let top = col.top_values.as_deref().ok_or_else(|| {
                 format!(
-                    "column '{}' is categorical but profile has no value frequencies; retrain",
-                    col_name
+                    "column '{}' is {} but profile has no value frequencies; retrain",
+                    col_name, col.logical_type
                 )
             })?;
             Ok(Marginal::Categorical(CategoricalParams {
@@ -248,10 +268,32 @@ fn fit_marginal(
             }))
         }
         other => Err(format!(
-            "column '{}' has logical type '{}'; training supports numerical and categorical only",
+            "column '{}' has logical type '{}'; training supports numerical, datetime, and categorical",
             col_name, other
         )),
     }
+}
+
+pub(crate) fn parse_primary_key(result: &crate::backend::QueryResult) -> Vec<String> {
+    crate::delta_diff::metadata::primary_key_columns(result)
+}
+
+/// Normalize catalog primary-key names to the casing of the sampled columns and
+/// drop key columns absent from the sample, so every recorded key column can be
+/// looked up in the trained model.
+pub(crate) fn reconcile_primary_key(pk: Vec<String>, columns: &[String]) -> Vec<String> {
+    pk.into_iter()
+        .filter_map(|key| {
+            columns
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(&key))
+                .cloned()
+        })
+        .collect()
+}
+
+pub(crate) fn parse_column_types(result: &crate::backend::QueryResult) -> HashMap<String, String> {
+    crate::delta_diff::metadata::column_name_and_type(result)
 }
 
 pub(crate) fn load_profiles(dir: &Path) -> Result<HashMap<String, TableProfile>, String> {
@@ -355,6 +397,11 @@ pub fn run_validate(model_path: &str) -> Result<(), String> {
     println!("  Columns: {}", model.columns.len());
     println!("  Copula dimension: {}", model.copula.correlation.len());
     println!("  Dialect: {}", model.dialect);
+    if model.pk.is_empty() {
+        println!("  Primary key: (none)");
+    } else {
+        println!("  Primary key: {}", model.pk.join(", "));
+    }
 
     Ok(())
 }
@@ -512,7 +559,7 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         assert!(skipped.is_empty());
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
@@ -529,7 +576,7 @@ mod tests {
     #[test]
     fn build_model_rejects_empty_profile() {
         let profile = TableProfile::from_rows("t", &[], &[]);
-        assert!(build_model("t", "mysql", &profile, &[]).is_err());
+        assert!(build_model("t", "mysql", &profile, &[], vec![]).is_err());
     }
 
     #[test]
@@ -544,7 +591,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("status").unwrap();
         match &col.marginal {
@@ -592,7 +639,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("flag").unwrap();
         let generated = col.marginal.inverse_cdf(0.01);
@@ -617,7 +664,7 @@ mod tests {
         )]);
         profile.save(&dir.join("users.profile.json")).unwrap();
 
-        let (model, _) = build_model("users", "mysql", &profile, &[]).unwrap();
+        let (model, _) = build_model("users", "mysql", &profile, &[], vec![]).unwrap();
         model.save(&dir.join("users.model.json")).unwrap();
 
         let loaded = load_profiles(&dir).unwrap();
@@ -651,7 +698,7 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
@@ -677,7 +724,7 @@ mod tests {
         ];
         let profile = TableProfile::from_rows("t", &columns, &rows);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &rows).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![]).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id", "v3"]);
         let r = model.copula.correlation[0][1];
@@ -700,7 +747,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         let col = model.columns.get("id").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -717,9 +764,215 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
         let col = model.columns.get("v").unwrap();
         assert_eq!(col.rounding, Some(0));
+    }
+
+    #[test]
+    fn build_model_records_composite_pk() {
+        let profile = profile_from(&[
+            (
+                "a",
+                vec![
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from(3),
+                    Value::from(4),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    Value::from(5),
+                    Value::from(6),
+                    Value::from(7),
+                    Value::from(8),
+                ],
+            ),
+        ]);
+        let (model, _) = build_model(
+            "t",
+            "mysql",
+            &profile,
+            &[],
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap();
+        assert_eq!(model.pk, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn build_model_drops_pk_column_missing_from_the_model() {
+        let profile = profile_from(&[(
+            "a",
+            vec![
+                Value::from(1),
+                Value::from(2),
+                Value::from(3),
+                Value::from(4),
+            ],
+        )]);
+        let (model, _) = build_model(
+            "t",
+            "mysql",
+            &profile,
+            &[],
+            vec!["a".to_string(), "ghost".to_string()],
+        )
+        .unwrap();
+        assert_eq!(model.pk, vec!["a"]);
+    }
+
+    #[test]
+    fn reconcile_primary_key_normalizes_case_and_drops_unknown() {
+        let columns = vec![
+            "Xwdm".to_string(),
+            "Security_Id".to_string(),
+            "amt".to_string(),
+        ];
+        let pk = vec![
+            "XWDM".to_string(),
+            "security_id".to_string(),
+            "missing".to_string(),
+        ];
+        assert_eq!(
+            reconcile_primary_key(pk, &columns),
+            vec!["Xwdm".to_string(), "Security_Id".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_primary_key_keeps_key_order_and_empty_input() {
+        let columns = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(
+            reconcile_primary_key(vec!["a".to_string(), "b".to_string()], &columns),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(reconcile_primary_key(vec![], &columns).is_empty());
+    }
+
+    #[test]
+    fn build_model_maps_compact_date_to_datetime() {
+        let profile = profile_from(&[(
+            "biz_date",
+            vec![
+                Value::from("20240101"),
+                Value::from("20240315"),
+                Value::from("20240630"),
+                Value::from("20241231"),
+            ],
+        )]);
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("biz_date").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Datetime));
+        assert_eq!(col.rounding, Some(0));
+        match &col.marginal {
+            Marginal::Normal(p) => assert!(p.loc > 20_000_000.0),
+            other => panic!("expected Normal for compact dates, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_model_fits_all_null_numeric_from_schema() {
+        let samples = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let col = crate::synth::profile::ColumnProfile::from_samples_typed(
+            &samples,
+            Some("numeric(16,2)"),
+        );
+        let mut columns = std::collections::HashMap::new();
+        columns.insert("amt".to_string(), col);
+        let profile = TableProfile {
+            table: "t".to_string(),
+            row_count: 4,
+            column_order: vec!["amt".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("amt").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Numerical));
+        assert_eq!(col.null_rate, Some(1.0));
+    }
+
+    #[test]
+    fn build_model_keeps_all_null_datetime() {
+        let samples = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let col = crate::synth::profile::ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp without time zone"),
+        );
+        let mut columns = std::collections::HashMap::new();
+        columns.insert("ts".to_string(), col);
+        let profile = TableProfile {
+            table: "t".to_string(),
+            row_count: 4,
+            column_order: vec!["ts".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("ts").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Datetime));
+        assert_eq!(col.null_rate, Some(1.0));
+    }
+
+    #[test]
+    fn parse_primary_key_reads_composite_index_row() {
+        let result = crate::backend::QueryResult {
+            columns: vec![
+                "index_name".to_string(),
+                "is_unique".to_string(),
+                "is_primary".to_string(),
+                "columns".to_string(),
+                "index_type".to_string(),
+            ],
+            rows: vec![vec![
+                Value::from("PRIMARY"),
+                Value::from(true),
+                Value::from(true),
+                Value::from("xwdm, security_id"),
+                Value::from("BTREE"),
+            ]],
+            row_count: 1,
+            rows_affected: None,
+        };
+        assert_eq!(
+            parse_primary_key(&result),
+            vec!["xwdm".to_string(), "security_id".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_column_types_maps_name_to_sql_type() {
+        let result = crate::backend::QueryResult {
+            columns: vec![
+                "column_name".to_string(),
+                "data_type".to_string(),
+                "nullable".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    Value::from("biz_date"),
+                    Value::from("character varying(8)"),
+                    Value::from(false),
+                ],
+                vec![
+                    Value::from("amt"),
+                    Value::from("numeric(16,2)"),
+                    Value::from(true),
+                ],
+            ],
+            row_count: 2,
+            rows_affected: None,
+        };
+        let types = parse_column_types(&result);
+        assert_eq!(
+            types.get("biz_date").map(String::as_str),
+            Some("character varying(8)")
+        );
+        assert_eq!(types.get("amt").map(String::as_str), Some("numeric(16,2)"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,8 +34,164 @@ fn is_unsupported_placeholder(s: &str) -> bool {
     s.starts_with("<unsupported type")
 }
 
+fn sql_type_base(data_type: &str) -> String {
+    let base = data_type
+        .split('(')
+        .next()
+        .unwrap_or(data_type)
+        .trim()
+        .to_ascii_lowercase();
+    // MySQL appends integer display attributes after the bare type name
+    // ("bigint unsigned", "int unsigned zerofill") and since 8.0.19 omits the
+    // display width, so the parenthesized split above is not enough. Strip the
+    // attribute tail; the bare type decides the logical category.
+    let mut base = base.as_str();
+    while let Some(stripped) = [" unsigned", " signed", " zerofill"]
+        .iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+    {
+        base = stripped;
+    }
+    base.to_string()
+}
+
+fn is_numeric_sql_type(data_type: &str) -> bool {
+    matches!(
+        sql_type_base(data_type).as_str(),
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "serial"
+            | "bigserial"
+            | "smallserial"
+            | "number"
+            | "decimal"
+            | "numeric"
+            | "money"
+            | "float"
+            | "float4"
+            | "float8"
+            | "double"
+            | "double precision"
+            | "real"
+            | "binary_float"
+            | "binary_double"
+            // DuckDB unsigned / wide integers (COLUMN_TYPE has no "unsigned"
+            // suffix there, the type name itself is unsigned).
+            | "utinyint"
+            | "usmallint"
+            | "uinteger"
+            | "ubigint"
+            | "uhugeint"
+            | "hugeint"
+    )
+}
+
+fn is_datetime_sql_type(data_type: &str) -> bool {
+    let base = sql_type_base(data_type);
+    // `starts_with("timestamp")` covers `timestamp(6)` / `timestamp with time
+    // zone`; `starts_with("time ")` covers `time with/without time zone`.
+    matches!(
+        base.as_str(),
+        "date" | "time" | "timetz" | "datetime" | "timestamp" | "timestamptz" | "year" | "interval"
+    ) || base.starts_with("timestamp")
+        || base.starts_with("time ")
+}
+
+fn compact_yyyymmdd_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(s, "%Y%m%d").ok()?;
+    if !(1900..=2100).contains(&date.year()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+fn is_datetime_text(s: &str) -> bool {
+    let s = s.trim();
+    if compact_yyyymmdd_number(s).is_some() {
+        return true;
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+        || NaiveDate::parse_from_str(s, "%Y/%m/%d").is_ok()
+        || NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").is_ok()
+        || NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").is_ok()
+        || NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
+        || NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+        || chrono::DateTime::parse_from_rfc3339(s).is_ok()
+}
+
+fn numerical_stats(nums: &[f64]) -> (Option<Value>, Option<Value>, Option<f64>, Option<f64>) {
+    let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+    let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
+    (
+        Some(Value::from(min)),
+        Some(Value::from(max)),
+        Some(mean),
+        Some(variance.sqrt()),
+    )
+}
+
+fn frequency_top_values(non_null: &[&Value]) -> Option<Vec<(String, f64)>> {
+    if non_null.is_empty() {
+        return None;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for v in non_null {
+        let key = if let Some(s) = v.as_str() {
+            Some(s.to_string())
+        } else if v.is_number() {
+            Some(v.to_string())
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<(String, f64)> = counts
+        .into_iter()
+        .map(|(k, c)| (k, c as f64 / non_null.len() as f64))
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    entries.truncate(TOP_VALUES_CAP);
+    Some(entries)
+}
+
+fn lookup_type<'a>(types: Option<&'a HashMap<String, String>>, name: &str) -> Option<&'a str> {
+    let types = types?;
+    types
+        .get(name)
+        .or_else(|| {
+            types
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
+        .map(String::as_str)
+}
+
 impl ColumnProfile {
     pub fn from_samples(samples: &[Value]) -> Self {
+        Self::from_samples_typed(samples, None)
+    }
+
+    pub fn from_samples_typed(samples: &[Value], data_type: Option<&str>) -> Self {
         let total = samples.len();
         let null_count = samples.iter().filter(|v| v.is_null()).count();
         let non_null: Vec<&Value> = samples.iter().filter(|v| !v.is_null()).collect();
@@ -50,6 +207,22 @@ impl ColumnProfile {
             .collect::<std::collections::HashSet<_>>()
             .len();
 
+        let schema_datetime = data_type.map(is_datetime_sql_type).unwrap_or(false);
+        let schema_numeric = data_type.map(is_numeric_sql_type).unwrap_or(false);
+
+        let all_compact_dates = !non_null.is_empty()
+            && !schema_numeric
+            && non_null.iter().all(|v| {
+                v.as_str()
+                    .map(|s| compact_yyyymmdd_number(s).is_some())
+                    .unwrap_or(false)
+            });
+        let all_datetime_text = !non_null.is_empty()
+            && !schema_numeric
+            && non_null
+                .iter()
+                .all(|v| v.as_str().map(is_datetime_text).unwrap_or(false));
+
         let numeric_strings: Option<Vec<f64>> = if !non_null.is_empty() && non_null[0].is_string() {
             let parsed: Option<Vec<f64>> = non_null
                 .iter()
@@ -60,74 +233,75 @@ impl ColumnProfile {
             None
         };
 
-        let (logical_type, min, max, mean, std_dev) = if non_null.is_empty() {
-            ("unknown".to_string(), None, None, None, None)
+        let (logical_type, min, max, mean, std_dev) = if non_null
+            .iter()
+            .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
+        {
+            ("unsupported".to_string(), None, None, None, None)
+        } else if non_null.is_empty() {
+            if schema_datetime {
+                ("datetime".to_string(), None, None, None, None)
+            } else if schema_numeric {
+                ("numerical".to_string(), None, None, None, None)
+            } else {
+                ("unknown".to_string(), None, None, None, None)
+            }
+        } else if schema_datetime || all_compact_dates || all_datetime_text {
+            if all_compact_dates || non_null[0].is_number() || numeric_strings.is_some() {
+                let nums: Vec<f64> = if all_compact_dates {
+                    non_null
+                        .iter()
+                        .filter_map(|v| v.as_str().and_then(compact_yyyymmdd_number))
+                        .collect()
+                } else if non_null[0].is_number() {
+                    non_null.iter().filter_map(|v| v.as_f64()).collect()
+                } else {
+                    numeric_strings.clone().unwrap_or_default()
+                };
+                let (min, max, mean, std_dev) = if nums.is_empty() {
+                    (None, None, None, None)
+                } else {
+                    numerical_stats(&nums)
+                };
+                ("datetime".to_string(), min, max, mean, std_dev)
+            } else {
+                ("datetime".to_string(), None, None, None, None)
+            }
         } else if non_null[0].is_number() || numeric_strings.is_some() {
             let nums: Vec<f64> = if non_null[0].is_number() {
                 non_null.iter().filter_map(|v| v.as_f64()).collect()
             } else {
                 numeric_strings.clone().unwrap()
             };
-            let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-            let std_dev = variance.sqrt();
-
-            (
-                "numerical".to_string(),
-                Some(Value::from(min)),
-                Some(Value::from(max)),
-                Some(mean),
-                Some(std_dev),
-            )
+            let (min, max, mean, std_dev) = numerical_stats(&nums);
+            ("numerical".to_string(), min, max, mean, std_dev)
         } else if non_null[0].is_string() {
-            if non_null
-                .iter()
-                .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
-            {
-                ("unsupported".to_string(), None, None, None, None)
-            } else {
-                ("categorical".to_string(), None, None, None, None)
-            }
+            ("categorical".to_string(), None, None, None, None)
         } else {
             ("unknown".to_string(), None, None, None, None)
         };
 
-        let is_integer = logical_type == "numerical"
-            && non_null
-                .iter()
-                .filter_map(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-                })
-                .all(|f| f.fract() == 0.0);
+        let parsed_nums: Vec<f64> = non_null
+            .iter()
+            .filter_map(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            })
+            .collect();
+        let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
+            && parsed_nums.len() == non_null.len()
+            && !parsed_nums.is_empty()
+            && parsed_nums.iter().all(|f| f.fract() == 0.0);
 
         let is_repeated_low_cardinality_numeric = logical_type == "numerical"
             && cardinality > 1
             && cardinality < non_null.len()
             && cardinality <= NUMERIC_TOP_VALUES_MAX;
-        let top_values = if logical_type == "categorical" || is_repeated_low_cardinality_numeric {
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for v in &non_null {
-                let key = if let Some(s) = v.as_str() {
-                    Some(s.to_string())
-                } else if v.is_number() {
-                    Some(v.to_string())
-                } else {
-                    None
-                };
-                if let Some(key) = key {
-                    *counts.entry(key).or_insert(0) += 1;
-                }
-            }
-            let mut entries: Vec<(String, f64)> = counts
-                .into_iter()
-                .map(|(k, c)| (k, c as f64 / non_null.len() as f64))
-                .collect();
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            entries.truncate(TOP_VALUES_CAP);
-            Some(entries)
+        let top_values = if logical_type == "categorical"
+            || is_repeated_low_cardinality_numeric
+            || (logical_type == "datetime" && mean.is_none() && !non_null.is_empty())
+        {
+            frequency_top_values(&non_null)
         } else {
             None
         };
@@ -148,6 +322,15 @@ impl ColumnProfile {
 
 impl TableProfile {
     pub fn from_rows(table: &str, columns: &[String], rows: &[Vec<Value>]) -> Self {
+        Self::from_rows_typed(table, columns, rows, None)
+    }
+
+    pub fn from_rows_typed(
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+        data_types: Option<&HashMap<String, String>>,
+    ) -> Self {
         let row_count = rows.len();
         let mut column_profiles = HashMap::new();
 
@@ -156,7 +339,10 @@ impl TableProfile {
                 .iter()
                 .filter_map(|row| row.get(col_idx).cloned())
                 .collect();
-            column_profiles.insert(col_name.clone(), ColumnProfile::from_samples(&samples));
+            column_profiles.insert(
+                col_name.clone(),
+                ColumnProfile::from_samples_typed(&samples, lookup_type(data_types, col_name)),
+            );
         }
 
         Self {
@@ -290,6 +476,111 @@ mod tests {
     }
 
     #[test]
+    fn column_profile_detects_yyyymmdd_strings_as_datetime() {
+        // VARCHAR(8) 存 YYYYMMDD 时驱动给出数字字符串，不得当成 numerical
+        let samples: Vec<Value> = ["20240101", "20240315", "20241231"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.is_integer);
+        assert!(profile.mean.is_some());
+    }
+
+    #[test]
+    fn column_profile_detects_iso_date_strings_as_datetime() {
+        let samples: Vec<Value> = ["2024-01-01", "2024-03-15", "2024-12-31"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(!profile.is_integer);
+        assert!(profile.top_values.is_some());
+    }
+
+    #[test]
+    fn column_profile_eight_digit_non_dates_stay_numerical() {
+        let samples: Vec<Value> = ["12345678", "10000001", "99999999"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+    }
+
+    #[test]
+    fn column_profile_varchar_schema_still_detects_compact_dates() {
+        let samples: Vec<Value> = ["20240101", "20240315"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("character varying(8)"));
+        assert_eq!(profile.logical_type, "datetime");
+    }
+
+    #[test]
+    fn column_profile_all_null_numeric_schema_is_numerical() {
+        let samples = vec![Value::Null, Value::Null, Value::Null];
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("numeric(16,2)"));
+        assert_eq!(profile.logical_type, "numerical");
+        assert_eq!(profile.null_rate, 1.0);
+        assert!(profile.mean.is_none());
+    }
+
+    #[test]
+    fn column_profile_unsigned_integer_schema_is_numerical() {
+        // MySQL 8.0.19+ drops the display width, so COLUMN_TYPE is
+        // "bigint unsigned" and the modifier must be stripped.
+        let samples = vec![Value::Null, Value::Null];
+        for ty in [
+            "bigint unsigned",
+            "int unsigned",
+            "smallint unsigned",
+            "double unsigned",
+            "int unsigned zerofill",
+        ] {
+            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
+        }
+    }
+
+    #[test]
+    fn column_profile_duckdb_unsigned_types_are_numerical() {
+        let samples = vec![Value::Null, Value::Null];
+        for ty in ["UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT", "HUGEINT"] {
+            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
+        }
+    }
+
+    #[test]
+    fn column_profile_unsigned_is_not_datetime() {
+        let samples: Vec<Value> = ["20240101", "20240315"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("bigint unsigned"));
+        assert_eq!(profile.logical_type, "numerical");
+    }
+
+    #[test]
+    fn column_profile_all_null_without_schema_stays_unknown() {
+        let samples = vec![Value::Null, Value::Null];
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "unknown");
+    }
+
+    #[test]
+    fn column_profile_date_schema_overrides_empty_values() {
+        let samples = vec![Value::Null, Value::Null];
+        let profile =
+            ColumnProfile::from_samples_typed(&samples, Some("timestamp without time zone"));
+        assert_eq!(profile.logical_type, "datetime");
+    }
+
+    #[test]
     fn column_profile_stays_categorical_when_strings_unparseable() {
         let samples: Vec<Value> = ["A", "B", "C", "A"]
             .iter()
@@ -341,6 +632,22 @@ mod tests {
         assert_eq!(profile.table, "users");
         assert_eq!(profile.row_count, 2);
         assert_eq!(profile.columns.len(), 2);
+    }
+
+    #[test]
+    fn table_profile_from_rows_typed_uses_schema() {
+        let columns = vec!["amt".to_string(), "biz_date".to_string()];
+        let rows = vec![
+            vec![Value::Null, Value::from("20240101")],
+            vec![Value::Null, Value::from("20240315")],
+        ];
+        let mut types = HashMap::new();
+        types.insert("amt".to_string(), "numeric(16,2)".to_string());
+        types.insert("biz_date".to_string(), "character varying(8)".to_string());
+
+        let profile = TableProfile::from_rows_typed("t", &columns, &rows, Some(&types));
+        assert_eq!(profile.columns["amt"].logical_type, "numerical");
+        assert_eq!(profile.columns["biz_date"].logical_type, "datetime");
     }
 
     #[test]
