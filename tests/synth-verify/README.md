@@ -1,9 +1,10 @@
-# synth M1 verification (`tests/synth-verify`)
+# synth M1/M2 verification (`tests/synth-verify`)
 
 End-to-end acceptance checks for the synth M1 work (issues #62 datetime columns,
-#63 NULL reproduction, #64 decimal scale, #65 robustness bundle). These run
-against a **real MySQL** and assert the artifacts a user actually gets, which is
-the half of the acceptance criteria that the Rust unit tests cannot cover.
+#63 NULL reproduction, #64 decimal scale, #65 robustness bundle) and the M2 work
+(#66 ECDF auto-selection, #67 `synth report`). These run against a **real
+MySQL** and assert the artifacts a user actually gets, which is the half of the
+acceptance criteria that the Rust unit tests cannot cover.
 
 ## Run it
 
@@ -29,6 +30,29 @@ passes.
 The fixture is dropped and recreated on every run; it only touches its own
 `m1_verify_*` tables. The connection is passed through `HEPTA_DBCLI_URL` rather
 than a config file, so no password is written to disk or to the OS keychain.
+
+## M2 run
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m2.sh
+```
+
+It reuses the same fixture and environment variables as the M1 run. After
+`train` (which now also writes `<table>.report-baseline.json`) it generates the
+same data twice, then runs `synth report` five ways: offline, against the live
+key pools (`--against-db`), on a degraded copy, and twice on a models directory
+with no baseline (`--strict`, and `--min-score`). `verify_m2.py` asserts:
+
+| Issue | Check |
+|---|---|
+| #66 | the trained model is not a blanket Normal: `m1_verify_parent.{id,cjje,whole_dec}` are `uniform`/`ecdf`/`gamma`/`beta`, while the formatted `trade_time` keeps its Normal epoch marginal |
+| #67 AC1 | the report carries `shapes` / `pairs` / `fk` sections and an overall score in `(0, 1)` |
+| #67 AC2 | shifting `cjje` by +10000 drops that column below 0.8 (>= 0.15 below the clean run) and fails `--min-score` with a non-zero exit code |
+| #67 AC4 | offline, the FK edge is scored at rate 1.0 against the **generated parent keys** (`source: "generated"`); with `--against-db` it is scored against the live pool (`source: "database"`) and still 1.0 with no warn |
+| #67 AC3 | a models directory without a baseline yields `status: skipped` with a reason and exit code 0; `--strict` fails. A model with no generated data is listed as a skipped table (not silently absent), fails `--strict`, and fails `--min-score` (the gate requires every table to be scored) |
+| #67 AC5 | two runs over the same inputs produce byte-identical report JSON (and the same seed regenerates byte-identical data) |
+| #67 AC6 | baseline files contain only aggregate payloads (numeric knots or `[value, frequency]` pairs), never a row record |
 
 ## What is asserted
 
@@ -56,5 +80,5 @@ UTC-normalisation path is covered by `synth::datetime` unit tests and by the
 
 ## CI
 
-`.github/workflows/ci.yml` runs this script in the `test` job after the
+`.github/workflows/ci.yml` runs both scripts in the `test` job after the
 integration suite, against the job's `mysql:8` service container.

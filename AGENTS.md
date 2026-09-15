@@ -211,7 +211,8 @@ dbcli/                          # Cargo workspace root
 │           ├── mod.rs          # synth::run dispatcher; config/connection resolution (default_connection aware)
 │           ├── cmd.rs          # clap SynthArgs + build_model (marginals + PIT/Pearson copula)
 │           ├── graph.rs        # Topological sort (Kahn) + Tarjan SCC; edge (from,to) = from first
-│           ├── marginal.rs     # Marginals: Normal/Beta/Gamma/Categorical/Uniform (real CDF+PPF, bisection inverse)
+│           ├── marginal.rs     # Marginals: Normal/Beta/Gamma/Categorical/Uniform/Ecdf + KS auto-selection
+│           ├── stats.rs        # KS statistic (ReferenceCdf carries the left limit F(x-))
 │           ├── copula.rs       # GaussianCopula: Cholesky + PSD projection + correlated sampling
 │           ├── model.rs        # TableModel JSON (version-checked load)
 │           ├── profile.rs      # Column/table stats incl. top_values + column_order
@@ -220,7 +221,8 @@ dbcli/                          # Cargo workspace root
 │           ├── fk_pool.rs      # FK pools: uniform/zipf selection, sample_unique (without replacement)
 │           ├── generator.rs    # Engine: per-table seeds (djb2), FK integrity via table.column pools
 │           ├── export.rs       # CSV/JSONL/JSON/SQL with real column names + quoted identifiers
-│           └── report.rs       # Synthesis report (library-only; not wired to CLI yet)
+│           ├── report.rs       # Legacy generation-stats struct (superseded by quality.rs)
+│           └── quality.rs      # M2 (#67): holdout baseline + `synth report` metrics
 │       └── duckdb/         # DuckDB backend (feature-gated: --features duckdb)
 │           ├── mod.rs      # DuckDbFactory
 │           ├── pool.rs     # DuckDbPool + duckdb:// URL parser (embedded, open once + try_clone)

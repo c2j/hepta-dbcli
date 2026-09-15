@@ -28,7 +28,16 @@ pub struct ColumnRule {
     /// Overrides the learned NULL rate for this column (`0.0` = never NULL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub null_rate: Option<f64>,
+    /// Forces the marginal family used while training this column, skipping
+    /// the KS auto-selection: one of `ALLOWED_MARGINALS`. Only read by
+    /// `synth train --rules`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marginal: Option<String>,
 }
+
+/// Marginal families a rules file may force on a column.
+pub const ALLOWED_MARGINALS: [&str; 6] =
+    ["normal", "beta", "gamma", "uniform", "ecdf", "categorical"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relationship {
@@ -97,6 +106,19 @@ impl SynthRules {
 
     pub fn validate(&self) -> Result<(), String> {
         for table in &self.tables {
+            for (column, rule) in &table.columns {
+                if let Some(name) = rule.marginal.as_deref() {
+                    if !ALLOWED_MARGINALS.contains(&name) {
+                        return Err(format!(
+                            "table '{}' column '{}': unknown marginal '{}' (expected one of {})",
+                            table.name,
+                            column,
+                            name,
+                            ALLOWED_MARGINALS.join(", ")
+                        ));
+                    }
+                }
+            }
             for rel in &table.relationships {
                 if rel.references.is_empty() {
                     return Err(format!(
@@ -236,5 +258,93 @@ tables:
 
         let serialized = serde_yaml::to_string(&rules).unwrap();
         assert!(serialized.contains("null_rate: 0.35"));
+    }
+
+    #[test]
+    fn should_parse_column_marginal_override() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      amount:
+        marginal: gamma
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rules.tables[0].columns["amount"].marginal.as_deref(),
+            Some("gamma")
+        );
+        assert_eq!(rules.tables[0].columns["amount"].null_rate, None);
+        rules.validate().unwrap();
+
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert!(serialized.contains("marginal: gamma"));
+    }
+
+    #[test]
+    fn should_leave_marginal_absent_for_legacy_column_rule() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    columns:
+      email:
+        null_rate: 0.35
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rules.tables[0].columns["email"].marginal, None);
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert!(!serialized.contains("marginal"));
+    }
+
+    #[test]
+    fn rules_validate_rejects_unknown_marginal_name() {
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![TableRule {
+                name: "t".to_string(),
+                columns: HashMap::from([(
+                    "amount".to_string(),
+                    ColumnRule {
+                        null_rate: None,
+                        marginal: Some("kde".to_string()),
+                    },
+                )]),
+                rows: None,
+                relationships: vec![],
+                strategy: TableStrategy::Uniform,
+            }],
+        };
+
+        let err = rules.validate().expect_err("unknown marginal must fail");
+        assert!(err.contains("kde"), "error should name the value: {err}");
+    }
+
+    #[test]
+    fn rules_validate_accepts_every_documented_marginal_name() {
+        for name in ALLOWED_MARGINALS {
+            let rules = SynthRules {
+                version: "1".to_string(),
+                tables: vec![TableRule {
+                    name: "t".to_string(),
+                    columns: HashMap::from([(
+                        "amount".to_string(),
+                        ColumnRule {
+                            null_rate: None,
+                            marginal: Some(name.to_string()),
+                        },
+                    )]),
+                    rows: None,
+                    relationships: vec![],
+                    strategy: TableStrategy::Uniform,
+                }],
+            };
+            rules
+                .validate()
+                .unwrap_or_else(|e| panic!("'{name}' should be accepted: {e}"));
+        }
     }
 }

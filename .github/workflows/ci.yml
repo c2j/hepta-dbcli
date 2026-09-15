@@ -152,3 +152,12 @@ jobs:
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
           SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth M2 work (#66 ECDF marginal
+      # auto-selection, #67 holdout baseline + `synth report`): trains,
+      # generates twice, scores offline and against the live key pools, and
+      # checks degradation detection, determinism and honest skips.
+      - name: synth M2 end-to-end verification
+        run: bash tests/synth-verify/run_m2.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb

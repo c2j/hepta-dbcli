@@ -890,22 +890,28 @@ hepta_dbcli synth rules-draft --name dev --tables users,orders \
 hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
   --output synth-out --rows 1000 --seed 42 --format csv
 
+# 4. 质量报告：对生成数据打分（对比 train 记录的留出集摘要）
+hepta_dbcli synth report --models .synth --data synth-out \
+  --rules synth-rules.yaml --min-score 0.85
+
 # 校验模型文件
 hepta_dbcli synth validate --model .synth/users.model.json
 ```
 
-`train` 为每张表写出两个文件：
+`train` 为每张表写出两到三个文件：
 
 | 文件 | 内容 |
 |------|------|
 | `{table}.model.json` | 边际分布参数 + Copula 相关矩阵（带版本号，拒绝更高版本） |
 | `{table}.profile.json` | 列统计（类型 / 基数 / top 值频次），供 rules-draft 唯一性检测 |
+| `{table}.report-baseline.json` | 留出集摘要（数值列分位、类别列频次、列对统计），供 `synth report` 离线打分；`--holdout-ratio 0` 时不生成。文件只含聚合摘要、不含原始行 |
 
 ### 10.3 子命令参数
 
 | 子命令 | 参数 | 说明 |
 |--------|------|------|
-| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample`、`--categorical-top-k` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000）；`--categorical-top-k N\|full` 控制分类列写入模型的档数（默认 50，与历史硬上限一致；`full` 不截断，模型文件超过 10 MiB 时打印警告） |
+| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample`、`--categorical-top-k`、`--rules`、`--holdout-ratio` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000）；`--categorical-top-k N\|full` 控制分类列写入模型的档数（默认 50，与历史硬上限一致；`full` 不截断，模型文件超过 10 MiB 时打印警告）；`--rules` 里的 `columns.<列>.marginal` 可强制该列边际族（见 §10.4），`--holdout-ratio`（默认 0.1，`0` 关闭）决定写入 `report-baseline.json` 的留出行占比（上限 5 万行） |
+| `report` | `--models`、`--data`、`--rules`、`--against-db [连接名]`、`--rows`、`--seed`、`--output`、`--min-score`、`--strict` | 对生成数据打分：`--data` 指定 `generate` 的输出目录（`{table}.csv/jsonl/json`；CSV 空字段 = NULL、`""` = 空字符串），省略时按 `--rows`（默认 1000）与 `--seed` 现场生成；`--rules` 提供 FK 关系用于 `fk` 节；`--against-db`（可省值，裸用即默认连接）用真库键池算 join-rate，否则用**生成出的父表键**；`--min-score F` 低于阈值时退出码非 0（要求**每张表都能打分**：缺 baseline/缺生成数据导致该表无分时直接失败）；`--strict` 把缺 baseline 或缺生成数据当作错误 |
 | `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
 | `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format`、`--no-schema-qualifier` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100）；SQL 默认带训练 schema 限定，`--no-schema-qualifier` 恢复旧的无前缀语句 |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |
@@ -924,6 +930,8 @@ tables:
     columns:
       email:
         null_rate: 0.20          # 覆盖该列训练得到的 NULL 比例；0.0 = 从不 NULL
+      score:
+        marginal: gamma          # 强制该列边际族：normal/beta/gamma/uniform/ecdf/categorical
     relationships: []
   - name: orders
     strategy: zipf               # 子表按 Zipf 偏置引用父表键；weighted 按父列观测频次（或分类边际权重）采样
@@ -938,7 +946,9 @@ tables:
         # null_label 仍可写（兼容旧 YAML），生成路径不再读取它
 ```
 
-列级 `null_rate` 优先于模型里训练到的 `null_rate`；省略则用模型值，再省略则视为 0。被其它表 `references` 指向的父键在生成时强制为 0（父键不能为 NULL），模型或规则若写了非 0 会在 stderr 告警。
+列级 `null_rate` 优先于模型里训练到的 `null_rate`；省略则用模型值，再省略则视为 0。
+
+列级 `marginal` **只在 `synth train --rules` 时生效**（`generate` 读模型，不重训）：它跳过自动择优、直接按指定族拟合；指定族拟合出的参数对该列不可用时（例如跨零样本拟合 Gamma 得到负 scale）打印告警并回退自动择优。规则与列不匹配会让 `train` 直接失败而不是静默丢列：未知列名、未知族名、给低基数（有 `top_values` 字典）列指定连续族（保留 `categorical`），或给带格式的日期时间列指定 `categorical`。被其它表 `references` 指向的父键在生成时强制为 0（父键不能为 NULL），模型或规则若写了非 0 会在 stderr 告警。
 
 `pool_strategy` 取值：
 
@@ -951,7 +961,7 @@ tables:
 
 - 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
 - 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
-- 数值列：高基数或值无重复的列拟合 Normal 分布（整数列生成取整值）；**低基数且值重复出现**的数值列（如 19 档离散价格）自动按观测档位拟合分类分布，生成值保持在观测档位上并保留数值类型
+- 数值列：**低基数且值重复出现**的数值列（如 19 档离散价格）按观测档位拟合分类分布（`top_values`），生成值保持在观测档位上并保留数值类型；其余数值列在 `normal` / `beta` / `gamma` / `uniform` / `ecdf` 五个候选里按**留出集上的 KS 统计量**自动择优。ECDF 是训练样本的均匀概率网格分位（每列至多 512 个 knot，序列化后单列 ≤16KB，超预算时 train 打印告警），用来还原偏态、多峰与零堆积形状；因为 ECDF 在拟合样本上按构造必胜，择优在留出集上打分，并要求 ECDF 相对最优参数族有 ≥20%（或绝对 ≥0.005）的优势才胜出，否则保持参数族（体积小）。整数列仍生成取整值
 - 数值列会学习 `decimal_scale`：字符串样本里纯小数面值（可选正负号、数字、至多一个 `.`，拒绝科学计数法）的最大小数位数，与 DDL 类型括号中的 scale（如 `numeric(16,2)` / `decimal(18,4)` / `NUMBER(18,4)`）取较大值。生成时按该标度做十进制 half-up 量化、再钳回 `[ceil(min), floor(max)]` 的格点区间，既避免 `1004.9999999999999` 这类二进制尾差写入 CSV/SQL，也不会因进位越出训练值域。**整数性由声明决定**：`int`/`bigint` 等整型或 scale 为 0 的 `DECIMAL` 输出 i64；声明了非零 scale 的列即使样本恰好全是整数（`"1.0000"` → 1.0）也按标度输出小数；只有拿不到 DDL 信息时才回退到样本判据。旧模型未带 `decimal_scale` 时不量化，输出与原先逐字节一致。日期时间和分类列不量化
 - 字符串列拟合分类分布，分类列输出原始字符串值
 - Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码；推断到格式的 datetime 列按 UTC epoch 做 PIT），PSD 修正用对角占优近似
@@ -969,6 +979,7 @@ tables:
 - 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
 - `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
+- 质量报告（`synth report`）以 `1-KS`（数值列）/ `1-TV`（类别列）/ Pearson-Δ 与 joint-TV（`baseline` 里登记过的列对）/ FK join-rate 打分，总分是各表已打分节的均值。留出集摘要只含聚合量（分位点、频次、相关系数），泄漏敏感性与 `top_values` 同级。类别列档数超过 50 时分数照常显示但 `counted: false`，不计入均值：数百档上两个多项分布的 TV 在完美模型下也接近 1，计入只会淹没真实信号。缺 baseline（旧模型）时对应节输出 `status: skipped` 与原因、退出码仍为 0，加 `--strict` 才报错；某表的生成数据缺失同样记为 skipped 表，并同时受 `--strict`（报错）与 `--min-score`（该表无分即失败）约束
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断。`synth train` 仅在**请求行数超过 100（`--sample` 默认 10000）且实际采样恰好 100 行**时认定被截断：向 stderr 打印 WARNING（含「分布可能失真」），并把 `{table}.model.json` 的 `provenance.truncated` 设为 `true`。`--sample 100`（或更小）是调用方自己的上限，不算截断；采样不足 100 行或非 Oracle 连接也不警告。该判定是启发式：恰好只有 100 行的表在请求更多行时仍会误报。native OCI 后端不受影响但当前无法从配置强制选择（见 `tests/benchmark/REPORT.md`）
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写。`synth train --schema S` 写入 `TableModel.schema`，`generate --format sql` **默认**输出 `INSERT INTO "S"."t"`（标识符按方言引用）；`--no-schema-qualifier` 恢复旧的无前缀语句
 - `train` 与 `rules-draft` 的 `--schema` 语义一致：显式值优先，缺省时都取连接默认 schema（`side_schema_from_conn`），不再分别回落到 `current_schema`
@@ -981,6 +992,7 @@ tables:
 | P1 | SynMeter 真实单表（**仅 Adult**）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15） | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
 | P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
 | M1 验收 | synth M1 端到端（真实 MySQL fixture）：datetime 格式还原与值域、NULL 比例复现、DECIMAL 标度、字典列全档、FK 引用完整性、SQL schema 限定、同 seed 逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m1.sh` |
+| M2 验收 | synth M2 端到端（同一 fixture）：边际自动择优（非整表 Normal）、留出集摘要隐私、report 的 shapes/pairs/fk 三节、劣化检出与 `--min-score` 退出码、离线（生成父键）与真库（`--against-db`）FK join-rate、缺 baseline / 缺数据的 skip 与 `--strict`、两次报告逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m2.sh` |
 
 CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 

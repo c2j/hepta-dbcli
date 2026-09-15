@@ -1,7 +1,8 @@
 use crate::synth::export::{export, ExportFormat};
 use crate::synth::generator::{generate, GeneratorConfig};
 use crate::synth::marginal::{
-    compute_gaussian_correlation, CategoricalParams, Marginal, NormalParams,
+    compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
+    NormalParams,
 };
 use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
 use crate::synth::profile::TableProfile;
@@ -77,6 +78,15 @@ pub enum SynthCommand {
         /// Categorical top_values cap (`N` or `full`; default 50)
         #[arg(long, default_value = "50", value_parser = parse_categorical_top_k)]
         categorical_top_k: CategoricalTopK,
+
+        /// Rules YAML supplying per-column overrides (`columns.<name>.marginal`)
+        #[arg(long)]
+        rules: Option<String>,
+
+        /// Fraction of the sampled rows kept as the report holdout
+        /// (`0` disables the baseline file)
+        #[arg(long, default_value_t = 0.1)]
+        holdout_ratio: f64,
     },
 
     /// Draft a rules YAML from database foreign keys
@@ -149,6 +159,47 @@ pub enum SynthCommand {
         #[arg(short, long)]
         model: String,
     },
+
+    /// Score generated data against the holdout baseline recorded by `train`
+    Report {
+        /// Directory holding trained model JSON files
+        #[arg(long, default_value = ".synth")]
+        models: String,
+
+        /// Directory with generated data (`<table>.csv|jsonl|json`); generated
+        /// on the fly when omitted
+        #[arg(long)]
+        data: Option<String>,
+
+        /// Rules YAML; supplies the foreign keys scored in the `fk` section
+        #[arg(long)]
+        rules: Option<String>,
+
+        /// Connection whose real keys back the `fk` section; `--against-db`
+        /// without a value uses the default connection
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        against_db: Option<String>,
+
+        /// Rows per table when generating on the fly (ignored with `--data`)
+        #[arg(long, default_value_t = 1_000)]
+        rows: usize,
+
+        /// Deterministic seed for on-the-fly generation
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Write the report JSON to this path
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Exit non-zero when the overall score falls below this threshold
+        #[arg(long)]
+        min_score: Option<f64>,
+
+        /// Treat a missing report baseline as an error instead of skipping
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
 }
 
 // ─── 模型拟合（纯函数，无 IO）────────────────────────────────────────────
@@ -161,18 +212,46 @@ pub(crate) fn build_model(
     pk: Vec<String>,
     schema: Option<String>,
 ) -> Result<(TableModel, Vec<String>), String> {
+    build_model_with_overrides(table, dialect, profile, rows, pk, schema, None)
+}
+
+/// Build a table model, optionally forcing a marginal family per column from
+/// the rules file (`columns.<name>.marginal`). Forced families bypass the KS
+/// auto-selection; an override that cannot apply to its column fails the table
+/// (see [`validate_forced_marginals`]) rather than dropping the column, and a
+/// family whose fitted parameters are unusable falls back to auto-selection
+/// with a warning.
+pub(crate) fn build_model_with_overrides(
+    table: &str,
+    dialect: &str,
+    profile: &TableProfile,
+    rows: &[Vec<serde_json::Value>],
+    pk: Vec<String>,
+    schema: Option<String>,
+    forced: Option<&HashMap<String, String>>,
+) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
     }
+    validate_forced_marginals(table, profile, forced)?;
 
     let mut columns = HashMap::new();
     let mut skipped = Vec::new();
     for (col_name, col_profile) in &profile.columns {
+        let forced_family = forced.and_then(|m| m.get(col_name)).map(String::as_str);
+        let col_idx = profile.column_order.iter().position(|c| c == col_name);
         if col_profile.logical_type == "datetime" {
             if let Some(fmt) = col_profile.datetime_format.as_deref() {
                 columns.insert(
                     col_name.clone(),
-                    fit_datetime_epoch_model(col_name, col_profile, profile, rows, fmt),
+                    fit_datetime_epoch_model(
+                        col_name,
+                        col_profile,
+                        profile,
+                        rows,
+                        fmt,
+                        forced_family,
+                    ),
                 );
                 continue;
             }
@@ -183,7 +262,10 @@ pub(crate) fn build_model(
                 );
             }
         }
-        match fit_marginal(col_name, col_profile) {
+        let samples = col_idx
+            .map(|idx| crate::synth::marginal::column_numeric_samples(rows, idx))
+            .unwrap_or_default();
+        match fit_marginal(col_name, col_profile, &samples, forced_family) {
             Ok(marginal) => {
                 let logical_type = match col_profile.logical_type.as_str() {
                     "categorical" => LogicalType::Categorical,
@@ -289,6 +371,7 @@ fn fit_datetime_epoch_model(
     profile: &TableProfile,
     rows: &[Vec<serde_json::Value>],
     fmt: &str,
+    forced: Option<&str>,
 ) -> ColumnModel {
     let col_idx = profile.column_order.iter().position(|c| c == col_name);
     let epochs: Vec<f64> = col_idx
@@ -324,34 +407,79 @@ fn fit_datetime_epoch_model(
         min,
         max,
         null_rate: Some(col_profile.null_rate),
-        marginal: Marginal::Normal(NormalParams { loc, scale }),
+        // Formatted datetimes keep the Normal marginal by default: the epoch
+        // axis is calendar-driven, and putting it through auto-selection is a
+        // separate decision. A rules override still wins, because the axis is
+        // numeric and a user asking for it has a reason.
+        marginal: match forced {
+            Some(name) => match try_forced_marginal(&epochs, name) {
+                Ok(Some(marginal)) => marginal,
+                Ok(None) => {
+                    eprintln!(
+                        "warning: column '{}': forced marginal '{}' produced unusable parameters on the epoch axis; keeping the Normal marginal",
+                        col_name, name
+                    );
+                    Marginal::Normal(NormalParams { loc, scale })
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: column '{}': forced marginal error ({}); keeping the Normal marginal",
+                        col_name, err
+                    );
+                    Marginal::Normal(NormalParams { loc, scale })
+                }
+            },
+            None => Marginal::Normal(NormalParams { loc, scale }),
+        },
     }
 }
 
 fn fit_marginal(
     col_name: &str,
     col: &crate::synth::profile::ColumnProfile,
+    samples: &[f64],
+    forced: Option<&str>,
 ) -> Result<Marginal, String> {
+    // Overrides reach this point already validated against the column
+    // (`validate_forced_marginals`): a rule wins even when its family is not
+    // the best fit, and only an unusable fit falls back to auto-selection.
+    if let Some(name) = forced {
+        if name == "categorical" {
+            // Validated above: a value dictionary exists for this column.
+            let top = col.top_values.as_deref().ok_or_else(|| {
+                format!(
+                    "column '{}': marginal 'categorical' needs a value dictionary",
+                    col_name
+                )
+            })?;
+            return Ok(categorical_from_top_values(top));
+        }
+        return match try_forced_marginal(samples, name) {
+            Ok(Some(marginal)) => Ok(marginal),
+            Ok(None) => {
+                eprintln!(
+                    "warning: column '{}': forced marginal '{}' produced unusable parameters; falling back to auto-selection",
+                    col_name, name
+                );
+                fit_auto_marginal(col_name, col, samples)
+            }
+            Err(err) => Err(format!("column '{}': {}", col_name, err)),
+        };
+    }
     match col.logical_type.as_str() {
         "numerical" => {
+            // Low-cardinality numeric columns stay on the value-dictionary
+            // (top_values -> Categorical) path; the ECDF never swallows them.
             if let Some(top) = col.top_values.as_deref() {
-                Ok(Marginal::Categorical(CategoricalParams {
-                    values: top.iter().map(|(v, _)| v.clone()).collect(),
-                    weights: top.iter().map(|(_, w)| *w).collect(),
-                }))
+                Ok(categorical_from_top_values(top))
             } else {
-                Ok(Marginal::Normal(NormalParams {
-                    loc: col.mean.unwrap_or(0.0),
-                    scale: col.std_dev.unwrap_or(0.0),
-                }))
+                fit_auto_marginal(col_name, col, samples)
             }
         }
-        // Numeric-encoded datetimes (compact YYYYMMDD, epoch integers) fit a
-        // Normal; date/timestamp strings fall through to the frequency path.
-        "datetime" if col.mean.is_some() => Ok(Marginal::Normal(NormalParams {
-            loc: col.mean.unwrap_or(0.0),
-            scale: col.std_dev.unwrap_or(0.0),
-        })),
+        // Numeric-encoded datetimes (compact YYYYMMDD, epoch integers) get the
+        // same shape treatment; date/timestamp strings fall through to the
+        // frequency path.
+        "datetime" if col.mean.is_some() => fit_auto_marginal(col_name, col, samples),
         // A datetime column with no observed value (all NULL) has no
         // distribution to fit: keep it in the model so generated data keeps
         // the column, and let the recorded null_rate drive NULL emission.
@@ -366,16 +494,75 @@ fn fit_marginal(
                     col_name, col.logical_type
                 )
             })?;
-            Ok(Marginal::Categorical(CategoricalParams {
-                values: top.iter().map(|(v, _)| v.clone()).collect(),
-                weights: top.iter().map(|(_, w)| *w).collect(),
-            }))
+            Ok(categorical_from_top_values(top))
         }
         other => Err(format!(
             "column '{}' has logical type '{}'; training supports numerical, datetime, and categorical",
             col_name, other
         )),
     }
+}
+
+fn categorical_from_top_values(top: &[(String, f64)]) -> Marginal {
+    Marginal::Categorical(CategoricalParams {
+        values: top.iter().map(|(v, _)| v.clone()).collect(),
+        weights: top.iter().map(|(_, w)| *w).collect(),
+    })
+}
+
+/// Stable name of a fitted marginal, for diagnostics and reports.
+pub(crate) fn marginal_name(marginal: &Marginal) -> &'static str {
+    match marginal {
+        Marginal::Normal(_) => "normal",
+        Marginal::Beta(_) => "beta",
+        Marginal::Gamma(_) => "gamma",
+        Marginal::Uniform(_) => "uniform",
+        Marginal::Ecdf(_) => "ecdf",
+        Marginal::Categorical(_) => "categorical",
+    }
+}
+
+/// KS auto-selection over {Normal, Beta, Gamma, Uniform, Ecdf} for a numeric
+/// column, falling back to the profile moments when the sampled rows carry no
+/// usable values (e.g. a model built from a profile alone).
+fn fit_auto_marginal(
+    col_name: &str,
+    col: &crate::synth::profile::ColumnProfile,
+    samples: &[f64],
+) -> Result<Marginal, String> {
+    // No usable samples (e.g. an all-NULL column): keep a degenerate point
+    // mass so the column still exists in the model, matching the pre-selector
+    // behaviour driven by the recorded null_rate.
+    if !samples.iter().any(|v| v.is_finite()) {
+        return Ok(Marginal::Normal(NormalParams {
+            loc: col.mean.unwrap_or(0.0),
+            scale: col.std_dev.unwrap_or(0.0),
+        }));
+    }
+    crate::synth::marginal::fit_auto_numeric_marginal(samples)
+        .map_err(|err| format!("column '{}': {}", col_name, err))
+}
+
+/// Serialized-size budget for a single column's marginal. The ECDF knot cap
+/// keeps one column under this on any sample size (issue #66).
+pub(crate) const COLUMN_MARGINAL_BUDGET_BYTES: usize = 16 * 1024;
+
+/// Columns whose marginal exceeds [`COLUMN_MARGINAL_BUDGET_BYTES`], with the
+/// measured size. Empty for every model the current knot cap can produce.
+pub(crate) fn oversized_marginal_columns(model: &TableModel) -> Vec<(String, usize)> {
+    let mut oversized: Vec<(String, usize)> = model
+        .columns
+        .iter()
+        .filter_map(|(name, column)| {
+            let size = serde_json::to_string_pretty(&column.marginal)
+                .map(|json| json.len())
+                .unwrap_or(0);
+            (size > COLUMN_MARGINAL_BUDGET_BYTES).then(|| (name.clone(), size))
+        })
+        .collect();
+    // Deterministic order: HashMap iteration is not stable.
+    oversized.sort();
+    oversized
 }
 
 pub(crate) fn parse_primary_key(result: &crate::backend::QueryResult) -> Vec<String> {
@@ -556,6 +743,91 @@ pub(crate) fn parse_foreign_keys(
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
+
+/// Reject overrides that cannot apply to their column *before* any fitting, so
+/// a bad rule fails the run with a precise message instead of being recorded
+/// as "column failed to fit" (which drops the column from the model and from
+/// `pk` while the rules file still looks applied).
+fn validate_forced_marginals(
+    table: &str,
+    profile: &TableProfile,
+    forced: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    let Some(forced) = forced else {
+        return Ok(());
+    };
+    for (column, name) in forced {
+        let profile_column = profile.columns.get(column).ok_or_else(|| {
+            format!(
+                "table '{}': rules force a marginal for unknown column '{}'",
+                table, column
+            )
+        })?;
+        // A datetime with an inferred format trains on its epoch axis: the raw
+        // value dictionary is irrelevant there, so continuous families apply.
+        let epoch_axis =
+            profile_column.logical_type == "datetime" && profile_column.datetime_format.is_some();
+        if name == "categorical" {
+            if epoch_axis {
+                return Err(format!(
+                    "table '{}' column '{}': a timestamp column trains on its epoch axis; \
+                     marginal 'categorical' is not supported there",
+                    table, column
+                ));
+            }
+            if profile_column.top_values.is_none() {
+                return Err(format!(
+                    "table '{}' column '{}': marginal 'categorical' needs a value dictionary, \
+                     but the column has none",
+                    table, column
+                ));
+            }
+            continue;
+        }
+        if crate::synth::marginal::NumericFamily::parse(name).is_none() && name != "ecdf" {
+            return Err(format!(
+                "table '{}' column '{}': unknown marginal '{}' (expected one of {})",
+                table,
+                column,
+                name,
+                crate::synth::rules::ALLOWED_MARGINALS.join(", ")
+            ));
+        }
+        if !epoch_axis && profile_column.top_values.is_some() {
+            return Err(format!(
+                "table '{}' column '{}': marginal '{}' conflicts with the {}-level value \
+                 dictionary; keep 'categorical' for low-cardinality columns",
+                table,
+                column,
+                name,
+                profile_column
+                    .top_values
+                    .as_ref()
+                    .map(|levels| levels.len())
+                    .unwrap_or(0)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fit a rules-forced family on `samples`. `Ok(None)` means the family cannot
+/// describe this data (moment matching produces unusable parameters), which
+/// the caller reports and then resolves with auto-selection.
+fn try_forced_marginal(samples: &[f64], name: &str) -> Result<Option<Marginal>, String> {
+    if name == "ecdf" {
+        return EcdfFitter
+            .fit(samples)
+            .map(Some)
+            .map_err(|err| format!("forced marginal 'ecdf': {}", err));
+    }
+    let family = crate::synth::marginal::NumericFamily::parse(name)
+        .ok_or_else(|| format!("unknown marginal '{}'", name))?;
+    Ok(match family.fit(samples) {
+        Ok(marginal) if family.parameters_are_usable(&marginal) => Some(marginal),
+        _ => None,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -879,8 +1151,9 @@ mod tests {
     fn should_fit_low_cardinality_numeric_as_categorical() {
         let samples: Vec<Value> = (0..190).map(|i| Value::from((i % 19) as i64)).collect();
         let profile = crate::synth::profile::ColumnProfile::from_samples(&samples);
+        let numeric: Vec<f64> = (0..190).map(|i| (i % 19) as f64).collect();
 
-        let marginal = fit_marginal("amount", &profile).unwrap();
+        let marginal = fit_marginal("amount", &profile, &numeric, None).unwrap();
 
         match marginal {
             Marginal::Categorical(params) => assert_eq!(params.values.len(), 19),
@@ -888,14 +1161,21 @@ mod tests {
         }
     }
 
+    // Contract: a well-fitting parametric family wins, and ECDF is never
+    // chosen for a clean shape. Uniform data therefore lands on Uniform.
     #[test]
-    fn should_still_fit_high_cardinality_numeric_as_normal() {
+    fn should_fit_high_cardinality_numeric_via_auto_selection() {
         let samples: Vec<Value> = (0..1000).map(Value::from).collect();
         let profile = crate::synth::profile::ColumnProfile::from_samples(&samples);
+        let numeric: Vec<f64> = (0..1000).map(|i| i as f64).collect();
 
-        let marginal = fit_marginal("amount", &profile).unwrap();
+        let marginal = fit_marginal("amount", &profile, &numeric, None).unwrap();
 
-        assert!(matches!(marginal, Marginal::Normal(_)));
+        assert!(
+            matches!(marginal, Marginal::Uniform(_)),
+            "uniform data must stay parametric, got {:?}",
+            marginal
+        );
     }
 
     #[test]
@@ -1520,5 +1800,285 @@ mod tests {
             }
             other => panic!("expected legacy Categorical, got {other:?}"),
         }
+    }
+
+    // ─── marginal auto-selection wiring (#66) ────────────────────────────
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u01(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+
+        fn uniform(&mut self, low: f64, high: f64) -> f64 {
+            low + (high - low) * self.next_u01()
+        }
+    }
+
+    /// Unit exponential sample: strongly right-skewed, and cheap to draw.
+    fn exponential_values(seed: u64, n: usize) -> Vec<Value> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|_| Value::from(-rng.next_u01().max(1e-12).ln()))
+            .collect()
+    }
+
+    #[test]
+    fn should_keep_low_cardinality_numeric_as_categorical() {
+        // AC4 regression: 19 repeating numeric levels stay on the top_values
+        // (Categorical) path and are never swallowed by the ECDF marginal.
+        let values: Vec<Value> = (0..190).map(|i| Value::from((i % 19) as i64)).collect();
+        let (profile, rows) = typed_profile("t", &[("code", "int", values)]);
+        assert!(profile.columns["code"].top_values.is_some());
+
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
+        assert!(skipped.is_empty());
+        match &model.columns["code"].marginal {
+            Marginal::Categorical(p) => assert_eq!(p.values.len(), 19),
+            other => panic!("expected Categorical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_apply_auto_selection_to_high_cardinality_numeric() {
+        let values = exponential_values(12345, 5_000);
+        let (profile, rows) = typed_profile("t", &[("amount", "double", values)]);
+        assert!(profile.columns["amount"].top_values.is_none());
+
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
+        assert!(skipped.is_empty());
+        match &model.columns["amount"].marginal {
+            Marginal::Gamma(_) | Marginal::Ecdf(_) => {}
+            other => panic!("skewed column must not stay Normal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_force_marginal_from_rules_override() {
+        // Zero-inflated: without a rule the auto-selector picks Ecdf, which
+        // still holds the 70% zero mass it cannot express parametrically.
+        let mut rng = Lcg(777);
+        let values: Vec<Value> = (0..5_000)
+            .map(|i| {
+                if i % 10 < 7 {
+                    Value::from(0.0)
+                } else {
+                    Value::from(rng.uniform(10.0, 100.0))
+                }
+            })
+            .collect();
+        let (profile, rows) = typed_profile("t", &[("fee", "double", values)]);
+
+        let (auto, _) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
+        assert!(
+            matches!(auto.columns["fee"].marginal, Marginal::Ecdf(_)),
+            "auto selection should pick Ecdf, got {:?}",
+            auto.columns["fee"].marginal
+        );
+
+        // AC3: the rule wins even though KS is not the smallest.
+        let forced = HashMap::from([("fee".to_string(), "gamma".to_string())]);
+        let (model, skipped) =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .unwrap();
+        assert!(skipped.is_empty());
+        assert!(
+            matches!(model.columns["fee"].marginal, Marginal::Gamma(_)),
+            "forced Gamma must win, got {:?}",
+            model.columns["fee"].marginal
+        );
+
+        let forced_ecdf = HashMap::from([("fee".to_string(), "ecdf".to_string())]);
+        let (model, _) = build_model_with_overrides(
+            "t",
+            "mysql",
+            &profile,
+            &rows,
+            vec![],
+            None,
+            Some(&forced_ecdf),
+        )
+        .unwrap();
+        assert!(matches!(model.columns["fee"].marginal, Marginal::Ecdf(_)));
+    }
+
+    #[test]
+    fn should_fall_back_to_auto_selection_when_forced_family_cannot_fit() {
+        // Gamma needs strictly positive samples. A forced-but-inapplicable
+        // family must not produce a broken marginal, and must not drop the
+        // column either.
+        let values: Vec<Value> = (0..1_000)
+            .map(|i| Value::from((i as f64) - 500.0))
+            .collect();
+        let (profile, rows) = typed_profile("t", &[("v", "double", values)]);
+        let forced = HashMap::from([("v".to_string(), "gamma".to_string())]);
+
+        let (model, skipped) =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .unwrap();
+        assert!(skipped.is_empty());
+        assert!(
+            !matches!(model.columns["v"].marginal, Marginal::Gamma(_)),
+            "inapplicable Gamma must fall back, got {:?}",
+            model.columns["v"].marginal
+        );
+        match &model.columns["v"].marginal {
+            Marginal::Uniform(p) => {
+                assert!((p.low + 500.0).abs() < 1e-9);
+                assert!((p.high - 499.0).abs() < 1e-9);
+            }
+            other => panic!("expected Uniform fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_fail_train_on_unknown_forced_marginal() {
+        let values = exponential_values(9, 500);
+        let (profile, rows) = typed_profile("t", &[("v", "double", values)]);
+        let forced = HashMap::from([("v".to_string(), "kde".to_string())]);
+
+        let err =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .expect_err("unknown marginal name must fail the table");
+        assert!(err.contains("unknown marginal 'kde'"), "{err}");
+        assert!(err.contains("column 'v'"), "{err}");
+    }
+
+    #[test]
+    fn should_fail_train_when_override_conflicts_with_the_value_dictionary() {
+        // A low-cardinality numeric column keeps its dictionary; silently
+        // dropping it from the model (and from `pk`) while the rules file looks
+        // applied is the failure this guards against.
+        let values: Vec<Value> = (0..400).map(|i| Value::from((i % 5) as i64)).collect();
+        let (profile, rows) = typed_profile("t", &[("status", "int", values)]);
+        assert!(profile.columns["status"].top_values.is_some());
+        let forced = HashMap::from([("status".to_string(), "gamma".to_string())]);
+
+        let err = build_model_with_overrides(
+            "t",
+            "mysql",
+            &profile,
+            &rows,
+            vec!["status".to_string()],
+            None,
+            Some(&forced),
+        )
+        .expect_err("conflicting override must fail the table");
+        assert!(
+            err.contains("conflicts with the 5-level value dictionary"),
+            "{err}"
+        );
+
+        // The forcing name itself stays accepted (categorical is the identity).
+        let forced = HashMap::from([("status".to_string(), "categorical".to_string())]);
+        let (model, skipped) = build_model_with_overrides(
+            "t",
+            "mysql",
+            &profile,
+            &rows,
+            vec!["status".to_string()],
+            None,
+            Some(&forced),
+        )
+        .unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(model.pk, vec!["status".to_string()]);
+        assert!(matches!(
+            model.columns["status"].marginal,
+            Marginal::Categorical(_)
+        ));
+    }
+
+    #[test]
+    fn should_fail_train_when_categorical_is_forced_on_a_timestamp() {
+        let values: Vec<Value> = (0..50)
+            .map(|i| Value::from(format!("2024-01-{:02} 00:00:00", (i % 28) + 1)))
+            .collect();
+        let (profile, rows) = typed_profile("t", &[("biz_date", "datetime", values)]);
+        assert!(profile.columns["biz_date"].datetime_format.is_some());
+        let forced = HashMap::from([("biz_date".to_string(), "categorical".to_string())]);
+
+        let err =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .expect_err("categorical on an epoch column must fail");
+        assert!(err.contains("epoch axis"), "{err}");
+    }
+
+    #[test]
+    fn should_apply_marginal_override_on_the_datetime_epoch_axis() {
+        // A rules override must reach the epoch axis, not be dropped by the
+        // datetime path.
+        let values: Vec<Value> = (0..400)
+            .map(|i| Value::from(format!("2024-01-01 {:02}:{:02}:00", (i / 60) % 24, i % 60)))
+            .collect();
+        let (profile, rows) = typed_profile("t", &[("biz_date", "datetime", values)]);
+        let fmt = profile.columns["biz_date"]
+            .datetime_format
+            .clone()
+            .expect("inferred format");
+
+        let (auto, _) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
+        assert!(
+            matches!(auto.columns["biz_date"].marginal, Marginal::Normal(_)),
+            "formatted datetimes keep Normal by default, got {:?}",
+            auto.columns["biz_date"].marginal
+        );
+
+        let forced = HashMap::from([("biz_date".to_string(), "ecdf".to_string())]);
+        let (model, _) =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .unwrap();
+        let column = &model.columns["biz_date"];
+        assert!(
+            matches!(column.marginal, Marginal::Ecdf(_)),
+            "override must reach the epoch axis, got {:?}",
+            column.marginal
+        );
+        assert_eq!(column.datetime_format.as_deref(), Some(fmt.as_str()));
+        // Generated text is still formatted with the inferred format.
+        let epoch = column.marginal.inverse_cdf(0.5);
+        assert!(crate::synth::datetime::format_epoch(epoch, &fmt).is_some());
+    }
+
+    #[test]
+    fn should_reject_override_for_an_unknown_column() {
+        let values = exponential_values(4, 200);
+        let (profile, rows) = typed_profile("t", &[("v", "double", values)]);
+        let forced = HashMap::from([("typo".to_string(), "gamma".to_string())]);
+
+        let err =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .expect_err("unknown column must fail");
+        assert!(err.contains("unknown column 'typo'"), "{err}");
+    }
+
+    #[test]
+    fn ecdf_column_marginal_stays_within_model_budget() {
+        // AC5 volume: the ECDF knot cap must keep one column's marginal under
+        // the documented 16KB budget even on a 10k-row sample.
+        let values = exponential_values(3, 10_000);
+        let (profile, rows) = typed_profile("t", &[("v", "double", values)]);
+        let forced = HashMap::from([("v".to_string(), "ecdf".to_string())]);
+        let (model, _) =
+            build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, Some(&forced))
+                .unwrap();
+
+        let Marginal::Ecdf(p) = &model.columns["v"].marginal else {
+            panic!("expected Ecdf");
+        };
+        assert!(p.knots.len() <= crate::synth::marginal::ECDF_MAX_KNOTS);
+        let pretty = serde_json::to_string_pretty(&model.columns["v"].marginal).unwrap();
+        assert!(
+            pretty.len() <= COLUMN_MARGINAL_BUDGET_BYTES,
+            "ECDF marginal serialized to {} bytes, budget {}",
+            pretty.len(),
+            COLUMN_MARGINAL_BUDGET_BYTES
+        );
+        assert!(oversized_marginal_columns(&model).is_empty());
     }
 }
