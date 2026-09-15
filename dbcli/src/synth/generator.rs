@@ -361,7 +361,14 @@ pub fn generate(
 
         // Phase 5 (plan §1): derived columns run last, over the values every
         // earlier phase produced.
-        apply_derive_rules(&mut rows, table_name, rule, model, column_order)?;
+        apply_derive_rules(
+            &mut rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+            &referenced_targets,
+        )?;
 
         value_pool_outcomes.extend(check_value_pools(
             &rows,
@@ -379,6 +386,7 @@ pub fn generate(
             rule,
             model,
             column_order,
+            &referenced_targets,
         )?);
 
         for (col_idx, col_name) in column_order.iter().enumerate() {
@@ -716,6 +724,7 @@ fn apply_branch_repair(
     rule: &crate::synth::rules::TableRule,
     model: &TableModel,
     column_order: &[String],
+    referenced_targets: &std::collections::HashSet<String>,
 ) -> Result<Vec<BranchOutcome>, String> {
     if rule.branches.is_empty() {
         return Ok(Vec::new());
@@ -763,15 +772,10 @@ fn apply_branch_repair(
                     table_name, branch.id, column
                 ));
             }
-            if rule
-                .relationships
-                .iter()
-                .flat_map(|rel| rel.references.iter())
-                .any(|target| target == &format!("{}.{}", table_name, column))
-            {
+            if referenced_targets.contains(&format!("{}.{}", table_name, column)) {
                 return Err(format!(
-                    "table '{}' branch '{}': repair.set cannot write parent key '{}' referenced by another table",
-                    table_name, branch.id, column
+                    "table '{}' branch '{}': repair.set cannot write parent key '{}.{}' referenced by another table (uniqueness is enforced before the repair phase)",
+                    table_name, branch.id, table_name, column
                 ));
             }
             if derived.contains(column.as_str()) {
@@ -916,7 +920,14 @@ fn apply_branch_repair(
         }
 
         // `derive` is idempotent and may read a column the repair just wrote.
-        apply_derive_rules(rows, table_name, rule, model, column_order)?;
+        apply_derive_rules(
+            rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+            referenced_targets,
+        )?;
     }
 
     for (position, (branch, predicate, _)) in prepared.iter().enumerate() {
@@ -987,11 +998,21 @@ fn apply_derive_rules(
     rule: &crate::synth::rules::TableRule,
     model: &TableModel,
     column_order: &[String],
+    referenced_targets: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     use rust_decimal::prelude::ToPrimitive;
 
     if rule.derive.is_empty() {
         return Ok(());
+    }
+
+    for derive in &rule.derive {
+        if referenced_targets.contains(&format!("{}.{}", table_name, derive.column)) {
+            return Err(format!(
+                "table '{}': derive cannot target parent key '{}.{}' referenced by another table (uniqueness is enforced before the derive phase, so derived values could repeat)",
+                table_name, table_name, derive.column
+            ));
+        }
     }
 
     let index_of: HashMap<&str, usize> = column_order
@@ -4935,6 +4956,78 @@ tables:
         assert!(
             outcome.is_within_tolerance(),
             "typed numeric pool must match: {outcome:?}"
+        );
+    }
+
+    /// Parent `p(id)` referenced by `c(fk)`, plus a plain `x` column.
+    fn parent_child_models() -> HashMap<String, TableModel> {
+        let mut models = HashMap::new();
+        models.insert("p".to_string(), numerical_model("p", "id", 0.0, 1.0));
+        models.insert("c".to_string(), numerical_model("c", "fk", 0.0, 1.0));
+        models
+    }
+
+    fn parent_child_rules(parent: TableRule) -> SynthRules {
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                parent,
+                single_rule(
+                    "c",
+                    vec![Relationship {
+                        pk: "fk".to_string(),
+                        references: vec!["p.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn should_reject_derive_on_a_referenced_parent_key_at_generate_time() {
+        // `run_generate` calls `validate`, but the generator keeps its own
+        // guard so a direct `generate` call cannot duplicate a parent key.
+        let models = parent_child_models();
+        let mut parent = single_rule("p", vec![]);
+        parent.derive.push(crate::synth::rules::DeriveRule {
+            column: "id".to_string(),
+            expr: "id * 0".to_string(),
+        });
+        let rules = parent_child_rules(parent);
+
+        let err = generate(&models, &rules, &config(&["p", "c"], 20))
+            .expect_err("deriving a referenced parent key must fail");
+        assert!(err.contains("p.id"), "error must name the key: {err}");
+        assert!(
+            err.contains("derive") || err.contains("derived"),
+            "error must name the phase: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_branch_repair_on_a_referenced_parent_key_at_generate_time() {
+        let models = parent_child_models();
+        let mut parent = single_rule("p", vec![]);
+        parent.branches.push(crate::synth::rules::BranchRule {
+            id: "pin".to_string(),
+            predicate: "id > 0".to_string(),
+            target_ratio: 0.9,
+            tolerance: None,
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("id".to_string(), "1".to_string())]),
+                linked_derive_recompute: false,
+            },
+        });
+        let rules = parent_child_rules(parent);
+
+        let err = generate(&models, &rules, &config(&["p", "c"], 20))
+            .expect_err("repairing a referenced parent key must fail");
+        assert!(err.contains("id"), "error must name the column: {err}");
+        assert!(
+            err.contains("referenced"),
+            "error must explain the reference: {err}"
         );
     }
 

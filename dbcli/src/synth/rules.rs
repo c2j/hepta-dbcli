@@ -346,12 +346,14 @@ impl SynthRules {
                     }
                 }
 
-                // V3: fixed/values on a parent key referenced by another table
-                // cannot stay unique.
-                if has_fixed_or_values && referenced.contains(&format!("{}.{}", table.name, column))
-                {
+                // V3: any pinned value on a parent key referenced by another
+                // table cannot stay unique. `generate` already refuses all
+                // three fields; validating it here too keeps the error at
+                // load time and keeps both layers in agreement.
+                let is_pinned = has_fixed_or_values || rule.fixed_range.is_some();
+                if is_pinned && referenced.contains(&format!("{}.{}", table.name, column)) {
                     return Err(format!(
-                        "table '{}' column '{}': 'fixed'/'values' on a parent key referenced by another table breaks uniqueness",
+                        "table '{}' column '{}': 'fixed'/'values'/'fixed_range' on a parent key referenced by another table breaks uniqueness",
                         table.name, column
                     ));
                 }
@@ -407,8 +409,8 @@ impl SynthRules {
                     }
                 }
             }
-            validate_derive_rules(table)?;
-            validate_branches(table)?;
+            validate_derive_rules(table, &referenced)?;
+            validate_branches(table, &referenced)?;
 
             for rel in &table.relationships {
                 if rel.references.is_empty() {
@@ -425,7 +427,10 @@ impl SynthRules {
 
 /// `#70` branch rules: valid predicate, sane ratio/tolerance, unique ids and a
 /// repair that can actually change something.
-fn validate_branches(table: &TableRule) -> Result<(), String> {
+fn validate_branches(
+    table: &TableRule,
+    parent_keys: &std::collections::HashSet<String>,
+) -> Result<(), String> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for branch in &table.branches {
@@ -459,6 +464,15 @@ fn validate_branches(table: &TableRule) -> Result<(), String> {
             }
         }
 
+        for column in branch.repair.set.keys() {
+            if parent_keys.contains(&format!("{}.{}", table.name, column)) {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write parent key '{}' referenced by another table (uniqueness is unreachable)",
+                    table.name, branch.id, column
+                ));
+            }
+        }
+
         if branch.repair.set.is_empty() {
             return Err(format!(
                 "table '{}' branch '{}': repair.set is empty, so the branch can never be repaired",
@@ -472,7 +486,10 @@ fn validate_branches(table: &TableRule) -> Result<(), String> {
 
 /// `#70` derive rules: whitelist the expression, reject priority conflicts
 /// and detect cycles in the derive graph.
-fn validate_derive_rules(table: &TableRule) -> Result<(), String> {
+fn validate_derive_rules(
+    table: &TableRule,
+    parent_keys: &std::collections::HashSet<String>,
+) -> Result<(), String> {
     let mut referenced: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -501,6 +518,13 @@ fn validate_derive_rules(table: &TableRule) -> Result<(), String> {
         {
             return Err(format!(
                 "table '{}' column '{}': a derived column cannot be a relationship pk (referential integrity)",
+                table.name, derive.column
+            ));
+        }
+
+        if parent_keys.contains(&format!("{}.{}", table.name, derive.column)) {
+            return Err(format!(
+                "table '{}' column '{}': a derived column cannot be a parent key referenced by another table (its uniqueness is enforced before the derive phase, so the derived values could repeat)",
                 table.name, derive.column
             ));
         }
@@ -856,6 +880,74 @@ tables:
         let err = validate_yaml(yaml).expect_err("fixed + derive must conflict");
         assert!(err.contains("total"), "error must name the column: {err}");
         assert!(err.contains("fixed"), "error must explain the clash: {err}");
+    }
+
+    #[test]
+    fn should_reject_fixed_range_on_a_parent_key_referenced_by_another_table() {
+        // `generate` refuses all three pinning fields on a referenced parent
+        // key; validation must not be laxer than the generator.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: parent
+    columns:
+      id:
+        fixed_range: [1, 2]
+    relationships: []
+  - name: child
+    relationships:
+      - pk: fk
+        references: [parent.id]
+"#;
+        let err = validate_yaml(yaml).expect_err("pinning a parent key must fail");
+        assert!(err.contains("id"), "error must name the column: {err}");
+        assert!(
+            err.contains("uniqueness"),
+            "error must explain the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_derive_on_a_parent_key_referenced_by_another_table() {
+        // A derived parent key loses the uniqueness guarantee the generator
+        // enforces before the derive phase, so an FK-enforced load breaks.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: parent
+    derive:
+      - column: id
+        expr: "other * 2"
+    relationships: []
+  - name: child
+    relationships:
+      - pk: fk
+        references: [parent.id]
+"#;
+        let err = validate_yaml(yaml).expect_err("deriving a parent key must fail");
+        assert!(err.contains("parent"), "error must name the table: {err}");
+        assert!(err.contains("id"), "error must name the column: {err}");
+    }
+
+    #[test]
+    fn should_reject_branch_repair_on_a_parent_key_referenced_by_another_table() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: parent
+    branches:
+      - id: pin
+        predicate: "other > 1"
+        target_ratio: 0.8
+        repair: {set: {id: "1"}}
+    relationships: []
+  - name: child
+    relationships:
+      - pk: fk
+        references: [parent.id]
+"#;
+        let err = validate_yaml(yaml).expect_err("repairing a parent key must fail");
+        assert!(err.contains("id"), "error must name the column: {err}");
     }
 
     #[test]
