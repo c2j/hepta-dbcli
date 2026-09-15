@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn compact_terminal_footer_when_truncated() {
-        let out = render_compact_sample(&keyed_report(), 1, false, SampleMode::Diverse);
+        let out = render_compact_sample(&keyed_report(), 1, false, SampleMode::Prefix);
         assert!(out.contains("sample diffs (1 of 3)"), "{out}");
         assert!(out.contains("showing 1 of 3"), "{out}");
         assert!(out.contains("--export"), "{out}");

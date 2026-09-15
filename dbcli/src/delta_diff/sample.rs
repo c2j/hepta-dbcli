@@ -105,61 +105,101 @@ fn diverse_indices(report: &DiffReport, n: usize) -> Vec<usize> {
     let key_len = report.key_columns.len();
     let value_len = report.value_columns.len();
 
-    // 单次 O(N·C) 扫描：status 配额候选 + 变化列签名代表（D3）
-    let mut quota: [Option<usize>; 3] = [None; 3]; // [MissingLeft, MissingRight, Modified]
-    let mut sig_reps: Vec<usize> = Vec::new();
-    let mut seen_sigs: HashSet<Vec<u64>> = HashSet::new();
+    // 单次 O(N·C) 扫描：各 status 首现位次 + Modified 行的变化列集合
+    let mut quota: [Option<usize>; 3] = [None; 3]; // [Modified, MissingLeft, MissingRight]
+    let mut modified: Vec<(usize, Vec<usize>)> = Vec::new();
 
     for (idx, row) in report.sample_diffs.iter().enumerate() {
         match row.status {
-            DiffStatus::MissingLeft => {
+            DiffStatus::Modified => {
                 if quota[0].is_none() {
                     quota[0] = Some(idx);
                 }
+                if column_aware {
+                    let changed = changed_value_indices(row, report, key_len, value_len);
+                    modified.push((idx, changed));
+                }
             }
-            DiffStatus::MissingRight => {
+            DiffStatus::MissingLeft => {
                 if quota[1].is_none() {
                     quota[1] = Some(idx);
                 }
             }
-            DiffStatus::Modified => {
+            DiffStatus::MissingRight => {
                 if quota[2].is_none() {
                     quota[2] = Some(idx);
-                }
-                if !column_aware {
-                    continue;
-                }
-                let changed = changed_value_indices(row, report, key_len, value_len);
-                let sig = bitmask(&changed, value_len);
-                if seen_sigs.insert(sig) {
-                    sig_reps.push(idx);
                 }
             }
         }
     }
 
-    // 预算内装配：配额 → 新签名代表 → 原序回填（D3/D7）
-    let mut picked: Vec<usize> = quota.into_iter().flatten().collect();
-    let mut chosen: HashSet<usize> = picked.iter().copied().collect();
-    for idx in &sig_reps {
+    let mut picked: Vec<usize> = Vec::with_capacity(n);
+    let mut chosen: HashSet<usize> = HashSet::new();
+    let mut covered = vec![false; value_len];
+
+    // 1) status 配额——Modified 优先：它是列形态的唯一载体，预算装不下全部
+    //    status 时不能被 Missing 行挤掉
+    for slot in quota.into_iter().flatten() {
         if picked.len() >= n {
             break;
         }
-        if chosen.insert(*idx) {
+        if chosen.insert(slot) {
+            picked.push(slot);
+            if let Some((_, cols)) = modified.iter().find(|(i, _)| *i == slot) {
+                for &c in cols {
+                    covered[c] = true;
+                }
+            }
+        }
+    }
+
+    // 2) set-cover——key 序扫 Modified，仅当覆盖尚未出现的列；重叠签名不得挤占稀有列的预算
+    for (idx, cols) in &modified {
+        if picked.len() >= n {
+            break;
+        }
+        if chosen.contains(idx) {
+            continue;
+        }
+        if cols.iter().any(|&c| !covered[c]) {
+            chosen.insert(*idx);
+            picked.push(*idx);
+            for &c in cols {
+                covered[c] = true;
+            }
+        }
+    }
+
+    // 3) 签名去重——同一变化列 bitmask 只留 1 个代表（不再提供新列，仅为形状样本）
+    let mut seen_sigs: HashSet<Vec<u64>> = HashSet::new();
+    for &p in &picked {
+        if let Some((_, cols)) = modified.iter().find(|(i, _)| *i == p) {
+            seen_sigs.insert(bitmask(cols, value_len));
+        }
+    }
+    for (idx, cols) in &modified {
+        if picked.len() >= n {
+            break;
+        }
+        if chosen.contains(idx) {
+            continue;
+        }
+        if seen_sigs.insert(bitmask(cols, value_len)) {
+            chosen.insert(*idx);
             picked.push(*idx);
         }
     }
-    if picked.len() < n {
-        for idx in 0..total {
-            if picked.len() >= n {
-                break;
-            }
-            if chosen.insert(idx) {
-                picked.push(idx);
-            }
+
+    // 4) 原序回填——剩余名额按 key 序补，避免样本全是罕见离群点
+    for idx in 0..total {
+        if picked.len() >= n {
+            break;
+        }
+        if chosen.insert(idx) {
+            picked.push(idx);
         }
     }
-    picked.truncate(n);
+
     picked.sort_unstable();
     picked
 }
@@ -537,6 +577,124 @@ mod tests {
     }
 
     #[test]
+    fn select_diverse_set_cover_skips_overlapping_signatures_for_new_columns() {
+        // 预算 2：row0 改 {cjsl,yhs}（配额），rows 1..10 只改 {cjsl}（新签名但零新列），
+        // row11 只改 {cjrq}。重叠签名不得挤占预算——{cjrq} 的唯一覆盖者必须入选。
+        let mut r = base_report();
+        let mut rows = Vec::new();
+        rows.push(mod_row(
+            0,
+            vec![
+                Value::from(0),
+                Value::from(1),
+                Value::from(1),
+                Value::from("d"),
+            ],
+            vec![
+                Value::from(0),
+                Value::from(2),
+                Value::from(2),
+                Value::from("d"),
+            ],
+        ));
+        for i in 1..11 {
+            rows.push(mod_row(
+                i,
+                vec![
+                    Value::from(i),
+                    Value::from(1),
+                    Value::from(1),
+                    Value::from("d"),
+                ],
+                vec![
+                    Value::from(i),
+                    Value::from(2),
+                    Value::from(1),
+                    Value::from("d"),
+                ],
+            ));
+        }
+        rows.push(mod_row(
+            11,
+            vec![
+                Value::from(11),
+                Value::from(1),
+                Value::from(1),
+                Value::from("x"),
+            ],
+            vec![
+                Value::from(11),
+                Value::from(1),
+                Value::from(1),
+                Value::from("y"),
+            ],
+        ));
+        r.sample_diffs = rows;
+        let picked = select_sample_indices(&r, 2, SampleMode::Diverse);
+        assert_eq!(
+            picked,
+            vec![0, 11],
+            "set-cover must reach the cjrq row: {picked:?}"
+        );
+    }
+
+    #[test]
+    fn select_diverse_quota_prefers_modified_when_budget_cannot_hold_all_statuses() {
+        // 混合 status + 预算 2：Modified 是列形态的唯一载体，不能被 Missing 配额挤掉
+        let mut r = base_report();
+        let mut rows: Vec<DiffRow> = vec![DiffRow {
+            key: Value::from(0),
+            left: None,
+            right: Some(vec![
+                Value::from(0),
+                Value::from(1),
+                Value::from(2),
+                Value::from("d"),
+            ]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        }];
+        for i in 1..31 {
+            rows.push(DiffRow {
+                key: Value::from(i),
+                left: Some(vec![
+                    Value::from(i),
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from("d"),
+                ]),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            });
+        }
+        rows.push(mod_row(
+            31,
+            vec![
+                Value::from(31),
+                Value::from(1),
+                Value::from(2),
+                Value::from("d"),
+            ],
+            vec![
+                Value::from(31),
+                Value::from(9),
+                Value::from(2),
+                Value::from("d"),
+            ],
+        ));
+        r.sample_diffs = rows;
+        let picked = select_sample_indices(&r, 2, SampleMode::Diverse);
+        assert_eq!(picked, vec![0, 31], "Modified survives quota: {picked:?}");
+        let picked1 = select_sample_indices(&r, 1, SampleMode::Diverse);
+        assert_eq!(
+            picked1,
+            vec![31],
+            "budget 1 still prefers Modified: {picked1:?}"
+        );
+    }
+
+    #[test]
     fn retain_sample_replaces_rows_with_diverse_selection() {
         let mut r = base_report();
         r.sample_diffs = skewed_rows();
@@ -567,57 +725,80 @@ mod tests {
 
     #[test]
     fn select_diverse_hash_count_degenerates_to_status_then_order() {
-        // 循环 7：HashCount 无列可比 → status 配额 + 原序回填
+        // HashCount 无列可比 → status 配额 + 原序回填；Modified 在尾部，prefix 选不到它
         let mut r = base_report();
         r.row_payload = RowPayload::HashCount;
         r.key_columns.clear();
         r.value_columns.clear();
         r.column_data_types.clear();
-        let mut rows: Vec<DiffRow> = (0..50)
+        let mut rows: Vec<DiffRow> = (0..49)
             .map(|i| DiffRow {
                 key: Value::from(i),
                 left: Some(vec![Value::from("h"), Value::from(1)]),
                 right: Some(vec![Value::from("h"), Value::from(2)]),
-                status: if i % 10 == 0 {
-                    DiffStatus::Modified
-                } else {
-                    DiffStatus::MissingRight
-                },
+                status: DiffStatus::MissingRight,
                 confirmed: true,
             })
             .collect();
-        rows[0].status = DiffStatus::Modified;
-        rows[0].left = Some(vec![Value::from("h0"), Value::from(1)]);
-        rows[0].right = Some(vec![Value::from("h0"), Value::from(2)]);
+        rows.push(DiffRow {
+            key: Value::from(49),
+            left: Some(vec![Value::from("h49"), Value::from(1)]),
+            right: Some(vec![Value::from("h49"), Value::from(2)]),
+            status: DiffStatus::Modified,
+            confirmed: true,
+        });
         r.sample_diffs = rows;
         let picked = select_sample_indices(&r, 3, SampleMode::Diverse);
-        assert_eq!(picked, vec![0, 1, 2], "quota(Modified@0) + 原序回填");
+        assert_eq!(
+            picked,
+            vec![0, 1, 49],
+            "quota(Modified@49 + MissingRight@0) + 原序回填: {picked:?}"
+        );
     }
 
     #[test]
     fn select_diverse_preserves_key_order_display() {
-        // 展示序恒为 key 序（升序下标），选择优先级只决定「选谁」
+        // 展示序恒为 key 序（升序下标）；row9 携带新列 {cjrq}，使选择集偏离 key 序前缀
         let mut r = base_report();
-        r.sample_diffs = (0..10)
-            .map(|i| DiffRow {
-                key: Value::from(i),
-                left: Some(vec![
+        let mut rows = Vec::new();
+        for i in 0..9 {
+            rows.push(mod_row(
+                i,
+                vec![
                     Value::from(i),
                     Value::from(1),
                     Value::from(2),
                     Value::from("d"),
-                ]),
-                right: Some(vec![
+                ],
+                vec![
                     Value::from(i),
                     Value::from(3),
                     Value::from(2),
                     Value::from("d"),
-                ]),
-                status: DiffStatus::Modified,
-                confirmed: true,
-            })
-            .collect();
+                ],
+            ));
+        }
+        rows.push(mod_row(
+            9,
+            vec![
+                Value::from(9),
+                Value::from(1),
+                Value::from(2),
+                Value::from("d"),
+            ],
+            vec![
+                Value::from(9),
+                Value::from(3),
+                Value::from(2),
+                Value::from("y"),
+            ],
+        ));
+        r.sample_diffs = rows;
         let picked = select_sample_indices(&r, 4, SampleMode::Diverse);
-        assert_eq!(picked, vec![0, 1, 2, 3]);
+        assert_eq!(
+            picked,
+            vec![0, 1, 2, 9],
+            "non-prefix selection rendered in key order: {picked:?}"
+        );
     }
 }
