@@ -7,6 +7,8 @@ pub mod datetime;
 #[cfg(feature = "synth")]
 pub mod export;
 #[cfg(feature = "synth")]
+pub mod expr;
+#[cfg(feature = "synth")]
 pub mod fk_pool;
 #[cfg(feature = "synth")]
 pub mod generator;
@@ -14,6 +16,8 @@ pub mod generator;
 pub mod graph;
 #[cfg(feature = "synth")]
 pub mod marginal;
+#[cfg(feature = "synth")]
+pub mod mine;
 #[cfg(feature = "synth")]
 pub mod model;
 #[cfg(feature = "synth")]
