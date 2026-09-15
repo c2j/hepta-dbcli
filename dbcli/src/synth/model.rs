@@ -52,9 +52,9 @@ pub struct ColumnModel {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
-    /// Share of NULLs observed in the training sample. `Some(1.0)` marks a
-    /// column that had no non-null value at all; generation emits NULL for it
-    /// instead of fabricating a constant from a degenerate marginal.
+    /// Share of NULLs observed in the training sample. Generation draws a
+    /// per-column Bernoulli at this rate (`Some(1.0)` is always NULL). A
+    /// rules `columns.<name>.null_rate` override wins when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub null_rate: Option<f64>,
     pub marginal: crate::synth::marginal::Marginal,

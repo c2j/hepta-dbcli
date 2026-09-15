@@ -64,8 +64,9 @@ fn export_csv(payload: &ExportPayload<'_>, output_dir: &std::path::Path) -> Resu
             let values: Vec<String> = row
                 .iter()
                 .map(|v| match v {
+                    Value::String(s) if s.is_empty() => "\"\"".to_string(),
                     Value::String(s) => csv_field(s),
-                    Value::Null => "null".to_string(),
+                    Value::Null => String::new(),
                     _ => csv_field(&v.to_string()),
                 })
                 .collect();
@@ -406,5 +407,102 @@ mod tests {
         assert!(content.contains("'o''brien'"));
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    fn parse_csv_null_aware(line: &str) -> Vec<Value> {
+        let mut fields = Vec::new();
+        let mut rest = line;
+        loop {
+            if rest.starts_with('"') {
+                let mut out = String::new();
+                let bytes = rest.as_bytes();
+                let mut i = 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            out.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                fields.push(Value::String(out));
+                rest = if i < rest.len() && rest.as_bytes()[i] == b',' {
+                    &rest[i + 1..]
+                } else {
+                    ""
+                };
+            } else if let Some((raw, tail)) = rest.split_once(',') {
+                fields.push(if raw.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(raw.to_string())
+                });
+                rest = tail;
+            } else {
+                fields.push(if rest.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(rest.to_string())
+                });
+                break;
+            }
+            if rest.is_empty() && line.ends_with(',') {
+                fields.push(Value::Null);
+                break;
+            }
+            if rest.is_empty() {
+                break;
+            }
+        }
+        fields
+    }
+
+    #[test]
+    fn should_export_null_and_empty_string_distinctly_in_all_formats() {
+        let mut tables = HashMap::new();
+        tables.insert("t".to_string(), vec![vec![Value::Null, Value::from("")]]);
+        let mut columns = HashMap::new();
+        columns.insert("t".to_string(), vec!["a".to_string(), "b".to_string()]);
+        let payload = ExportPayload {
+            tables: &tables,
+            columns: &columns,
+            dialect: "mysql",
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        export(&payload, &ExportFormat::Csv, dir).unwrap();
+        export(&payload, &ExportFormat::Jsonl, dir).unwrap();
+        export(&payload, &ExportFormat::Json, dir).unwrap();
+        export(&payload, &ExportFormat::Sql, dir).unwrap();
+
+        let csv = std::fs::read_to_string(dir.join("t.csv")).unwrap();
+        assert!(csv.starts_with("a,b\n"), "csv header: {csv:?}");
+        let data_line = csv.lines().nth(1).expect("csv data row");
+        assert_eq!(data_line, ",\"\"");
+        let parsed = parse_csv_null_aware(data_line);
+        assert_eq!(parsed, vec![Value::Null, Value::from("")]);
+
+        let jsonl = std::fs::read_to_string(dir.join("t.jsonl")).unwrap();
+        let jsonl_row: serde_json::Value =
+            serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        assert!(jsonl_row["a"].is_null(), "jsonl a: {jsonl_row}");
+        assert_eq!(jsonl_row["b"], "");
+
+        let json: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("t.json")).unwrap()).unwrap();
+        assert!(json[0]["a"].is_null(), "json a: {}", json[0]);
+        assert_eq!(json[0]["b"], "");
+
+        let sql = std::fs::read_to_string(dir.join("t.sql")).unwrap();
+        assert!(
+            sql.contains("VALUES (NULL, '');"),
+            "sql must distinguish NULL from empty string, got {sql:?}"
+        );
     }
 }

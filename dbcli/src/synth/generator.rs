@@ -112,12 +112,42 @@ pub fn generate(
         let copula = GaussianCopula::new(model.copula.correlation.clone());
         let uniform_samples = copula.sample(row_count, table_seed(config.seed, table_name));
 
+        let null_rates: Vec<f64> = column_order
+            .iter()
+            .map(|col_name| {
+                let is_referenced =
+                    referenced_targets.contains(&format!("{}.{}", table_name, col_name));
+                effective_null_rate(rule, model, table_name, col_name, is_referenced)
+            })
+            .collect();
+        // Independent streams, built only when the effective rate is > 0 so
+        // all-zero models keep the same copula/FK draws as before this change.
+        let mut null_rngs: Vec<Option<rand::rngs::StdRng>> = column_order
+            .iter()
+            .zip(null_rates.iter())
+            .map(|(col_name, rate)| {
+                if *rate > 0.0 {
+                    Some(column_null_rng(config.seed, table_name, col_name))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let mut rows = Vec::with_capacity(row_count);
 
         for t in 0..row_count {
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
+                if let Some(null_rng) = null_rngs[col_idx].as_mut() {
+                    let u: f64 = null_rng.gen();
+                    if u < null_rates[col_idx] {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                }
+
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
                     let value = if rel.unique {
                         rel.pool.sample_unique(&mut rng).ok_or_else(|| {
@@ -331,6 +361,37 @@ fn numeric_value_or_string(value: String) -> Value {
         .unwrap_or(Value::String(value))
 }
 
+fn effective_null_rate(
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    table_name: &str,
+    col_name: &str,
+    is_referenced: bool,
+) -> f64 {
+    let rate = rule
+        .columns
+        .get(col_name)
+        .and_then(|c| c.null_rate)
+        .or_else(|| model.columns.get(col_name).and_then(|c| c.null_rate))
+        .unwrap_or(0.0);
+    if is_referenced && rate > 0.0 {
+        eprintln!(
+            "warning: referenced column '{}.{}' cannot be NULL; ignoring null_rate {}",
+            table_name, col_name, rate
+        );
+        0.0
+    } else {
+        rate
+    }
+}
+
+fn column_null_rng(base: Option<u64>, table: &str, column: &str) -> rand::rngs::StdRng {
+    match table_seed(base, &format!("{}:{}:null", table, column)) {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    }
+}
+
 // 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
 fn table_seed(base: Option<u64>, table: &str) -> Option<u64> {
     base.map(|s| {
@@ -416,7 +477,7 @@ mod tests {
     use super::*;
     use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
-    use crate::synth::rules::{Relationship, TableRule};
+    use crate::synth::rules::{ColumnRule, Relationship, TableRule};
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
         let mut columns = HashMap::new();
@@ -1771,5 +1832,388 @@ mod tests {
         let config = config(&["users"], 3);
         let result = generate(&models, &rules, &config).unwrap();
         assert_eq!(result.columns.get("users"), Some(&vec!["id".to_string()]));
+    }
+
+    fn zero_null_rate_snapshot() -> GeneratedData {
+        // Two tables, mixed None/Some(0.0) null_rate, FK sampling + copula.
+        // Captured before null-injection landed so AC2 can lock byte identity.
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let mut order_columns = HashMap::new();
+        order_columns.insert(
+            "amount".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 10.0,
+                    scale: 2.0,
+                }),
+                ..Default::default()
+            },
+        );
+        order_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "orders".to_string(),
+            TableModel {
+                version: 1,
+                table: "orders".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns: order_columns,
+                copula: CopulaInfo {
+                    column_order: vec!["amount".to_string(), "user_id".to_string()],
+                    correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule("users", vec![]),
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        generate(&models, &rules, &config(&["users", "orders"], 4)).unwrap()
+    }
+
+    #[test]
+    fn should_keep_zero_null_rate_output_byte_identical() {
+        let result = zero_null_rate_snapshot();
+        let users = serde_json::to_string(result.tables.get("users").unwrap()).unwrap();
+        let orders = serde_json::to_string(result.tables.get("orders").unwrap()).unwrap();
+        // Captured from this test on the pre-null-injection generator
+        // (seed 42, 4 rows, mixed None/Some(0.0) null_rate, FK + copula).
+        assert_eq!(
+            users,
+            "[[2.3076754763602025],[-0.5264344435639146],[-0.48212996526018514],[-0.07395728769978405]]"
+        );
+        assert_eq!(
+            orders,
+            "[[8.56627954969241,-0.48212996526018514],[9.248506620196224,-0.48212996526018514],[8.233932622046893,2.3076754763602025],[7.009810102099152,-0.07395728769978405]]"
+        );
+    }
+
+    fn model_with_null_rate(table: &str, column: &str, null_rate: f64) -> TableModel {
+        let mut model = numerical_model(table, column, 0.0, 1.0);
+        model.columns.get_mut(column).unwrap().null_rate = Some(null_rate);
+        model
+    }
+
+    #[test]
+    fn should_reproduce_training_null_rate() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.20),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+
+        let result = generate(&models, &rules, &config(&["users"], 10_000)).unwrap();
+        let rows = result.tables.get("users").unwrap();
+        assert_eq!(rows.len(), 10_000);
+        let nulls = rows.iter().filter(|row| row[0].is_null()).count();
+        let observed = nulls as f64 / rows.len() as f64;
+        assert!(
+            (0.17..=0.23).contains(&observed),
+            "observed null rate {observed} outside [0.17, 0.23] ({nulls}/10000)"
+        );
+    }
+
+    #[test]
+    fn should_place_nulls_identically_for_same_seed() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.20),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+        let cfg = config(&["users"], 200);
+
+        let first = generate(&models, &rules, &cfg).unwrap();
+        let second = generate(&models, &rules, &cfg).unwrap();
+        let mask = |data: &GeneratedData| -> Vec<bool> {
+            data.tables["users"]
+                .iter()
+                .map(|row| row[0].is_null())
+                .collect()
+        };
+        let first_mask = mask(&first);
+        let second_mask = mask(&second);
+        assert_eq!(first_mask, second_mask);
+        assert!(
+            first_mask.iter().any(|is_null| *is_null),
+            "same-seed match must include real NULLs, not an all-filled column"
+        );
+        assert!(
+            first_mask.iter().any(|is_null| !*is_null),
+            "same-seed match must include real values, not an all-NULL column"
+        );
+    }
+
+    #[test]
+    fn should_keep_fk_values_in_parent_pool_when_null_rate_is_set() {
+        let parent = model_with_null_rate("users", "id", 0.5);
+
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.1),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["user_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+
+        let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule("users", vec![]),
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        let result = generate(&models, &rules, &config(&["users", "orders"], 200)).unwrap();
+        let parent_rows = result.tables.get("users").unwrap();
+        assert!(
+            parent_rows.iter().all(|row| !row[0].is_null()),
+            "referenced parent key must never be NULL"
+        );
+        let pool: std::collections::HashSet<String> =
+            parent_rows.iter().map(|row| row[0].to_string()).collect();
+
+        let child_rows = result.tables.get("orders").unwrap();
+        let mut saw_null = false;
+        let mut saw_member = false;
+        for row in child_rows {
+            if row[0].is_null() {
+                saw_null = true;
+                continue;
+            }
+            assert!(
+                pool.contains(&row[0].to_string()),
+                "FK value {} is neither NULL nor in the parent pool",
+                row[0]
+            );
+            saw_member = true;
+        }
+        assert!(
+            saw_null,
+            "FK column with null_rate 0.1 must emit some NULLs"
+        );
+        assert!(saw_member, "FK column must still draw some parent keys");
+    }
+
+    #[test]
+    fn should_override_null_rate_from_rules() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.50),
+        )]);
+        let mut forced_zero = single_rule("users", vec![]);
+        forced_zero.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                null_rate: Some(0.0),
+            },
+        );
+        let zero_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![forced_zero],
+        };
+        let zero_result = generate(&models, &zero_rules, &config(&["users"], 200)).unwrap();
+        assert!(
+            zero_result.tables["users"]
+                .iter()
+                .all(|row| !row[0].is_null()),
+            "rules null_rate 0.0 must suppress the model's 0.50 rate"
+        );
+
+        let mut forced_rate = single_rule("users", vec![]);
+        forced_rate.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                null_rate: Some(0.20),
+            },
+        );
+        let mut zero_model = model_with_null_rate("users", "email", 0.0);
+        zero_model.columns.get_mut("email").unwrap().null_rate = Some(0.0);
+        let models = HashMap::from([("users".to_string(), zero_model)]);
+        let rate_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![forced_rate],
+        };
+        let rate_result = generate(&models, &rate_rules, &config(&["users"], 10_000)).unwrap();
+        let nulls = rate_result.tables["users"]
+            .iter()
+            .filter(|row| row[0].is_null())
+            .count();
+        let observed = nulls as f64 / 10_000.0;
+        assert!(
+            (0.17..=0.23).contains(&observed),
+            "rules null_rate 0.20 must win over model 0.0, got {observed}"
+        );
+    }
+
+    #[test]
+    fn should_not_consume_unique_fk_pool_on_null_rows() {
+        let parent = numerical_model("users", "id", 0.0, 1.0);
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.5),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["user_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
+        let mut parent_rule = single_rule("users", vec![]);
+        parent_rule.rows = Some(10);
+        let mut child_rule = single_rule(
+            "orders",
+            vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: true },
+                null_label: "null".to_string(),
+            }],
+        );
+        child_rule.rows = Some(14);
+        child_rule.columns.insert(
+            "user_id".to_string(),
+            ColumnRule {
+                null_rate: Some(0.5),
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let result = generate(&models, &rules, &GeneratorConfig::default())
+            .expect("NULL unique-FK rows must not exhaust the parent pool");
+        let pool: std::collections::HashSet<String> = result.tables["users"]
+            .iter()
+            .map(|row| row[0].to_string())
+            .collect();
+        let mut used = std::collections::HashSet::new();
+        for row in &result.tables["orders"] {
+            if row[0].is_null() {
+                continue;
+            }
+            let key = row[0].to_string();
+            assert!(pool.contains(&key));
+            assert!(used.insert(key), "non-null unique FK must not repeat");
+        }
+        assert!(
+            result.tables["orders"].iter().any(|row| row[0].is_null()),
+            "expected some NULL FK rows so the extra children can fit"
+        );
     }
 }

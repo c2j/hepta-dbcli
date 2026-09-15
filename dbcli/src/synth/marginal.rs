@@ -464,9 +464,18 @@ impl MarginalFitter for UniformFitter {
     }
 }
 
-/// Compute Gaussian-space correlation matrix from training rows using PIT.
-/// For each column: apply marginal CDF (PIT) → Φ⁻¹ (normal_ppf) → Pearson correlation.
-/// Categorical columns use SDV-style UniformEncoder: map to cumulative frequency intervals.
+/// Compute Gaussian-space correlation from training rows via PIT then Pearson.
+///
+/// For each column: marginal CDF (PIT) → Φ⁻¹ → Pearson. Categorical columns
+/// use SDV-style UniformEncoder (cumulative-frequency mid-points).
+///
+/// Missing values are handled with **pairwise deletion**: each column pair
+/// keeps only rows where both sides are non-NULL, and the Pearson denominator
+/// is that pair's complete count. Filling NULLs with `loc` / `0.5` (the
+/// previous behaviour) treats missingness as a typical observation and can
+/// invent or cancel correlation; pairwise-complete avoids that distortion.
+/// The trade-off is that pairs no longer share a common sample size, and a
+/// pair with fewer than two complete rows falls back to 0.
 pub fn compute_gaussian_correlation(
     rows: &[Vec<serde_json::Value>],
     column_order: &[String],
@@ -484,74 +493,21 @@ pub fn compute_gaussian_correlation(
             .collect();
     }
 
-    // Transform each column to standard normal space
-    let mut gaussian_data = vec![vec![0.0f64; n_rows]; n_cols];
+    let mut gaussian_data = vec![vec![None; n_rows]; n_cols];
 
     for (col_idx, col_name) in column_order.iter().enumerate() {
         let col_model = columns.get(col_name);
         for (row_idx, row) in rows.iter().enumerate() {
             let val = row.get(col_idx).cloned().unwrap_or(serde_json::Value::Null);
-            let u = if let Some(model) = col_model {
-                match &model.marginal {
-                    crate::synth::marginal::Marginal::Normal(p) => {
-                        // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
-                        let x = val
-                            .as_f64()
-                            .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-                            .unwrap_or(p.loc);
-                        let cdf = normal_cdf(x, p.loc, p.scale);
-                        // Clamp to avoid ppf at exactly 0 or 1
-                        cdf.clamp(1e-12, 1.0 - 1e-12)
-                    }
-                    crate::synth::marginal::Marginal::Categorical(p) => {
-                        // SDV UniformEncoder: map category to mid-point of its cumulative interval.
-                        // top_values keys are stringified (numeric levels → "1"), so numeric
-                        // row values must be matched through their string form too.
-                        let key = val
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| val.to_string());
-                        if let Some(idx) = p.values.iter().position(|v| v == &key) {
-                            let total: f64 = p.weights.iter().sum();
-                            let cum_before: f64 = p.weights[..idx].iter().sum();
-                            (cum_before + p.weights[idx] / 2.0) / total
-                        } else {
-                            0.5
-                        }
-                    }
-                    _ => 0.5,
-                }
-            } else {
-                0.5
-            };
-            gaussian_data[col_idx][row_idx] = normal_ppf(0.0, 1.0, u);
+            gaussian_data[col_idx][row_idx] = pit_to_gaussian(&val, col_model);
         }
     }
 
-    // Compute Pearson correlation
     let mut corr = vec![vec![0.0f64; n_cols]; n_cols];
     for i in 0..n_cols {
         corr[i][i] = 1.0;
         for j in (i + 1)..n_cols {
-            let xi = &gaussian_data[i];
-            let xj = &gaussian_data[j];
-            let mean_i = xi.iter().sum::<f64>() / n_rows as f64;
-            let mean_j = xj.iter().sum::<f64>() / n_rows as f64;
-            let mut cov = 0.0;
-            let mut var_i = 0.0;
-            let mut var_j = 0.0;
-            for k in 0..n_rows {
-                let di = xi[k] - mean_i;
-                let dj = xj[k] - mean_j;
-                cov += di * dj;
-                var_i += di * di;
-                var_j += dj * dj;
-            }
-            let r = if var_i > 0.0 && var_j > 0.0 {
-                cov / (var_i * var_j).sqrt()
-            } else {
-                0.0
-            };
+            let r = pearson_pairwise(&gaussian_data[i], &gaussian_data[j]);
             corr[i][j] = r;
             corr[j][i] = r;
         }
@@ -571,6 +527,79 @@ pub fn compute_gaussian_correlation(
     }
 
     corr
+}
+
+fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> Option<f64> {
+    if val.is_null() {
+        return None;
+    }
+    let u = if let Some(model) = col_model {
+        match &model.marginal {
+            Marginal::Normal(p) => {
+                // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
+                let x = val
+                    .as_f64()
+                    .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+                let cdf = normal_cdf(x, p.loc, p.scale);
+                cdf.clamp(1e-12, 1.0 - 1e-12)
+            }
+            Marginal::Categorical(p) => {
+                // SDV UniformEncoder: map category to mid-point of its cumulative interval.
+                // top_values keys are stringified (numeric levels → "1"), so numeric
+                // row values must be matched through their string form too.
+                let key = val
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| val.to_string());
+                if let Some(idx) = p.values.iter().position(|v| v == &key) {
+                    let total: f64 = p.weights.iter().sum();
+                    let cum_before: f64 = p.weights[..idx].iter().sum();
+                    (cum_before + p.weights[idx] / 2.0) / total
+                } else {
+                    0.5
+                }
+            }
+            _ => 0.5,
+        }
+    } else {
+        0.5
+    };
+    Some(normal_ppf(0.0, 1.0, u))
+}
+
+fn pearson_pairwise(xi: &[Option<f64>], xj: &[Option<f64>]) -> f64 {
+    let mut n = 0.0;
+    let mut sum_i = 0.0;
+    let mut sum_j = 0.0;
+    for (a, b) in xi.iter().zip(xj.iter()) {
+        if let (Some(a), Some(b)) = (*a, *b) {
+            n += 1.0;
+            sum_i += a;
+            sum_j += b;
+        }
+    }
+    if n < 2.0 {
+        return 0.0;
+    }
+    let mean_i = sum_i / n;
+    let mean_j = sum_j / n;
+    let mut cov = 0.0;
+    let mut var_i = 0.0;
+    let mut var_j = 0.0;
+    for (a, b) in xi.iter().zip(xj.iter()) {
+        if let (Some(a), Some(b)) = (*a, *b) {
+            let di = a - mean_i;
+            let dj = b - mean_j;
+            cov += di * dj;
+            var_i += di * di;
+            var_j += dj * dj;
+        }
+    }
+    if var_i > 0.0 && var_j > 0.0 {
+        cov / (var_i * var_j).sqrt()
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -932,6 +961,96 @@ mod tests {
         assert!(
             corr[0][1].abs() < 0.2,
             "alternating column must be ~uncorrelated, got {}",
+            corr[0][1]
+        );
+    }
+
+    fn pit_standard_normal(x: f64, loc: f64, scale: f64) -> f64 {
+        let marginal = Marginal::Normal(NormalParams { loc, scale });
+        let standard = Marginal::Normal(NormalParams {
+            loc: 0.0,
+            scale: 1.0,
+        });
+        let u = marginal.cdf(x).clamp(1e-12, 1.0 - 1e-12);
+        standard.inverse_cdf(u)
+    }
+
+    fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+        assert_eq!(xs.len(), ys.len());
+        let n = xs.len() as f64;
+        let mean_x = xs.iter().sum::<f64>() / n;
+        let mean_y = ys.iter().sum::<f64>() / n;
+        let mut cov = 0.0;
+        let mut var_x = 0.0;
+        let mut var_y = 0.0;
+        for i in 0..xs.len() {
+            let dx = xs[i] - mean_x;
+            let dy = ys[i] - mean_y;
+            cov += dx * dy;
+            var_x += dx * dx;
+            var_y += dy * dy;
+        }
+        cov / (var_x * var_y).sqrt()
+    }
+
+    #[test]
+    fn should_use_pairwise_complete_correlation() {
+        // Complete pairs are perfectly linear (b = 2a). Three trailing A
+        // NULLs sit opposite large B values; filling those with loc would
+        // fabricate a strong negative pull that pairwise deletion ignores.
+        let rows: Vec<Vec<serde_json::Value>> = vec![
+            vec![serde_json::Value::from(0.0), serde_json::Value::from(0.0)],
+            vec![serde_json::Value::from(1.0), serde_json::Value::from(2.0)],
+            vec![serde_json::Value::from(2.0), serde_json::Value::from(4.0)],
+            vec![serde_json::Value::from(3.0), serde_json::Value::from(6.0)],
+            vec![serde_json::Value::from(4.0), serde_json::Value::from(8.0)],
+            vec![serde_json::Value::Null, serde_json::Value::from(100.0)],
+            vec![serde_json::Value::Null, serde_json::Value::from(100.0)],
+            vec![serde_json::Value::Null, serde_json::Value::from(100.0)],
+        ];
+        let loc_a = 2.0;
+        let scale_a = 1.5;
+        let loc_b = 4.0;
+        let scale_b = 3.0;
+        let order = vec!["a".to_string(), "b".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(loc_a, scale_a)),
+            ("b".to_string(), normal_column_model(loc_b, scale_b)),
+        ]);
+
+        let complete_a: Vec<f64> = (0..5)
+            .map(|i| pit_standard_normal(i as f64, loc_a, scale_a))
+            .collect();
+        let complete_b: Vec<f64> = (0..5)
+            .map(|i| pit_standard_normal(2.0 * i as f64, loc_b, scale_b))
+            .collect();
+        let pairwise_hand = pearson(&complete_a, &complete_b);
+
+        let filled_a: Vec<f64> = (0..8)
+            .map(|i| {
+                let x = if i < 5 { i as f64 } else { loc_a };
+                pit_standard_normal(x, loc_a, scale_a)
+            })
+            .collect();
+        let filled_b: Vec<f64> = [0.0, 2.0, 4.0, 6.0, 8.0, 100.0, 100.0, 100.0]
+            .into_iter()
+            .map(|x| pit_standard_normal(x, loc_b, scale_b))
+            .collect();
+        let fill_hand = pearson(&filled_a, &filled_b);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            (corr[0][1] - pairwise_hand).abs() < 1e-6,
+            "expected pairwise-complete Pearson {pairwise_hand}, got {}",
+            corr[0][1]
+        );
+        assert!(
+            (pairwise_hand - fill_hand).abs() > 0.2,
+            "fixture must separate pairwise ({pairwise_hand}) from fill-with-loc ({fill_hand})"
+        );
+        assert!(
+            (corr[0][1] - fill_hand).abs() > 0.2,
+            "result must not match the old fill-with-loc Pearson {fill_hand}, got {}",
             corr[0][1]
         );
     }
