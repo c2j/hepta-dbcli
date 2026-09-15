@@ -28,6 +28,7 @@ pub(crate) mod progress;
 pub(crate) mod recheck;
 pub(crate) mod report;
 pub(crate) mod rowdiff;
+pub(crate) mod sample;
 pub(crate) mod sql_patch;
 pub(crate) mod strategy;
 

@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::backend::QueryResult;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
+use crate::delta_diff::sample::{cells_differ, changed_value_indices, value_data_type};
 
 /// 差异样本投影：列 [key, status, left, right]
 pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
@@ -170,42 +171,6 @@ fn visible_value_indices(
         .enumerate()
         .filter(|(_, on)| **on)
         .map(|(i, _)| i)
-        .collect()
-}
-
-fn value_data_type(report: &DiffReport, key_len: usize, value_idx: usize) -> &str {
-    report
-        .column_data_types
-        .get(key_len + value_idx)
-        .map(String::as_str)
-        .unwrap_or("")
-}
-
-fn cells_differ(left: Option<&Value>, right: Option<&Value>, data_type: &str) -> bool {
-    match (left, right) {
-        (None, None) => false,
-        (Some(left), Some(right)) => !crate::delta_diff::rowdiff::values_equal(
-            left,
-            right,
-            crate::delta_diff::metadata::TablePlan::is_numeric_type(data_type),
-        ),
-        _ => true,
-    }
-}
-
-fn changed_value_indices(
-    row: &DiffRow,
-    report: &DiffReport,
-    key_len: usize,
-    value_len: usize,
-) -> Vec<usize> {
-    (0..value_len)
-        .filter(|&i| {
-            let ty = value_data_type(report, key_len, i);
-            let l = row.left.as_ref().and_then(|r| r.get(key_len + i));
-            let r = row.right.as_ref().and_then(|r| r.get(key_len + i));
-            cells_differ(l, r, ty)
-        })
         .collect()
 }
 
