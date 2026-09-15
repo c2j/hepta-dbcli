@@ -712,6 +712,11 @@ fn check_value_pools(
     outcomes
 }
 
+/// A round's rewrites, kept so a round that moves no predicate can be undone:
+/// the branch position, its flip count before the round, and the pre-write
+/// snapshot of every row it touched.
+type RepairBackup = (usize, usize, Vec<(usize, Vec<Value>)>);
+
 /// Measure every `branches[]` predicate and rewrite rows until each target is
 /// met, in at most `rules::MAX_REPAIR_ROUNDS` rounds (issue #70).
 ///
@@ -852,6 +857,8 @@ fn apply_branch_repair(
     let mut rounds_used = 0usize;
     for _round in 0..crate::synth::rules::MAX_REPAIR_ROUNDS {
         let mut touched = 0usize;
+        // `(branch position, flips before the round, [(row index, snapshot)])`.
+        let mut backups: Vec<RepairBackup> = Vec::new();
 
         for (position, (branch, predicate, assignments)) in prepared.iter().enumerate() {
             let (matching, failures) = measure_predicate(rows, predicate, &index_of);
@@ -887,16 +894,22 @@ fn apply_branch_repair(
             }
 
             // Spread the rewrites over the candidate list instead of
-            // clustering them on the first rows.
+            // clustering them on the first rows. Snapshot every row we touch so
+            // a round that turns out to move nothing can be undone instead of
+            // leaving `set` values behind.
+            let flips_before = outcomes[position].flips;
+            let mut backup: Vec<(usize, Vec<Value>)> = Vec::with_capacity(needed);
             for pick in 0..needed {
                 let offset = pick * candidates.len() / needed;
                 let candidate = candidates[offset.min(candidates.len() - 1)];
+                backup.push((candidate, rows[candidate].clone()));
                 for (index, value) in assignments {
                     rows[candidate][*index] = value.clone();
                 }
                 outcomes[position].flips += 1;
                 touched += 1;
             }
+            backups.push((position, flips_before, backup));
         }
 
         if touched == 0 {
@@ -904,9 +917,21 @@ fn apply_branch_repair(
         }
         rounds_used += 1;
 
+        // `derive` is idempotent and may read a column the repair just wrote,
+        // so it must run *before* progress is measured: a predicate that reads
+        // a derived column cannot be judged until its inputs are refreshed.
+        apply_derive_rules(
+            rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+            referenced_targets,
+        )?;
+
         // A repair that cannot move any predicate (typically `set` writing
         // columns the predicate does not read) must stop instead of burning
-        // the remaining rounds.
+        // the remaining rounds, and must leave no trace behind.
         let progressed = prepared
             .iter()
             .enumerate()
@@ -916,18 +941,15 @@ fn apply_branch_repair(
                 (actual - outcomes[position].actual_ratio).abs() > f64::EPSILON
             });
         if !progressed {
+            for (position, flips_before, backup) in backups.drain(..) {
+                for (index, snapshot) in backup {
+                    rows[index] = snapshot;
+                }
+                outcomes[position].flips = flips_before;
+            }
             break;
         }
-
-        // `derive` is idempotent and may read a column the repair just wrote.
-        apply_derive_rules(
-            rows,
-            table_name,
-            rule,
-            model,
-            column_order,
-            referenced_targets,
-        )?;
+        backups.clear();
     }
 
     for (position, (branch, predicate, _)) in prepared.iter().enumerate() {
@@ -4728,6 +4750,109 @@ tables:
                 (amount * rust_decimal::Decimal::TWO).round_dp(12)
             );
         }
+    }
+
+    #[test]
+    fn should_recompute_derived_columns_when_the_predicate_reads_them() {
+        // Same shape as `should_recompute_derived_columns_after_a_repair`, but
+        // the predicate reads the *derived* column. The repair writes `amount`,
+        // so the branch cannot be seen to move until `double` is recomputed.
+        // If the loop measures progress on stale derived values and bails out,
+        // `double != amount * 2` and the branch is reported as uncovered.
+        let mut models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        {
+            let model = models.get_mut("t").unwrap();
+            model.columns.insert(
+                "double".to_string(),
+                numerical_model("t", "double", 0.0, 1.0).columns["double"].clone(),
+            );
+            model.copula.column_order = vec![
+                "status".to_string(),
+                "amount".to_string(),
+                "double".to_string(),
+            ];
+            model.copula.correlation = vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ];
+        }
+
+        let mut table = single_rule("t", vec![]);
+        table.derive.push(crate::synth::rules::DeriveRule {
+            column: "double".to_string(),
+            expr: "amount * 2".to_string(),
+        });
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "big".to_string(),
+            predicate: "double > 3".to_string(),
+            target_ratio: 0.8,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("amount".to_string(), "7.5".to_string())]),
+                linked_derive_recompute: true,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 600)).unwrap();
+        assert_eq!(
+            data.branches[0].status,
+            CoverageStatus::Pass,
+            "repair must be seen to move the predicate: {:?}",
+            data.branches[0]
+        );
+        for row in data.tables.get("t").unwrap() {
+            let amount = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let double = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                double.round_dp(12),
+                (amount * rust_decimal::Decimal::TWO).round_dp(12),
+                "derived column must stay consistent with its inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn should_leave_no_writes_behind_when_a_repair_cannot_move_the_predicate() {
+        // `set` writes `amount`, but the predicate only reads `status`, so no
+        // round can ever move it. The values already written must be rolled
+        // back: a branch that reports no progress must not still mutate data.
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let clean = generate(
+            &models,
+            &SynthRules {
+                version: "1".to_string(),
+                tables: vec![single_rule("t", vec![])],
+            },
+            &config(&["t"], 400),
+        )
+        .unwrap();
+        let rules = branch_rules(0.8, Some(0.02), &[("amount", "1")]);
+        let repaired = generate(&models, &rules, &config(&["t"], 400)).unwrap();
+
+        let outcome = &repaired.branches[0];
+        assert_ne!(outcome.status, CoverageStatus::Pass, "{outcome:?}");
+        assert_eq!(
+            outcome.flips, 0,
+            "a repair that could not move the predicate must not report flips"
+        );
+
+        let clean_amounts: Vec<String> = clean.tables["t"]
+            .iter()
+            .map(|row| row[1].to_string())
+            .collect();
+        let repaired_amounts: Vec<String> = repaired.tables["t"]
+            .iter()
+            .map(|row| row[1].to_string())
+            .collect();
+        assert_eq!(
+            clean_amounts, repaired_amounts,
+            "stalled repair must leave the column untouched"
+        );
     }
 
     #[test]
