@@ -21,13 +21,32 @@ GENERATED_ROWS = 1000  # run_m1.sh passes --rows 1000
 CHILD_DISTINCT_PARENTS = 700  # parents reused by the fixture's FK data
 DICTIONARY_LEVELS = 120
 DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
-DECIMAL_RE = re.compile(r"\d+\.\d{1,4}")
+MICRO_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}")
+DECIMAL_4_RE = re.compile(r"\d+\.\d{1,4}")
+DECIMAL_2_RE = re.compile(r"\d+\.\d{1,2}")
 
 
 def epoch_text(epoch: float, fmt: str) -> str:
     """Render an epoch the same way the generator does (naive/UTC)."""
     moment = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
     return moment.strftime(fmt.replace("%:z", "").strip())
+
+
+def parse_with_chrono_format(text: str, fmt: str) -> datetime.datetime:
+    """Parse generator output using a chrono format (Python has no `%.6f`)."""
+    python_fmt = fmt
+    for chrono, python in (
+        ("%:z", "%z"),
+        ("%.9f", ".%f"),
+        ("%.6f", ".%f"),
+        ("%.3f", ".%f"),
+        ("%.f", ".%f"),
+    ):
+        python_fmt = python_fmt.replace(chrono, python)
+    parsed = datetime.datetime.strptime(text, python_fmt)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
 
 failures: list[str] = []
 checks = 0
@@ -130,9 +149,45 @@ def main() -> int:
         str(parent_cols["discount_rate"].get("decimal_scale")),
     )
     check(
-        all(DECIMAL_RE.fullmatch(row["cjje"]) for row in parent_rows)
-        and all(DECIMAL_RE.fullmatch(row["discount_rate"]) for row in parent_rows),
+        all(DECIMAL_4_RE.fullmatch(row["cjje"]) for row in parent_rows)
+        and all(DECIMAL_2_RE.fullmatch(row["discount_rate"]) for row in parent_rows),
         "generated decimals sit on the learned scale (no binary tail digits)",
+    )
+
+    # A scaled column whose whole-number sample must not be mistaken for an integer.
+    check(
+        parent_cols["whole_dec"].get("decimal_scale") == 4
+        and parent_cols["whole_dec"].get("rounding") is None,
+        "DECIMAL(18,4) of whole values keeps its scale and stays decimal",
+        f"scale={parent_cols['whole_dec'].get('decimal_scale')} rounding={parent_cols['whole_dec'].get('rounding')}",
+    )
+    check(
+        all(DECIMAL_4_RE.fullmatch(row["whole_dec"]) for row in parent_rows),
+        "whole-number DECIMAL still generates scaled decimals",
+    )
+
+    print("#62 microsecond datetimes")
+    micro = parent_cols["trade_time_micro"]
+    check(
+        (micro.get("datetime_format") or "").endswith("%.6f"),
+        "DATETIME(6) infers a fixed-width microsecond format",
+        str(micro.get("datetime_format")),
+    )
+    micro_values = [row["trade_time_micro"] for row in parent_rows]
+    check(
+        all(MICRO_DATETIME_RE.fullmatch(value) for value in micro_values),
+        "generated microseconds keep six digits (no trailing-zero loss)",
+        str(micro_values[:2]),
+    )
+    micro_lo = datetime.datetime.fromtimestamp(micro["min"], datetime.timezone.utc)
+    micro_hi = datetime.datetime.fromtimestamp(micro["max"], datetime.timezone.utc)
+    micro_instants = [
+        parse_with_chrono_format(value, micro["datetime_format"]) for value in micro_values
+    ]
+    check(
+        all(micro_lo <= instant <= micro_hi for instant in micro_instants),
+        "generated microseconds stay inside the trained range",
+        f"{micro_lo}..{micro_hi} vs {min(micro_values)}..{max(micro_values)}",
     )
 
     print("#65a --categorical-top-k full")

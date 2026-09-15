@@ -35,8 +35,10 @@ than a config file, so no password is written to disk or to the OS keychain.
 | Issue | Check |
 |---|---|
 | #62 | `TIMESTAMP` column trains as `datetime` with an inferred primary format and epoch min/max; every generated value re-parses with that exact format and stays inside the trained epoch range |
+| #62 | `DATETIME(6)` (fixed-width microseconds, including `…00.000000`) infers a `%.6f` format and keeps six digits on output |
 | #63 | trained `null_rate` is reproduced within ±3pp; non-NULL values stay in the trained value space; NULLs also appear in a nullable child-table column |
-| #64 | `DECIMAL(18,4)` / `DECIMAL(4,2)` scales are learned and every generated value sits on that scale (no `…9999` binary tail) |
+| #64 | `DECIMAL(18,4)` / `DECIMAL(4,2)` scales are learned and every generated value sits on that scale (no `…9999` binary tail), each against its own digit pattern |
+| #64 | a `DECIMAL(18,4)` column holding only whole values keeps `decimal_scale: 4` (and no integer rounding) instead of degrading to i64 |
 | #65a | a 120-level dictionary column survives training intact under `--categorical-top-k full` |
 | #65b/c | `rules-draft` discovers the FK; every generated child key exists in the generated parent pool; a non-unique FK reuses the pool instead of inventing keys |
 | #65d | SQL export is schema qualified by default; `--no-schema-qualifier` restores the legacy statement |
@@ -47,6 +49,10 @@ than a config file, so no password is written to disk or to the OS keychain.
 plus a manual check against the `gvenzl/oracle-free` container: training a
 200-row table prints the truncation WARNING and writes
 `"truncated": true` into the model's `provenance`.
+
+Timezone-aware columns (`timestamptz`) have no equivalent MySQL type, so the
+UTC-normalisation path is covered by `synth::datetime` unit tests and by the
+`fixture_mysql.sql` microsecond column for the format half of the behaviour.
 
 ## CI
 
