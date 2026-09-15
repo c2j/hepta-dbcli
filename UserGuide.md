@@ -921,15 +921,24 @@ tables:
   - name: users
     rows: 599                    # 可选：本表生成行数（CLI --rows 优先于它）
     strategy: uniform            # uniform | zipf（weighted 暂不支持，会报错）
+    columns:
+      email:
+        null_rate: 0.20          # 覆盖该列训练得到的 NULL 比例；0.0 = 从不 NULL
     relationships: []
   - name: orders
     strategy: zipf               # 子表按 Zipf 偏置引用父表键
+    columns:
+      user_id:
+        null_rate: 0.10          # 可空 FK：命中 NULL 时不消耗父池
     relationships:
       - pk: user_id              # 本表 FK 列
         references: [users.id]   # 父表.列
         pool_strategy: !projection
           unique: false          # true = 无放回采样（1:1）；子行数超过父池时报错
+        # null_label 仍可写（兼容旧 YAML），生成路径不再读取它
 ```
+
+列级 `null_rate` 优先于模型里训练到的 `null_rate`；省略则用模型值，再省略则视为 0。被其它表 `references` 指向的父键在生成时强制为 0（父键不能为 NULL），模型或规则若写了非 0 会在 stderr 告警。
 
 `pool_strategy` 取值：
 
@@ -949,6 +958,9 @@ tables:
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位）在训练时跳过并打印警告，生成的数据不含这些列
 - `{table}.model.json` 的 `pk` 来自 catalog 主键（`Dialect::table_indexes`），支持联合主键；无主键时为 `[]`。列名按采样列的大小写归一，且只保留最终进入模型的列（训练时被跳过的 PK 列不会出现在 `pk` 中）；`synth train` 与 `synth validate` 会打印主键
 - 列逻辑类型会结合 DDL：全空的 `numeric`/`decimal`/`number`（含 MySQL `unsigned`/`zerofill`、DuckDB `ubigint` 等）记为 `numerical`；全空的 `date`/`timestamp` 记为 `datetime`（不再 `unknown`）
+- 生成按列复现 NULL：有效比例为规则 `columns.<col>.null_rate`，否则模型 `null_rate`，否则 0。每列用独立 RNG 流（`{table}:{column}:null`）做 Bernoulli；比例为 0 时不构造该流，因此全 0 模型与开启 NULL 注入前的输出逐字节一致。`null_rate: 1.0` 仍为整列 NULL。可空 FK 命中 NULL 时不从父池取值，也不计入 `unique` 池耗尽。关系上的 `null_label` 仅保留解析兼容，生成不再消费。
+- Copula 相关矩阵改为 pairwise-complete：列对中任一侧为 NULL 的行不参与 Pearson，分母是有效成对行数。不再用 `loc` / `0.5` 填缺失（那会把缺失当成典型值、扭曲相关）。
+- 导出时 NULL 与空字符串可区分：CSV 空字段 = NULL、`""` = 空字符串；JSON/JSONL 为 `null`；SQL 为 `NULL`
 - 全空列仍写入 `model.json`（`null_rate: 1.0`），生成时该列输出 NULL——保留列以便导出/建表结构与源表一致，但不会用 0 之类的常量伪造数据
 - `YYYYMMDD`（及 ISO 日期字符串）即使物理类型是 `varchar(8)` 也会识别为 `datetime`，不再当成 numerical。DECIMAL/NUMBER 仍按数值训练。邮编、零填充 SKU、纯数字类别码仍可能被误判为数值；此类列请勿用于 synth 或先在库内转型
 - `YYYYMMDD` 这类紧凑日期在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
