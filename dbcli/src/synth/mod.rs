@@ -262,6 +262,14 @@ fn split_tables(tables: &str) -> Vec<String> {
 
 #[cfg(feature = "synth")]
 const FULL_MODEL_SIZE_WARN_BYTES: u64 = 10 * 1024 * 1024;
+const ORACLE_DRIVER_PREFETCH_CAP: usize = 100;
+
+/// Pure-Rust Oracle driver silently stops at 100 prefetched rows. A sample
+/// that lands exactly on that cap is treated as truncated so train can warn
+/// and record `provenance.truncated`.
+fn sample_may_be_truncated(scheme: &str, row_count: usize) -> bool {
+    scheme.eq_ignore_ascii_case("oracle") && row_count == ORACLE_DRIVER_PREFETCH_CAP
+}
 
 async fn run_train(
     name: Option<String>,
@@ -336,7 +344,7 @@ async fn run_train(
             Some(&data_types),
             categorical_top_k.cap(),
         );
-        let (model, skipped) = cmd::build_model(
+        let (mut model, skipped) = cmd::build_model(
             table,
             &scheme,
             &profile,
@@ -349,6 +357,14 @@ async fn run_train(
                 "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",
                 table, col
             );
+        }
+        if sample_may_be_truncated(&scheme, result.row_count) {
+            eprintln!(
+                "warning: Oracle driver truncated the sample of table '{}' at {} rows; \
+                 fitted distributions may be distorted",
+                table, ORACLE_DRIVER_PREFETCH_CAP
+            );
+            model.provenance.truncated = true;
         }
 
         let model_path = output_dir.join(format!("{}.model.json", table));
@@ -438,6 +454,26 @@ async fn run_rules_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_flag_oracle_sample_at_driver_cap() {
+        assert!(sample_may_be_truncated("oracle", 100));
+        assert!(sample_may_be_truncated("Oracle", 100));
+    }
+
+    #[test]
+    fn should_not_flag_oracle_sample_below_cap() {
+        assert!(!sample_may_be_truncated("oracle", 99));
+        assert!(!sample_may_be_truncated("oracle", 101));
+        assert!(!sample_may_be_truncated("oracle", 0));
+    }
+
+    #[test]
+    fn should_not_flag_non_oracle_sample_of_100() {
+        assert!(!sample_may_be_truncated("mysql", 100));
+        assert!(!sample_may_be_truncated("gaussdb", 100));
+        assert!(!sample_may_be_truncated("duckdb", 100));
+    }
 
     #[test]
     fn split_tables_trims_and_skips_empty() {
