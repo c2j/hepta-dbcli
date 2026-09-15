@@ -739,10 +739,12 @@ fn render_stdout(
             }
             if !args.summary_only && !report.sample_diffs.is_empty() {
                 buf.extend_from_slice(b"\nsample diffs:\n");
+                let indices = sample::select_sample_indices(report, args.sample, args.sample_mode);
                 let mut sampled = report.clone();
-                if args.sample > 0 && sampled.sample_diffs.len() > args.sample {
-                    sampled.sample_diffs.truncate(args.sample);
-                }
+                sampled.sample_diffs = indices
+                    .into_iter()
+                    .map(|i| report.sample_diffs[i].clone())
+                    .collect();
                 let diffs = output::diffs_to_query_result(&sampled);
                 crate::cli::render_result(&diffs, &mut buf, fmt).map_err(|e| e.to_string())?;
             }
@@ -1041,6 +1043,80 @@ mod emit_tests {
         let buf = render_stdout(&args, &report_with_n_diffs(5)).unwrap();
         let v: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["sample_diffs"].as_array().unwrap().len(), 5);
+    }
+
+    fn mixed_status_report() -> report::DiffReport {
+        // 5 行 MissingRight + 5 行 Modified(改 name)，列同 report_with_n_diffs
+        let mut r = report_with_n_diffs(5);
+        r.summary.missing_right = 5;
+        r.summary.modified = 5;
+        r.summary.diff_rate = 1.0;
+        let mut rows: Vec<report::DiffRow> = r.sample_diffs.clone();
+        for i in 5..10 {
+            rows.push(report::DiffRow {
+                key: Value::from(i),
+                left: Some(vec![Value::from(i), Value::from("x")]),
+                right: Some(vec![Value::from(i), Value::from("y")]),
+                status: DiffStatus::Modified,
+                confirmed: true,
+            });
+        }
+        r.sample_diffs = rows;
+        r
+    }
+
+    #[test]
+    fn csv_stdout_diverse_sample_contains_both_statuses() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--format",
+            "csv",
+            "--sample",
+            "4",
+        ]);
+        let text = String::from_utf8(render_stdout(&args, &mixed_status_report()).unwrap())
+            .expect("utf8 output");
+        let sample = text
+            .split("sample diffs:\n")
+            .nth(1)
+            .expect("sample section");
+        let data: Vec<&str> = sample
+            .lines()
+            .filter(|l| l.contains("MissingRight") || l.contains("Modified"))
+            .collect();
+        assert_eq!(data.len(), 4, "{text}");
+        assert!(
+            data.iter().any(|l| l.contains("MissingRight")),
+            "quota row present: {data:?}"
+        );
+        assert!(
+            data.iter().any(|l| l.contains("Modified")),
+            "Modified present: {data:?}"
+        );
+    }
+
+    #[test]
+    fn table_stdout_default_mode_label_diverse() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--sample",
+            "2",
+        ]);
+        let text =
+            String::from_utf8(render_stdout(&args, &report_with_n_diffs(5)).unwrap()).unwrap();
+        assert!(text.contains("sample diffs (2 of 5) [diverse]"), "{text}");
     }
 
     #[test]
