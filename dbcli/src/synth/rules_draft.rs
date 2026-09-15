@@ -78,7 +78,10 @@ fn is_unique(
 /// are skipped, and columns already covered by a database foreign key are never
 /// re-inferred. Results are sorted, so the draft stays deterministic.
 ///
-/// Inferred relationships use `Projection { unique: true }` (issue #76-E).
+/// Inferred relationships project from the parent pool without replacement
+/// only when the child column is itself unique (`cardinality == row_count`),
+/// matching the explicit-FK path. A 1:N child column must stay `unique: false`,
+/// otherwise `synth generate` would demand one parent row per child row.
 pub fn infer_implicit_relationships(
     tables: &[String],
     foreign_keys: &[ForeignKeyInfo],
@@ -166,13 +169,16 @@ pub fn generate_draft_with_implicit(
 ) -> (SynthRules, usize) {
     let mut rules = generate_draft_from_profiles(tables, foreign_keys, profiles);
     let inferred = infer_implicit_relationships(tables, foreign_keys, profiles, primary_keys);
+    let table_stats = table_stats_from_profiles(profiles);
 
     for fk in &inferred {
         if let Some(rule) = rules.tables.iter_mut().find(|t| t.name == fk.from_table) {
             rule.relationships.push(Relationship {
                 pk: fk.from_column.clone(),
                 references: vec![format!("{}.{}", fk.to_table, fk.to_column)],
-                pool_strategy: PoolStrategy::Projection { unique: true },
+                pool_strategy: PoolStrategy::Projection {
+                    unique: is_unique(fk, &table_stats),
+                },
                 null_label: "null".to_string(),
             });
         }
@@ -195,7 +201,16 @@ pub fn generate_draft_from_profiles(
     foreign_keys: &[ForeignKeyInfo],
     profiles: &std::collections::HashMap<String, crate::synth::profile::TableProfile>,
 ) -> SynthRules {
-    let table_stats: std::collections::HashMap<String, TableStats> = profiles
+    let table_stats = table_stats_from_profiles(profiles);
+    generate_rules_draft(tables, foreign_keys, &table_stats)
+}
+
+/// Column cardinalities keyed by table, used to decide whether a projected
+/// relationship column is unique.
+fn table_stats_from_profiles(
+    profiles: &std::collections::HashMap<String, crate::synth::profile::TableProfile>,
+) -> std::collections::HashMap<String, TableStats> {
+    profiles
         .iter()
         .map(|(name, profile)| {
             let columns: std::collections::HashMap<String, ColumnStats> = profile
@@ -219,9 +234,7 @@ pub fn generate_draft_from_profiles(
                 },
             )
         })
-        .collect();
-
-    generate_rules_draft(tables, foreign_keys, &table_stats)
+        .collect()
 }
 
 #[cfg(test)]
@@ -301,13 +314,18 @@ mod tests {
 
     #[test]
     fn should_infer_implicit_relationship_from_unique_column_name() {
+        // Both sides are unique here (1:1): `users.account_no` is 100/100 and
+        // `orders.account_no` is 300/300. Both are their table's primary key, so
+        // the heuristic only infers the child direction.
         let tables = vec!["users".to_string(), "orders".to_string()];
         let profiles = profiles(&[
             ("users", 100, &[("account_no", 100)]),
-            ("orders", 300, &[("order_id", 300), ("account_no", 80)]),
+            ("orders", 300, &[("order_id", 300), ("account_no", 300)]),
         ]);
-        let primary_keys =
-            std::collections::HashMap::from([("orders".to_string(), "order_id".to_string())]);
+        let primary_keys = std::collections::HashMap::from([
+            ("orders".to_string(), "order_id".to_string()),
+            ("users".to_string(), "account_no".to_string()),
+        ]);
 
         let inferred = infer_implicit_relationships(&tables, &[], &profiles, &primary_keys);
 
@@ -328,6 +346,35 @@ mod tests {
         );
         match &orders.relationships[0].pool_strategy {
             PoolStrategy::Projection { unique } => assert!(*unique, "inferred FK projects unique"),
+            other => panic!("expected Projection pool strategy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_not_mark_implicit_one_to_many_relationship_as_unique() {
+        // `users.account_no` is unique (100 distinct / 100 rows) but
+        // `orders.account_no` is 1:N (80 distinct / 300 rows). The inferred
+        // relationship must not claim `unique` on the child column, otherwise
+        // `synth generate` would demand 300 distinct parent keys from a pool
+        // of 100 and fail.
+        let tables = vec!["users".to_string(), "orders".to_string()];
+        let profiles = profiles(&[
+            ("users", 100, &[("account_no", 100)]),
+            ("orders", 300, &[("order_id", 300), ("account_no", 80)]),
+        ]);
+        let primary_keys =
+            std::collections::HashMap::from([("orders".to_string(), "order_id".to_string())]);
+
+        let (rules, count) = generate_draft_with_implicit(&tables, &[], &profiles, &primary_keys);
+        assert_eq!(count, 1);
+
+        let orders = rules.tables.iter().find(|t| t.name == "orders").unwrap();
+        assert_eq!(orders.relationships.len(), 1);
+        match &orders.relationships[0].pool_strategy {
+            PoolStrategy::Projection { unique } => assert!(
+                !*unique,
+                "1:N child column (80 distinct / 300 rows) must not be marked unique"
+            ),
             other => panic!("expected Projection pool strategy, got {other:?}"),
         }
     }
