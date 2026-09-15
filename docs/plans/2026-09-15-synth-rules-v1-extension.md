@@ -47,6 +47,10 @@
 可翻 = 非 FK 列 ∧ 非被其他表 references 的列 ∧ 非 derive 目标 ∧ 非 branches.predicate 直接依赖的常量列
 ```
 
+**分支互斥（第三轮补充）**：同一轮里，已被兄弟分支改写的行、以及已命中任一分支的行，都不允许
+被其他分支改写。`set` 只能让行**命中**谓词，改写这两类行只会破坏兄弟分支已达成的覆盖；
+让它们只从「不命中任何分支」的行里取，两个争抢同一列的分支才能在一轮内收敛（见 §9.1/#2）。
+
 理由：FK 值在生成时从父表复制，父表行也可能已被子表引用；改动 FK/被引用列会破坏
 引用完整性。derive 目标由公式决定，不能独立翻动。
 
@@ -342,6 +346,58 @@ impl Expr {
 
 ### 环境限制（未验证项）
 
-- `#69` 的挖掘与 `#76-E` 的隐式推断只在**单元测试**层面验证（纯函数 + 合成行）；它们的 CLI 路径需要真实数据库采样，本机无 MySQL，`cargo test --all --features integration` 因 `127.0.0.1:3306 connection refused` 未能执行。
+- `#69` 的挖掘与 `#76-E` 的隐式推断只在**单元测试**层面验证（纯函数 + 合成行）；它们的 CLI 路径需要真实数据库采样，写本文时本机无 MySQL，`cargo test --all --features integration` 因 `127.0.0.1:3306 connection refused` 未能执行。（2026-09-15 第三轮：本机 MySQL 8.4.10 可用，`--features integration` 全绿 908 项，本轮修复均已按 §9.2 在真实数据库上复现。）
 - Oracle / GaussDB / DuckDB 相关路径与本次改动无关，未跑。
 
+
+---
+
+## 9. PR #81 评审修复（2026-09-15，第三轮）
+
+源码评审（`gh api repos/c2j/hepta-dbcli/pulls/81/comments`）给出 8 条内联意见：4 条 `[bug]`、4 条
+`[suggestion]`。逐条独立复现后确认 7 条成立、1 条部分成立，全部按 TDD 修复；另有 1 条相邻缺陷
+在复现过程中被证伪（见下）。每条都先在真实 MySQL 上复现，再改代码。
+
+### 9.1 行为决策（新增/收紧，需与 UserGuide 同步）
+
+| # | 决策 | 理由 |
+|---|---|---|
+| 1 | `derive` 的源列为 NULL 时，目标列写成 NULL 并继续生成 | §1 阶段 6 无条件重算目标列，三值逻辑下 `price * qty` 遇 NULL 即 NULL；除零/类型错误仍是硬错误（那是配置写错，不是 NULL 输入） |
+| 2 | 修复循环里「本轮已被兄弟分支改写」与「已命中任一分支」的行，其他分支不得再改写 | `set` 只能让行**命中**，改写这两类行只会破坏兄弟分支已达成的覆盖 |
+| 3 | 日期时间列的 `fixed_range` 端点按**时刻**（epoch 秒）比较，只写到日期的端点 = 当天 00:00:00 | 与 `copula_conditional` 用同一域；文本比较会漏判（`01/02/2026 < 31/01/2026`）也会误杀（`2026-01-31 00:00:00 > 2026-01-31`） |
+| 4 | 端点/`fixed` 字面量先按列的 `datetime_format` 解析，失败再按通用 ISO 形状解析；纯数字端点当 epoch 秒 | 文档示例 `["2026-01-01","2026-01-31"]` 在两种 `mode` 下都必须能用 |
+| 5 | V2/V4 的 `fixed`/`values` 扩到 `fixed_range` | 阶段 4 覆盖整列，`null_rate` 无意义；`generate` 本来就拒绝这三个字段，两层必须一致 |
+| 6 | V11 可判定部分（FK 列 / 被引用父键 / derive 目标 / 被 pin 的列）移到 `validate()` 加载期 | 这些关系 YAML 里就有；未知列仍只能在生成期判（`table.columns` 只记覆盖项） |
+| 7 | 算术溢出返回 `ExprError::Overflow`，不 panic | `rust_decimal` 的 `+ - *` 在溢出时 panic；文档承诺「不会 panic」。一元负号只翻符号位，无需 checked |
+
+### 9.2 复现证据（真实 CLI + MySQL 8.4.10，`rev81` 库）
+
+预修复二进制在 `git worktree add $SCRATCH/prefix 57f5ce5` 单独构建，与修复后二进制跑同一份
+模型与 rules。
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `derive: total = price * qty`，`price` 有 NULL | `error: ... expression evaluated to NULL (value left unchanged for this row)`，exit 1 | 200 行全部生成，31 行 price NULL ↔ 31 行 total NULL，169 行非 NULL 全部满足 `total = price*qty`，exit 0 |
+| 两分支改写同一列（A 0.3 + B 0.7） | `a` Warn 0.272 / 10 轮 / 改写 364 行；`b` Pass 0.700 / 10 轮 / 改写 639 行 | 两个分支各 1 轮全部 Pass：0.300 / 0.700，改写 35 + 350 行 |
+| `copula_conditional` + `fixed_range: ["2026-01-10","2026-01-20"]` | `error: ... cannot read '2026-01-10' as a datetime with format '%Y-%m-%d %H:%M:%S'` | 300/300 落在区间内（min 01-10 01:12，max 01-19 22:32），rejection 模式同样 300/300 |
+| `derive: product = a * b`，`a`/`b` ≈ 1e20 | **panic** `Multiplication overflowed`（rust_decimal arithmetic_impls.rs:232），exit **101** | `error: table 'big_numbers' derive 'product': arithmetic overflow in expression (operator '*')`，exit 1 |
+| `fixed_range` + `null_rate: 0.2` | 生成成功但可空列 0% NULL（静默回退） | 加载期报错：`'fixed'/'values'/'fixed_range' cannot be combined with null_rate > 0 (got 0.2)`，exit 1 |
+| 分支 `repair.set` 写 FK 列 / derive 目标 / 被 pin 的列 | 生成期报错 | 加载期报错（错误信息含表名、分支 id、列名） |
+
+SQL 往返（`-f sql` → 真实 MySQL）复核 `derive`：200 行全部插入成功，
+`SUM(price IS NOT NULL AND total <> price*qty) = 0`、`SUM(price IS NULL AND total IS NOT NULL) = 0`。
+
+### 9.3 被证伪的意见
+
+- 「stalled 修复回滚后会留下陈旧的 derive 值」：`backup` 保存的是**整行**快照，回滚同时撤销
+  `derive` 的写入，不存在陈旧值。已补一条特征测试锁定该不变量（若日后改成只快照 `set` 的单元
+  格，测试会失败）。
+- 「`!` 的 lexer 报错文案不应暗示用户想写 `!=`」：语法是冻结的 `unary := "-" unary | primary`，
+  文案 `unexpected \`!\`; use \`!=\` for inequality` 是正确提示，保留；只改文档。
+
+### 9.4 相邻发现（未修，待决策）
+
+生成 `line_items`（12 行训练样本，`id` 为主键）时，`id` 因低基数被拟合为**分类**边际，
+200 行里只有 12 个不同 id → 导出 SQL 插入到有主键的表会 `Duplicate entry`。修复前二进制
+（`57f5ce5`）行为相同（12/200），与本次评审无关，属既有设计：只有被其他表 `references` 的列
+才强制唯一。需要产品决策（例如对 `pk` 列强制唯一/改用序列），未擅自改动。
