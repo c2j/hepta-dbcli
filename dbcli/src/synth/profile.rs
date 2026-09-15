@@ -25,6 +25,13 @@ pub struct ColumnProfile {
     pub top_values: Option<Vec<(String, f64)>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_integer: bool,
+    /// Max number of fractional digits observed in string-encoded samples;
+    /// `None` when the column is not a fixed-scale numeric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimal_scale: Option<u8>,
+    /// chrono format that all datetime samples matched, if one was inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datetime_format: Option<String>,
 }
 
 const TOP_VALUES_CAP: usize = 50;
@@ -316,6 +323,8 @@ impl ColumnProfile {
             std_dev,
             top_values,
             is_integer,
+            decimal_scale: None,
+            datetime_format: None,
         }
     }
 }

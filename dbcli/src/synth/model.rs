@@ -7,6 +7,11 @@ const CURRENT_VERSION: u32 = 1;
 pub struct TableModel {
     pub version: u32,
     pub table: String,
+    /// Schema the table was trained from. When present, SQL export qualifies
+    /// the target (`INSERT INTO "sales"."t"`); `None` keeps the legacy
+    /// unqualified statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     pub dialect: String,
     pub provenance: Provenance,
     pub pk: Vec<String>,
@@ -19,6 +24,11 @@ pub struct Provenance {
     pub source: String,
     pub converter_version: Option<String>,
     pub sdv_version: Option<String>,
+    /// True when the training sample hit a driver row cap (the pure-Rust
+    /// Oracle driver prefetches only 100 rows), so the fitted distributions
+    /// may be distorted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +38,16 @@ pub struct ColumnModel {
     pub rounding: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datetime_epoch: Option<bool>,
+    /// Decimal digits observed in the training sample. When set, generated
+    /// values are quantized to this scale; `None` means no quantization
+    /// (legacy models keep their previous output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimal_scale: Option<u8>,
+    /// chrono format the training samples were written in. When set together
+    /// with `LogicalType::Datetime`, generated epoch values are rendered back
+    /// to text with this format; `None` keeps legacy datetime handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datetime_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +66,8 @@ impl Default for ColumnModel {
             logical_type: LogicalType::Numerical,
             rounding: None,
             datetime_epoch: None,
+            decimal_scale: None,
+            datetime_format: None,
             min: None,
             max: None,
             null_rate: None,
@@ -115,6 +137,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 min: None,
                 max: None,
                 null_rate: None,
@@ -129,10 +153,12 @@ mod tests {
             version: 1,
             table: "orders".to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "native".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -158,11 +184,75 @@ mod tests {
     }
 
     #[test]
+    fn should_load_legacy_model_without_m1_fields() {
+        // A pre-M1 model.json has no schema / truncated / decimal_scale /
+        // datetime_format keys; it must keep loading with those defaulted.
+        let json = r#"{
+            "version": 1,
+            "table": "orders",
+            "dialect": "mysql",
+            "provenance": {"source": "native", "converter_version": null, "sdv_version": null},
+            "pk": [],
+            "columns": {
+                "amt": {
+                    "logical_type": "numerical",
+                    "rounding": null,
+                    "datetime_epoch": null,
+                    "min": 1.0,
+                    "max": 2.0,
+                    "null_rate": 0.0,
+                    "marginal": {"name": "norm", "loc": 1.0, "scale": 1.0}
+                }
+            },
+            "copula": {"column_order": ["amt"], "correlation": [[1.0]]}
+        }"#;
+
+        let model: TableModel = serde_json::from_str(json).unwrap();
+        assert!(model.schema.is_none());
+        assert!(!model.provenance.truncated);
+        let col = &model.columns["amt"];
+        assert!(col.decimal_scale.is_none());
+        assert!(col.datetime_format.is_none());
+    }
+
+    #[test]
+    fn should_omit_unset_m1_fields_from_serialized_model() {
+        let model = TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            schema: None,
+            dialect: "mysql".to_string(),
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: HashMap::new(),
+            copula: CopulaInfo {
+                column_order: vec![],
+                correlation: vec![],
+            },
+        };
+
+        let json = serde_json::to_string(&model).unwrap();
+        for absent in ["schema", "truncated", "decimal_scale", "datetime_format"] {
+            assert!(
+                !json.contains(absent),
+                "unset field '{absent}' must not be serialized: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn categorical_column_model() {
         let column = ColumnModel {
             logical_type: LogicalType::Categorical,
             rounding: None,
             datetime_epoch: None,
+            decimal_scale: None,
+            datetime_format: None,
             min: None,
             max: None,
             null_rate: None,

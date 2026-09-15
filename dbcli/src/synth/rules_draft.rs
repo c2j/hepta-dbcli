@@ -21,6 +21,7 @@ pub fn generate_rules_draft(
             table.clone(),
             TableRule {
                 name: table.clone(),
+                columns: std::collections::HashMap::new(),
                 rows: None,
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),

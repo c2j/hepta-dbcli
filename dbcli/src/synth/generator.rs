@@ -426,6 +426,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams { loc, scale }),
                 ..Default::default()
             },
@@ -434,10 +436,12 @@ mod tests {
             version: 1,
             table: table.to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec![column.to_string()],
             columns,
@@ -451,6 +455,7 @@ mod tests {
     fn single_rule(table: &str, relationships: Vec<Relationship>) -> TableRule {
         TableRule {
             name: table.to_string(),
+            columns: HashMap::new(),
             rows: None,
             relationships,
             strategy: TableStrategy::default(),
@@ -473,6 +478,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams { loc, scale: 1.0 }),
                 ..Default::default()
             },
@@ -481,10 +488,12 @@ mod tests {
             version: 1,
             table: table.to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec![column.to_string()],
             columns,
@@ -595,6 +604,8 @@ mod tests {
                     logical_type: LogicalType::Numerical,
                     rounding: Some(0),
                     datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
                     marginal: Marginal::Uniform(crate::synth::marginal::UniformParams {
                         low: 0.0,
                         high: 100.0,
@@ -606,10 +617,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -720,6 +733,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Categorical(CategoricalParams {
                     values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
                     weights: vec![1.0 / 3.0; 3],
@@ -731,10 +746,12 @@ mod tests {
             version: 1,
             table: "parent".to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec!["k".to_string()],
             columns,
@@ -783,6 +800,8 @@ mod tests {
                     logical_type: LogicalType::Numerical,
                     rounding: Some(0),
                     datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
                     marginal: Marginal::Categorical(CategoricalParams {
                         values: vec!["1".to_string(), "2".to_string()],
                         weights: vec![0.5, 0.5],
@@ -794,10 +813,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -855,6 +876,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 0.01,
@@ -866,10 +889,12 @@ mod tests {
             version: 1,
             table: "parent".to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -922,6 +947,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 10.0,
                     scale: 2.0,
@@ -935,6 +962,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 1.0,
@@ -948,10 +977,12 @@ mod tests {
                 version: 1,
                 table: "orders".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -1018,6 +1049,8 @@ mod tests {
                             logical_type: LogicalType::Numerical,
                             rounding: Some(0),
                             datetime_epoch: None,
+                            decimal_scale: None,
+                            datetime_format: None,
                             marginal: Marginal::Normal(NormalParams {
                                 loc: 100.0,
                                 scale: 15.0,
@@ -1032,10 +1065,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec!["id".to_string()],
                 columns: modeled_columns,
@@ -1138,6 +1173,7 @@ mod tests {
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "users".to_string(),
+                columns: HashMap::new(),
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Weighted,
@@ -1193,6 +1229,8 @@ mod tests {
                 logical_type: LogicalType::Categorical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Categorical(CategoricalParams {
                     values: vec!["open".to_string(), "closed".to_string()],
                     weights: vec![0.5, 0.5],
@@ -1207,10 +1245,12 @@ mod tests {
                 version: 1,
                 table: "tasks".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1245,10 +1285,12 @@ mod tests {
                 version: 1,
                 table: "payments".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1257,6 +1299,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: Some(0),
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(1.0),
                         max: Some(19.0),
                         null_rate: None,
@@ -1302,6 +1346,7 @@ mod tests {
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "users".to_string(),
+                columns: HashMap::new(),
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Zipf,
@@ -1422,6 +1467,7 @@ mod tests {
             tables: vec![
                 TableRule {
                     name: "orders".to_string(),
+                    columns: HashMap::new(),
                     rows: None,
                     relationships: vec![Relationship {
                         pk: "total".to_string(),
@@ -1472,6 +1518,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 100.0,
                     scale: 15.0,
@@ -1486,10 +1534,12 @@ mod tests {
                 version: 1,
                 table: "users".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1525,6 +1575,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 100.0,
                     scale: 15.0,
@@ -1539,10 +1591,12 @@ mod tests {
                 version: 1,
                 table: "users".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1593,10 +1647,12 @@ mod tests {
                 version: 1,
                 table: "metrics".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1605,6 +1661,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: None,
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(0.0),
                         max: Some(120.0),
                         null_rate: None,
@@ -1648,10 +1706,12 @@ mod tests {
                 version: 1,
                 table: "metrics".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1660,6 +1720,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: None,
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(0.0),
                         max: Some(101.0),
                         null_rate: None,
