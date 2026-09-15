@@ -964,7 +964,8 @@ tables:
 - 导出时 NULL 与空字符串可区分：CSV 空字段 = NULL、`""` = 空字符串；JSON/JSONL 为 `null`；SQL 为 `NULL`
 - 全空列仍写入 `model.json`（`null_rate: 1.0`），生成时该列输出 NULL——保留列以便导出/建表结构与源表一致，但不会用 0 之类的常量伪造数据
 - `YYYYMMDD`（及 ISO 日期字符串）即使物理类型是 `varchar(8)` 也会识别为 `datetime`，不再当成 numerical。DECIMAL/NUMBER 仍按数值训练。邮编、零填充 SKU、纯数字类别码仍可能被误判为数值；此类列请勿用于 synth 或先在库内转型
-- 可推断格式的文本 datetime（`%Y-%m-%d`、`%Y-%m-%d %H:%M:%S`、ISO-8601、`%Y/%m/%d` 等）按 UTC epoch 拟合 Normal（`datetime_epoch: true` + `datetime_format`），生成时再按该格式还原字符串。无时区的值视为 UTC 午夜/墙钟；带偏移的字符串保留绝对时刻。`enforce_min_max_values` 在 epoch 空间裁剪
+- 可推断格式的文本 datetime（`%Y-%m-%d`、`%Y-%m-%d %H:%M:%S`、固定宽度小数秒 `%.3f`/`%.6f`、ISO-8601、`%Y/%m/%d` 等）按 UTC epoch 拟合 Normal（`datetime_epoch: true` + `datetime_format`），生成时再按该格式还原字符串。无时区的值视为 UTC 午夜/墙钟。`enforce_min_max_values` 在 epoch 空间裁剪
+- **带时区的列（`2024-01-15T12:34:56+08:00` / `+08` / `Z`）按 UTC 规范化输出**：绝对时刻与训练一致，但偏移与墙钟文本变成 `+00:00` 形式（与 delta-diff 对 `TIMESTAMPTZ` 的约定一致）。无时区的列才是逐字符还原；微秒列（`%.6f`）同样逐字符还原
 - 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
 - `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
