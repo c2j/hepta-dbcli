@@ -3,6 +3,8 @@ pub mod cmd;
 #[cfg(feature = "synth")]
 pub mod copula;
 #[cfg(feature = "synth")]
+pub mod datetime;
+#[cfg(feature = "synth")]
 pub mod export;
 #[cfg(feature = "synth")]
 pub mod fk_pool;

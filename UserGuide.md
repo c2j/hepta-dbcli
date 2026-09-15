@@ -954,7 +954,7 @@ tables:
 - 数值列：高基数或值无重复的列拟合 Normal 分布（整数列生成取整值）；**低基数且值重复出现**的数值列（如 19 档离散价格）自动按观测档位拟合分类分布，生成值保持在观测档位上并保留数值类型
 - 非整数数值列会学习 `decimal_scale`：字符串样本里纯小数面值（可选正负号、数字、至多一个 `.`，拒绝科学计数法）的最大小数位数，与 DDL 类型括号中的 scale（如 `numeric(16,2)` / `decimal(18,4)` / `NUMBER(18,4)`）取较大值。生成时在 min/max 裁剪之后按该标度做十进制 half-up 量化，避免 `1004.9999999999999` 这类二进制尾差写入 CSV/SQL。整数列仍输出 i64；旧模型未带 `decimal_scale` 时不量化，输出与原先逐字节一致。日期时间和分类列不量化
 - 字符串列拟合分类分布，分类列输出原始字符串值
-- Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码），PSD 修正用对角占优近似
+- Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码；推断到格式的 datetime 列按 UTC epoch 做 PIT），PSD 修正用对角占优近似
 - `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位）在训练时跳过并打印警告，生成的数据不含这些列
 - `{table}.model.json` 的 `pk` 来自 catalog 主键（`Dialect::table_indexes`），支持联合主键；无主键时为 `[]`。列名按采样列的大小写归一，且只保留最终进入模型的列（训练时被跳过的 PK 列不会出现在 `pk` 中）；`synth train` 与 `synth validate` 会打印主键
@@ -964,7 +964,9 @@ tables:
 - 导出时 NULL 与空字符串可区分：CSV 空字段 = NULL、`""` = 空字符串；JSON/JSONL 为 `null`；SQL 为 `NULL`
 - 全空列仍写入 `model.json`（`null_rate: 1.0`），生成时该列输出 NULL——保留列以便导出/建表结构与源表一致，但不会用 0 之类的常量伪造数据
 - `YYYYMMDD`（及 ISO 日期字符串）即使物理类型是 `varchar(8)` 也会识别为 `datetime`，不再当成 numerical。DECIMAL/NUMBER 仍按数值训练。邮编、零填充 SKU、纯数字类别码仍可能被误判为数值；此类列请勿用于 synth 或先在库内转型
-- `YYYYMMDD` 这类紧凑日期在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
+- 可推断格式的文本 datetime（`%Y-%m-%d`、`%Y-%m-%d %H:%M:%S`、ISO-8601、`%Y/%m/%d` 等）按 UTC epoch 拟合 Normal（`datetime_epoch: true` + `datetime_format`），生成时再按该格式还原字符串。无时区的值视为 UTC 午夜/墙钟；带偏移的字符串保留绝对时刻。`enforce_min_max_values` 在 epoch 空间裁剪
+- 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
+- `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断，`synth train` 在 Oracle 上最多采样 100 行，保真度相应下降（见 `tests/benchmark/REPORT.md`）；native OCI 后端不受影响但当前无法从配置强制选择
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写；导出语句**不带 schema 限定**，灌库前请确认目标 schema 在 search_path 中（或手工补前缀）

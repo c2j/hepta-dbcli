@@ -351,6 +351,15 @@ fn gen_column_value(
                     }
                 }
             }
+            if let Some(col) = column_model {
+                if matches!(col.logical_type, crate::synth::model::LogicalType::Datetime) {
+                    if let Some(fmt) = col.datetime_format.as_deref() {
+                        return crate::synth::datetime::format_epoch(generated, fmt)
+                            .map(Value::String)
+                            .unwrap_or(Value::Null);
+                    }
+                }
+            }
             if column_model.and_then(|c| c.rounding) == Some(0) {
                 Value::from(generated.round() as i64)
             } else if let Some(scale) = column_model
@@ -2444,6 +2453,72 @@ mod tests {
                 "rounding Some(0) must emit Value::Number(i64), got {:?}",
                 row[0]
             );
+        }
+    }
+
+    #[test]
+    fn should_keep_legacy_datetime_model_behaviour() {
+        fn datetime_categorical(logical_type: LogicalType) -> TableModel {
+            let mut columns = HashMap::new();
+            columns.insert(
+                "created_at".to_string(),
+                ColumnModel {
+                    logical_type,
+                    rounding: None,
+                    datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
+                    min: None,
+                    max: None,
+                    null_rate: None,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: vec!["2024-01-01".into(), "2024-06-01".into()],
+                        weights: vec![0.5, 0.5],
+                    }),
+                },
+            );
+            TableModel {
+                version: 1,
+                table: "t".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec!["created_at".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            }
+        }
+
+        let legacy = datetime_categorical(LogicalType::Datetime);
+        let as_cat = datetime_categorical(LogicalType::Categorical);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let cfg = config(&["t"], 80);
+        let mut models_dt = HashMap::new();
+        models_dt.insert("t".to_string(), legacy);
+        let mut models_cat = HashMap::new();
+        models_cat.insert("t".to_string(), as_cat);
+
+        let from_dt = generate(&models_dt, &rules, &cfg).unwrap();
+        let from_cat = generate(&models_cat, &rules, &cfg).unwrap();
+        assert_eq!(
+            from_dt.tables.get("t").unwrap(),
+            from_cat.tables.get("t").unwrap(),
+            "Datetime + Categorical + datetime_format None must match the pre-change path"
+        );
+        for row in from_dt.tables.get("t").unwrap() {
+            let s = row[0].as_str().expect("legacy datetime stays a string");
+            assert!(s == "2024-01-01" || s == "2024-06-01");
         }
     }
 }

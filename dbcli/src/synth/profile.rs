@@ -301,7 +301,7 @@ impl ColumnProfile {
             None
         };
 
-        let (logical_type, min, max, mean, std_dev) = if non_null
+        let (logical_type, mut min, mut max, mut mean, mut std_dev) = if non_null
             .iter()
             .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
         {
@@ -356,6 +356,26 @@ impl ColumnProfile {
                     .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
             })
             .collect();
+        let is_numeric_datetime = logical_type == "datetime"
+            && (all_compact_dates
+                || non_null.first().is_some_and(|v| v.is_number())
+                || numeric_strings.is_some());
+
+        let mut datetime_format = None;
+        if logical_type == "datetime" && !non_null.is_empty() && !is_numeric_datetime {
+            let samples: Vec<Value> = non_null.iter().map(|v| (*v).clone()).collect();
+            datetime_format = super::datetime::infer_format(&samples);
+            if let Some(fmt) = datetime_format.as_deref() {
+                let epochs: Vec<f64> = non_null
+                    .iter()
+                    .filter_map(|v| super::datetime::parse_to_epoch(v, Some(fmt)))
+                    .collect();
+                if !epochs.is_empty() {
+                    (min, max, mean, std_dev) = numerical_stats(&epochs);
+                }
+            }
+        }
+
         let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
             && parsed_nums.len() == non_null.len()
             && !parsed_nums.is_empty()
@@ -367,7 +387,7 @@ impl ColumnProfile {
             && cardinality <= NUMERIC_TOP_VALUES_MAX;
         let top_values = if logical_type == "categorical"
             || is_repeated_low_cardinality_numeric
-            || (logical_type == "datetime" && mean.is_none() && !non_null.is_empty())
+            || (logical_type == "datetime" && !non_null.is_empty() && !is_numeric_datetime)
         {
             frequency_top_values(&non_null)
         } else {
@@ -391,7 +411,7 @@ impl ColumnProfile {
             top_values,
             is_integer,
             decimal_scale,
-            datetime_format: None,
+            datetime_format,
         }
     }
 }
@@ -573,6 +593,50 @@ mod tests {
         let profile = ColumnProfile::from_samples(&samples);
         assert_eq!(profile.logical_type, "datetime");
         assert!(!profile.is_integer);
+        assert!(profile.top_values.is_some());
+    }
+
+    #[test]
+    fn should_infer_iso_datetime_format_and_epoch_stats() {
+        let samples: Vec<Value> = ["2024-01-01", "2024-03-15", "2024-12-31"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile =
+            ColumnProfile::from_samples_typed(&samples, Some("timestamp without time zone"));
+        assert_eq!(profile.logical_type, "datetime");
+        assert_eq!(profile.datetime_format.as_deref(), Some("%Y-%m-%d"));
+        let min = crate::synth::datetime::parse_to_epoch(&samples[0], Some("%Y-%m-%d")).unwrap();
+        let max = crate::synth::datetime::parse_to_epoch(&samples[2], Some("%Y-%m-%d")).unwrap();
+        assert_eq!(profile.min.as_ref().and_then(Value::as_f64), Some(min));
+        assert_eq!(profile.max.as_ref().and_then(Value::as_f64), Some(max));
+        assert!(profile.mean.is_some());
+        assert!(profile.std_dev.is_some());
+        assert!(profile.mean.unwrap() > min && profile.mean.unwrap() < max);
+    }
+
+    #[test]
+    fn should_leave_compact_yyyymmdd_without_datetime_format() {
+        let samples: Vec<Value> = ["20240101", "20240315", "20241231"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.datetime_format.is_none());
+        assert!(profile.mean.unwrap() > 20_000_000.0);
+    }
+
+    #[test]
+    fn should_not_infer_format_for_oracle_style_dates() {
+        let samples: Vec<Value> = ["15-JAN-24", "16-JAN-24", "17-JAN-24"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("date"));
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.datetime_format.is_none());
+        assert!(profile.mean.is_none());
         assert!(profile.top_values.is_some());
     }
 

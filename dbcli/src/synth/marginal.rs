@@ -1,4 +1,4 @@
-use crate::synth::model::ColumnModel;
+use crate::synth::model::{ColumnModel, LogicalType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -529,6 +529,15 @@ pub fn compute_gaussian_correlation(
     corr
 }
 
+/// DECIMAL/NUMBER values are often serialized as JSON strings by drivers;
+/// fall back to parsing the text form. Returns `None` when the value is
+/// neither a JSON number nor a numeric string, so the row pair is dropped
+/// from the pairwise-complete correlation instead of being filled in.
+fn numeric_value(val: &serde_json::Value) -> Option<f64> {
+    val.as_f64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+}
+
 fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> Option<f64> {
     if val.is_null() {
         return None;
@@ -536,10 +545,17 @@ fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> 
     let u = if let Some(model) = col_model {
         match &model.marginal {
             Marginal::Normal(p) => {
-                // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
-                let x = val
-                    .as_f64()
-                    .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+                // Datetime columns are modelled in epoch seconds, so text
+                // samples have to be converted before the normal PIT.
+                let x = if matches!(model.logical_type, LogicalType::Datetime) {
+                    match model.datetime_format.as_deref() {
+                        Some(fmt) => crate::synth::datetime::parse_to_epoch(val, Some(fmt))?,
+                        // Integer-encoded datetimes (compact YYYYMMDD) stay numeric.
+                        None => numeric_value(val)?,
+                    }
+                } else {
+                    numeric_value(val)?
+                };
                 let cdf = normal_cdf(x, p.loc, p.scale);
                 cdf.clamp(1e-12, 1.0 - 1e-12)
             }

@@ -128,6 +128,21 @@ pub(crate) fn build_model(
     let mut columns = HashMap::new();
     let mut skipped = Vec::new();
     for (col_name, col_profile) in &profile.columns {
+        if col_profile.logical_type == "datetime" {
+            if let Some(fmt) = col_profile.datetime_format.as_deref() {
+                columns.insert(
+                    col_name.clone(),
+                    fit_datetime_epoch_model(col_name, col_profile, profile, rows, fmt),
+                );
+                continue;
+            }
+            if col_profile.null_rate < 1.0 && col_profile.mean.is_none() {
+                eprintln!(
+                    "warning: column '{}': datetime format could not be inferred; falling back to legacy modelling",
+                    col_name
+                );
+            }
+        }
         match fit_marginal(col_name, col_profile) {
             Ok(marginal) => {
                 let logical_type = match col_profile.logical_type.as_str() {
@@ -226,6 +241,51 @@ pub(crate) fn build_model(
         },
     };
     Ok((model, skipped))
+}
+
+fn fit_datetime_epoch_model(
+    col_name: &str,
+    col_profile: &crate::synth::profile::ColumnProfile,
+    profile: &TableProfile,
+    rows: &[Vec<serde_json::Value>],
+    fmt: &str,
+) -> ColumnModel {
+    let col_idx = profile.column_order.iter().position(|c| c == col_name);
+    let epochs: Vec<f64> = col_idx
+        .map(|idx| {
+            rows.iter()
+                .filter_map(|row| {
+                    row.get(idx)
+                        .and_then(|v| crate::synth::datetime::parse_to_epoch(v, Some(fmt)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let (loc, scale, min, max) = if epochs.is_empty() {
+        (
+            col_profile.mean.unwrap_or(0.0),
+            col_profile.std_dev.unwrap_or(0.0),
+            col_profile.min.as_ref().and_then(serde_json::Value::as_f64),
+            col_profile.max.as_ref().and_then(serde_json::Value::as_f64),
+        )
+    } else {
+        let min = epochs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = epochs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let loc = epochs.iter().sum::<f64>() / epochs.len() as f64;
+        let var = epochs.iter().map(|x| (x - loc).powi(2)).sum::<f64>() / epochs.len() as f64;
+        (loc, var.sqrt(), Some(min), Some(max))
+    };
+    ColumnModel {
+        logical_type: LogicalType::Datetime,
+        rounding: None,
+        datetime_epoch: Some(true),
+        decimal_scale: None,
+        datetime_format: Some(fmt.to_string()),
+        min,
+        max,
+        null_rate: Some(col_profile.null_rate),
+        marginal: Marginal::Normal(NormalParams { loc, scale }),
+    }
 }
 
 fn fit_marginal(
@@ -1059,5 +1119,190 @@ mod tests {
             rows_affected: None,
         };
         assert_eq!(parse_foreign_keys(&result).unwrap(), vec![]);
+    }
+
+    fn typed_profile(
+        table: &str,
+        columns: &[(&str, &str, Vec<Value>)],
+    ) -> (TableProfile, Vec<Vec<Value>>) {
+        let names: Vec<String> = columns.iter().map(|(n, _, _)| n.to_string()).collect();
+        let n_rows = columns[0].2.len();
+        let rows: Vec<Vec<Value>> = (0..n_rows)
+            .map(|i| columns.iter().map(|(_, _, vals)| vals[i].clone()).collect())
+            .collect();
+        let mut types = HashMap::new();
+        for (name, ty, _) in columns {
+            types.insert(name.to_string(), ty.to_string());
+        }
+        (
+            TableProfile::from_rows_typed(table, &names, &rows, Some(&types)),
+            rows,
+        )
+    }
+
+    fn generate_table(model: TableModel, rows: usize) -> Vec<Vec<Value>> {
+        let table = model.table.clone();
+        let mut models = HashMap::new();
+        models.insert(table.clone(), model);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![crate::synth::rules::TableRule {
+                name: table.clone(),
+                columns: HashMap::new(),
+                rows: Some(rows),
+                relationships: vec![],
+                strategy: Default::default(),
+            }],
+        };
+        let config = crate::synth::generator::GeneratorConfig {
+            rows_per_table: HashMap::from([(table.clone(), rows)]),
+            seed: Some(42),
+            enforce_min_max_values: true,
+        };
+        crate::synth::generator::generate(&models, &rules, &config)
+            .unwrap()
+            .tables
+            .remove(&table)
+            .unwrap()
+    }
+
+    fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+        let n = xs.len() as f64;
+        let mx = xs.iter().sum::<f64>() / n;
+        let my = ys.iter().sum::<f64>() / n;
+        let mut cov = 0.0;
+        let mut vx = 0.0;
+        let mut vy = 0.0;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let dx = x - mx;
+            let dy = y - my;
+            cov += dx * dy;
+            vx += dx * dx;
+            vy += dy * dy;
+        }
+        cov / (vx * vy).sqrt()
+    }
+
+    #[test]
+    fn should_restore_primary_datetime_format_round_trip() {
+        let values: Vec<Value> = (0..200)
+            .map(|i| Value::from(format!("2024-03-{:02} {:02}:30:00", 1 + (i % 28), i % 24)))
+            .collect();
+        let (profile, rows) = typed_profile(
+            "t1",
+            &[("created_at", "timestamp without time zone", values)],
+        );
+        let (model, skipped) = build_model("t1", "gaussdb", &profile, &rows, vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("created_at").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Datetime));
+        assert_eq!(col.datetime_epoch, Some(true));
+        let fmt = col
+            .datetime_format
+            .clone()
+            .expect("inferred datetime format");
+        assert_eq!(fmt, "%Y-%m-%d %H:%M:%S");
+        assert!(matches!(col.marginal, Marginal::Normal(_)));
+
+        let generated = generate_table(model, 1000);
+        assert_eq!(generated.len(), 1000);
+        for row in &generated {
+            let s = row[0].as_str().expect("datetime must be a string");
+            let epoch = crate::synth::datetime::parse_to_epoch(&Value::from(s), Some(&fmt))
+                .unwrap_or_else(|| panic!("generated {s:?} must parse as {fmt}"));
+            let rendered = crate::synth::datetime::format_epoch(epoch, &fmt).unwrap();
+            assert_eq!(rendered, s, "generated value must be character-identical");
+        }
+    }
+
+    #[test]
+    fn should_clip_generated_datetime_to_training_range() {
+        let mut values = vec![Value::from("2020-01-01"), Value::from("2026-01-01")];
+        for i in 0..80 {
+            let year = 2020 + (i % 6);
+            values.push(Value::from(format!("{year}-06-15")));
+        }
+        let (profile, rows) = typed_profile("t1", &[("created_at", "date", values)]);
+        let (model, skipped) = build_model("t1", "mysql", &profile, &rows, vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("created_at").unwrap();
+        let fmt = col.datetime_format.clone().expect("date format");
+        let min_epoch = col.min.expect("epoch min");
+        let max_epoch = col.max.expect("epoch max");
+        let generated = generate_table(model, 400);
+        for row in &generated {
+            let s = row[0].as_str().expect("datetime string");
+            let epoch = crate::synth::datetime::parse_to_epoch(&Value::from(s), Some(&fmt))
+                .unwrap_or_else(|| panic!("unparseable generated datetime {s:?}"));
+            assert!(
+                epoch + 1e-6 >= min_epoch && epoch <= max_epoch + 1e-6,
+                "{s} epoch {epoch} outside [{min_epoch}, {max_epoch}]"
+            );
+        }
+    }
+
+    #[test]
+    fn should_correlate_datetime_epoch_with_numeric_column() {
+        let start =
+            crate::synth::datetime::parse_to_epoch(&Value::from("2020-01-01"), Some("%Y-%m-%d"))
+                .unwrap();
+        let n = 200usize;
+        let mut created = Vec::with_capacity(n);
+        let mut amounts = Vec::with_capacity(n);
+        let mut epochs = Vec::with_capacity(n);
+        let mut amount_nums = Vec::with_capacity(n);
+        for i in 0..n {
+            let epoch = start + (i as f64) * 86_400.0;
+            let s = crate::synth::datetime::format_epoch(epoch, "%Y-%m-%d").unwrap();
+            created.push(Value::from(s));
+            let amt = i as f64 * 10.0;
+            amounts.push(Value::from(amt));
+            epochs.push(epoch);
+            amount_nums.push(amt);
+        }
+        let (profile, rows) = typed_profile(
+            "t",
+            &[
+                ("created_at", "timestamp without time zone", created),
+                ("amount", "numeric", amounts),
+            ],
+        );
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let order = &model.copula.column_order;
+        let i_dt = order.iter().position(|c| c == "created_at").unwrap();
+        let i_amt = order.iter().position(|c| c == "amount").unwrap();
+        let r_model = model.copula.correlation[i_dt][i_amt];
+        let r_train = pearson(&epochs, &amount_nums);
+        assert!(
+            r_model.signum() == r_train.signum() || r_model * r_train > 0.0,
+            "correlation must keep the training sign: model={r_model} train={r_train}"
+        );
+        assert!(
+            (r_model - r_train).abs() < 0.3,
+            "model correlation {r_model} too far from training Pearson {r_train}"
+        );
+    }
+
+    #[test]
+    fn should_warn_and_fall_back_when_datetime_format_is_unknown() {
+        let values: Vec<Value> = ["15-JAN-24", "16-JAN-24", "17-JAN-24", "18-JAN-24"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let (profile, rows) = typed_profile("t", &[("biz_date", "date", values)]);
+        assert!(profile.columns["biz_date"].datetime_format.is_none());
+        let (model, skipped) = build_model("t", "oracle", &profile, &rows, vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("biz_date").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Datetime));
+        assert!(col.datetime_format.is_none());
+        assert_ne!(col.datetime_epoch, Some(true));
+        match &col.marginal {
+            Marginal::Categorical(p) => {
+                assert!(p.values.iter().any(|v| v == "15-JAN-24"));
+            }
+            other => panic!("expected legacy Categorical, got {other:?}"),
+        }
     }
 }
