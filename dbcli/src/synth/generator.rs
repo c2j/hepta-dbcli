@@ -3708,8 +3708,22 @@ tables:
             tables: vec![parent_rule, child_rule],
         };
 
-        let result = generate(&models, &rules, &GeneratorConfig::default())
-            .expect("NULL unique-FK rows must not exhaust the parent pool");
+        // The seed is pinned so the draw cannot decide the outcome. This fixture
+        // only means something while the child has more rows (14) than the
+        // parent pool (10): if NULL rows consumed the pool, 14 draws would
+        // exhaust 10 slots and `generate` would error. Unseeded, the non-NULL
+        // count lands above 10 in roughly 3% of runs, which made the suite (and
+        // CI) fail at random. Seed 42 draws 8 non-NULL rows, so the scenario
+        // still exercises the same path.
+        let result = generate(
+            &models,
+            &rules,
+            &GeneratorConfig {
+                seed: Some(42),
+                ..Default::default()
+            },
+        )
+        .expect("NULL unique-FK rows must not exhaust the parent pool");
         let pool: std::collections::HashSet<String> = result.tables["users"]
             .iter()
             .map(|row| row[0].to_string())
