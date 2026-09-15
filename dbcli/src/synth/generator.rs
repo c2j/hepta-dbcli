@@ -2058,10 +2058,8 @@ mod tests {
             parent_rows.iter().all(|row| !row[0].is_null()),
             "referenced parent key must never be NULL"
         );
-        let pool: std::collections::HashSet<String> = parent_rows
-            .iter()
-            .map(|row| row[0].to_string())
-            .collect();
+        let pool: std::collections::HashSet<String> =
+            parent_rows.iter().map(|row| row[0].to_string()).collect();
 
         let child_rows = result.tables.get("orders").unwrap();
         let mut saw_null = false;
@@ -2078,7 +2076,10 @@ mod tests {
             );
             saw_member = true;
         }
-        assert!(saw_null, "FK column with null_rate 0.1 must emit some NULLs");
+        assert!(
+            saw_null,
+            "FK column with null_rate 0.1 must emit some NULLs"
+        );
         assert!(saw_member, "FK column must still draw some parent keys");
     }
 
@@ -2211,9 +2212,7 @@ mod tests {
             assert!(used.insert(key), "non-null unique FK must not repeat");
         }
         assert!(
-            result.tables["orders"]
-                .iter()
-                .any(|row| row[0].is_null()),
+            result.tables["orders"].iter().any(|row| row[0].is_null()),
             "expected some NULL FK rows so the extra children can fit"
         );
     }

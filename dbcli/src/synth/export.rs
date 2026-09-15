@@ -465,10 +465,7 @@ mod tests {
     #[test]
     fn should_export_null_and_empty_string_distinctly_in_all_formats() {
         let mut tables = HashMap::new();
-        tables.insert(
-            "t".to_string(),
-            vec![vec![Value::Null, Value::from("")]],
-        );
+        tables.insert("t".to_string(), vec![vec![Value::Null, Value::from("")]]);
         let mut columns = HashMap::new();
         columns.insert("t".to_string(), vec!["a".to_string(), "b".to_string()]);
         let payload = ExportPayload {
@@ -492,7 +489,8 @@ mod tests {
         assert_eq!(parsed, vec![Value::Null, Value::from("")]);
 
         let jsonl = std::fs::read_to_string(dir.join("t.jsonl")).unwrap();
-        let jsonl_row: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let jsonl_row: serde_json::Value =
+            serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
         assert!(jsonl_row["a"].is_null(), "jsonl a: {jsonl_row}");
         assert_eq!(jsonl_row["b"], "");
 

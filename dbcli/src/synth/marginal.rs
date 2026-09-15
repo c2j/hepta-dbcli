@@ -529,10 +529,7 @@ pub fn compute_gaussian_correlation(
     corr
 }
 
-fn pit_to_gaussian(
-    val: &serde_json::Value,
-    col_model: Option<&ColumnModel>,
-) -> Option<f64> {
+fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> Option<f64> {
     if val.is_null() {
         return None;
     }
@@ -1021,7 +1018,9 @@ mod tests {
             ("b".to_string(), normal_column_model(loc_b, scale_b)),
         ]);
 
-        let complete_a: Vec<f64> = (0..5).map(|i| pit_standard_normal(i as f64, loc_a, scale_a)).collect();
+        let complete_a: Vec<f64> = (0..5)
+            .map(|i| pit_standard_normal(i as f64, loc_a, scale_a))
+            .collect();
         let complete_b: Vec<f64> = (0..5)
             .map(|i| pit_standard_normal(2.0 * i as f64, loc_b, scale_b))
             .collect();
