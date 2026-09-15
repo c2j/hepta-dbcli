@@ -979,6 +979,7 @@ tables:
 | Case A | 合成 4 列高斯 Copula，对标 SDV `GaussianCopulaSynthesizer(norm)` | [tests/benchmark/REPORT.md](../tests/benchmark/REPORT.md) | `tests/benchmark/run_case_a.sh` |
 | P1 | SynMeter 真实单表（**仅 Adult**）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15） | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
 | P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
+| M1 验收 | synth M1 端到端（真实 MySQL fixture）：datetime 格式还原与值域、NULL 比例复现、DECIMAL 标度、字典列全档、FK 引用完整性、SQL schema 限定、同 seed 逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m1.sh` |
 
 CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 
