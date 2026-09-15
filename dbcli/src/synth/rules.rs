@@ -36,6 +36,8 @@ pub struct Relationship {
     pub references: Vec<String>,
     #[serde(default)]
     pub pool_strategy: PoolStrategy,
+    /// Parsed for YAML compatibility with existing rules files. Generation
+    /// does not read this field; NULL injection uses per-column `null_rate`.
     #[serde(default = "default_null_label")]
     pub null_label: String,
 }
