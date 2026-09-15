@@ -1236,6 +1236,29 @@ tables:
     }
 
     #[test]
+    fn should_read_unquoted_numeric_uniform_value_pool_entries() {
+        // Mirrors `should_read_unquoted_numeric_value_pool_keys`: the weighted
+        // shape already accepts `{1: 0.7}`, so `[1, 2]` must not force quotes.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      part_id:
+        values: [1, 2]
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        match rules.tables[0].columns["part_id"].values.as_ref().unwrap() {
+            ValuePool::Uniform(values) => {
+                assert_eq!(values, &vec!["1".to_string(), "2".to_string()])
+            }
+            other => panic!("expected a uniform pool, got {other:?}"),
+        }
+        rules.validate().unwrap();
+    }
+
+    #[test]
     fn should_read_quoted_and_float_value_pool_keys() {
         let yaml = r#"
 version: "1"
