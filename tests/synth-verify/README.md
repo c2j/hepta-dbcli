@@ -40,9 +40,9 @@ HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
 
 It reuses the same fixture and environment variables as the M1 run. After
 `train` (which now also writes `<table>.report-baseline.json`) it generates the
-same data twice, then runs `synth report` four ways: offline, against the live
-key pools (`--against-db`), on a degraded copy, and on a models directory with
-no baseline. `verify_m2.py` asserts:
+same data twice, then runs `synth report` five ways: offline, against the live
+key pools (`--against-db`), on a degraded copy, and twice on a models directory
+with no baseline (`--strict`, and `--min-score`). `verify_m2.py` asserts:
 
 | Issue | Check |
 |---|---|
@@ -50,7 +50,7 @@ no baseline. `verify_m2.py` asserts:
 | #67 AC1 | the report carries `shapes` / `pairs` / `fk` sections and an overall score in `(0, 1)` |
 | #67 AC2 | shifting `cjje` by +10000 drops that column below 0.8 (>= 0.15 below the clean run) and fails `--min-score` with a non-zero exit code |
 | #67 AC4 | offline, the FK edge is scored at rate 1.0 against the **generated parent keys** (`source: "generated"`); with `--against-db` it is scored against the live pool (`source: "database"`) and still 1.0 with no warn |
-| #67 AC3 | a models directory without a baseline yields `status: skipped` with a reason and exit code 0; `--strict` fails. A model with no generated data is listed as a skipped table (not silently absent) and also fails `--strict` |
+| #67 AC3 | a models directory without a baseline yields `status: skipped` with a reason and exit code 0; `--strict` fails. A model with no generated data is listed as a skipped table (not silently absent), fails `--strict`, and fails `--min-score` (the gate requires every table to be scored) |
 | #67 AC5 | two runs over the same inputs produce byte-identical report JSON (and the same seed regenerates byte-identical data) |
 | #67 AC6 | baseline files contain only aggregate payloads (numeric knots or `[value, frequency]` pairs), never a row record |
 

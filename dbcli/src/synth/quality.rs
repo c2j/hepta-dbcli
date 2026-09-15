@@ -450,7 +450,9 @@ pub struct FkRate {
     pub keys: usize,
     pub hits: usize,
     pub rate: f64,
-    /// `database` (real keys) or `model` (parent value pool approximation).
+    /// Where the parent key pool came from: `database` (live keys read with
+    /// `--against-db`) or `generated` (the parent column of the generated
+    /// data).
     pub source: String,
     pub warn: bool,
 }
@@ -540,8 +542,10 @@ impl QualityReport {
 }
 
 /// Mean of the scored sections of a table; `None` when every section was
-/// skipped. FK rates are reported but not averaged in: an approximate
-/// (model-pool) rate is not a fidelity score.
+/// skipped. FK rates are reported but not averaged in: they measure
+/// referential integrity, not shape fidelity, and the offline pool is the
+/// generated parent column, where a rate of 1.0 is expected by construction
+/// (the real check is `--against-db`).
 pub fn mean_of(values: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     let collected: Vec<f64> = values.into_iter().flatten().collect();
     if collected.is_empty() {
@@ -981,10 +985,10 @@ pub type ParentKeyPools = HashMap<(String, String), Vec<String>>;
 
 /// Join rate of every generated child column against its parent key pool.
 ///
-/// `table_columns` maps a table to the column names of its generated rows;
-/// `parent_pools` maps `(table, column)` to the keys the child values must
-/// appear in. Without `--against-db` the pool is the parent model's value
-/// dictionary, which is an approximation and is labelled as such.
+/// `parent_pools` is built by the caller: the live database keys with
+/// `--against-db`, otherwise [`generated_key_pools`] over the generated parent
+/// table. An edge whose parent column is not in that pool is skipped, so the
+/// caller's chosen source is visible in every reported rate.
 pub fn evaluate_fk(
     relations: &[FkRelation],
     table_columns: &GeneratedColumns,

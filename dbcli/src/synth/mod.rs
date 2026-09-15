@@ -801,9 +801,9 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         fk_source,
     );
 
-    // Every model gets a row in the report. A table whose data is missing is
-    // reported as `skipped` instead of silently absent, so `--min-score` can
-    // never average away a table that was not scored at all.
+    // Every model gets a row in the report: a table whose data is missing is
+    // reported as `skipped` instead of silently absent, and `--min-score`
+    // additionally refuses to gate on a report with unscored tables.
     let mut table_names: Vec<&String> = models.keys().collect();
     table_names.sort();
     let mut tables = Vec::new();
@@ -846,6 +846,30 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         println!("report written to {}", path);
     }
     if let Some(min_score) = options.min_score {
+        // The gate covers every model, not just the tables that produced a
+        // score: `mean_of` drops `None`, so without this an unscored table
+        // would let a partially scored report pass.
+        let mut unscored: Vec<String> = report
+            .tables
+            .iter()
+            .filter(|table| table.score.is_none())
+            .map(|table| {
+                let reason = match &table.shapes {
+                    Section::Skipped { reason } => reason.clone(),
+                    Section::Scored { .. } => "no scored section".to_string(),
+                };
+                format!("{} ({})", table.table, reason)
+            })
+            .collect();
+        unscored.sort();
+        if !unscored.is_empty() {
+            return Err(format!(
+                "--min-score {} requires every table to be scored, but {} could not be: {}",
+                min_score,
+                unscored.len(),
+                unscored.join("; ")
+            ));
+        }
         let score = overall_score.ok_or_else(|| {
             format!(
                 "--min-score {} cannot be checked: no section was scored",
@@ -1595,6 +1619,36 @@ mod tests {
         let err = run_report(options, None).await.unwrap_err();
         assert!(err.contains("no generated data"), "{err}");
 
+        // --min-score is a gate over every model: the scored table must not
+        // let the data-less one pass unnoticed.
+        let mut options = report_options(&models_dir, &data_dir, None);
+        options.min_score = Some(0.5);
+        let err = run_report(options, None).await.unwrap_err();
+        assert!(err.contains("requires every table to be scored"), "{err}");
+        assert!(
+            err.contains("other"),
+            "the error must name the table: {err}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn report_min_score_fails_when_nothing_is_scored() {
+        // Baseline-less model: shapes and pairs are skipped, so the gate has
+        // nothing to average and must fail rather than pass on an empty set.
+        let training = report_rows(500, |i| ["a", "b", "c"][i % 3]);
+        let models_dir = report_fixture_dir("unscored", &training, false);
+        let data_dir = std::env::temp_dir().join("synth-report-unscored-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_generated_jsonl(&data_dir, &report_rows(100, |i| ["a", "b", "c"][i % 3]));
+
+        let mut options = report_options(&models_dir, &data_dir, None);
+        options.min_score = Some(0.5);
+        let err = run_report(options, None).await.unwrap_err();
+        assert!(err.contains("requires every table to be scored"), "{err}");
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 }

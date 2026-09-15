@@ -365,7 +365,9 @@ column pair, and FK join rates (against the generated parent keys, or the live
 database with `--against-db`). Categorical columns with more than 50 levels are
 reported but left out of the average, since total variation over hundreds of
 levels is sampling noise rather than fidelity; a models directory without a
-baseline reports `skipped` (exit 0) unless `--strict` is set.
+baseline reports `skipped` (exit 0) unless `--strict` is set, and `--min-score`
+gates on every model: a table that could not be scored fails the run instead of
+being averaged away.
 
 Tables are generated in FK topological order (cycles rejected). Child FK values are drawn from the parent's generated keys; `pool_strategy: !projection { unique: true }` samples them without replacement. `--seed` derives a stable per-table RNG stream. See [UserGuide.md](UserGuide.md) §10 for the rules YAML reference.
 

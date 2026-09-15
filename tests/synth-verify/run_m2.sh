@@ -9,7 +9,8 @@
 # database, runs `synth train` (which now records a holdout report baseline),
 # `rules-draft`, `generate` (jsonl, twice for determinism) and `synth report`
 # offline, against the live database, on a degraded copy, and without a
-# baseline (honest skip + --strict). Assertions live in verify_m2.py.
+# baseline (honest skip + --strict + --min-score). Assertions live in
+# verify_m2.py.
 #
 # Environment:
 #   HEPTA_DBCLI_TEST_URL   required; the database to create the fixture in
@@ -159,13 +160,18 @@ echo "== synth report (no baseline, --strict) =="
 "${HEPTA_BIN}" synth report --models "${OUT}/nobase" --data "${OUT}/data" \
     --strict >/dev/null 2>&1
 strict_code=$?
+
+echo "== synth report (no baseline, --min-score: every table must be scored) =="
+"${HEPTA_BIN}" synth report --models "${OUT}/nobase" --data "${OUT}/data" \
+    --min-score 0.5 >/dev/null 2>&1
+unscored_gate_code=$?
 set -e
 
 echo
 echo "== verifying artifacts in ${OUT} =="
 if python3 "${ROOT}/verify_m2.py" "${OUT}" "${SCHEMA}" \
     "${good_code}" "${second_code}" "${degraded_code}" "${fk_db_code}" \
-    "${lenient_code}" "${strict_code}"; then
+    "${lenient_code}" "${strict_code}" "${unscored_gate_code}"; then
     echo "M2 end-to-end verification PASSED"
     if [[ "${SYNTH_E2E_KEEP:-0}" != "1" ]]; then
         rm -rf "${OUT}"

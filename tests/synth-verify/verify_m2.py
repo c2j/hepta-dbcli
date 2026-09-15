@@ -2,7 +2,7 @@
 """Assertions for the M2 synth end-to-end run (tests/synth-verify/run_m2.sh).
 
 Usage: verify_m2.py OUT SCHEMA GOOD_CODE SECOND_CODE DEGRADED_CODE FK_DB_CODE \
-                    LENIENT_CODE STRICT_CODE
+                    LENIENT_CODE STRICT_CODE UNSCORED_GATE_CODE
 
 Checks the artifacts produced by run_m2.sh:
   * `train` wrote a holdout baseline per table, and it holds aggregate
@@ -15,7 +15,9 @@ Checks the artifacts produced by run_m2.sh:
   * a degraded numeric column is detected (score < 0.8 and >= 0.15 lower than
     the clean run) and trips --min-score (exit code != 0);
   * `--against-db` scores the foreign key against the live key pool at 1.0;
-  * a missing baseline is an honest skip (exit 0) unless --strict is given.
+  * a missing baseline is an honest skip (exit 0) unless --strict is given,
+    and --min-score refuses to gate on a report where a table could not be
+    scored.
 """
 
 import json
@@ -156,13 +158,15 @@ def main():
         fk_db_code,
         lenient_code,
         strict_code,
-    ) = sys.argv[1:9]
+        unscored_gate_code,
+    ) = sys.argv[1:10]
     good_code = int(good_code)
     second_code = int(second_code)
     degraded_code = int(degraded_code)
     fk_db_code = int(fk_db_code)
     lenient_code = int(lenient_code)
     strict_code = int(strict_code)
+    unscored_gate_code = int(unscored_gate_code)
 
     try:
         check_marginals(out)
@@ -246,6 +250,11 @@ def main():
         check(len(nobase["tables"][0].get("pairs", {}) or {}) >= 1, "pairs section present")
         check(lenient_code == 0, f"missing baseline must exit 0, got {lenient_code}")
         check(strict_code != 0, f"--strict must exit non-zero, got {strict_code}")
+        check(
+            unscored_gate_code != 0,
+            "--min-score must fail when a table cannot be scored, "
+            f"got {unscored_gate_code}",
+        )
         check(schema and len(schema) > 0, "schema must be non-empty")
     except Failure as error:
         print(f"FAIL: {error}", file=sys.stderr)
@@ -253,7 +262,7 @@ def main():
 
     print(
         "M2 assertions: marginals, baselines, shapes, pairs, degradation, "
-        "fk (generated + database), skip/strict OK"
+        "fk (generated + database), skip/strict/min-score OK"
     )
     return 0
 
