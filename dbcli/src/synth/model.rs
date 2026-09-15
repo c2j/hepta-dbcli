@@ -32,6 +32,11 @@ pub struct ColumnModel {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Share of NULLs observed in the training sample. `Some(1.0)` marks a
+    /// column that had no non-null value at all; generation emits NULL for it
+    /// instead of fabricating a constant from a degenerate marginal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub null_rate: Option<f64>,
     pub marginal: crate::synth::marginal::Marginal,
 }
 
@@ -43,6 +48,7 @@ impl Default for ColumnModel {
             datetime_epoch: None,
             min: None,
             max: None,
+            null_rate: None,
             marginal: crate::synth::marginal::Marginal::Normal(
                 crate::synth::marginal::NormalParams {
                     loc: 0.0,
@@ -111,6 +117,7 @@ mod tests {
                 datetime_epoch: None,
                 min: None,
                 max: None,
+                null_rate: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 1.0,
@@ -158,6 +165,7 @@ mod tests {
             datetime_epoch: None,
             min: None,
             max: None,
+            null_rate: None,
             marginal: Marginal::Categorical(CategoricalParams {
                 values: vec!["a".to_string(), "b".to_string()],
                 weights: vec![0.5, 0.5],

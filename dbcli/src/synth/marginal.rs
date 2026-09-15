@@ -812,6 +812,7 @@ mod tests {
             datetime_epoch: None,
             min: None,
             max: None,
+            null_rate: None,
             marginal: Marginal::Normal(NormalParams { loc, scale }),
         }
     }
@@ -851,6 +852,7 @@ mod tests {
                 datetime_epoch: None,
                 min: None,
                 max: None,
+                null_rate: None,
                 marginal: Marginal::Categorical(CategoricalParams {
                     values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
                     weights: vec![1.0 / 3.0; 3],

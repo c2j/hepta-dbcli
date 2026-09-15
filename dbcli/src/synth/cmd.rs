@@ -148,6 +148,7 @@ pub(crate) fn build_model(
                         datetime_epoch: None,
                         min: col_profile.min.as_ref().and_then(|v| v.as_f64()),
                         max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
+                        null_rate: Some(col_profile.null_rate),
                         marginal,
                     },
                 );
@@ -237,9 +238,18 @@ fn fit_marginal(
                 }))
             }
         }
+        // Numeric-encoded datetimes (compact YYYYMMDD, epoch integers) fit a
+        // Normal; date/timestamp strings fall through to the frequency path.
         "datetime" if col.mean.is_some() => Ok(Marginal::Normal(NormalParams {
             loc: col.mean.unwrap_or(0.0),
             scale: col.std_dev.unwrap_or(0.0),
+        })),
+        // A datetime column with no observed value (all NULL) has no
+        // distribution to fit: keep it in the model so generated data keeps
+        // the column, and let the recorded null_rate drive NULL emission.
+        "datetime" if col.top_values.is_none() => Ok(Marginal::Normal(NormalParams {
+            loc: 0.0,
+            scale: 0.0,
         })),
         "categorical" | "datetime" => {
             let top = col.top_values.as_deref().ok_or_else(|| {
@@ -799,6 +809,29 @@ mod tests {
         assert!(skipped.is_empty());
         let col = model.columns.get("amt").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Numerical));
+        assert_eq!(col.null_rate, Some(1.0));
+    }
+
+    #[test]
+    fn build_model_keeps_all_null_datetime() {
+        let samples = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let col = crate::synth::profile::ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp without time zone"),
+        );
+        let mut columns = std::collections::HashMap::new();
+        columns.insert("ts".to_string(), col);
+        let profile = TableProfile {
+            table: "t".to_string(),
+            row_count: 4,
+            column_order: vec!["ts".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+        let col = model.columns.get("ts").unwrap();
+        assert!(matches!(col.logical_type, LogicalType::Datetime));
+        assert_eq!(col.null_rate, Some(1.0));
     }
 
     #[test]

@@ -35,12 +35,24 @@ fn is_unsupported_placeholder(s: &str) -> bool {
 }
 
 fn sql_type_base(data_type: &str) -> String {
-    data_type
+    let base = data_type
         .split('(')
         .next()
         .unwrap_or(data_type)
         .trim()
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    // MySQL appends integer display attributes after the bare type name
+    // ("bigint unsigned", "int unsigned zerofill") and since 8.0.19 omits the
+    // display width, so the parenthesized split above is not enough. Strip the
+    // attribute tail; the bare type decides the logical category.
+    let mut base = base.as_str();
+    while let Some(stripped) = [" unsigned", " signed", " zerofill"]
+        .iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+    {
+        base = stripped;
+    }
+    base.to_string()
 }
 
 fn is_numeric_sql_type(data_type: &str) -> bool {
@@ -71,6 +83,14 @@ fn is_numeric_sql_type(data_type: &str) -> bool {
             | "real"
             | "binary_float"
             | "binary_double"
+            // DuckDB unsigned / wide integers (COLUMN_TYPE has no "unsigned"
+            // suffix there, the type name itself is unsigned).
+            | "utinyint"
+            | "usmallint"
+            | "uinteger"
+            | "ubigint"
+            | "uhugeint"
+            | "hugeint"
     )
 }
 
@@ -507,6 +527,42 @@ mod tests {
         assert_eq!(profile.logical_type, "numerical");
         assert_eq!(profile.null_rate, 1.0);
         assert!(profile.mean.is_none());
+    }
+
+    #[test]
+    fn column_profile_unsigned_integer_schema_is_numerical() {
+        // MySQL 8.0.19+ drops the display width, so COLUMN_TYPE is
+        // "bigint unsigned" and the modifier must be stripped.
+        let samples = vec![Value::Null, Value::Null];
+        for ty in [
+            "bigint unsigned",
+            "int unsigned",
+            "smallint unsigned",
+            "double unsigned",
+            "int unsigned zerofill",
+        ] {
+            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
+        }
+    }
+
+    #[test]
+    fn column_profile_duckdb_unsigned_types_are_numerical() {
+        let samples = vec![Value::Null, Value::Null];
+        for ty in ["UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT", "HUGEINT"] {
+            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
+        }
+    }
+
+    #[test]
+    fn column_profile_unsigned_is_not_datetime() {
+        let samples: Vec<Value> = ["20240101", "20240315"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("bigint unsigned"));
+        assert_eq!(profile.logical_type, "numerical");
     }
 
     #[test]
