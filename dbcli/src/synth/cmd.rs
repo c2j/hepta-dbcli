@@ -146,7 +146,7 @@ pub(crate) fn build_model(
                         logical_type,
                         rounding,
                         datetime_epoch: None,
-                        decimal_scale: None,
+                        decimal_scale: col_profile.decimal_scale,
                         datetime_format: None,
                         min: col_profile.min.as_ref().and_then(|v| v.as_f64()),
                         max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
@@ -877,6 +877,27 @@ mod tests {
             Marginal::Normal(p) => assert!(p.loc > 20_000_000.0),
             other => panic!("expected Normal for compact dates, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_copy_decimal_scale_from_profile() {
+        let samples: Vec<Value> = ["1.2345", "2.3456", "3.4567", "4.5678"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let col = crate::synth::profile::ColumnProfile::from_samples(&samples);
+        assert_eq!(col.decimal_scale, Some(4));
+        let mut columns = std::collections::HashMap::new();
+        columns.insert("amt".to_string(), col);
+        let profile = TableProfile {
+            table: "t".to_string(),
+            row_count: 4,
+            column_order: vec!["amt".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(model.columns.get("amt").unwrap().decimal_scale, Some(4));
     }
 
     #[test]

@@ -290,6 +290,18 @@ pub fn generate(
     })
 }
 
+fn quantize(value: f64, scale: u8) -> f64 {
+    use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+    use rust_decimal::{Decimal, RoundingStrategy};
+
+    let Some(dec) = Decimal::from_f64(value) else {
+        return value;
+    };
+    let dp = u32::from(scale).min(Decimal::MAX_SCALE);
+    let rounded = dec.round_dp_with_strategy(dp, RoundingStrategy::MidpointAwayFromZero);
+    rounded.to_f64().unwrap_or(value)
+}
+
 fn gen_column_value(
     column_model: Option<&crate::synth::model::ColumnModel>,
     uniform_val: f64,
@@ -341,6 +353,11 @@ fn gen_column_value(
             }
             if column_model.and_then(|c| c.rounding) == Some(0) {
                 Value::from(generated.round() as i64)
+            } else if let Some(scale) = column_model
+                .filter(|c| matches!(c.logical_type, crate::synth::model::LogicalType::Numerical))
+                .and_then(|c| c.decimal_scale)
+            {
+                Value::from(quantize(generated, scale))
             } else {
                 Value::from(generated)
             }
@@ -2215,5 +2232,218 @@ mod tests {
             result.tables["orders"].iter().any(|row| row[0].is_null()),
             "expected some NULL FK rows so the extra children can fit"
         );
+    }
+
+    fn legacy_unquantized_amt_json() -> String {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "amt".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                min: Some(1.0),
+                max: Some(2000.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 1004.5678,
+                    scale: 12.5,
+                }),
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "payments".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["amt".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("payments".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("payments", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["payments"], 8)).unwrap();
+        serde_json::to_string(result.tables.get("payments").unwrap()).expect("serialize rows")
+    }
+
+    #[test]
+    fn should_keep_legacy_model_without_decimal_scale_byte_identical() {
+        // Captured from current generator output (decimal_scale: None, seed 42,
+        // 8 rows) BEFORE quantization landed. A regression that starts
+        // quantizing legacy models will change this JSON.
+        const EXPECTED: &str = "[[1007.664388321776],[1021.4910250901899],[1000.258291072789],[1022.4674214957709],[989.8366471906627],[1004.3359119647007],[1007.8413059613897],[982.1004635402403]]";
+        assert_eq!(legacy_unquantized_amt_json(), EXPECTED);
+    }
+
+    fn scaled_amt_model(decimal_scale: u8, loc: f64, std_dev: f64) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "amt".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: Some(decimal_scale),
+                datetime_format: None,
+                min: Some(1.0),
+                max: Some(9999.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc,
+                    scale: std_dev,
+                }),
+            },
+        );
+        TableModel {
+            version: 1,
+            table: "payments".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["amt".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        }
+    }
+
+    fn matches_scaled_decimal(s: &str, max_frac: usize) -> bool {
+        let Some((int_part, frac)) = s.split_once('.') else {
+            return false;
+        };
+        !int_part.is_empty()
+            && int_part.bytes().all(|b| b.is_ascii_digit())
+            && (1..=max_frac).contains(&frac.len())
+            && frac.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    fn generated_amt_strings(decimal_scale: u8, rows: usize) -> Vec<String> {
+        let models = HashMap::from([(
+            "payments".to_string(),
+            scaled_amt_model(decimal_scale, 1004.5678, 50.0),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("payments", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["payments"], rows)).unwrap();
+        result
+            .tables
+            .get("payments")
+            .unwrap()
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Number(n) => n.to_string(),
+                other => panic!("expected number, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quantize_is_bit_exact_and_uses_decimal_half_up() {
+        assert_eq!(quantize(1.23456, 4).to_bits(), 1.2346f64.to_bits());
+        assert_eq!(quantize(1.23455, 4).to_bits(), 1.2346f64.to_bits());
+        assert_eq!(quantize(1.23454, 4).to_bits(), 1.2345f64.to_bits());
+        assert_eq!(quantize(1.225, 2).to_bits(), 1.23f64.to_bits());
+        assert_eq!(quantize(-1.225, 2).to_bits(), (-1.23f64).to_bits());
+        let artefact = quantize(1004.9999999999999, 4);
+        assert_eq!(artefact.to_bits(), 1005.0f64.to_bits());
+        assert!(!format!("{artefact}").contains("9999999"));
+    }
+
+    #[test]
+    fn should_quantize_generated_values_to_four_place_scale() {
+        for s in generated_amt_strings(4, 10_000) {
+            assert!(
+                matches_scaled_decimal(&s, 4),
+                "value {s} must match ^\\d+\\.\\d{{1,4}}$"
+            );
+            assert!(!s.contains("9999999"), "trailing 9s artefact: {s}");
+        }
+    }
+
+    #[test]
+    fn should_quantize_generated_values_to_two_place_scale() {
+        for s in generated_amt_strings(2, 10_000) {
+            assert!(
+                matches_scaled_decimal(&s, 2),
+                "value {s} must match ^\\d+\\.\\d{{1,2}}$"
+            );
+            assert!(!s.contains("9999999"), "trailing 9s artefact: {s}");
+        }
+    }
+
+    #[test]
+    fn should_keep_integer_columns_emitting_i64() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: Some(0),
+                datetime_format: None,
+                min: Some(0.0),
+                max: Some(100.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 50.0,
+                    scale: 10.0,
+                }),
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "ids".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["id".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("ids".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("ids", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["ids"], 200)).unwrap();
+        for row in result.tables.get("ids").unwrap() {
+            assert!(
+                row[0].as_i64().is_some(),
+                "rounding Some(0) must emit Value::Number(i64), got {:?}",
+                row[0]
+            );
+        }
     }
 }

@@ -62,6 +62,67 @@ fn sql_type_base(data_type: &str) -> String {
     base.to_string()
 }
 
+/// Scale `s` from a SQL `(p,s)` declaration such as `numeric(16,2)`,
+/// `decimal(18, 4)`, or `NUMBER(18,4)`. One-argument forms (`float(24)`,
+/// `varchar(8)`) and unparsable inner lists yield `None`.
+fn sql_type_scale(data_type: &str) -> Option<u8> {
+    let start = data_type.find('(')?;
+    let end = data_type[start + 1..].find(')')?;
+    let inner = data_type[start + 1..start + 1 + end].trim();
+    let mut parts = inner.split(',');
+    let _precision = parts.next()?.trim();
+    let scale = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    scale.parse().ok()
+}
+
+/// Fractional-digit count of a plain decimal literal: optional sign, digits,
+/// at most one `.`. Exponent forms (`1.2e3`) and any other character are
+/// rejected so f64 noise / scientific notation cannot inflate the scale.
+fn decimal_literal_scale(s: &str) -> Option<u8> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix('+')
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().any(|b| b == b'e' || b == b'E') {
+        return None;
+    }
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    let mut frac: u8 = 0;
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                if seen_dot {
+                    frac = frac.saturating_add(1);
+                }
+            }
+            b'.' if !seen_dot => seen_dot = true,
+            _ => return None,
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    Some(if seen_dot { frac } else { 0 })
+}
+
+fn learned_decimal_scale(non_null: &[&Value], data_type: Option<&str>) -> Option<u8> {
+    let sample_scale = non_null
+        .iter()
+        .filter_map(|v| v.as_str().and_then(decimal_literal_scale))
+        .max();
+    let ddl_scale = data_type.and_then(sql_type_scale);
+    [sample_scale, ddl_scale].into_iter().flatten().max()
+}
+
 fn is_numeric_sql_type(data_type: &str) -> bool {
     matches!(
         sql_type_base(data_type).as_str(),
@@ -313,6 +374,12 @@ impl ColumnProfile {
             None
         };
 
+        let decimal_scale = if logical_type == "numerical" && !is_integer {
+            learned_decimal_scale(&non_null, data_type)
+        } else {
+            None
+        };
+
         Self {
             logical_type,
             null_rate,
@@ -323,7 +390,7 @@ impl ColumnProfile {
             std_dev,
             top_values,
             is_integer,
-            decimal_scale: None,
+            decimal_scale,
             datetime_format: None,
         }
     }
@@ -703,5 +770,51 @@ mod tests {
         let loaded: TableProfile = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.table, "t");
         assert!(loaded.column_order.is_empty());
+    }
+
+    #[test]
+    fn should_take_max_scale_on_mixed_sample_scales() {
+        let samples: Vec<Value> = ["1.2", "3.456", "7.89", "-0.10"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(!profile.is_integer);
+        assert_eq!(profile.decimal_scale, Some(3));
+    }
+
+    #[test]
+    fn should_learn_scale_from_ddl_type_when_samples_are_numeric() {
+        let samples = vec![
+            serde_json::json!(10.5),
+            serde_json::json!(20.25),
+            serde_json::json!(30.0),
+        ];
+        let profile = ColumnProfile::from_samples_typed(&samples, Some("numeric(16,2)"));
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(!profile.is_integer);
+        assert_eq!(profile.decimal_scale, Some(2));
+    }
+
+    #[test]
+    fn should_not_learn_scale_for_integer_or_datetime_columns() {
+        let ints = vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ];
+        let int_profile = ColumnProfile::from_samples_typed(&ints, Some("decimal(18,4)"));
+        assert_eq!(int_profile.logical_type, "numerical");
+        assert!(int_profile.is_integer);
+        assert_eq!(int_profile.decimal_scale, None);
+
+        let dates: Vec<Value> = ["2024-01-01", "2024-03-15", "2024-12-31"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let date_profile = ColumnProfile::from_samples(&dates);
+        assert_eq!(date_profile.logical_type, "datetime");
+        assert_eq!(date_profile.decimal_scale, None);
     }
 }
