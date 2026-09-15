@@ -597,12 +597,20 @@ async fn run_rules_draft(
     });
 
     // Primary keys come from the trained models; without them the heuristic
-    // simply cannot tell a child key from a reference (issue #76-E).
-    let primary_keys: HashMap<String, String> = load_models(models_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(table, model)| model.pk.first().map(|pk| (table, pk.clone())))
-        .collect();
+    // simply cannot tell a child key from a reference (issue #76-E). Swallowing
+    // the error would run the heuristic with an empty map and invent references
+    // out of primary keys, so the failure is reported.
+    let primary_keys = match load_primary_keys(models_dir) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!(
+                "warning: ignoring trained models (implicit relationship detection \
+                 may invent references): {}",
+                e
+            );
+            HashMap::new()
+        }
+    };
 
     let (rules, inferred) = crate::synth::rules_draft::generate_draft_with_implicit(
         &tables,
@@ -733,6 +741,16 @@ fn write_report_baseline(
         path.display()
     );
     Ok(())
+}
+
+/// Primary key per table, as recorded by `synth train`. Errors are returned
+/// rather than defaulted: an empty map silently weakens the implicit-FK
+/// heuristic (`rules_draft`) so primary keys get mistaken for references.
+fn load_primary_keys(models_dir: &Path) -> Result<HashMap<String, String>, String> {
+    Ok(load_models(models_dir)?
+        .into_iter()
+        .filter_map(|(table, model)| model.pk.first().map(|pk| (table, pk.clone())))
+        .collect())
 }
 
 /// Load every `<table>.model.json` in a models directory.
@@ -1103,6 +1121,47 @@ const KEY_POOL_LIMIT: usize = 100_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_error_when_a_models_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            load_primary_keys(&missing).is_err(),
+            "a missing models directory must not silently yield an empty key map"
+        );
+    }
+
+    #[test]
+    fn should_read_primary_keys_from_trained_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = crate::synth::model::TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: crate::synth::model::Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["order_id".to_string()],
+            columns: HashMap::new(),
+            copula: crate::synth::model::CopulaInfo {
+                column_order: vec![],
+                correlation: vec![],
+            },
+        };
+        std::fs::write(
+            dir.path().join("orders.model.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
+
+        let keys = load_primary_keys(dir.path()).expect("trained model must load");
+        assert_eq!(keys.get("orders").map(String::as_str), Some("order_id"));
+    }
 
     #[test]
     fn should_resolve_schema_from_connection_default_when_unspecified() {
