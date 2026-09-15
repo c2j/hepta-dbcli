@@ -1,4 +1,5 @@
 use crate::synth::model::{ColumnModel, LogicalType};
+use crate::synth::stats::ks_statistic;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,6 +16,12 @@ pub enum Marginal {
     Categorical(CategoricalParams),
     #[serde(rename = "uniform")]
     Uniform(UniformParams),
+    /// Empirical (piecewise-linear quantile) marginal. Knots are the sorted
+    /// training values sampled at a uniform probability grid, so the
+    /// probabilities are implicit (`i / (len - 1)`) and the serialized model
+    /// only carries the value axis.
+    #[serde(rename = "ecdf")]
+    Ecdf(EcdfParams),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +74,15 @@ pub struct UniformParams {
     pub high: f64,
 }
 
+/// Knot values of the empirical quantile function at uniformly spaced
+/// probabilities. `knots` is non-decreasing; `knots[0]` / `knots[last]` are the
+/// observed sample min / max, so an ECDF marginal can never generate outside
+/// the training range (no min/max clipping needed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcdfParams {
+    pub knots: Vec<f64>,
+}
+
 impl Marginal {
     pub fn cdf(&self, x: f64) -> f64 {
         match self {
@@ -78,6 +94,7 @@ impl Marginal {
             Marginal::Gamma(p) => gamma_cdf(x, p.shape, p.scale),
             Marginal::Uniform(p) => uniform_cdf(x, p.low, p.high),
             Marginal::Categorical(_) => 0.0,
+            Marginal::Ecdf(p) => p.cdf(x),
         }
     }
 
@@ -88,7 +105,113 @@ impl Marginal {
             Marginal::Gamma(params) => gamma_ppf(params.shape, params.scale, p),
             Marginal::Uniform(params) => uniform_ppf(params.low, params.high, p),
             Marginal::Categorical(params) => params.sample_index(p) as f64,
+            Marginal::Ecdf(params) => params.inverse_cdf(p),
         }
+    }
+
+    /// Left limit `F(x⁻)`. Only the ECDF carries atoms; every parametric
+    /// family is continuous, so its left limit equals `cdf`.
+    pub fn cdf_left(&self, x: f64) -> f64 {
+        match self {
+            Marginal::Ecdf(params) => params.cdf_left(x),
+            other => other.cdf(x),
+        }
+    }
+}
+
+impl crate::synth::stats::ReferenceCdf for &Marginal {
+    fn cdf(&self, x: f64) -> f64 {
+        Marginal::cdf(self, x)
+    }
+
+    fn cdf_left(&self, x: f64) -> f64 {
+        Marginal::cdf_left(self, x)
+    }
+}
+
+impl EcdfParams {
+    /// Largest knot index `i` with `knots[i] <= x`, or `None` when no knot is
+    /// at or below `x`.
+    fn last_knot_at_or_below(&self, x: f64) -> Option<usize> {
+        let count = self.knots.partition_point(|&v| v <= x);
+        count.checked_sub(1)
+    }
+
+    /// Right-continuous empirical CDF: at a mass point the value is the *end*
+    /// of the flat quantile region, so a zero-inflated sample reports
+    /// `F(0) = P(X <= 0)` rather than 0.
+    pub fn cdf(&self, x: f64) -> f64 {
+        let n = self.knots.len();
+        if n == 0 {
+            return 0.0;
+        }
+        if n == 1 {
+            return if x >= self.knots[0] { 1.0 } else { 0.0 };
+        }
+        if x < self.knots[0] {
+            return 0.0;
+        }
+        if x >= self.knots[n - 1] {
+            return 1.0;
+        }
+        let last = n - 1;
+        match self.last_knot_at_or_below(x) {
+            None => 0.0,
+            Some(i) => {
+                if self.knots[i] == x {
+                    return i as f64 / last as f64;
+                }
+                // knots[i] < x < knots[i + 1] because i is the last index at or
+                // below x and x < knots[last].
+                let lo = self.knots[i];
+                let hi = self.knots[i + 1];
+                let frac = (x - lo) / (hi - lo);
+                (i as f64 + frac) / last as f64
+            }
+        }
+    }
+
+    pub fn inverse_cdf(&self, p: f64) -> f64 {
+        let n = self.knots.len();
+        if n == 0 {
+            return 0.0;
+        }
+        if n == 1 {
+            return self.knots[0];
+        }
+        let last = (n - 1) as f64;
+        let t = p.clamp(0.0, 1.0) * last;
+        let i = (t.floor() as usize).min(n - 2);
+        let frac = t - i as f64;
+        self.knots[i] + frac * (self.knots[i + 1] - self.knots[i])
+    }
+
+    /// Left limit of the CDF: at an atom it is the *start* of the flat
+    /// quantile region, mirroring `cdf`'s use of the end.
+    pub fn cdf_left(&self, x: f64) -> f64 {
+        let n = self.knots.len();
+        if n == 0 {
+            return 0.0;
+        }
+        if n == 1 {
+            return if x > self.knots[0] { 1.0 } else { 0.0 };
+        }
+        let last = n - 1;
+        if x <= self.knots[0] {
+            return 0.0;
+        }
+        if x > self.knots[last] {
+            return 1.0;
+        }
+        let below = self.knots.partition_point(|&v| v < x);
+        if self.knots.get(below) == Some(&x) {
+            // `below` is the first knot equal to x: the atom's left edge.
+            return below as f64 / last as f64;
+        }
+        let lo = self.knots[below - 1];
+        let hi = self.knots[below];
+        let frac = (x - lo) / (hi - lo);
+        (below as f64 - 1.0 + frac) / last as f64
     }
 }
 
@@ -464,6 +587,202 @@ impl MarginalFitter for UniformFitter {
     }
 }
 
+/// Upper bound on ECDF knots per column. Knots carry one `f64` each, so 512
+/// keeps the pretty-printed JSON increment under ~16KB per column while still
+/// resolving the shapes (skew, multi-mode, zero inflation) that parametric
+/// marginals flatten.
+pub const ECDF_MAX_KNOTS: usize = 512;
+
+pub struct EcdfFitter;
+
+impl MarginalFitter for EcdfFitter {
+    fn fit(&self, samples: &[f64]) -> Result<Marginal, String> {
+        let mut sorted: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+        if sorted.is_empty() {
+            return Err("empty samples".to_string());
+        }
+        // Stable, order-independent: sorting removes any dependence on the
+        // sampling order, so the same multiset always yields the same knots.
+        sorted.sort_by(f64::total_cmp);
+
+        let m = sorted.len().min(ECDF_MAX_KNOTS);
+        let knots: Vec<f64> = if m == 1 {
+            vec![sorted[0]]
+        } else {
+            let last = (sorted.len() - 1) as f64;
+            (0..m)
+                .map(|i| {
+                    let t = i as f64 / (m - 1) as f64 * last;
+                    let lo = t.floor() as usize;
+                    let hi = (lo + 1).min(sorted.len() - 1);
+                    sorted[lo] + (t - lo as f64) * (sorted[hi] - sorted[lo])
+                })
+                .collect()
+        };
+
+        Ok(Marginal::Ecdf(EcdfParams { knots }))
+    }
+}
+
+/// Parametric families considered by automatic selection, in tie-break order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericFamily {
+    Normal,
+    Beta,
+    Gamma,
+    Uniform,
+}
+
+impl NumericFamily {
+    /// Fixed order: on an exact KS tie the earlier family wins, so selection
+    /// never depends on iteration order.
+    pub const ORDER: [NumericFamily; 4] = [Self::Normal, Self::Beta, Self::Gamma, Self::Uniform];
+
+    /// Stable name used by the `marginal:` rules override and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Beta => "beta",
+            Self::Gamma => "gamma",
+            Self::Uniform => "uniform",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ORDER.into_iter().find(|f| f.name() == name)
+    }
+
+    pub fn fit(self, samples: &[f64]) -> Result<Marginal, String> {
+        match self {
+            Self::Normal => NormalFitter.fit(samples),
+            Self::Beta => BetaFitter.fit(samples),
+            Self::Gamma => GammaFitter.fit(samples),
+            Self::Uniform => UniformFitter.fit(samples),
+        }
+    }
+
+    /// Support constraints of the fitted family. Beta is fitted on the unit
+    /// interval (`loc = 0`, `scale = 1`) and Gamma on the positive half-line,
+    /// so out-of-support samples are excluded rather than fitted into a
+    /// nonsensical shape.
+    pub(crate) fn applicable(self, samples: &[f64]) -> bool {
+        match self {
+            Self::Normal | Self::Uniform => true,
+            Self::Beta => samples.iter().all(|v| (0.0..=1.0).contains(v)),
+            Self::Gamma => samples.iter().all(|v| *v > 0.0),
+        }
+    }
+
+    /// Whether the fitted parameters are usable. Moment matching does not
+    /// validate its inputs: Gamma on a sample that straddles zero yields a
+    /// negative scale, and Beta outside the unit interval can yield negative
+    /// shape parameters. A forced family whose fit fails this check falls back
+    /// to auto-selection instead of producing a broken marginal.
+    pub(crate) fn parameters_are_usable(self, marginal: &Marginal) -> bool {
+        match (self, marginal) {
+            (Self::Normal, Marginal::Normal(p)) => {
+                p.loc.is_finite() && p.scale.is_finite() && p.scale >= 0.0
+            }
+            (Self::Beta, Marginal::Beta(p)) => {
+                p.a.is_finite()
+                    && p.b.is_finite()
+                    && p.a > 0.0
+                    && p.b > 0.0
+                    && p.loc.is_finite()
+                    && p.scale > 0.0
+            }
+            (Self::Gamma, Marginal::Gamma(p)) => {
+                p.shape.is_finite() && p.scale.is_finite() && p.shape > 0.0 && p.scale > 0.0
+            }
+            (Self::Uniform, Marginal::Uniform(p)) => {
+                p.low.is_finite() && p.high.is_finite() && p.high >= p.low
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Below this sample count a holdout is too small for KS to be meaningful, so
+/// selection stays parametric. Numerical columns only reach selection when
+/// their cardinality exceeds the `top_values` cap, so this is a safety net.
+const MIN_SELECTION_SPLIT: usize = 40;
+/// One in N samples is held out for scoring. The split runs over the sorted
+/// sample, so it is deterministic and independent of the input row order.
+const SELECTION_HOLDOUT_STRIDE: usize = 10;
+/// ECDF must beat the best parametric KS by this relative margin...
+const ECDF_RELATIVE_MARGIN: f64 = 0.2;
+/// ...or at least by this absolute margin, before its model size is justified.
+const ECDF_ABSOLUTE_MARGIN: f64 = 0.005;
+
+/// Choose a marginal for a high-cardinality numerical column.
+///
+/// Candidates are fitted on the training split and scored by KS on a held-out
+/// split. Scoring on the samples the ECDF interpolates would make it win by
+/// construction and turn "auto-select" into "always ECDF"; the holdout plus
+/// the relative margin keeps a well-fitting parametric family in place while
+/// still catching shapes no parametric family can express.
+pub fn fit_auto_numeric_marginal(samples: &[f64]) -> Result<Marginal, String> {
+    let mut all: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+    if all.is_empty() {
+        return Err("no finite samples to fit a marginal".to_string());
+    }
+    all.sort_by(f64::total_cmp);
+
+    // Constant column: keep the legacy point-mass Normal so downstream
+    // rounding / scale handling is unchanged.
+    if all[0] == all[all.len() - 1] {
+        return NormalFitter.fit(&all);
+    }
+
+    let (train, holdout): (Vec<f64>, Vec<f64>) = if all.len() >= MIN_SELECTION_SPLIT {
+        let mut train = Vec::with_capacity(all.len());
+        let mut holdout = Vec::with_capacity(all.len() / SELECTION_HOLDOUT_STRIDE + 1);
+        for (i, value) in all.iter().enumerate() {
+            if i % SELECTION_HOLDOUT_STRIDE == 0 {
+                holdout.push(*value);
+            } else {
+                train.push(*value);
+            }
+        }
+        (train, holdout)
+    } else {
+        (all.clone(), all.clone())
+    };
+
+    let mut best: Option<(NumericFamily, f64)> = None;
+    for family in NumericFamily::ORDER {
+        if !family.applicable(&all) {
+            continue;
+        }
+        let Ok(candidate) = family.fit(&train) else {
+            continue;
+        };
+        let ks = ks_statistic(&holdout, &candidate);
+        let better = match best {
+            None => true,
+            Some((_, incumbent)) => ks < incumbent,
+        };
+        if better {
+            best = Some((family, ks));
+        }
+    }
+    let (family, ks_param) =
+        best.ok_or_else(|| "no candidate marginal fit the samples".to_string())?;
+
+    if all.len() >= MIN_SELECTION_SPLIT {
+        let ecdf_train = EcdfFitter.fit(&train)?;
+        let ks_ecdf = ks_statistic(&holdout, &ecdf_train);
+        let margin = (ECDF_RELATIVE_MARGIN * ks_param).max(ECDF_ABSOLUTE_MARGIN);
+        if ks_ecdf + margin < ks_param {
+            return EcdfFitter.fit(&all);
+        }
+    }
+
+    // Refit the winning family on everything: the split exists to judge the
+    // family, not to throw away fitting data.
+    family.fit(&all)
+}
+
 /// Compute Gaussian-space correlation from training rows via PIT then Pearson.
 ///
 /// For each column: marginal CDF (PIT) → Φ⁻¹ → Pearson. Categorical columns
@@ -538,27 +857,34 @@ fn numeric_value(val: &serde_json::Value) -> Option<f64> {
         .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
+/// Non-NULL numeric samples of one column, used to fit (and score) the
+/// candidate marginals of a numerical column.
+pub(crate) fn column_numeric_samples(rows: &[Vec<serde_json::Value>], col_idx: usize) -> Vec<f64> {
+    rows.iter()
+        .filter_map(|row| row.get(col_idx).and_then(numeric_value))
+        .collect()
+}
+
+/// Value on the axis the column's marginal is expressed in. Datetime columns
+/// are modelled in epoch seconds, so text samples are converted first;
+/// integer-encoded datetimes (compact `YYYYMMDD`) stay numeric.
+fn numeric_axis_value(val: &serde_json::Value, model: &ColumnModel) -> Option<f64> {
+    if matches!(model.logical_type, LogicalType::Datetime) {
+        match model.datetime_format.as_deref() {
+            Some(fmt) => crate::synth::datetime::parse_to_epoch(val, Some(fmt)),
+            None => numeric_value(val),
+        }
+    } else {
+        numeric_value(val)
+    }
+}
+
 fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> Option<f64> {
     if val.is_null() {
         return None;
     }
     let u = if let Some(model) = col_model {
         match &model.marginal {
-            Marginal::Normal(p) => {
-                // Datetime columns are modelled in epoch seconds, so text
-                // samples have to be converted before the normal PIT.
-                let x = if matches!(model.logical_type, LogicalType::Datetime) {
-                    match model.datetime_format.as_deref() {
-                        Some(fmt) => crate::synth::datetime::parse_to_epoch(val, Some(fmt))?,
-                        // Integer-encoded datetimes (compact YYYYMMDD) stay numeric.
-                        None => numeric_value(val)?,
-                    }
-                } else {
-                    numeric_value(val)?
-                };
-                let cdf = normal_cdf(x, p.loc, p.scale);
-                cdf.clamp(1e-12, 1.0 - 1e-12)
-            }
             Marginal::Categorical(p) => {
                 // SDV UniformEncoder: map category to mid-point of its cumulative interval.
                 // top_values keys are stringified (numeric levels → "1"), so numeric
@@ -575,7 +901,15 @@ fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> 
                     0.5
                 }
             }
-            _ => 0.5,
+            marginal => {
+                // Every numeric marginal (Normal / Beta / Gamma / Uniform /
+                // Ecdf) routes through its own CDF, so the copula's Gaussian
+                // space always reflects the fitted shape. A missing arm here
+                // used to collapse the column to the constant 0.5 and report
+                // r = 0 against every other column.
+                let x = numeric_axis_value(val, model)?;
+                marginal.cdf(x).clamp(1e-12, 1.0 - 1e-12)
+            }
         }
     } else {
         0.5
@@ -1069,5 +1403,388 @@ mod tests {
             "result must not match the old fill-with-loc Pearson {fill_hand}, got {}",
             corr[0][1]
         );
+    }
+
+    // ─── ECDF marginal (#66) ─────────────────────────────────────────────
+
+    /// Deterministic uniform source for fixture generation; avoids depending
+    /// on the RNG crates in unit tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u01(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+
+        fn uniform(&mut self, low: f64, high: f64) -> f64 {
+            low + (high - low) * self.next_u01()
+        }
+    }
+
+    fn sorted_uniform_1_to(n: usize) -> Vec<f64> {
+        (1..=n).map(|i| i as f64).collect()
+    }
+
+    #[test]
+    fn ecdf_fitter_caps_knots_on_large_samples() {
+        let samples: Vec<f64> = (1..=10_000).map(|i| i as f64).collect();
+        let Marginal::Ecdf(p) = EcdfFitter.fit(&samples).unwrap() else {
+            panic!("expected Ecdf");
+        };
+        assert!(
+            p.knots.len() <= ECDF_MAX_KNOTS,
+            "knots = {} > cap {}",
+            p.knots.len(),
+            ECDF_MAX_KNOTS
+        );
+        assert!(p.knots.len() > 1);
+        assert!((p.knots[0] - 1.0).abs() < 1e-9);
+        assert!((p.knots[p.knots.len() - 1] - 10_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ecdf_fitter_uses_uniform_probability_grid() {
+        // Below the knot cap every sample becomes a knot, so the grid is the
+        // exact empirical quantile function.
+        let samples = sorted_uniform_1_to(100);
+        let Marginal::Ecdf(p) = EcdfFitter.fit(&samples).unwrap() else {
+            panic!("expected Ecdf");
+        };
+        assert_eq!(p.knots.len(), 100);
+        assert!((p.knots[0] - 1.0).abs() < 1e-9);
+        assert!(
+            (p.knots[50] - 51.0).abs() < 1e-9,
+            "median knot = {}",
+            p.knots[50]
+        );
+        assert!((p.knots[99] - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ecdf_cdf_and_inverse_are_mutually_consistent() {
+        let samples = sorted_uniform_1_to(1000);
+        let Marginal::Ecdf(p) = EcdfFitter.fit(&samples).unwrap() else {
+            panic!("expected Ecdf");
+        };
+        for &u in &[0.05, 0.25, 0.5, 0.75, 0.95] {
+            let x = p.inverse_cdf(u);
+            let back = p.cdf(x);
+            assert!(
+                (back - u).abs() < 1e-9,
+                "u = {u} -> x = {x} -> cdf = {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn ecdf_captures_zero_inflation_without_negative_values() {
+        // 70% zeros, 30% Uniform(10, 100).
+        let mut rng = Lcg(42);
+        let samples: Vec<f64> = (0..10_000)
+            .map(|i| {
+                if i < 7_000 {
+                    0.0
+                } else {
+                    rng.uniform(10.0, 100.0)
+                }
+            })
+            .collect();
+        let Marginal::Ecdf(p) = EcdfFitter.fit(&samples).unwrap() else {
+            panic!("expected Ecdf");
+        };
+
+        let mass_at_zero = p.cdf(0.0);
+        assert!(
+            (0.65..=0.75).contains(&mass_at_zero),
+            "F(0) = {mass_at_zero}"
+        );
+        assert_eq!(p.inverse_cdf(0.3), 0.0, "u below the mass point must be 0");
+        assert!(
+            p.inverse_cdf(0.85) > 10.0,
+            "upper quantile = {}",
+            p.inverse_cdf(0.85)
+        );
+
+        // Every generated value stays inside the observed range: no negatives
+        // and no clipping fallback needed.
+        for i in 0..=100 {
+            let x = p.inverse_cdf(i as f64 / 100.0);
+            assert!(x >= 0.0, "negative value {x} at u = {}", i as f64 / 100.0);
+        }
+    }
+
+    #[test]
+    fn ecdf_fit_is_deterministic() {
+        let mut rng = Lcg(7);
+        let samples: Vec<f64> = (0..5_000).map(|_| rng.uniform(-3.0, 9.0)).collect();
+        let a = EcdfFitter.fit(&samples).unwrap();
+        let mut shuffled = samples.clone();
+        shuffled.reverse();
+        let b = EcdfFitter.fit(&shuffled).unwrap();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "fitting must not depend on input order"
+        );
+    }
+
+    #[test]
+    fn ecdf_serde_roundtrip_preserves_cdf() {
+        let samples = sorted_uniform_1_to(200);
+        let marginal = EcdfFitter.fit(&samples).unwrap();
+        let json = serde_json::to_string(&marginal).unwrap();
+        let loaded: Marginal = serde_json::from_str(&json).unwrap();
+        for x in [1.0, 50.5, 137.25, 200.0, 250.0] {
+            assert!((loaded.cdf(x) - marginal.cdf(x)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn ecdf_degenerate_constant_sample_is_flat() {
+        let samples = vec![5.0; 100];
+        let Marginal::Ecdf(p) = EcdfFitter.fit(&samples).unwrap() else {
+            panic!("expected Ecdf");
+        };
+        assert_eq!(p.cdf(4.0), 0.0);
+        assert_eq!(p.cdf(5.0), 1.0);
+        assert_eq!(p.inverse_cdf(0.5), 5.0);
+    }
+
+    // ─── PIT must cover every marginal variant (#66) ─────────────────────
+
+    // ─── automatic marginal selection (#66) ──────────────────────────────
+
+    /// Gamma(2, 1) is the sum of two unit exponentials, so `-ln u1 - ln u2`
+    /// draws it exactly without a PPF round trip.
+    fn gamma2_samples(seed: u64, n: usize) -> Vec<f64> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|_| {
+                let u1 = rng.next_u01().max(1e-12);
+                let u2 = rng.next_u01().max(1e-12);
+                -u1.ln() - u2.ln()
+            })
+            .collect()
+    }
+
+    fn skewness(xs: &[f64]) -> f64 {
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        let m2 = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let m3 = xs.iter().map(|x| (x - mean).powi(3)).sum::<f64>() / n;
+        m3 / m2.powf(1.5)
+    }
+
+    /// Exact `P(X <= x)` of Gamma(2, 1) = `1 - e^-x (1 + x)`.
+    fn gamma2_cdf(x: f64) -> f64 {
+        1.0 - (-x).exp() * (1.0 + x)
+    }
+
+    /// Exact Gamma(2, 1) quantile by bisection on the closed-form CDF, so the
+    /// shape assertions are not polluted by sampling noise.
+    fn gamma2_quantile(p: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0f64, 50.0f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if gamma2_cdf(mid) < p {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    #[test]
+    fn auto_selection_recovers_skewed_shape_and_beats_normal_baseline() {
+        let train = gamma2_samples(2024, 10_000);
+        let chosen = fit_auto_numeric_marginal(&train).unwrap();
+        assert!(
+            matches!(chosen, Marginal::Gamma(_) | Marginal::Ecdf(_)),
+            "skewed samples must not fall back to Normal, got {chosen:?}"
+        );
+
+        // Quantiles are compared against the analytic distribution, so the
+        // 5% budget covers model error only, not Monte-Carlo noise.
+        for p in [0.1, 0.5, 0.9] {
+            let expected = gamma2_quantile(p);
+            let got = chosen.inverse_cdf(p);
+            let err = (got - expected).abs() / expected;
+            assert!(
+                err < 0.05,
+                "p{p} relative error {err} (got {got}, want {expected})"
+            );
+        }
+
+        // Generated skewness matches the analytic 2/sqrt(2) = 1.414.
+        let mut rng = Lcg(99);
+        let generated: Vec<f64> = (0..2_000)
+            .map(|_| chosen.inverse_cdf(rng.next_u01()))
+            .collect();
+        let skew_gap = (std::f64::consts::SQRT_2 - skewness(&generated)).abs();
+        assert!(skew_gap < 0.2, "skewness gap {skew_gap}");
+
+        // The Normal baseline misses the tail the chosen marginal holds.
+        // (Note: p90 is a poor discriminator here — the Normal p90 error is
+        // ~2% — so the tail check uses p99, where it is ~20%.)
+        let normal = NormalFitter.fit(&train).unwrap();
+        let p99 = gamma2_quantile(0.99);
+        let normal_err = (normal.inverse_cdf(0.99) - p99).abs() / p99;
+        assert!(
+            normal_err > 0.15,
+            "fixture must expose the Normal p99 miss, got {normal_err}"
+        );
+        let chosen_err = (chosen.inverse_cdf(0.99) - p99).abs() / p99;
+        assert!(chosen_err < 0.05, "chosen p99 relative error {chosen_err}");
+    }
+
+    #[test]
+    fn auto_selection_picks_ecdf_for_zero_inflated_mixture() {
+        let mut rng = Lcg(7);
+        let train: Vec<f64> = (0..10_000)
+            .map(|i| {
+                if i < 7_000 {
+                    0.0
+                } else {
+                    rng.uniform(10.0, 100.0)
+                }
+            })
+            .collect();
+        let chosen = fit_auto_numeric_marginal(&train).unwrap();
+        assert!(
+            matches!(chosen, Marginal::Ecdf(_)),
+            "zero-inflated mixture must select Ecdf, got {chosen:?}"
+        );
+
+        let mut rng = Lcg(11);
+        let generated: Vec<f64> = (0..10_000)
+            .map(|_| chosen.inverse_cdf(rng.next_u01()))
+            .collect();
+        let zero_ratio =
+            generated.iter().filter(|v| **v == 0.0).count() as f64 / generated.len() as f64;
+        assert!(
+            (0.65..=0.75).contains(&zero_ratio),
+            "zero ratio {zero_ratio}"
+        );
+        assert!(
+            generated.iter().all(|v| *v >= 0.0),
+            "ECDF must not generate negative values without clipping"
+        );
+    }
+
+    #[test]
+    fn auto_selection_keeps_parametric_when_shape_matches() {
+        // A near-perfect Normal sample must not be replaced by ECDF just
+        // because ECDF wins on the training points by construction.
+        let mut rng = Lcg(5);
+        let standard = Marginal::Normal(NormalParams {
+            loc: 0.0,
+            scale: 1.0,
+        });
+        let train: Vec<f64> = (0..10_000)
+            .map(|_| standard.inverse_cdf(rng.next_u01()))
+            .collect();
+        let chosen = fit_auto_numeric_marginal(&train).unwrap();
+        assert!(
+            matches!(chosen, Marginal::Normal(_)),
+            "well-fitting Normal must stay parametric, got {chosen:?}"
+        );
+    }
+
+    #[test]
+    fn auto_selection_is_deterministic_and_order_independent() {
+        let train = gamma2_samples(31, 3_000);
+        let a = fit_auto_numeric_marginal(&train).unwrap();
+        let mut reversed = train.clone();
+        reversed.reverse();
+        let b = fit_auto_numeric_marginal(&reversed).unwrap();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+    }
+
+    #[test]
+    fn auto_selection_keeps_normal_for_constant_column() {
+        let chosen = fit_auto_numeric_marginal(&[7.5; 500]).unwrap();
+        assert!(matches!(chosen, Marginal::Normal(_)), "got {chosen:?}");
+        assert_eq!(chosen.inverse_cdf(0.5), 7.5);
+    }
+
+    #[test]
+    fn auto_selection_rejects_empty_samples() {
+        assert!(fit_auto_numeric_marginal(&[]).is_err());
+        assert!(fit_auto_numeric_marginal(&[f64::NAN, f64::INFINITY]).is_err());
+    }
+
+    fn column_model(marginal: Marginal) -> ColumnModel {
+        ColumnModel {
+            logical_type: crate::synth::model::LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            decimal_scale: None,
+            datetime_format: None,
+            min: None,
+            max: None,
+            null_rate: None,
+            marginal,
+        }
+    }
+
+    /// A strictly monotone pair whose marginals are each fitted from their own
+    /// column must come out strongly correlated. The previous `_ => 0.5`
+    /// fallback collapsed non-Normal columns to a constant and reported r = 0.
+    fn assert_monotone_pair_correlates(a: &[f64], b: &[f64], fit: impl Fn(&[f64]) -> Marginal) {
+        assert_eq!(a.len(), b.len());
+        let columns = HashMap::from([
+            ("a".to_string(), column_model(fit(a))),
+            ("b".to_string(), column_model(fit(b))),
+        ]);
+        let rows: Vec<Vec<serde_json::Value>> = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| vec![serde_json::Value::from(x), serde_json::Value::from(y)])
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string()];
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        assert!(
+            corr[0][1] > 0.99,
+            "monotone pair must correlate, got {}",
+            corr[0][1]
+        );
+    }
+
+    #[test]
+    fn pit_correlates_gamma_marginals() {
+        let samples: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+        let doubled: Vec<f64> = samples.iter().map(|&x| 2.0 * x).collect();
+        assert_monotone_pair_correlates(&samples, &doubled, |s| GammaFitter.fit(s).unwrap());
+    }
+
+    #[test]
+    fn pit_correlates_ecdf_marginals() {
+        let samples: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+        let doubled: Vec<f64> = samples.iter().map(|&x| 2.0 * x).collect();
+        assert_monotone_pair_correlates(&samples, &doubled, |s| EcdfFitter.fit(s).unwrap());
+    }
+
+    #[test]
+    fn pit_correlates_uniform_marginals() {
+        let samples: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+        let doubled: Vec<f64> = samples.iter().map(|&x| 2.0 * x).collect();
+        assert_monotone_pair_correlates(&samples, &doubled, |s| UniformFitter.fit(s).unwrap());
+    }
+
+    #[test]
+    fn pit_correlates_beta_marginals() {
+        // Stay inside the unit interval. Scaled Beta has no closed-form Beta
+        // fit, so this pair is identical (rank correlation 1) which still
+        // fails the old constant-0.5 fallback (zero variance -> r = 0).
+        let samples: Vec<f64> = (1..=60).map(|i| i as f64 / 120.0).collect();
+        assert_monotone_pair_correlates(&samples, &samples, |s| BetaFitter.fit(s).unwrap());
     }
 }

@@ -2274,6 +2274,7 @@ mod tests {
             "email".to_string(),
             ColumnRule {
                 null_rate: Some(0.0),
+                marginal: None,
             },
         );
         let zero_rules = SynthRules {
@@ -2293,6 +2294,7 @@ mod tests {
             "email".to_string(),
             ColumnRule {
                 null_rate: Some(0.20),
+                marginal: None,
             },
         );
         let mut zero_model = model_with_null_rate("users", "email", 0.0);
@@ -2369,6 +2371,7 @@ mod tests {
             "user_id".to_string(),
             ColumnRule {
                 null_rate: Some(0.5),
+                marginal: None,
             },
         );
         let rules = SynthRules {

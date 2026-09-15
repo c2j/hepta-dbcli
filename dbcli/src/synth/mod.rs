@@ -24,6 +24,8 @@ pub mod report;
 pub mod rules;
 #[cfg(feature = "synth")]
 pub mod rules_draft;
+#[cfg(feature = "synth")]
+pub mod stats;
 
 #[cfg(feature = "synth")]
 use std::collections::HashMap;
@@ -58,14 +60,18 @@ pub async fn run(
             output,
             sample,
             categorical_top_k,
+            rules,
         } => {
             run_train(
                 name,
                 &tables,
-                schema.as_deref(),
-                Path::new(&output),
-                sample,
-                categorical_top_k,
+                TrainRunOptions {
+                    schema: schema.as_deref(),
+                    output_dir: Path::new(&output),
+                    sample,
+                    categorical_top_k,
+                    rules_path: rules.as_deref(),
+                },
                 config_path,
             )
             .await
@@ -307,20 +313,60 @@ fn sample_may_be_truncated(scheme: &str, row_count: usize, requested_sample: usi
         && requested_sample > ORACLE_DRIVER_PREFETCH_CAP
 }
 
+/// Flags of a `synth train` run, grouped so the function signature stays
+/// readable as options grow.
+struct TrainRunOptions<'a> {
+    schema: Option<&'a str>,
+    output_dir: &'a Path,
+    sample: usize,
+    categorical_top_k: cmd::CategoricalTopK,
+    rules_path: Option<&'a str>,
+}
+
 async fn run_train(
     name: Option<String>,
     tables: &str,
-    schema: Option<&str>,
-    output_dir: &Path,
-    sample: usize,
-    categorical_top_k: cmd::CategoricalTopK,
+    options: TrainRunOptions<'_>,
     config_path: Option<String>,
 ) -> Result<(), String> {
+    let TrainRunOptions {
+        schema,
+        output_dir,
+        sample,
+        categorical_top_k,
+        rules_path,
+    } = options;
     let tables = split_tables(tables);
     if tables.is_empty() {
         return Err("--tables must list at least one table".to_string());
     }
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create output dir: {}", e))?;
+
+    // Per-column marginal overrides, keyed by table then column. Optional: a
+    // rules file only needs the `columns` section to steer training.
+    let forced_marginals: HashMap<String, HashMap<String, String>> = match rules_path {
+        Some(path) => {
+            let rules = crate::synth::rules::SynthRules::load(Path::new(path))?;
+            rules.validate()?;
+            rules
+                .tables
+                .iter()
+                .filter_map(|table| {
+                    let forced: HashMap<String, String> = table
+                        .columns
+                        .iter()
+                        .filter_map(|(column, rule)| {
+                            rule.marginal
+                                .as_ref()
+                                .map(|marginal| (column.clone(), marginal.clone()))
+                        })
+                        .collect();
+                    (!forced.is_empty()).then(|| (table.name.clone(), forced))
+                })
+                .collect()
+        }
+        None => HashMap::new(),
+    };
 
     let raw =
         crate::config::read_config(config_path.map(PathBuf::from)).map_err(|e| e.to_string())?;
@@ -374,13 +420,15 @@ async fn run_train(
             Some(&data_types),
             categorical_top_k.cap(),
         );
-        let (mut model, skipped) = cmd::build_model(
+        let forced = forced_marginals.get(table);
+        let (mut model, skipped) = cmd::build_model_with_overrides(
             table,
             &scheme,
             &profile,
             &result.rows,
             pk,
             Some(schema.clone()),
+            forced,
         )?;
         for col in &skipped {
             eprintln!(
@@ -395,6 +443,15 @@ async fn run_train(
                 table, ORACLE_DRIVER_PREFETCH_CAP
             );
             model.provenance.truncated = true;
+        }
+        for (column, size) in cmd::oversized_marginal_columns(&model) {
+            eprintln!(
+                "warning: table '{}': column '{}' marginal serializes to {} bytes, over the {} byte budget",
+                table,
+                column,
+                size,
+                cmd::COLUMN_MARGINAL_BUDGET_BYTES
+            );
         }
 
         let model_path = output_dir.join(format!("{}.model.json", table));
@@ -542,6 +599,7 @@ mod tests {
                 output: ".synth".to_string(),
                 sample: 1000,
                 categorical_top_k: cmd::CategoricalTopK::Limit(50),
+                rules: None,
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );
