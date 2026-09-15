@@ -15,6 +15,7 @@ pub struct FkPool {
     harmonic: f64,
     weights: Vec<f64>,
     weight_sum: f64,
+    es_prepared: bool,
 }
 
 fn value_key(v: &Value) -> String {
@@ -31,6 +32,7 @@ impl FkPool {
             harmonic,
             weights: Vec::new(),
             weight_sum: 0.0,
+            es_prepared: false,
         }
     }
 
@@ -77,6 +79,7 @@ impl FkPool {
             harmonic,
             weights,
             weight_sum,
+            es_prepared: false,
         }
     }
 
@@ -108,12 +111,52 @@ impl FkPool {
         self.values.get(idx).cloned()
     }
 
-    pub fn sample_unique(&mut self, rng: &mut impl Rng) -> Option<Value> {
+    pub fn sample_unique(
+        &mut self,
+        strategy: SelectionStrategy,
+        rng: &mut impl Rng,
+    ) -> Option<Value> {
         if self.values.is_empty() {
             return None;
         }
-        let idx = rng.gen_range(0..self.values.len());
-        Some(self.values.swap_remove(idx))
+        match strategy {
+            SelectionStrategy::Uniform => {
+                let idx = rng.gen_range(0..self.values.len());
+                Some(self.values.swap_remove(idx))
+            }
+            SelectionStrategy::Zipf | SelectionStrategy::Weighted => {
+                if !self.es_prepared {
+                    self.prepare_efraimidis_spirakis(strategy, rng);
+                    self.es_prepared = true;
+                }
+                self.values.pop()
+            }
+        }
+    }
+
+    /// Efraimidis–Spirakis: key = u^(1/w) once, then draw in descending key
+    /// order. O(n log n) prepare, O(1) per subsequent pop.
+    fn prepare_efraimidis_spirakis(&mut self, strategy: SelectionStrategy, rng: &mut impl Rng) {
+        let n = self.values.len();
+        let mut keyed: Vec<(f64, usize)> = (0..n)
+            .map(|i| {
+                let u = rng.gen::<f64>().clamp(1e-12, 1.0);
+                let w = match strategy {
+                    SelectionStrategy::Zipf => 1.0 / (i + 1) as f64,
+                    SelectionStrategy::Weighted => self
+                        .weights
+                        .get(i)
+                        .copied()
+                        .filter(|w| *w > 0.0)
+                        .unwrap_or(1.0),
+                    SelectionStrategy::Uniform => 1.0,
+                };
+                (u.powf(1.0 / w), i)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let old = std::mem::take(&mut self.values);
+        self.values = keyed.into_iter().map(|(_, i)| old[i].clone()).collect();
     }
 
     // P(rank) ∝ 1/rank 的逆变换采样；walk 均摊 O(1)（Zipf 集中在头部）
@@ -227,21 +270,62 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10 {
-            let v = p.sample_unique(&mut rng).unwrap();
+            let v = p
+                .sample_unique(SelectionStrategy::Uniform, &mut rng)
+                .unwrap();
             assert!(
                 seen.insert(v.as_f64().unwrap().to_bits()),
                 "unique draw repeated"
             );
         }
         assert_eq!(seen.len(), 10);
-        assert!(p.sample_unique(&mut rng).is_none());
+        assert!(p
+            .sample_unique(SelectionStrategy::Uniform, &mut rng)
+            .is_none());
     }
 
     #[test]
     fn sample_unique_on_empty_returns_none() {
         let mut p = pool(0);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        assert!(p.sample_unique(&mut rng).is_none());
+        assert!(p
+            .sample_unique(SelectionStrategy::Uniform, &mut rng)
+            .is_none());
+    }
+
+    #[test]
+    fn should_sample_unique_zipf_without_replacement() {
+        let mut p = pool(1000);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut seen = std::collections::HashSet::new();
+        let mut drawn = Vec::new();
+        for _ in 0..100 {
+            let v = p.sample_unique(SelectionStrategy::Zipf, &mut rng).unwrap();
+            let idx = v.as_f64().unwrap() as usize;
+            assert!(seen.insert(idx), "unique+zipf repeated {}", idx);
+            drawn.push(idx);
+        }
+        assert_eq!(seen.len(), 100);
+        let head = drawn.iter().filter(|&&i| i < 100).count();
+        let tail = drawn.iter().filter(|&&i| i >= 900).count();
+        assert!(
+            head > tail * 2,
+            "unique+zipf should prefer the head of the pool (head {head} vs tail {tail})"
+        );
+
+        let mut big = pool(10_000);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            big.sample_unique(SelectionStrategy::Zipf, &mut rng)
+                .expect("10k unique zipf draws from a 10k pool");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "10k unique zipf draws took {:?}, expected < 1s",
+            elapsed
+        );
     }
 
     #[test]

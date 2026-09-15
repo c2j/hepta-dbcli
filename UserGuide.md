@@ -945,7 +945,7 @@ tables:
 - 数值列：高基数或值无重复的列拟合 Normal 分布（整数列生成取整值）；**低基数且值重复出现**的数值列（如 19 档离散价格）自动按观测档位拟合分类分布，生成值保持在观测档位上并保留数值类型
 - 字符串列拟合分类分布，分类列输出原始字符串值
 - Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码），PSD 修正用对角占优近似
-- `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
+- `unique: true`（无放回）可与 `uniform` / `zipf` / `weighted` 组合；`zipf`/`weighted` 使用 Efraimidis–Spirakis 加权无放回抽样（按权重一次排序，随后 O(1) 弹出）
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位）在训练时跳过并打印警告，生成的数据不含这些列
 - `{table}.model.json` 的 `pk` 来自 catalog 主键（`Dialect::table_indexes`），支持联合主键；无主键时为 `[]`。列名按采样列的大小写归一，且只保留最终进入模型的列（训练时被跳过的 PK 列不会出现在 `pk` 中）；`synth train` 与 `synth validate` 会打印主键
 - 列逻辑类型会结合 DDL：全空的 `numeric`/`decimal`/`number`（含 MySQL `unsigned`/`zerofill`、DuckDB `ubigint` 等）记为 `numerical`；全空的 `date`/`timestamp` 记为 `datetime`（不再 `unknown`）

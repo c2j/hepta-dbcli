@@ -115,13 +115,15 @@ pub fn generate(
             for (col_idx, col_name) in column_order.iter().enumerate() {
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
                     let value = if rel.unique {
-                        rel.pool.sample_unique(&mut rng).ok_or_else(|| {
-                            format!(
-                                "table '{}': unique FK '{}' exhausted its parent pool \
+                        rel.pool
+                            .sample_unique(rel.strategy, &mut rng)
+                            .ok_or_else(|| {
+                                format!(
+                                    "table '{}': unique FK '{}' exhausted its parent pool \
                                  ({} parent rows); reduce row count or set unique: false",
-                                table_name, rel.column, rel.pool_size
-                            )
-                        })?
+                                    table_name, rel.column, rel.pool_size
+                                )
+                            })?
                     } else {
                         rel.pool.sample_one(rel.strategy, &mut rng).ok_or_else(|| {
                             format!(
@@ -409,14 +411,6 @@ fn build_rel_pools(
                 (pool, *unique)
             }
         };
-
-        if unique && strategy == SelectionStrategy::Zipf {
-            return Err(format!(
-                "table '{}': zipf strategy cannot be combined with unique FK '{}'; \
-                 unique requires uniform selection",
-                table_name, rel.pk
-            ));
-        }
 
         let pool_size = pool.len();
 
@@ -1547,6 +1541,8 @@ mod tests {
 
     #[test]
     fn unique_fk_with_zipf_is_rejected() {
+        // Behaviour change (#65c): unique + zipf is now supported via
+        // Efraimidis–Spirakis sampling without replacement.
         let mut models = HashMap::new();
         models.insert(
             "users".to_string(),
@@ -1577,9 +1573,14 @@ mod tests {
         };
 
         let config = config(&["users", "orders"], 5);
-        let err = generate(&models, &rules, &config).unwrap_err();
-        assert!(err.contains("zipf"), "error: {}", err);
-        assert!(err.contains("unique"), "error: {}", err);
+        let result = generate(&models, &rules, &config).expect("unique+zipf must not error");
+        let orders = result.tables.get("orders").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for row in orders {
+            let bits = row[0].as_f64().expect("numeric fk").to_bits();
+            assert!(seen.insert(bits), "unique+zipf repeated a parent key");
+        }
+        assert_eq!(seen.len(), 5);
     }
 
     #[test]
