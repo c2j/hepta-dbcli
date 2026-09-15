@@ -815,6 +815,14 @@ fn apply_branch_repair(
         prepared.push((branch, predicate, assignments));
     }
 
+    // The candidate filter below has to know what a `set` does to *derived*
+    // columns: `repair.set` cannot write a derive target, but it can write a
+    // derive source, and `derive` only runs at the end of the round. Judging a
+    // simulated row without re-deriving it both misses destruction that only
+    // shows up after `derive` and lets a sibling overwrite cells a branch just
+    // wrote for a derived predicate.
+    let derive_plan = DerivePlan::build(table_name, rule, model, column_order)?;
+
     // A predicate that cannot be evaluated on a single row is a type or
     // column mistake (e.g. `bs == \'1\'` against a numeric column), not an
     // uncovered branch. Fail loudly instead of reporting 0% coverage.
@@ -890,16 +898,34 @@ fn apply_branch_repair(
         let destroys_protected_coverage =
             |position: usize, row: &[Value], assignments: &[(usize, Value)]| {
                 prepared.iter().enumerate().any(|(other, (_, sibling, _))| {
-                    other != position
-                        && protected[other]
-                        && predicate_matches(sibling, row, &index_of)
-                        && {
-                            let mut rewritten = row.to_vec();
-                            for (index, value) in assignments {
-                                rewritten[*index] = value.clone();
-                            }
-                            !predicate_matches(sibling, &rewritten, &index_of)
-                        }
+                    if other == position || !protected[other] {
+                        return false;
+                    }
+                    // Both sides are judged after re-running `derive`: within a
+                    // round the derived columns of rows a sibling just rewrote
+                    // are stale, and a write to a derive source does not change
+                    // them until the round-end pass. Simulating the write
+                    // without the derive both overlooks destruction and lets a
+                    // sibling clobber rows a branch just wrote.
+                    let mut before = row.to_vec();
+                    if derive_plan.apply_to_row(&mut before).is_err() {
+                        // A row this branch cannot derive would abort the
+                        // round-end pass as well; let that pass report it
+                        // rather than turning a configuration error into a
+                        // silently skipped candidate.
+                        return false;
+                    }
+                    if !predicate_matches(sibling, &before, &index_of) {
+                        return false;
+                    }
+                    let mut after = row.to_vec();
+                    for (index, value) in assignments {
+                        after[*index] = value.clone();
+                    }
+                    if derive_plan.apply_to_row(&mut after).is_err() {
+                        return false;
+                    }
+                    !predicate_matches(sibling, &after, &index_of)
                 })
             };
         // `(branch position, flips before the round, [(row index, snapshot)])`.
@@ -1068,8 +1094,6 @@ fn apply_derive_rules(
     column_order: &[String],
     referenced_targets: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
-    use rust_decimal::prelude::ToPrimitive;
-
     if rule.derive.is_empty() {
         return Ok(());
     }
@@ -1083,108 +1107,156 @@ fn apply_derive_rules(
         }
     }
 
-    let index_of: HashMap<&str, usize> = column_order
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect();
+    DerivePlan::build(table_name, rule, model, column_order)?.apply_to_rows(rows)
+}
 
-    // Kahn over the derive graph: a target waits for the derive columns it
-    // references (cycles were already rejected by `rules.validate`).
-    let mut parsed: HashMap<&str, crate::synth::expr::Expr> = HashMap::new();
-    for derive in &rule.derive {
-        let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
-            format!(
-                "table '{}' derive '{}': expression '{}' rejected: {}",
-                table_name, derive.column, derive.expr, e
-            )
-        })?;
-        parsed.insert(derive.column.as_str(), expr);
-    }
+/// Per-row `derive` evaluation in dependency order. The round-end pass applies
+/// it to every row; the branch repair loop applies it to a *single* simulated
+/// row, because `repair.set` may write a column a derived predicate reads.
+struct DerivePlan {
+    table_name: String,
+    index_of: HashMap<String, usize>,
+    steps: Vec<DeriveStep>,
+}
 
-    // Repeatedly take whatever is ready; `n` is tiny and this keeps the
-    // dependency rule readable.
-    let mut ordered: Vec<&str> = Vec::with_capacity(rule.derive.len());
-    let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut progress = true;
-    while progress {
-        progress = false;
+struct DeriveStep {
+    column: String,
+    index: usize,
+    expr: crate::synth::expr::Expr,
+    is_integer: bool,
+    scale: Option<u8>,
+}
+
+impl DerivePlan {
+    /// Parse and order the `derive` rules (Kahn over the derive graph: a target
+    /// waits for the derive columns it references; cycles were already
+    /// rejected by `rules.validate`).
+    fn build(
+        table_name: &str,
+        rule: &crate::synth::rules::TableRule,
+        model: &TableModel,
+        column_order: &[String],
+    ) -> Result<Self, String> {
+        let index_of: HashMap<&str, usize> = column_order
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect();
+
+        let mut parsed: HashMap<&str, crate::synth::expr::Expr> = HashMap::new();
         for derive in &rule.derive {
-            let name = derive.column.as_str();
-            if done.contains(name) {
-                continue;
-            }
-            let Some(expr) = parsed.get(name) else {
-                continue;
-            };
-            let ready = expr.referenced_columns().iter().all(|referenced| {
-                !parsed.contains_key(referenced.as_str()) || done.contains(referenced.as_str())
-            });
-            if ready {
-                ordered.push(name);
-                done.insert(name);
-                progress = true;
+            let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+                format!(
+                    "table '{}' derive '{}': expression '{}' rejected: {}",
+                    table_name, derive.column, derive.expr, e
+                )
+            })?;
+            parsed.insert(derive.column.as_str(), expr);
+        }
+
+        // Repeatedly take whatever is ready; `n` is tiny and this keeps the
+        // dependency rule readable.
+        let mut ordered: Vec<&str> = Vec::with_capacity(rule.derive.len());
+        let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for derive in &rule.derive {
+                let name = derive.column.as_str();
+                if done.contains(name) {
+                    continue;
+                }
+                let Some(expr) = parsed.get(name) else {
+                    continue;
+                };
+                let ready = expr.referenced_columns().iter().all(|referenced| {
+                    !parsed.contains_key(referenced.as_str()) || done.contains(referenced.as_str())
+                });
+                if ready {
+                    ordered.push(name);
+                    done.insert(name);
+                    progress = true;
+                }
             }
         }
-    }
 
-    if ordered.len() != rule.derive.len() {
-        let mut unresolved: Vec<&str> = rule
-            .derive
-            .iter()
-            .map(|derive| derive.column.as_str())
-            .filter(|name| !done.contains(name))
-            .collect();
-        unresolved.sort_unstable();
-        return Err(format!(
-            "table '{}': derive rules form a cycle involving {}",
-            table_name,
-            unresolved.join(", ")
-        ));
-    }
+        if ordered.len() != rule.derive.len() {
+            let mut unresolved: Vec<&str> = rule
+                .derive
+                .iter()
+                .map(|derive| derive.column.as_str())
+                .filter(|name| !done.contains(name))
+                .collect();
+            unresolved.sort_unstable();
+            return Err(format!(
+                "table '{}': derive rules form a cycle involving {}",
+                table_name,
+                unresolved.join(", ")
+            ));
+        }
 
-    // Referenced columns must exist in this table; `.` is rejected by the
-    // expression grammar, so a name here is always a local column.
-    for (target, expr) in &parsed {
-        for name in expr.referenced_columns() {
-            if !index_of.contains_key(name.as_str()) {
+        // Referenced columns must exist in this table; `.` is rejected by the
+        // expression grammar, so a name here is always a local column.
+        for (target, expr) in &parsed {
+            for name in expr.referenced_columns() {
+                if !index_of.contains_key(name.as_str()) {
+                    return Err(format!(
+                        "table '{}' derive '{}': unknown column '{}'",
+                        table_name, target, name
+                    ));
+                }
+            }
+            if !index_of.contains_key(target) {
                 return Err(format!(
-                    "table '{}' derive '{}': unknown column '{}'",
-                    table_name, target, name
+                    "table '{}' derive '{}': unknown target column",
+                    table_name, target
                 ));
             }
         }
-        if !index_of.contains_key(target) {
-            return Err(format!(
-                "table '{}' derive '{}': unknown target column",
-                table_name, target
-            ));
+
+        let mut steps = Vec::with_capacity(ordered.len());
+        for target in ordered {
+            let Some(&index) = index_of.get(target) else {
+                return Err(format!(
+                    "table '{}': derive target '{}' vanished",
+                    table_name, target
+                ));
+            };
+            let expr = parsed.get(target).cloned().ok_or_else(|| {
+                format!("table '{}': derive '{}' was not parsed", table_name, target)
+            })?;
+            let column_model = model.columns.get(target);
+            steps.push(DeriveStep {
+                column: target.to_string(),
+                index,
+                expr,
+                is_integer: column_model.and_then(|column| column.rounding) == Some(0),
+                scale: column_model.and_then(|column| column.decimal_scale),
+            });
         }
+
+        Ok(DerivePlan {
+            table_name: table_name.to_string(),
+            index_of: index_of
+                .iter()
+                .map(|(name, index)| (name.to_string(), *index))
+                .collect(),
+            steps,
+        })
     }
 
-    for target in ordered {
-        let Some(&col_idx) = index_of.get(target) else {
-            return Err(format!(
-                "table '{}': derive target '{}' vanished",
-                table_name, target
-            ));
-        };
-        let expr = parsed
-            .get(target)
-            .ok_or_else(|| format!("table '{}': derive '{}' was not parsed", table_name, target))?;
-        let column_model = model.columns.get(target);
-        let is_integer = column_model.and_then(|column| column.rounding) == Some(0);
-        let scale = column_model.and_then(|column| column.decimal_scale);
+    fn apply_to_row(&self, row: &mut [Value]) -> Result<(), String> {
+        use rust_decimal::prelude::ToPrimitive;
 
-        for row in rows.iter_mut() {
+        for step in &self.steps {
             let evaluated = {
                 let lookup = |name: &str| -> Option<Value> {
-                    index_of
+                    self.index_of
                         .get(name)
                         .and_then(|index| row.get(*index))
                         .cloned()
                 };
-                expr.eval_decimal(&lookup)
+                step.expr.eval_decimal(&lookup)
             };
 
             let value = match evaluated {
@@ -1196,23 +1268,23 @@ fn apply_derive_rules(
                 // carry a `null_rate`. Division by zero and type errors stay
                 // fatal: those are configuration mistakes, not NULL input.
                 Err(crate::synth::expr::ExprError::NullResult) => {
-                    row[col_idx] = Value::Null;
+                    row[step.index] = Value::Null;
                     continue;
                 }
                 Err(error) => {
                     return Err(format!(
                         "table '{}' derive '{}': {}",
-                        table_name, target, error
+                        self.table_name, step.column, error
                     ));
                 }
             };
 
-            let number = if is_integer {
+            let number = if step.is_integer {
                 let rounded = value.round();
                 let as_i64 = rounded.to_i64().ok_or_else(|| {
                     format!(
                         "table '{}' derive '{}': result {} does not fit an integer column",
-                        table_name, target, rounded
+                        self.table_name, step.column, rounded
                     )
                 })?;
                 Value::Number(as_i64.into())
@@ -1220,10 +1292,10 @@ fn apply_derive_rules(
                 let as_f64 = value.to_f64().ok_or_else(|| {
                     format!(
                         "table '{}' derive '{}': result {} is out of range for a double",
-                        table_name, target, value
+                        self.table_name, step.column, value
                     )
                 })?;
-                let quantized = match scale {
+                let quantized = match step.scale {
                     Some(scale) => quantize(as_f64, scale),
                     None => as_f64,
                 };
@@ -1232,15 +1304,22 @@ fn apply_derive_rules(
                     .ok_or_else(|| {
                         format!(
                             "table '{}' derive '{}': result {} is not a finite number",
-                            table_name, target, quantized
+                            self.table_name, step.column, quantized
                         )
                     })?
             };
-            row[col_idx] = number;
+            row[step.index] = number;
         }
+
+        Ok(())
     }
 
-    Ok(())
+    fn apply_to_rows(&self, rows: &mut [Vec<Value>]) -> Result<(), String> {
+        for row in rows.iter_mut() {
+            self.apply_to_row(row)?;
+        }
+        Ok(())
+    }
 }
 
 /// Resolve a rules literal into the numeric domain the marginal was fitted on:
@@ -5406,6 +5485,250 @@ tables:
                 "every branch must pass: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn should_not_let_a_branch_destroy_coverage_that_runs_through_a_derived_column() {
+        // `big` matches on the derived `double`, which is only refreshed at the
+        // end of a round. Simulating a sibling's `set` without re-running
+        // `derive` leaves the stale `double` on the clone, so `killed` writing
+        // `amount = 0` looks harmless while it actually wipes out matches
+        // `big` has not finished collecting.
+        let models = derived_amount_model();
+        let (baseline, deficit) = derived_baseline(&models);
+        let data = generate(&models, &derived_branch_rules(false), &config(&["t"], 600)).unwrap();
+        assert_derived_repair(&data, baseline, deficit);
+    }
+
+    #[test]
+    fn should_not_let_a_sibling_clobber_rows_written_for_a_derived_predicate() {
+        // Same fixture, reversed declaration order: `big` writes `amount = 7.5`
+        // first, and those rows only match `double > 3` once `derive` runs.
+        // Judging the clone without re-deriving makes them look unconverted, so
+        // `killed` would rewrite the very cells `big` just wrote and send it
+        // back for another round.
+        let models = derived_amount_model();
+        let (baseline, deficit) = derived_baseline(&models);
+        let data = generate(&models, &derived_branch_rules(true), &config(&["t"], 600)).unwrap();
+        assert_derived_repair(&data, baseline, deficit);
+    }
+
+    /// `derive: double = amount * 2` plus a branch on the derived column
+    /// (`big`) and one rewriting its source (`killed`), declared in the given
+    /// order.
+    fn derived_branch_rules(derived_first: bool) -> SynthRules {
+        derived_branch_rules_with(derived_first, 0.6, 0.3)
+    }
+
+    fn derived_branch_rules_with(
+        derived_first: bool,
+        big_target: f64,
+        killed_target: f64,
+    ) -> SynthRules {
+        let mut table = single_rule("t", vec![]);
+        table.derive.push(derive_double_rule());
+        table.branches = vec![
+            derived_test_branch("killed", "amount == 0", killed_target, "amount", "0"),
+            derived_test_branch("big", "double > 3", big_target, "amount", "7.5"),
+        ];
+        if derived_first {
+            table.branches.reverse();
+        }
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        }
+    }
+
+    fn derived_test_branch(
+        id: &str,
+        predicate: &str,
+        target: f64,
+        column: &str,
+        literal: &str,
+    ) -> crate::synth::rules::BranchRule {
+        crate::synth::rules::BranchRule {
+            id: id.to_string(),
+            predicate: predicate.to_string(),
+            target_ratio: target,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([(column.to_string(), literal.to_string())]),
+                linked_derive_recompute: true,
+            },
+        }
+    }
+
+    fn derive_double_rule() -> crate::synth::rules::DeriveRule {
+        crate::synth::rules::DeriveRule {
+            column: "double".to_string(),
+            expr: "amount * 2".to_string(),
+        }
+    }
+
+    /// Rows matching `double > 3` in a branch-free run (same seed), and how many
+    /// rows `big` is short of its 60% target.
+    fn derived_baseline(models: &HashMap<String, TableModel>) -> (usize, usize) {
+        let mut clean_table = single_rule("t", vec![]);
+        clean_table.derive.push(derive_double_rule());
+        let clean = generate(
+            models,
+            &SynthRules {
+                version: "1".to_string(),
+                tables: vec![clean_table],
+            },
+            &config(&["t"], 600),
+        )
+        .unwrap();
+        let baseline = clean.tables["t"]
+            .iter()
+            .filter(|row| row[2].as_f64().is_some_and(|double| double > 3.0))
+            .count();
+        (baseline, (0.6 * 600f64).round() as usize - baseline)
+    }
+
+    fn assert_derived_repair(data: &GeneratedData, baseline: usize, deficit: usize) {
+        let rows = data.tables.get("t").unwrap();
+        let big = rows
+            .iter()
+            .filter(|row| row[2].as_f64().is_some_and(|double| double > 3.0))
+            .count() as f64
+            / rows.len() as f64;
+        let killed = rows
+            .iter()
+            .filter(|row| row[1].as_f64() == Some(0.0))
+            .count() as f64
+            / rows.len() as f64;
+        for row in rows {
+            let amount = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let double = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                double.round_dp(12),
+                (amount * rust_decimal::Decimal::TWO).round_dp(12),
+                "derived column must stay consistent with its inputs"
+            );
+        }
+        assert!(
+            (big - 0.6).abs() <= 0.02,
+            "the branch reading the derived column must keep its 60%: got {big} ({:?})",
+            data.branches
+        );
+        assert!(
+            (killed - 0.3).abs() <= 0.02,
+            "the sibling must reach its 30% without eating those rows: got {killed} ({:?})",
+            data.branches
+        );
+        for outcome in &data.branches {
+            assert_eq!(
+                outcome.status,
+                CoverageStatus::Pass,
+                "every branch must pass: {outcome:?}"
+            );
+        }
+        let flips = |id: &str| {
+            data.branches
+                .iter()
+                .find(|outcome| outcome.id == id)
+                .unwrap()
+                .flips
+        };
+        assert_eq!(
+            flips("big"),
+            deficit,
+            "the derived branch must only add the rows it is short of, not redo \
+             matches a sibling wiped out; baseline {baseline}, deficit {deficit}: {:?}",
+            data.branches
+        );
+        assert_eq!(
+            flips("killed"),
+            180,
+            "the source-rewriting branch must not have to repeat work: {:?}",
+            data.branches
+        );
+        for outcome in &data.branches {
+            assert_eq!(
+                outcome.rounds, 1,
+                "both branches must settle in one round: {:?}",
+                data.branches
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_let_an_unreachable_branch_destroy_a_reachable_one() {
+        // `killed` cannot reach 95% without rewriting rows `big` still needs,
+        // so left unchecked it steals `big`'s matches every round until `big`
+        // reports 5% coverage. Protecting an under-target sibling keeps the
+        // achievable branch achievable; the impossible one is the one that
+        // warns.
+        let models = derived_amount_model();
+        let rules = derived_branch_rules_with(true, 0.6, 0.95);
+        let data = generate(&models, &rules, &config(&["t"], 600)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let big = rows
+            .iter()
+            .filter(|row| row[2].as_f64().is_some_and(|double| double > 3.0))
+            .count() as f64
+            / rows.len() as f64;
+        for row in rows {
+            let amount = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let double = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                double.round_dp(12),
+                (amount * rust_decimal::Decimal::TWO).round_dp(12),
+                "derived column must stay consistent with its inputs"
+            );
+        }
+        let outcome = |id: &str| {
+            data.branches
+                .iter()
+                .find(|outcome| outcome.id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            outcome("big").status,
+            CoverageStatus::Pass,
+            "an unreachable sibling must not sink the reachable branch: {:?}",
+            data.branches
+        );
+        assert!(
+            (big - 0.6).abs() <= 0.02,
+            "the reachable branch must keep its 60%: got {big} ({:?})",
+            data.branches
+        );
+        assert_ne!(
+            outcome("killed").status,
+            CoverageStatus::Pass,
+            "the impossible target must be reported, not quietly met: {:?}",
+            data.branches
+        );
+    }
+
+    /// `status` (A/B) plus a numeric `amount` centred on the boundary of
+    /// `double > 3` for `double = amount * 2`, and the derived column itself.
+    fn derived_amount_model() -> HashMap<String, TableModel> {
+        let mut models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let model = models.get_mut("t").unwrap();
+        model.columns.insert(
+            "amount".to_string(),
+            numerical_model("t", "amount", 1.5, 1.0).columns["amount"].clone(),
+        );
+        model.columns.insert(
+            "double".to_string(),
+            numerical_model("t", "double", 0.0, 1.0).columns["double"].clone(),
+        );
+        model.copula.column_order = vec![
+            "status".to_string(),
+            "amount".to_string(),
+            "double".to_string(),
+        ];
+        model.copula.correlation = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        models
     }
 
     #[test]

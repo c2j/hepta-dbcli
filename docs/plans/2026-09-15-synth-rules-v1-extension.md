@@ -422,3 +422,27 @@ SQL 往返（`-f sql` → 真实 MySQL）复核 `derive`：200 行全部插入�
 （`should_convert_surplus_from_an_over_target_sibling_branch`、
 `should_stack_two_branches_that_write_different_columns`）钉住该行为；第三轮的
 三分类两分支用例保留为「同列争抢不再拉锯」的回归。
+
+### 9.6 第五轮：derived 谓词的破坏判定（复审意见 4020606491）
+
+复审指出 `destroys_protected_coverage` 克隆行后只重放 `repair.set`、**不重跑 derive**，因此在
+「谓词读 derive 列」时判定失真。成立，两种形态都在单元与 CLI 上复现（预修复二进制 `fad8e0e`）：
+
+| 场景（`derive: dbl = amount * 2`） | 修复前 | 修复后 |
+|---|---|---|
+| 单测：`killed`(amount==0, 30%) 先声明，`big`(dbl>3, 60%) | `big` 改写 158 行、2 轮（基线 299，缺口 61） | 改写 **61** 行、1 轮 |
+| 单测：反序声明（`big` 先写、`killed` 后覆盖） | `big` 改写 178 行、2 轮 | 改写 61 行、1 轮 |
+| CLI（真实 MySQL 训练的 `derived_demo`，400 行，big 75%） | `big` 134 行 / 2 轮（反序 151 行 / 2 轮） | 96 行 / 1 轮（两种顺序一致） |
+| CLI 不可达兄弟（`killed` 95%） | **`big` 只剩 0.050，Warn** | `big` Pass 0.750，`killed` Warn |
+
+最后一行是关键：被破坏的覆盖在可行配置里通常还能在后续轮次补回来（表现为多改写、多轮），但当兄弟
+分支目标不可达、每轮都来抢时，可达分支会被拖到 Fail。
+
+修法：把 derive 的解析/拓扑排序/逐行求值抽成 `DerivePlan`（`build` + `apply_to_row`），
+轮末整表刷新与分支候选判定共用同一实现。判定时**两侧都在重跑 derive 之后比较**：`before` 用当前行
+（含本轮兄弟刚写过的陈旧 derive 值）重算一次，`after` 再叠加本分支赋值并重算一次。模拟求值失败
+（除零/溢出/类型错）时按「不破坏」放行，让轮末整表刷新原样报错，不把配置错误降级成静默跳过。
+
+三条新测试：`should_not_let_a_branch_destroy_coverage_that_runs_through_a_derived_column`、
+`should_not_let_a_sibling_clobber_rows_written_for_a_derived_predicate`、
+`should_not_let_an_unreachable_branch_destroy_a_reachable_one`。
