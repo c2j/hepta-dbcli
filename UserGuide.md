@@ -885,9 +885,13 @@ cargo build --release -p polar-mysql --no-default-features --features "oracle-rs
 # 1. 训练：采样真实数据，拟合每列边际分布 + Copula 相关矩阵
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
-# 2. 起草规则：从数据库外键自动生成 YAML 规则草案
+# 2. 起草规则：从数据库外键自动生成 YAML 规则草案（--models 存在时额外做隐式引用推断）
 hepta_dbcli synth rules-draft --name dev --tables users,orders \
   --models .synth --output synth-rules.yaml
+# 2b. 顺带挖掘条件业务规则候选（只输出注释，永不自动启用）
+hepta_dbcli synth rules-draft --name dev --tables users,orders \
+  --models .synth --output synth-rules.yaml \
+  --mine --mine-confidence 0.95 --mine-support 0.05 --emit-candidates candidates.txt
 
 # 3. 生成：按模型与规则批量产出合成数据
 hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
@@ -935,6 +939,15 @@ tables:
         null_rate: 0.20          # 覆盖该列训练得到的 NULL 比例；0.0 = 从不 NULL
       score:
         marginal: gamma          # 强制该列边际族：normal/beta/gamma/uniform/ecdf/categorical
+      part_date:
+        fixed: "20240101"        # 全表同值（数值字面量按列类型输出，SQL 里不带引号）
+      status:
+        values:                  # 加权值池；也支持等权写法 values: [normal, peak]
+          normal: 0.7
+          peak: 0.3
+      created_at:
+        fixed_range: ["2026-01-01", "2026-01-31"]   # 闭区间，端点可为数值/日期字符串
+        mode: rejection          # rejection（默认）| copula_conditional
     relationships: []
   - name: orders
     strategy: zipf               # 子表按 Zipf 偏置引用父表键；weighted 按父列观测频次（或分类边际权重）采样
@@ -959,6 +972,83 @@ tables:
 |------|------|
 | `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
 | `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
+
+#### 列级固定值与区间（`fixed` / `values` / `fixed_range`）
+
+| 字段 | 行为 |
+|------|------|
+| `fixed: <字面量>` | 该列全表取同一值。按列的逻辑类型输出：数值列的数值字面量在 JSON/SQL 中都是数值（分区键不会被引号包裹），日期时间列会按模型的 `datetime_format` 解析成 epoch 再定位 |
+| `values: {值: 权重}` 或 `values: [值, ...]` | 逐行独立按权重/等权取值；省略权重即等权。加权池用有序映射，保证同 seed 可复现。键按**标量**读取，`values: {1: 0.7, 2: 0.3}` 这种数值键不需要加引号 |
+| `fixed_range: [low, high]` | 闭区间。数值与可解析的日期时间列都支持；`low > high`、端点类型不一致、或区间落在训练分布外都会在配置期/生成期报错。日期时间列的两个端点按**时刻**比较（epoch 秒，与 `copula_conditional` 同一域），端点先按列的 `datetime_format` 解析、失败再按通用 ISO 形状解析，纯数字端点直接当 epoch 秒；只写到日期的端点等于**当天 00:00:00** |
+
+`fixed` / `values` / `fixed_range` 与以下组合都会被拒绝（错误含表名与列名）：`fixed` 与 `values` 并存、与该列 `null_rate > 0` 并存（阶段 4 覆盖整列，rate 无意义）、该列是被其他表 `references` 的父键、该列是 relationship 的 `pk`。
+
+区间约束有两条路径，取舍如下：
+
+| `mode` | 机制 | 保真 | 代价 |
+|--------|------|------|------|
+| `rejection`（默认） | 正常采样后校验，落在区间外就用该列自己的独立流重抽 | 保留原始边际形状（截断分布） | 区间概率质量越小时越慢；单值超过 10000 次重抽或区间内质量 < 1% 直接报错（不会静默截断行数） |
+| `copula_conditional` | 把该列钉到 `z = Φ⁻¹(F(x))`（区间则逐行取 `[F(low), F(high)]` 内的分位数），**其余列按条件多元正态分布采样** | 同样落在区间内，且**保留与被固定列的相关结构** | 需要可逆的数值/日期边际（分类列报错）；固定维度的协方差子矩阵奇异时报错 |
+
+`copula_conditional` 只能配 `fixed` 或 `fixed_range`（`values` 是逐行独立的，没有可条件化的量）。被 pin 的列不再做 min/max 裁剪，用户的区间优先。示例：把 `occurred_at` 钉到 2026-01-05..01-10、且它与 `event_id` 相关系数 0.77 时，生成的 `event_id` 会跟着下移（均值 10.9 → 4.9），而不是独立重采样。
+
+#### 派生列（`derive`，issue #70）
+
+```yaml
+tables:
+  - name: line_items
+    derive:
+      - column: total          # 覆盖该列：total = price * qty * 2 + 0.01
+        expr: "price * qty * 2 + 0.01"
+```
+
+- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**函数调用、属性访问、下标一律拒绝**（加载期报错并指出违规节点）。
+- 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，溢出报错而不是 panic。
+- **NULL 传播（三值逻辑）**：`derive` 无条件重算目标列，源列为 NULL 时结果也是 NULL（`total = price * qty` 在 `price` 为 NULL 的那一行把 `total` 写成 NULL），**不会**中断整张表的生成。目标列若在库里是 `NOT NULL`，会在写入时报数据库错误。除零/类型错误仍是硬错误：那是配置写错，不是 NULL 输入。
+- 时机：**所有列生成（含 copula、FK、NULL、`fixed`/`values`/`fixed_range`）之后统一求值**，因此表达式读到的是最终值；`derive` 之间按依赖顺序求值（`c = b + 1`、`b = price * 2` 可以声明为任意顺序），成环在加载期报错。
+- 输出按目标列的类型量化：整数列取整为 i64；带 `decimal_scale` 的列量化到该标度（避免 `110.16999999999999` 这类二进制尾差写入 CSV/SQL）。
+- 冲突校验（**加载期**，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、derive 成环。**未知列在生成期报错**：`table.columns` 只记录覆盖项，列的存在性要拿模型才判得出来（`table 'orders' derive 'amount': unknown column 'x'`）。
+- 不含 `derive` 的 rules 输出与之前逐字节一致。
+
+#### 分支覆盖率（`branches`，issue #70）
+
+```yaml
+tables:
+  - name: orders
+    branches:
+      - id: paid                 # 报告里的标识
+        predicate: "status == 'A'"   # 布尔表达式（白名单同 derive）
+        target_ratio: 0.30        # 目标命中比例
+        tolerance: 0.02           # 可选，默认 0.05
+        repair:
+          set:
+            status: "A"           # 把未命中行改写成这些字面量
+          linked_derive_recompute: true
+```
+
+- 时机：`derive` 之后的最后一个阶段。先度量谓词命中率，未达目标就改写未命中的行，再重算 `derive`，最多 10 轮；命中率进入报告（stdout 为 Pass，stderr 为 `warning:` 的 Warn/Fail），**不阻断主流程退出码**（exit 仍为 0）。
+- 改写行的选择是确定性的：在未命中行里按等距抽取，避免把改动堆在表头；`set` 只能让行**命中**谓词，因此只从下方补齐，超出目标不会被「反向撤销」。
+- 谓词读 `derive` 列时（如 `predicate: "total > 50"` 配合 `derive: total = price * qty`），判定「某次改写会不会破坏未达标兄弟的覆盖」会在**单行上重跑同一条 derive**：`set` 不能写 derive 目标，但可以写它的**输入**，而 derive 只在轮末整体刷新。不重跑 derive 会漏判（把 `price` 写成 0 看起来无害，实际把 `total > 50` 的命中抹掉），也会让兄弟分支覆盖掉刚为本分支写下的行。
+- 可写列白名单（错误含表名、分支 id 与列名）：不能写 FK 列、被其它表 `references` 的父键、`derive` 目标列、以及被 `fixed`/`values`/`fixed_range` 钉住的列。这些关系在 YAML 里就能判定，因此都在**加载期**报错；只有「列是否存在」要等模型，在**生成期**报错。
+- 多分支同轮：一个分支只在改写**会破坏某个未达标兄弟的命中**时才被拦（`set` 只能让行命中，未达标的兄弟补不回来）。**超目标的兄弟不是拦截对象**，它的富余行可以被其他分支转化——互补谓词（二值列上 `A` 0.3 与 `B` 0.7）正是靠这一点在一轮内收敛，而不是把整张表锁死。改写不涉及兄弟谓词所读的列时同样放行，因此两个分支可以叠加在同一批行上（`status == 'A'` 90% 与 `qty == 99` 50% 可同时达标）。两个分支争抢同一列且都未达标时不再互相覆盖到最后一轮（此前只有最后声明的分支达标）。
+- 超目标只能被其他分支的转化消化，`set` 本身不会「反向撤销」超射（见下一条）。
+- 一轮下来命中率没有任何变化（典型是 `set` 写的列与谓词无关）会立即停止并报 Warn，不会空转到 10 轮；若**所有**行都无法求值（例如字符串列写了 `predicate: "name == 1"`），直接报错而不是伪装成 0% 覆盖。
+- 与影子数据的差异（诚实说明）：本实现只做 `set` 补齐与 `derive` 联动重算，**不做** `derive` 表达式形式的 `set`、不做多轮最小扰动选行、不做「反向撤销」。不含 `branches` 的 rules 输出与之前逐字节一致。
+
+#### 生成后分布校验（诚实 WARN，#76-C）
+
+- **值池**：生成结束后统计每个 `values` 池各声明值的实际占比与声明权重，最大偏差 > 0.05 时向 stderr 打印 `warning:`，并列出 declared 与 actual 两列。
+- **分支**：每个 `branches[]` 的命中率与 `target_ratio` 的偏差超过 `tolerance` 时同样按 `warning:` 输出（见上一节）。
+- 两者都是**告警不阻断**：退出码仍为 0，生成结果照常落盘。小样本（如 20 行）上 0.05 的容差本就容易被采样噪声触发，这是有意的——它提示「这批数据在这个规模上并不复现你声明的分布」。
+
+#### rules-draft：隐式引用推断与规则挖掘
+
+- **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship，与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。
+  - 推断出的 `unique` **跟随子表列**，与显式外键同一判据：子表该列在 profile 中唯一（`cardinality == row_count`，即 1:1）才是无放回采样的 `unique: true`；1:N 一律 `unique: false`，否则子表行数超过父表池时会报 `exhausted its parent pool`。
+- **条件规则挖掘**（`--mine`，默认关闭）：对类别列对 `(A, B)`，统计每个高频值 `a` 下 `B` 的条件分布与边缘分布的 TV 距离，`TV > --mine-support` 且最大条件取值占比 `≥ --mine-confidence` 时输出候选 `A=a => B=b`（附 confidence / support）。
+  - 候选**只写入 YAML 注释或 `--emit-candidates` 指定文件，永不自动启用**；不传 `--mine` 时 draft 输出与之前完全一致。
+  - 唯一值占该列非 NULL 行数过半的列（id、单据号等）视为标识符不参与，避免小样本上「每个取值都蕴含一条规则」的伪候选；`--mine-max-pairs` 限制列对数量（超出会记录并截断）；同输入同参数候选清单逐位一致。
+  - 挖掘结果是**相关性观测，不是因果**，也未必是业务约束；启用前请人工确认，把它当作 `rules` / `columns` 的候选来源而不是自动配置。
 
 ### 10.5 语义与限制
 

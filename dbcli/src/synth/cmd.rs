@@ -110,6 +110,9 @@ pub enum SynthCommand {
         /// Directory holding trained profiles; enables unique-FK detection
         #[arg(long, default_value = ".synth")]
         models: String,
+
+        #[command(flatten)]
+        mine: MineArgs,
     },
 
     /// Generate synthetic rows from trained models and rules
@@ -200,6 +203,47 @@ pub enum SynthCommand {
         #[arg(long, default_value_t = false)]
         strict: bool,
     },
+}
+
+/// `rules-draft` conditional-rule mining options (issue #69).
+///
+/// Mining is off by default: without `--mine` the draft is byte-identical to
+/// the pre-#69 output. Candidates are only ever written as comments (see
+/// `synth::mine`), never enabled.
+#[derive(Args, Debug, Clone)]
+pub struct MineArgs {
+    /// Mine conditional `A=a => B=b` candidates from sampled rows (default off)
+    #[arg(long, default_value_t = false)]
+    pub mine: bool,
+
+    /// Minimum `P(B=b | A=a)` for a candidate
+    #[arg(long, default_value_t = 0.95)]
+    pub mine_confidence: f64,
+
+    /// Minimum antecedent support, and the minimum total-variation distance
+    /// between the conditional and the marginal distribution
+    #[arg(long, default_value_t = 0.05)]
+    pub mine_support: f64,
+
+    /// Cap on directed column pairs scanned per table (guards the O(c^2) scan)
+    #[arg(long, default_value_t = 2000)]
+    pub mine_max_pairs: usize,
+
+    /// Write the full candidate list to this path (comments stay in the YAML)
+    #[arg(long)]
+    pub emit_candidates: Option<String>,
+}
+
+impl Default for MineArgs {
+    fn default() -> Self {
+        Self {
+            mine: false,
+            mine_confidence: 0.95,
+            mine_support: 0.05,
+            mine_max_pairs: 2000,
+            emit_candidates: None,
+        }
+    }
 }
 
 // ─── 模型拟合（纯函数，无 IO）────────────────────────────────────────────
@@ -676,6 +720,56 @@ pub fn run_generate(
     };
     export(&payload, &export_format, output_dir)?;
 
+    for pool in &data.value_pools {
+        if pool.is_within_tolerance() {
+            continue;
+        }
+        let declared = pool
+            .declared
+            .iter()
+            .map(|(value, share)| format!("{}={:.3}", value, share))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let actual = pool
+            .actual
+            .iter()
+            .map(|(value, share)| format!("{}={:.3}", value, share))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Declared weights are what the sampler draws from, so a deviation
+        // this large means the pool did not take effect (#76-C). Honest
+        // warning, no effect on the exit code.
+        eprintln!(
+            "warning: table '{}' column '{}': generated shares deviate from the declared weights by {:.3} (tolerance {:.2}); declared [{}] actual [{}]",
+            pool.table,
+            pool.column,
+            pool.max_deviation,
+            crate::synth::generator::VALUE_POOL_TOLERANCE,
+            declared,
+            actual
+        );
+    }
+
+    for outcome in &data.branches {
+        let line = format!(
+            "branch '{}': target {:.3}, actual {:.3} ({:?}, {} round(s), {} row(s) rewritten, {} evaluation failure(s))",
+            outcome.id,
+            outcome.target_ratio,
+            outcome.actual_ratio,
+            outcome.status,
+            outcome.rounds,
+            outcome.flips,
+            outcome.failed_evaluations
+        );
+        match outcome.status {
+            crate::synth::generator::CoverageStatus::Pass => println!("{}", line),
+            // A missed coverage target is a warning, not a failed generation
+            // (plan §7 D2); the exit code stays 0.
+            crate::synth::generator::CoverageStatus::Warn
+            | crate::synth::generator::CoverageStatus::Fail => eprintln!("warning: {}", line),
+        }
+    }
+
     println!(
         "Generation complete. Data saved to {}",
         output_dir.display()
@@ -848,6 +942,50 @@ mod tests {
     }
 
     #[test]
+    fn draft_without_mine_flag_is_unchanged() {
+        let cmd = parse(&["synth", "rules-draft", "--tables", "orders"]);
+        match cmd {
+            SynthCommand::RulesDraft { mine, .. } => {
+                assert!(!mine.mine, "--mine must default to off");
+                assert_eq!(mine.mine_confidence, 0.95);
+                assert_eq!(mine.mine_support, 0.05);
+                assert_eq!(mine.mine_max_pairs, 2000);
+                assert_eq!(mine.emit_candidates, None);
+            }
+            other => panic!("expected rules-draft, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rules_draft_mine_flags() {
+        let cmd = parse(&[
+            "synth",
+            "rules-draft",
+            "--tables",
+            "orders",
+            "--mine",
+            "--mine-confidence",
+            "0.85",
+            "--mine-support",
+            "0.10",
+            "--mine-max-pairs",
+            "42",
+            "--emit-candidates",
+            "candidates.txt",
+        ]);
+        match cmd {
+            SynthCommand::RulesDraft { mine, .. } => {
+                assert!(mine.mine);
+                assert_eq!(mine.mine_confidence, 0.85);
+                assert_eq!(mine.mine_support, 0.10);
+                assert_eq!(mine.mine_max_pairs, 42);
+                assert_eq!(mine.emit_candidates.as_deref(), Some("candidates.txt"));
+            }
+            other => panic!("expected rules-draft, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_train_subcommand() {
         let cmd = parse(&["synth", "train", "--tables", "users,orders"]);
         match cmd {
@@ -943,6 +1081,8 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: "dict".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
+                branches: vec![],
                 rows: Some(GEN_ROWS),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1042,6 +1182,8 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: "orders".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
+                branches: vec![],
                 rows: Some(2),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1645,6 +1787,8 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: table.clone(),
                 columns: HashMap::new(),
+                derive: vec![],
+                branches: vec![],
                 rows: Some(rows),
                 relationships: vec![],
                 strategy: Default::default(),

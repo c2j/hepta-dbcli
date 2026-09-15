@@ -7,6 +7,8 @@ pub mod datetime;
 #[cfg(feature = "synth")]
 pub mod export;
 #[cfg(feature = "synth")]
+pub mod expr;
+#[cfg(feature = "synth")]
 pub mod fk_pool;
 #[cfg(feature = "synth")]
 pub mod generator;
@@ -14,6 +16,8 @@ pub mod generator;
 pub mod graph;
 #[cfg(feature = "synth")]
 pub mod marginal;
+#[cfg(feature = "synth")]
+pub mod mine;
 #[cfg(feature = "synth")]
 pub mod model;
 #[cfg(feature = "synth")]
@@ -86,6 +90,7 @@ pub async fn run(
             schema,
             output,
             models,
+            mine,
         } => {
             run_rules_draft(
                 name,
@@ -93,6 +98,7 @@ pub async fn run(
                 schema,
                 Path::new(&output),
                 Path::new(&models),
+                mine,
                 config_path,
             )
             .await
@@ -544,6 +550,11 @@ async fn run_train(
     Ok(())
 }
 
+/// Rows sampled per table while mining conditional rules (issue #69). The
+/// pair scan is O(c^2 * n), so the sample is capped and the decision logged.
+#[cfg(feature = "synth")]
+const MINE_SAMPLE_ROWS: usize = 50_000;
+
 #[cfg(feature = "synth")]
 async fn run_rules_draft(
     name: Option<String>,
@@ -551,6 +562,7 @@ async fn run_rules_draft(
     schema: Option<String>,
     output: &Path,
     models_dir: &Path,
+    mine: cmd::MineArgs,
     config_path: Option<String>,
 ) -> Result<(), String> {
     let tables = split_tables(tables);
@@ -584,13 +596,108 @@ async fn run_rules_draft(
         HashMap::new()
     });
 
-    let rules =
-        crate::synth::rules_draft::generate_draft_from_profiles(&tables, &foreign_keys, &profiles);
+    // Primary keys come from the trained models; without them the heuristic
+    // simply cannot tell a child key from a reference (issue #76-E), so a
+    // failure here is reported instead of silently degrading the draft.
+    let primary_keys = match load_primary_keys(models_dir) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("warning: ignoring trained models: {}", e);
+            HashMap::new()
+        }
+    };
+    if let Some(warning) = implicit_fk_warning(&primary_keys, &profiles, models_dir) {
+        eprintln!("warning: {}", warning);
+    }
 
-    let yaml = serde_yaml::to_string(&rules).map_err(|e| format!("serialize rules: {}", e))?;
+    let (rules, inferred) = crate::synth::rules_draft::generate_draft_with_implicit(
+        &tables,
+        &foreign_keys,
+        &profiles,
+        &primary_keys,
+    );
+    if inferred > 0 {
+        eprintln!("inferred {} implicit relationship(s)", inferred);
+    }
+
+    let mut yaml = serde_yaml::to_string(&rules).map_err(|e| format!("serialize rules: {}", e))?;
+
+    if mine.mine {
+        let mined = mine_tables(&mut *conn, &schema, &tables, &mine).await?;
+        if let Some(path) = mine.emit_candidates.as_deref() {
+            std::fs::write(path, crate::synth::mine::render_candidate_report(&mined))
+                .map_err(|e| format!("write candidate list: {}", e))?;
+            println!("Candidate list saved to {}", path);
+        }
+        let total: usize = mined.iter().map(|t| t.candidates.len()).sum();
+        if total > 0 {
+            eprintln!(
+                "mined {} conditional rule candidate(s); they are comments only (never enabled)",
+                total
+            );
+        }
+        // Candidates are appended as comments: the YAML stays parseable and
+        // nothing is enabled (issue #69, AC4/A hard constraint).
+        yaml = crate::synth::mine::append_candidate_comments(&yaml, &mined);
+    }
+
     std::fs::write(output, yaml).map_err(|e| format!("write rules file: {}", e))?;
     println!("Rules draft saved to {}", output.display());
     Ok(())
+}
+
+/// Sample each table (capped at [`MINE_SAMPLE_ROWS`]) and mine conditional
+/// candidates. Logs the sampling decision per table (issue #69, AC5).
+#[cfg(feature = "synth")]
+async fn mine_tables(
+    conn: &mut (dyn crate::backend::DbConn + Send),
+    schema: &str,
+    tables: &[String],
+    mine: &cmd::MineArgs,
+) -> Result<Vec<crate::synth::mine::TableCandidates>, String> {
+    let config = crate::synth::mine::MineConfig {
+        confidence: mine.mine_confidence,
+        support: mine.mine_support,
+        max_pairs: mine.mine_max_pairs,
+        ..crate::synth::mine::MineConfig::default()
+    };
+
+    let mut mined = Vec::new();
+    for table in tables {
+        let sample_sql = {
+            let dialect = conn.dialect();
+            dialect.add_limit(
+                &format!("SELECT * FROM {}", dialect.quote_table(Some(schema), table)),
+                MINE_SAMPLE_ROWS,
+            )
+        };
+        let result = conn
+            .query(&sample_sql)
+            .await
+            .map_err(|e| format!("mine table '{}': {}", table, e))?;
+        let report = crate::synth::mine::mine_candidates(&result.columns, &result.rows, &config);
+        eprintln!(
+            "mining table '{}': sampled {} row(s) (cap {}), scanned {} of {} column pair(s), {} candidate(s){}",
+            table,
+            result.row_count,
+            MINE_SAMPLE_ROWS,
+            report.pairs_considered,
+            report.pairs_total,
+            report.candidates.len(),
+            if report.pairs_truncated() {
+                " - pair cap hit"
+            } else {
+                ""
+            }
+        );
+        if !report.candidates.is_empty() {
+            mined.push(crate::synth::mine::TableCandidates {
+                table: table.clone(),
+                candidates: report.candidates,
+            });
+        }
+    }
+    Ok(mined)
 }
 
 /// Record the holdout baseline next to a freshly trained model. A ratio of 0
@@ -632,6 +739,37 @@ fn write_report_baseline(
         path.display()
     );
     Ok(())
+}
+
+/// The implicit-FK heuristic skips a child column that is its own primary key,
+/// and it can only know the primary keys from the trained models. Profiles
+/// without models (for example a directory holding only `*.profile.json`) leave
+/// that guard inert, so the draft can invent a reference such as
+/// `orders.id -> users.id`. Returns the warning to print in that case.
+fn implicit_fk_warning(
+    primary_keys: &HashMap<String, String>,
+    profiles: &HashMap<String, crate::synth::profile::TableProfile>,
+    models_dir: &Path,
+) -> Option<String> {
+    if primary_keys.is_empty() && !profiles.is_empty() {
+        return Some(format!(
+            "trained profiles in {} carry no primary keys; implicit relationship \
+             detection cannot skip a child key and may invent references \
+             (retrain with `synth train` to restore it)",
+            models_dir.display()
+        ));
+    }
+    None
+}
+
+/// Primary key per table, as recorded by `synth train`. Errors are returned
+/// rather than defaulted: an empty map silently weakens the implicit-FK
+/// heuristic (`rules_draft`) so primary keys get mistaken for references.
+fn load_primary_keys(models_dir: &Path) -> Result<HashMap<String, String>, String> {
+    Ok(load_models(models_dir)?
+        .into_iter()
+        .filter_map(|(table, model)| model.pk.first().map(|pk| (table, pk.clone())))
+        .collect())
 }
 
 /// Load every `<table>.model.json` in a models directory.
@@ -923,6 +1061,8 @@ fn rules_from_models(
                 name: name.clone(),
                 rows: Some(rows),
                 columns: HashMap::new(),
+                derive: vec![],
+                branches: vec![],
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::Uniform,
             })
@@ -1001,6 +1141,78 @@ const KEY_POOL_LIMIT: usize = 100_000;
 mod tests {
     use super::*;
 
+    fn profile_for(table: &str) -> crate::synth::profile::TableProfile {
+        serde_json::from_value(serde_json::json!({
+            "table": table,
+            "row_count": 10,
+            "columns": {}
+        }))
+        .expect("test profile")
+    }
+
+    #[test]
+    fn should_warn_when_profiles_run_without_primary_keys() {
+        let profiles = HashMap::from([("orders".to_string(), profile_for("orders"))]);
+        let warning =
+            implicit_fk_warning(&HashMap::new(), &profiles, Path::new("/nonexistent/.synth"))
+                .expect("profiles without models must warn");
+        assert!(
+            warning.contains("may invent references"),
+            "warning must name the consequence: {warning}"
+        );
+    }
+
+    #[test]
+    fn should_not_warn_when_primary_keys_or_profiles_are_present() {
+        let profiles = HashMap::from([("orders".to_string(), profile_for("orders"))]);
+        let keys = HashMap::from([("orders".to_string(), "order_id".to_string())]);
+        assert!(implicit_fk_warning(&keys, &profiles, Path::new(".synth")).is_none());
+        // No profiles at all: inference never runs, so there is nothing to warn about.
+        assert!(
+            implicit_fk_warning(&HashMap::new(), &HashMap::new(), Path::new(".synth")).is_none()
+        );
+    }
+    #[test]
+    fn should_error_when_a_models_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            load_primary_keys(&missing).is_err(),
+            "a missing models directory must not silently yield an empty key map"
+        );
+    }
+
+    #[test]
+    fn should_read_primary_keys_from_trained_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = crate::synth::model::TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: crate::synth::model::Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["order_id".to_string()],
+            columns: HashMap::new(),
+            copula: crate::synth::model::CopulaInfo {
+                column_order: vec![],
+                correlation: vec![],
+            },
+        };
+        std::fs::write(
+            dir.path().join("orders.model.json"),
+            serde_json::to_string(&model).unwrap(),
+        )
+        .unwrap();
+
+        let keys = load_primary_keys(dir.path()).expect("trained model must load");
+        assert_eq!(keys.get("orders").map(String::as_str), Some("order_id"));
+    }
+
     #[test]
     fn should_resolve_schema_from_connection_default_when_unspecified() {
         assert_eq!(resolve_schema(None, "public".to_string()), "public");
@@ -1071,6 +1283,7 @@ mod tests {
                 schema: None,
                 output: "rules.yaml".to_string(),
                 models: ".synth".to_string(),
+                mine: cmd::MineArgs::default(),
             }),
             (
                 "rules-draft".to_string(),
