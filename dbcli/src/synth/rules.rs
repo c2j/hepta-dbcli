@@ -69,11 +69,108 @@ impl ColumnRule {
 /// YAML accepts two shapes: `values: {a: 0.7, b: 0.3}` (weighted) and
 /// `values: [a, b]` (uniform). Weighted pools use a `BTreeMap` so iteration
 /// order is deterministic and same-seed generation is reproducible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+///
+/// Keys are read as **scalars**, so the natural `values: {1: 0.7, 2: 0.3}` for
+/// a numeric column works without quoting.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ValuePool {
     Weighted(BTreeMap<String, f64>),
     Uniform(Vec<String>),
+}
+
+impl Serialize for ValuePool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        match self {
+            ValuePool::Uniform(values) => values.serialize(serializer),
+            ValuePool::Weighted(weights) => {
+                let mut map = serializer.serialize_map(Some(weights.len()))?;
+                for (value, weight) in weights {
+                    map.serialize_entry(value, weight)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// Scalar key of a weighted pool: YAML `9`, `9.5`, `'9'` and `true` all map to
+/// their literal spelling.
+struct PoolKey(String);
+
+impl<'de> Deserialize<'de> for PoolKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(PoolKeyVisitor).map(PoolKey)
+    }
+}
+
+struct PoolKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PoolKeyVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a scalar value-pool key")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ValuePool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PoolVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PoolVisitor {
+            type Value = ValuePool;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a list of values or a map of value -> weight")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ValuePool, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<String>()? {
+                    values.push(value);
+                }
+                Ok(ValuePool::Uniform(values))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ValuePool, A::Error> {
+                let mut weights = BTreeMap::new();
+                while let Some((key, weight)) = map.next_entry::<PoolKey, f64>()? {
+                    weights.insert(key.0, weight);
+                }
+                Ok(ValuePool::Weighted(weights))
+            }
+        }
+
+        deserializer.deserialize_any(PoolVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1020,6 +1117,77 @@ tables:
         let err = validate_yaml(yaml).expect_err("values on a relationship pk must fail");
         assert!(err.contains("orders"), "error must name the table: {err}");
         assert!(err.contains("user_id"), "error must name the column: {err}");
+    }
+
+    #[test]
+    fn should_read_unquoted_numeric_value_pool_keys() {
+        // `values: {1: 0.7, 2: 0.3}` is the natural spelling for a numeric
+        // column; requiring quotes would be a footgun found only at runtime.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      part_id:
+        values: {1: 0.7, 2: 0.3}
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        match rules.tables[0].columns["part_id"].values.as_ref().unwrap() {
+            ValuePool::Weighted(weights) => {
+                assert_eq!(weights["1"], 0.7);
+                assert_eq!(weights["2"], 0.3);
+            }
+            other => panic!("expected a weighted pool, got {other:?}"),
+        }
+        rules.validate().unwrap();
+    }
+
+    #[test]
+    fn should_read_quoted_and_float_value_pool_keys() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      code:
+        values: {"A": 0.5, 1.5: 0.5}
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        match rules.tables[0].columns["code"].values.as_ref().unwrap() {
+            ValuePool::Weighted(weights) => {
+                assert_eq!(weights["A"], 0.5);
+                assert_eq!(weights["1.5"], 0.5);
+            }
+            other => panic!("expected a weighted pool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_round_trip_both_value_pool_shapes() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      status:
+        values: {a: 0.7, b: 0.3}
+      kind:
+        values: [x, y]
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        let text = serde_yaml::to_string(&rules).unwrap();
+        let reparsed: SynthRules = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(
+            reparsed.tables[0].columns["status"].values,
+            rules.tables[0].columns["status"].values
+        );
+        assert_eq!(
+            reparsed.tables[0].columns["kind"].values,
+            rules.tables[0].columns["kind"].values
+        );
     }
 
     #[test]

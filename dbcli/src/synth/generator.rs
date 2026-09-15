@@ -34,6 +34,33 @@ pub struct GeneratedData {
     pub schemas: HashMap<String, String>,
     /// Branch coverage after repair, one entry per `branches[]` rule.
     pub branches: Vec<BranchOutcome>,
+    /// Sampled-vs-declared conformance of every `values` pool.
+    pub value_pools: Vec<ValuePoolOutcome>,
+}
+
+/// Absolute deviation allowed between a `values` pool's declared weights and
+/// the shares actually generated (#76-C).
+pub const VALUE_POOL_TOLERANCE: f64 = 0.05;
+
+/// How well one weighted `values` pool reproduced its declared distribution.
+#[derive(Debug, Clone)]
+pub struct ValuePoolOutcome {
+    pub table: String,
+    pub column: String,
+    /// Declared `(value, share)` pairs, normalised to sum to 1.
+    pub declared: Vec<(String, f64)>,
+    /// Shares actually present in the generated rows.
+    pub actual: Vec<(String, f64)>,
+    /// Largest absolute difference between the two.
+    pub max_deviation: f64,
+}
+
+impl ValuePoolOutcome {
+    /// `true` when the generated shares match the declared weights closely
+    /// enough to stay quiet.
+    pub fn is_within_tolerance(&self) -> bool {
+        self.max_deviation <= VALUE_POOL_TOLERANCE
+    }
 }
 
 /// Coverage state of one branch after the repair loop.
@@ -104,6 +131,7 @@ pub fn generate(
 
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
     let mut branch_outcomes: Vec<BranchOutcome> = Vec::new();
+    let mut value_pool_outcomes: Vec<ValuePoolOutcome> = Vec::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
@@ -335,6 +363,14 @@ pub fn generate(
         // earlier phase produced.
         apply_derive_rules(&mut rows, table_name, rule, model, column_order)?;
 
+        value_pool_outcomes.extend(check_value_pools(
+            &rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+        ));
+
         // Phase 6 (plan §1): branch coverage repair, restricted to the
         // flippable columns (never FK, referenced, derived or pinned).
         branch_outcomes.extend(apply_branch_repair(
@@ -369,6 +405,7 @@ pub fn generate(
         dialect,
         schemas: table_schemas,
         branches: branch_outcomes,
+        value_pools: value_pool_outcomes,
     })
 }
 
@@ -597,6 +634,74 @@ fn column_value_rng(
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::rngs::StdRng::from_entropy(),
     }
+}
+
+/// Compare each `values` pool's declared weights with the shares actually
+/// generated (#76-C). Purely observational: the caller only warns.
+fn check_value_pools(
+    rows: &[Vec<Value>],
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    column_order: &[String],
+) -> Vec<ValuePoolOutcome> {
+    let mut outcomes = Vec::new();
+    if rows.is_empty() {
+        return outcomes;
+    }
+
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let Some(pool) = rule
+            .columns
+            .get(col_name)
+            .and_then(|column_rule| column_rule.values.as_ref())
+        else {
+            continue;
+        };
+
+        let column_model = model.columns.get(col_name);
+        let declared_raw: Vec<(String, f64)> = match pool {
+            ValuePool::Weighted(weights) => weights
+                .iter()
+                .map(|(value, w)| (value.clone(), *w))
+                .collect(),
+            ValuePool::Uniform(values) => {
+                let share = 1.0 / values.len() as f64;
+                values.iter().map(|value| (value.clone(), share)).collect()
+            }
+        };
+        let total: f64 = declared_raw.iter().map(|(_, weight)| weight).sum();
+        if total <= 0.0 {
+            continue;
+        }
+
+        let row_count = rows.len() as f64;
+        let mut declared = Vec::with_capacity(declared_raw.len());
+        let mut actual = Vec::with_capacity(declared_raw.len());
+        let mut max_deviation = 0.0f64;
+        for (value, weight) in &declared_raw {
+            let share = weight / total;
+            let typed = typed_literal(value, column_model);
+            let hits = rows
+                .iter()
+                .filter(|row| row.get(col_idx) == Some(&typed))
+                .count() as f64;
+            let observed = hits / row_count;
+            max_deviation = max_deviation.max((observed - share).abs());
+            declared.push((value.clone(), share));
+            actual.push((value.clone(), observed));
+        }
+
+        outcomes.push(ValuePoolOutcome {
+            table: table_name.to_string(),
+            column: col_name.clone(),
+            declared,
+            actual,
+            max_deviation,
+        });
+    }
+
+    outcomes
 }
 
 /// Measure every `branches[]` predicate and rewrite rows until each target is
@@ -4705,6 +4810,131 @@ tables:
         assert!(
             err.contains("evaluated"),
             "error must explain the predicate could not run: {err}"
+        );
+    }
+
+    // ─── values 分布校验（#76-C）────────────────────────────────────────
+
+    fn value_pool_rules(weights: &[(&str, f64)]) -> SynthRules {
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "status".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Weighted(
+                    weights
+                        .iter()
+                        .map(|(value, weight)| (value.to_string(), *weight))
+                        .collect(),
+                )),
+                ..Default::default()
+            },
+        );
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        }
+    }
+
+    #[test]
+    fn should_report_value_pool_shares_close_to_the_declared_weights() {
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let rules = value_pool_rules(&[("A", 0.7), ("B", 0.3)]);
+
+        let data = generate(&models, &rules, &config(&["t"], 5000)).unwrap();
+        assert_eq!(data.value_pools.len(), 1, "one pool must be audited");
+        let outcome = &data.value_pools[0];
+        assert_eq!(outcome.column, "status");
+        assert!(
+            outcome.is_within_tolerance(),
+            "a correct pool must not warn: {outcome:?}"
+        );
+        // The two shares must add up to the whole table.
+        let total: f64 = outcome.actual.iter().map(|(_, share)| share).sum();
+        assert!((total - 1.0).abs() < 1e-9, "shares summed to {total}");
+    }
+
+    #[test]
+    fn should_flag_a_value_pool_whose_shares_miss_the_declared_weights() {
+        // Exercises the real checker: the rows below hold a 50/50 split while
+        // the pool declares 70/30, which is what a broken pool would look
+        // like. The sampler cannot produce this by itself, so the audit is
+        // the guard against a regression.
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let model = models.get("t").unwrap();
+        let rules = value_pool_rules(&[("A", 0.7), ("B", 0.3)]);
+        let rows: Vec<Vec<Value>> = (0..10)
+            .map(|index| vec![Value::String(if index < 5 { "A" } else { "B" }.to_string())])
+            .collect();
+
+        let outcomes =
+            check_value_pools(&rows, "t", &rules.tables[0], model, &["status".to_string()]);
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0];
+        assert!(
+            (outcome.max_deviation - 0.2).abs() < 1e-12,
+            "deviation was {}",
+            outcome.max_deviation
+        );
+        assert!(outcome.declared[0].1 > outcome.actual[0].1);
+        assert!(!outcome.is_within_tolerance());
+    }
+
+    #[test]
+    fn should_audit_a_uniform_value_pool_against_equal_shares() {
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "status".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Uniform(vec!["A".to_string(), "B".to_string()])),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+
+        let data = generate(&models, &rules, &config(&["t"], 4000)).unwrap();
+        let outcome = &data.value_pools[0];
+        assert!((outcome.declared[0].1 - 0.5).abs() < 1e-12);
+        assert!(outcome.is_within_tolerance(), "{outcome:?}");
+    }
+
+    #[test]
+    fn should_audit_numeric_value_pools_by_typed_literal() {
+        // A numeric pool key must be matched against the generated number,
+        // not against its string form.
+        let mut models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        models
+            .get_mut("t")
+            .unwrap()
+            .columns
+            .get_mut("amount")
+            .unwrap()
+            .logical_type = LogicalType::Numerical;
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "amount".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Weighted(std::collections::BTreeMap::from([
+                    ("1".to_string(), 0.8),
+                    ("2".to_string(), 0.2),
+                ]))),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 2000)).unwrap();
+        let outcome = &data.value_pools[0];
+        assert_eq!(outcome.column, "amount");
+        assert!(
+            outcome.is_within_tolerance(),
+            "typed numeric pool must match: {outcome:?}"
         );
     }
 

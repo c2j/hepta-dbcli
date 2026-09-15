@@ -720,6 +720,36 @@ pub fn run_generate(
     };
     export(&payload, &export_format, output_dir)?;
 
+    for pool in &data.value_pools {
+        if pool.is_within_tolerance() {
+            continue;
+        }
+        let declared = pool
+            .declared
+            .iter()
+            .map(|(value, share)| format!("{}={:.3}", value, share))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let actual = pool
+            .actual
+            .iter()
+            .map(|(value, share)| format!("{}={:.3}", value, share))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Declared weights are what the sampler draws from, so a deviation
+        // this large means the pool did not take effect (#76-C). Honest
+        // warning, no effect on the exit code.
+        eprintln!(
+            "warning: table '{}' column '{}': generated shares deviate from the declared weights by {:.3} (tolerance {:.2}); declared [{}] actual [{}]",
+            pool.table,
+            pool.column,
+            pool.max_deviation,
+            crate::synth::generator::VALUE_POOL_TOLERANCE,
+            declared,
+            actual
+        );
+    }
+
     for outcome in &data.branches {
         let line = format!(
             "branch '{}': target {:.3}, actual {:.3} ({:?}, {} round(s), {} row(s) rewritten, {} evaluation failure(s))",

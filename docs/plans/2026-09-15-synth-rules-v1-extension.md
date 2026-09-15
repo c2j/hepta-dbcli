@@ -294,7 +294,7 @@ impl Expr {
 
 ### 尚未完成的串行项
 
-1. **#76-C 生成后 WARN**：值池权重与 branch ratio 的实际占比校验并入 `quality.rs` / `report`（目前 branch 命中率已在 `synth generate` 输出中报告，但尚未进入 `synth report` 的打分）。
+1. **把生成期断言并入 `synth report`**：值池/分支的通过情况目前由 `synth generate` 直接报告；`synth report` 的打分仍只覆盖留出集形状、列对趋势与 FK join-rate。issue #76-C 只要求「结构上预留」，故未强制并入。
 2. **#76-B**：其「结构化 `when` + `set`」已被 #70 的 `branches[].predicate + repair.set` 覆盖（谓词是表达式超集），不再单独实现；若要保留 `ratio` 语义，用 `branches[].target_ratio`。
 3. **#76-D**：完全由 #70 的 `derive` 覆盖。
 
@@ -305,6 +305,8 @@ impl Expr {
 | `75dd48b` | MySQL 容器验证 + `mine` 同一性列守卫 |
 | `e5f00ad` | #68 `copula_conditional` 接线 |
 | `c8e45f0` | #70 `derive` 接线（切片 1+2） |
+| `00b25cb` | #70 `branches` 覆盖度量 + 修复循环（切片 3+4） |
+| （本轮） | #76-C 值池分布校验 + `values` 标量键 |
 
 **#70 derive 验收（真实 CLI，MySQL 8.4 训练的 `line_items` 模型，seed 42，2000 行）**
 
@@ -315,6 +317,14 @@ impl Expr {
 | AC2 白名单 | `min(a,b)` / `price.__class__` / 未知列 | 加载期 fail-fast，错误指出违规节点与列名 |
 | 依赖顺序 | `c = b + 1` 先于 `b = price * 2` 声明 | 按依赖求值，结果正确；成环在加载期报错 |
 | AC5 回归 | 不含 `derive` 的 rules | 新增逐字节快照测试锁定 |
+
+**#76-C 值池校验验收（同一容器，`events` 模型）**
+
+| 需求 | 检查 | 观察结果 |
+|---|---|---|
+| 值池实际占比 vs 声明权重 | `values: {9: 0.5, 10: 0.5}`，20 行 | 偏差 0.050 > 0.05 → stderr `warning:`，**退出码仍为 0**，数据照常落盘 |
+| 同上，规模放大 | 同 rules，5000 行 | 实际 0.506 / 0.494，无告警 |
+| 数值键不需要引号 | `values: {9: 0.5, 10: 0.5}` | 解析通过（此前会因键是整数而整份 rules 解析失败） |
 
 **#68 copula_conditional 验收（同一容器，`events` 模型，seed 42，500 行）**
 
