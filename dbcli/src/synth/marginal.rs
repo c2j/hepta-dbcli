@@ -1,4 +1,4 @@
-use crate::synth::model::ColumnModel;
+use crate::synth::model::{ColumnModel, LogicalType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -495,10 +495,18 @@ pub fn compute_gaussian_correlation(
                 match &model.marginal {
                     crate::synth::marginal::Marginal::Normal(p) => {
                         // DECIMAL/NUMBER 常被驱动序列化为字符串，须回退解析
-                        let x = val
-                            .as_f64()
-                            .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-                            .unwrap_or(p.loc);
+                        let numeric = || {
+                            val.as_f64()
+                                .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                                .unwrap_or(p.loc)
+                        };
+                        let x = match model.datetime_format.as_deref() {
+                            Some(fmt) if matches!(model.logical_type, LogicalType::Datetime) => {
+                                crate::synth::datetime::parse_to_epoch(&val, Some(fmt))
+                                    .unwrap_or(p.loc)
+                            }
+                            _ => numeric(),
+                        };
                         let cdf = normal_cdf(x, p.loc, p.scale);
                         // Clamp to avoid ppf at exactly 0 or 1
                         cdf.clamp(1e-12, 1.0 - 1e-12)

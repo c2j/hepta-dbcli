@@ -42,10 +42,7 @@ pub(crate) fn infer_format(samples: &[Value]) -> Option<String> {
         if value.is_null() {
             continue;
         }
-        match value.as_str() {
-            Some(s) => strings.push(s),
-            None => return None,
-        }
+        strings.push(value.as_str()?);
     }
     if strings.is_empty() {
         return None;
@@ -173,9 +170,7 @@ mod tests {
             (naive - epoch - 8.0 * 3600.0).abs() < 1e-6,
             "offset must shift the instant, naive={naive} aware={epoch}"
         );
-        let rfc = DateTime::parse_from_rfc3339(aware)
-            .unwrap()
-            .timestamp() as f64;
+        let rfc = DateTime::parse_from_rfc3339(aware).unwrap().timestamp() as f64;
         assert!((epoch - rfc).abs() < 1e-6);
     }
 
