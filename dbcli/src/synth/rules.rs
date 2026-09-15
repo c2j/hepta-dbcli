@@ -187,6 +187,44 @@ tables: []
         assert!(result.is_err());
     }
 
+    /// Guards the schema extension in
+    /// `docs/plans/2026-09-15-synth-rules-v1-extension.md`: a rules file that
+    /// predates every new field must keep parsing and validating.
+    #[test]
+    fn should_accept_legacy_yaml_without_new_fields() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    rows: 10
+    relationships: []
+  - name: orders
+    columns:
+      user_id:
+        null_rate: 0.0
+      amount:
+        marginal: normal
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        pool_strategy: !projection
+          unique: false
+    strategy: weighted
+"#;
+
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        rules.validate().unwrap();
+
+        assert_eq!(rules.version, "1");
+        assert_eq!(rules.tables[1].columns.len(), 2);
+        assert_eq!(rules.tables[1].columns["user_id"].null_rate, Some(0.0));
+        assert_eq!(
+            rules.tables[1].columns["amount"].marginal.as_deref(),
+            Some("normal")
+        );
+        assert!(matches!(rules.tables[1].strategy, TableStrategy::Weighted));
+    }
+
     #[test]
     fn rules_validate_catches_empty_references() {
         let rules = SynthRules {

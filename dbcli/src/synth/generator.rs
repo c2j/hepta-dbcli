@@ -2114,6 +2114,102 @@ mod tests {
         );
     }
 
+    /// Guards the schema extension in
+    /// `docs/plans/2026-09-15-synth-rules-v1-extension.md`: rules loaded from a
+    /// real YAML file (not a Rust struct) must keep producing byte-identical
+    /// output. Values captured from this test before the schema extension.
+    #[test]
+    fn should_keep_legacy_rules_yaml_output_byte_identical() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    rows: 4
+    relationships: []
+  - name: orders
+    rows: 4
+    columns:
+      user_id:
+        null_rate: 0.25
+      amount:
+        null_rate: 0.0
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        pool_strategy: !projection
+          unique: false
+    strategy: zipf
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rules.yaml");
+        std::fs::write(&path, yaml).expect("write rules");
+        let rules = SynthRules::load(&path).expect("load rules");
+        rules.validate().expect("validate rules");
+
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let mut order_columns = HashMap::new();
+        order_columns.insert(
+            "amount".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                null_rate: None,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 10.0,
+                    scale: 2.0,
+                }),
+                ..Default::default()
+            },
+        );
+        order_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "orders".to_string(),
+            TableModel {
+                version: 1,
+                table: "orders".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns: order_columns,
+                copula: CopulaInfo {
+                    column_order: vec!["amount".to_string(), "user_id".to_string()],
+                    correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                },
+            },
+        );
+
+        let data = generate(&models, &rules, &config(&["users", "orders"], 4)).unwrap();
+        let users = serde_json::to_string(data.tables.get("users").unwrap()).unwrap();
+        let orders = serde_json::to_string(data.tables.get("orders").unwrap()).unwrap();
+        // Captured from this test on the pre-extension generator (seed 42, 4
+        // rows, FK projection pool, rules-driven `null_rate` on the FK column
+        // and `strategy: zipf`). Any schema change that perturbs these numbers
+        // for a legacy rules file must be justified in the PR.
+        assert_eq!(users, "[[2.3076754763602025],[-0.5264344435639146],[-0.48212996526018514],[-0.07395728769978405]]");
+        assert_eq!(orders, "[[8.56627954969241,null],[9.248506620196224,-0.5264344435639146],[8.233932622046893,null],[7.009810102099152,-0.5264344435639146]]");
+    }
+
     fn model_with_null_rate(table: &str, column: &str, null_rate: f64) -> TableModel {
         let mut model = numerical_model(table, column, 0.0, 1.0);
         model.columns.get_mut(column).unwrap().null_rate = Some(null_rate);
