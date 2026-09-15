@@ -119,6 +119,16 @@ impl Marginal {
     }
 }
 
+impl crate::synth::stats::ReferenceCdf for &EcdfParams {
+    fn cdf(&self, x: f64) -> f64 {
+        EcdfParams::cdf(self, x)
+    }
+
+    fn cdf_left(&self, x: f64) -> f64 {
+        EcdfParams::cdf_left(self, x)
+    }
+}
+
 impl crate::synth::stats::ReferenceCdf for &Marginal {
     fn cdf(&self, x: f64) -> f64 {
         Marginal::cdf(self, x)
@@ -868,7 +878,7 @@ pub(crate) fn column_numeric_samples(rows: &[Vec<serde_json::Value>], col_idx: u
 /// Value on the axis the column's marginal is expressed in. Datetime columns
 /// are modelled in epoch seconds, so text samples are converted first;
 /// integer-encoded datetimes (compact `YYYYMMDD`) stay numeric.
-fn numeric_axis_value(val: &serde_json::Value, model: &ColumnModel) -> Option<f64> {
+pub(crate) fn numeric_axis_value(val: &serde_json::Value, model: &ColumnModel) -> Option<f64> {
     if matches!(model.logical_type, LogicalType::Datetime) {
         match model.datetime_format.as_deref() {
             Some(fmt) => crate::synth::datetime::parse_to_epoch(val, Some(fmt)),

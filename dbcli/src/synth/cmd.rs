@@ -82,6 +82,11 @@ pub enum SynthCommand {
         /// Rules YAML supplying per-column overrides (`columns.<name>.marginal`)
         #[arg(long)]
         rules: Option<String>,
+
+        /// Fraction of the sampled rows kept as the report holdout
+        /// (`0` disables the baseline file)
+        #[arg(long, default_value_t = 0.1)]
+        holdout_ratio: f64,
     },
 
     /// Draft a rules YAML from database foreign keys
@@ -153,6 +158,47 @@ pub enum SynthCommand {
         /// Path to the model JSON file
         #[arg(short, long)]
         model: String,
+    },
+
+    /// Score generated data against the holdout baseline recorded by `train`
+    Report {
+        /// Directory holding trained model JSON files
+        #[arg(long, default_value = ".synth")]
+        models: String,
+
+        /// Directory with generated data (`<table>.csv|jsonl|json`); generated
+        /// on the fly when omitted
+        #[arg(long)]
+        data: Option<String>,
+
+        /// Rules YAML; supplies the foreign keys scored in the `fk` section
+        #[arg(long)]
+        rules: Option<String>,
+
+        /// Connection whose real keys back the `fk` section; `--against-db`
+        /// without a value uses the default connection
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        against_db: Option<String>,
+
+        /// Rows per table when generating on the fly (ignored with `--data`)
+        #[arg(long, default_value_t = 1_000)]
+        rows: usize,
+
+        /// Deterministic seed for on-the-fly generation
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Write the report JSON to this path
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Exit non-zero when the overall score falls below this threshold
+        #[arg(long)]
+        min_score: Option<f64>,
+
+        /// Treat a missing report baseline as an error instead of skipping
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 }
 

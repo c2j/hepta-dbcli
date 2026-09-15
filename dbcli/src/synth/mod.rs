@@ -19,6 +19,8 @@ pub mod model;
 #[cfg(feature = "synth")]
 pub mod profile;
 #[cfg(feature = "synth")]
+pub mod quality;
+#[cfg(feature = "synth")]
 pub mod report;
 #[cfg(feature = "synth")]
 pub mod rules;
@@ -61,6 +63,7 @@ pub async fn run(
             sample,
             categorical_top_k,
             rules,
+            holdout_ratio,
         } => {
             run_train(
                 name,
@@ -71,6 +74,7 @@ pub async fn run(
                     sample,
                     categorical_top_k,
                     rules_path: rules.as_deref(),
+                    holdout_ratio,
                 },
                 config_path,
             )
@@ -115,6 +119,33 @@ pub async fn run(
             },
         ),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
+        cmd::SynthCommand::Report {
+            models,
+            data,
+            rules,
+            against_db,
+            rows,
+            seed,
+            output,
+            min_score,
+            strict,
+        } => {
+            run_report(
+                ReportRunOptions {
+                    models,
+                    data,
+                    rules,
+                    against_db,
+                    rows,
+                    seed,
+                    output,
+                    min_score,
+                    strict,
+                },
+                config_path,
+            )
+            .await
+        }
     };
     let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -153,6 +184,22 @@ fn synth_subcommand_detail(command: &cmd::SynthCommand) -> (String, String) {
             format!("models={models}; rules={rules}"),
         ),
         cmd::SynthCommand::Validate { model } => ("validate".to_string(), format!("model={model}")),
+        cmd::SynthCommand::Report {
+            models,
+            data,
+            output,
+            ..
+        } => {
+            let mut detail = format!(
+                "models={}; data={}",
+                models,
+                data.as_deref().unwrap_or("(generated)")
+            );
+            if let Some(output) = output {
+                detail.push_str(&format!("; output={output}"));
+            }
+            ("report".to_string(), detail)
+        }
     }
 }
 
@@ -321,6 +368,7 @@ struct TrainRunOptions<'a> {
     sample: usize,
     categorical_top_k: cmd::CategoricalTopK,
     rules_path: Option<&'a str>,
+    holdout_ratio: f64,
 }
 
 async fn run_train(
@@ -335,6 +383,7 @@ async fn run_train(
         sample,
         categorical_top_k,
         rules_path,
+        holdout_ratio,
     } = options;
     let tables = split_tables(tables);
     if tables.is_empty() {
@@ -469,6 +518,14 @@ async fn run_train(
             }
         }
         profile.save(&profile_path)?;
+        write_report_baseline(
+            table,
+            &model,
+            &profile,
+            &result.rows,
+            output_dir,
+            holdout_ratio,
+        )?;
         let pk_note = if model.pk.is_empty() {
             String::new()
         } else {
@@ -536,7 +593,346 @@ async fn run_rules_draft(
     Ok(())
 }
 
-#[cfg(feature = "synth")]
+/// Record the holdout baseline next to a freshly trained model. A ratio of 0
+/// disables it (and `synth report` then skips the shapes/pairs sections).
+fn write_report_baseline(
+    table: &str,
+    model: &crate::synth::model::TableModel,
+    profile: &crate::synth::profile::TableProfile,
+    rows: &[Vec<serde_json::Value>],
+    output_dir: &Path,
+    ratio: f64,
+) -> Result<(), String> {
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return Ok(());
+    }
+    let col_pos: HashMap<&str, usize> = profile
+        .column_order
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let mut indices = Vec::with_capacity(model.copula.column_order.len());
+    for name in &model.copula.column_order {
+        let Some(&idx) = col_pos.get(name.as_str()) else {
+            return Err(format!(
+                "table '{}': column '{}' is in the model but not in the sampled order",
+                table, name
+            ));
+        };
+        indices.push(idx);
+    }
+    let baseline = crate::synth::quality::build_baseline(table, model, rows, &indices, ratio)?;
+    let path = output_dir.join(format!("{}.report-baseline.json", table));
+    baseline.save(&path)?;
+    println!(
+        "baseline {}: {} holdout rows -> {}",
+        table,
+        baseline.holdout_rows,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Load every `<table>.model.json` in a models directory.
+fn load_models(
+    models_dir: &Path,
+) -> Result<HashMap<String, crate::synth::model::TableModel>, String> {
+    let mut models = HashMap::new();
+    for entry in std::fs::read_dir(models_dir)
+        .map_err(|e| format!("read models dir {}: {}", models_dir.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("read dir entry: {}", e))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(table_name) = file_name.strip_suffix(".model") else {
+            continue;
+        };
+        let model = crate::synth::model::TableModel::load(&path)?;
+        models.insert(table_name.to_string(), model);
+    }
+    Ok(models)
+}
+
+struct ReportRunOptions {
+    models: String,
+    data: Option<String>,
+    rules: Option<String>,
+    against_db: Option<String>,
+    rows: usize,
+    seed: Option<u64>,
+    output: Option<String>,
+    min_score: Option<f64>,
+    strict: bool,
+}
+
+async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> Result<(), String> {
+    use crate::synth::quality::{
+        evaluate_fk, evaluate_table, fk_relations, read_generated_table, BaselineSummary, FkRate,
+        QualityReport, Section, REPORT_SCHEMA_VERSION,
+    };
+
+    let models_dir = Path::new(&options.models);
+    let models = load_models(models_dir)?;
+    if models.is_empty() {
+        return Err(format!(
+            "no trained models found in {} (expected <table>.model.json)",
+            models_dir.display()
+        ));
+    }
+
+    let mut baselines: HashMap<String, BaselineSummary> = HashMap::new();
+    let mut missing: Vec<String> = Vec::new();
+    for table in models.keys() {
+        let path = models_dir.join(format!("{}.report-baseline.json", table));
+        if path.is_file() {
+            baselines.insert(table.clone(), BaselineSummary::load(&path)?);
+        } else {
+            missing.push(table.clone());
+        }
+    }
+    if options.strict && !missing.is_empty() {
+        return Err(format!(
+            "--strict: no report baseline for {:?} (retrain with --holdout-ratio > 0)",
+            missing
+        ));
+    }
+    for table in &missing {
+        eprintln!(
+            "warning: table '{}': no report baseline; shapes and pairs will be skipped",
+            table
+        );
+    }
+
+    let rules = match options.rules.as_deref() {
+        Some(path) => {
+            let rules = crate::synth::rules::SynthRules::load(Path::new(path))?;
+            rules.validate()?;
+            Some(rules)
+        }
+        None => None,
+    };
+
+    let mut table_columns: crate::synth::quality::GeneratedColumns = HashMap::new();
+    let mut table_rows: crate::synth::quality::GeneratedTables = HashMap::new();
+    match options.data.as_deref() {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            for table in models.keys() {
+                match read_generated_table(dir, table)? {
+                    Some((columns, rows)) => {
+                        table_columns.insert(table.clone(), columns);
+                        table_rows.insert(table.clone(), rows);
+                    }
+                    None => eprintln!(
+                        "warning: no generated data for table '{}' in {}",
+                        table,
+                        dir.display()
+                    ),
+                }
+            }
+        }
+        None => {
+            let generated_rules = match &rules {
+                Some(rules) => rules.clone(),
+                None => rules_from_models(&models, options.rows),
+            };
+            let rows_per_table = models.keys().map(|t| (t.clone(), options.rows)).collect();
+            let data = crate::synth::generator::generate(
+                &models,
+                &generated_rules,
+                &crate::synth::generator::GeneratorConfig {
+                    rows_per_table,
+                    seed: options.seed,
+                    enforce_min_max_values: true,
+                },
+            )?;
+            for (table, columns) in &data.columns {
+                if data.tables.contains_key(table) {
+                    table_columns.insert(table.clone(), columns.clone());
+                }
+            }
+            table_rows = data.tables;
+        }
+    }
+
+    let relations = rules.as_ref().map(fk_relations).unwrap_or_default();
+    let (parent_pools, fk_source) = match options.against_db.as_deref() {
+        Some(connection) => {
+            // A bare `--against-db` (empty value) means the default connection.
+            let name = (!connection.is_empty()).then(|| connection.to_string());
+            (
+                load_real_key_pools(&relations, &name, config_path).await?,
+                "database",
+            )
+        }
+        None => (model_key_pools(&relations, &models), "model"),
+    };
+    let fk: Section<Vec<FkRate>> = evaluate_fk(
+        &relations,
+        &table_columns,
+        &table_rows,
+        &parent_pools,
+        fk_source,
+    );
+
+    let mut table_names: Vec<&String> = table_rows.keys().collect();
+    table_names.sort();
+    let mut tables = Vec::new();
+    for table in table_names {
+        let Some(model) = models.get(table) else {
+            continue;
+        };
+        let columns = table_columns.get(table).cloned().unwrap_or_default();
+        let table_fk = crate::synth::quality::fk_section_for_table(&fk, table);
+        tables.push(evaluate_table(
+            table,
+            model,
+            baselines.get(table),
+            &columns,
+            &table_rows[table],
+            table_fk,
+        ));
+    }
+    let overall_score = crate::synth::quality::mean_of(tables.iter().map(|t| t.score));
+    let report = QualityReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        tables,
+        overall_score,
+    };
+
+    println!("{}", report.summary());
+    if let Some(path) = options.output.as_deref() {
+        report.save(Path::new(path))?;
+        println!("report written to {}", path);
+    }
+    if let Some(min_score) = options.min_score {
+        let score = overall_score.ok_or_else(|| {
+            format!(
+                "--min-score {} cannot be checked: no section was scored",
+                min_score
+            )
+        })?;
+        if score < min_score {
+            return Err(format!(
+                "quality score {:.3} is below --min-score {:.3}",
+                score, min_score
+            ));
+        }
+        println!("quality score {:.3} >= --min-score {:.3}", score, min_score);
+    }
+    Ok(())
+}
+
+/// Rules used for on-the-fly generation: every model becomes a table with the
+/// requested row count and no relationships (FKs come from `--rules`).
+fn rules_from_models(
+    models: &HashMap<String, crate::synth::model::TableModel>,
+    rows: usize,
+) -> crate::synth::rules::SynthRules {
+    let mut names: Vec<&String> = models.keys().collect();
+    names.sort();
+    crate::synth::rules::SynthRules {
+        version: "1".to_string(),
+        tables: names
+            .into_iter()
+            .map(|name| crate::synth::rules::TableRule {
+                name: name.clone(),
+                rows: Some(rows),
+                columns: HashMap::new(),
+                relationships: vec![],
+                strategy: crate::synth::rules::TableStrategy::Uniform,
+            })
+            .collect(),
+    }
+}
+
+/// Parent key pools taken from the trained parent models (value dictionaries).
+fn model_key_pools(
+    relations: &[crate::synth::quality::FkRelation],
+    models: &HashMap<String, crate::synth::model::TableModel>,
+) -> crate::synth::quality::ParentKeyPools {
+    let mut pools = HashMap::new();
+    for relation in relations {
+        let Some(model) = models.get(&relation.parent_table) else {
+            continue;
+        };
+        if let Some(pool) = crate::synth::quality::model_key_pool(model, &relation.parent_column) {
+            pools.insert(
+                (
+                    relation.parent_table.clone(),
+                    relation.parent_column.clone(),
+                ),
+                pool,
+            );
+        }
+    }
+    pools
+}
+
+/// Parent key pools read from the live database (`select distinct`).
+async fn load_real_key_pools(
+    relations: &[crate::synth::quality::FkRelation],
+    connection: &Option<String>,
+    config_path: Option<String>,
+) -> Result<crate::synth::quality::ParentKeyPools, String> {
+    let mut wanted: Vec<(String, String)> = relations
+        .iter()
+        .map(|r| (r.parent_table.clone(), r.parent_column.clone()))
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+
+    let mut pools = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(pools);
+    }
+
+    let raw =
+        crate::config::read_config(config_path.map(PathBuf::from)).map_err(|e| e.to_string())?;
+    let side = resolve_connection(&raw, connection)?;
+    let mut conn = connect(&side).await?;
+    let schema = resolved_side_schema(None, &mut *conn, &side.connection_url, &side.name).await?;
+
+    for (table, column) in wanted {
+        let sql = {
+            let dialect = conn.dialect();
+            let query = format!(
+                "SELECT DISTINCT {} FROM {}",
+                dialect.quote_ident(&column),
+                dialect.quote_table(Some(&schema), &table)
+            );
+            dialect.add_limit(&query, KEY_POOL_LIMIT)
+        };
+        let result = conn
+            .query(&sql)
+            .await
+            .map_err(|e| format!("read key pool {}.{}: {}", table, column, e))?;
+        let values = result
+            .rows
+            .iter()
+            .filter_map(|row| row.first())
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .collect();
+        pools.insert((table, column), values);
+    }
+    Ok(pools)
+}
+
+/// Upper bound on keys pulled from the database for a join-rate check.
+const KEY_POOL_LIMIT: usize = 100_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +996,7 @@ mod tests {
                 sample: 1000,
                 categorical_top_k: cmd::CategoricalTopK::Limit(50),
                 rules: None,
+                holdout_ratio: 0.1,
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );
@@ -680,5 +1077,402 @@ mod tests {
     fn synth_error_outcome_marks_decision_error() {
         let e = synth_outcome_event("train", "tables=users", AuditOutcome::error(3, "synth"));
         assert_eq!(e.decision, Decision::Error);
+    }
+
+    // ─── report CLI (#67) ────────────────────────────────────────────────
+
+    fn report_fixture_model() -> crate::synth::model::TableModel {
+        use crate::synth::marginal::{CategoricalParams, NormalParams};
+        use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
+        let numeric = ColumnModel {
+            logical_type: LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            decimal_scale: None,
+            datetime_format: None,
+            min: None,
+            max: None,
+            null_rate: None,
+            marginal: crate::synth::marginal::Marginal::Normal(NormalParams {
+                loc: 50.0,
+                scale: 10.0,
+            }),
+        };
+        let categorical = ColumnModel {
+            logical_type: LogicalType::Categorical,
+            rounding: None,
+            datetime_epoch: None,
+            decimal_scale: None,
+            datetime_format: None,
+            min: None,
+            max: None,
+            null_rate: None,
+            marginal: crate::synth::marginal::Marginal::Categorical(CategoricalParams {
+                values: vec!["a".to_string(), "b".to_string()],
+                weights: vec![0.5, 0.5],
+            }),
+        };
+        TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: HashMap::from([
+                ("amount".to_string(), numeric),
+                ("kind".to_string(), categorical),
+            ]),
+            copula: CopulaInfo {
+                column_order: vec!["amount".to_string(), "kind".to_string()],
+                correlation: vec![],
+            },
+        }
+    }
+
+    /// Build a models dir with a model plus a baseline built from `rows`.
+    fn report_fixture_dir(
+        name: &str,
+        rows: &[Vec<serde_json::Value>],
+        with_baseline: bool,
+    ) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("synth-report-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = report_fixture_model();
+        model.save(&dir.join("t.model.json")).unwrap();
+        if with_baseline {
+            let baseline = crate::synth::quality::build_baseline(
+                "t",
+                &model,
+                rows,
+                &[0, 1],
+                crate::synth::quality::DEFAULT_HOLDOUT_RATIO,
+            )
+            .unwrap();
+            baseline.save(&dir.join("t.report-baseline.json")).unwrap();
+        }
+        dir
+    }
+
+    fn report_rows(
+        sample: usize,
+        kind_of: impl Fn(usize) -> &'static str,
+    ) -> Vec<Vec<serde_json::Value>> {
+        (0..sample)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i as f64),
+                    serde_json::Value::from(kind_of(i)),
+                ]
+            })
+            .collect()
+    }
+
+    fn write_generated_jsonl(dir: &Path, rows: &[Vec<serde_json::Value>]) {
+        let body: String = rows
+            .iter()
+            .map(|row| serde_json::json!({"amount": row[0], "kind": row[1]}).to_string())
+            .map(|line| line + "\n")
+            .collect();
+        std::fs::write(dir.join("t.jsonl"), body).unwrap();
+    }
+
+    fn report_options(
+        models_dir: &Path,
+        data_dir: &Path,
+        output: Option<PathBuf>,
+    ) -> ReportRunOptions {
+        ReportRunOptions {
+            models: models_dir.to_string_lossy().to_string(),
+            data: Some(data_dir.to_string_lossy().to_string()),
+            rules: None,
+            against_db: None,
+            rows: 100,
+            seed: Some(1),
+            output: output.map(|p| p.to_string_lossy().to_string()),
+            min_score: None,
+            strict: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn report_scores_generated_data_against_the_baseline() {
+        // Period-3 values: the 1-in-10 holdout still sees every level.
+        let training = report_rows(1000, |i| ["a", "b", "c"][i % 3]);
+        let models_dir = report_fixture_dir("scored", &training, true);
+
+        let data_dir = std::env::temp_dir().join("synth-report-scored-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_generated_jsonl(&data_dir, &report_rows(1000, |i| ["a", "b", "c"][i % 3]));
+        let output = std::env::temp_dir().join("synth-report-scored.json");
+
+        run_report(
+            report_options(&models_dir, &data_dir, Some(output.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let report: crate::synth::quality::QualityReport =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        // Same inputs, same report bytes.
+        let second = std::env::temp_dir().join("synth-report-scored-2.json");
+        run_report(
+            report_options(&models_dir, &data_dir, Some(second.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            std::fs::read_to_string(&second).unwrap()
+        );
+        std::fs::remove_file(&second).ok();
+
+        assert_eq!(report.tables.len(), 1);
+        let crate::synth::quality::Section::Scored { items, .. } = &report.tables[0].shapes else {
+            panic!("expected scored shapes");
+        };
+        assert_eq!(items.len(), 2);
+        for item in items {
+            // The categorical score carries the TV noise floor of a ~100-row
+            // holdout against 1000 generated rows (~0.1), so it cannot reach
+            // the numeric column's 0.95.
+            let floor = if item.metric == "1-ks" { 0.9 } else { 0.85 };
+            assert!(item.score > floor, "{item:?}");
+        }
+        // No rules: the fk section is honestly skipped.
+        assert!(matches!(
+            report.tables[0].fk,
+            crate::synth::quality::Section::Skipped { .. }
+        ));
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    #[tokio::test]
+    async fn report_skips_shapes_without_a_baseline() {
+        let training = report_rows(500, |i| ["a", "b", "c"][i % 3]);
+        let models_dir = report_fixture_dir("nobaseline", &training, false);
+        let data_dir = std::env::temp_dir().join("synth-report-nobaseline-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        write_generated_jsonl(&data_dir, &report_rows(100, |i| ["a", "b", "c"][i % 3]));
+
+        // Exit code stays 0: a missing baseline is a skip, not an error.
+        run_report(report_options(&models_dir, &data_dir, None), None)
+            .await
+            .unwrap();
+
+        // ... unless --strict is requested.
+        let mut options = report_options(&models_dir, &data_dir, None);
+        options.strict = true;
+        let err = run_report(options, None).await.unwrap_err();
+        assert!(err.contains("--strict"), "{err}");
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn report_min_score_rejects_degraded_data() {
+        let training = report_rows(2000, |i| ["a", "b", "c"][i % 3]);
+        let models_dir = report_fixture_dir("degraded", &training, true);
+        let data_dir = std::env::temp_dir().join("synth-report-degraded-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let degraded: Vec<Vec<serde_json::Value>> = report_rows(2000, |i| ["a", "b", "c"][i % 3])
+            .into_iter()
+            .map(|mut row| {
+                row[0] = serde_json::Value::from(row[0].as_f64().unwrap() + 10_000.0);
+                row
+            })
+            .collect();
+        write_generated_jsonl(&data_dir, &degraded);
+
+        let mut options = report_options(&models_dir, &data_dir, None);
+        options.min_score = Some(0.9);
+        let err = run_report(options, None).await.unwrap_err();
+        assert!(err.contains("below --min-score"), "{err}");
+
+        // Without the gate the same data reports the low score instead.
+        run_report(report_options(&models_dir, &data_dir, None), None)
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn train_writes_a_holdout_baseline_next_to_the_model() {
+        let rows: Vec<Vec<serde_json::Value>> = (0..400)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i as f64),
+                    serde_json::Value::from(["a", "b", "c"][i % 3]),
+                ]
+            })
+            .collect();
+        let names = ["amount", "kind"];
+        let types = HashMap::from([
+            ("amount".to_string(), "double".to_string()),
+            ("kind".to_string(), "varchar".to_string()),
+        ]);
+        let profile = crate::synth::profile::TableProfile::from_rows_typed(
+            "t",
+            &names.map(str::to_string),
+            &rows,
+            Some(&types),
+            Some(crate::synth::profile::TOP_VALUES_CAP),
+        );
+        let (model, skipped) =
+            cmd::build_model_with_overrides("t", "mysql", &profile, &rows, vec![], None, None)
+                .unwrap();
+        assert!(skipped.is_empty());
+
+        let dir = std::env::temp_dir().join("synth-train-baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_report_baseline("t", &model, &profile, &rows, &dir, 0.2).unwrap();
+        let path = dir.join("t.report-baseline.json");
+        let baseline = crate::synth::quality::BaselineSummary::load(&path).unwrap();
+        // Hash selection is binomial around 20% of 400 rows.
+        assert!(
+            (50..=110).contains(&baseline.holdout_rows),
+            "{}",
+            baseline.holdout_rows
+        );
+        assert!(baseline.columns.contains_key("amount"));
+        assert!(baseline.columns.contains_key("kind"));
+
+        // Ratio 0 disables the baseline instead of writing an empty one.
+        std::fs::remove_file(&path).unwrap();
+        write_report_baseline("t", &model, &profile, &rows, &dir, 0.0).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn categorical_model(
+        table: &str,
+        columns: &[(&str, &[&str])],
+    ) -> crate::synth::model::TableModel {
+        use crate::synth::marginal::{CategoricalParams, Marginal};
+        use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance, TableModel};
+        let map: HashMap<String, ColumnModel> = columns
+            .iter()
+            .map(|(name, values)| {
+                (
+                    name.to_string(),
+                    ColumnModel {
+                        logical_type: LogicalType::Categorical,
+                        rounding: None,
+                        datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
+                        min: None,
+                        max: None,
+                        null_rate: None,
+                        marginal: Marginal::Categorical(CategoricalParams {
+                            values: values.iter().map(|v| v.to_string()).collect(),
+                            weights: vec![1.0 / values.len() as f64; values.len()],
+                        }),
+                    },
+                )
+            })
+            .collect();
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: map,
+            copula: CopulaInfo {
+                column_order: columns.iter().map(|(n, _)| n.to_string()).collect(),
+                correlation: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn report_scores_foreign_keys_from_the_rules_file() {
+        let root = std::env::temp_dir().join("synth-report-fk");
+        let models_dir = root.join("models");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        categorical_model("users", &[("id", &["1", "2", "3"])])
+            .save(&models_dir.join("users.model.json"))
+            .unwrap();
+        categorical_model("orders", &[("user_id", &["1", "2", "9"])])
+            .save(&models_dir.join("orders.model.json"))
+            .unwrap();
+        std::fs::write(
+            data_dir.join("users.jsonl"),
+            "{\"id\":\"1\"}\n{\"id\":\"2\"}\n{\"id\":\"3\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("orders.jsonl"),
+            "{\"user_id\":\"1\"}\n{\"user_id\":\"2\"}\n{\"user_id\":\"9\"}\n",
+        )
+        .unwrap();
+        let rules_path = root.join("rules.yaml");
+        std::fs::write(
+            &rules_path,
+            "version: \"1\"\ntables:\n  - name: users\n    relationships: []\n  - name: orders\n    relationships:\n      - pk: user_id\n        references: [users.id]\n",
+        )
+        .unwrap();
+        let output = root.join("report.json");
+
+        let mut options = report_options(&models_dir, &data_dir, Some(output.clone()));
+        options.rules = Some(rules_path.to_string_lossy().to_string());
+        run_report(options, None).await.unwrap();
+
+        let report: crate::synth::quality::QualityReport =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        let orders = report
+            .tables
+            .iter()
+            .find(|t| t.table == "orders")
+            .expect("orders table");
+        let crate::synth::quality::Section::Scored { items, .. } = &orders.fk else {
+            panic!(
+                "expected a scored fk section on the child table, got {:?}",
+                orders.fk
+            );
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].parent_table, "users");
+        assert_eq!(items[0].hits, 2);
+        assert_eq!(items[0].keys, 3);
+        assert!(items[0].warn, "2/3 is below the 0.99 threshold");
+        assert_eq!(items[0].source, "model");
+
+        // The parent table owns no FK edge and is skipped rather than shown
+        // with the child's numbers.
+        let users = report
+            .tables
+            .iter()
+            .find(|t| t.table == "users")
+            .expect("users table");
+        assert!(matches!(
+            users.fk,
+            crate::synth::quality::Section::Skipped { .. }
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
