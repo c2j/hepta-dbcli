@@ -57,6 +57,7 @@ pub async fn run(
             schema,
             output,
             sample,
+            categorical_top_k,
         } => {
             run_train(
                 name,
@@ -64,6 +65,7 @@ pub async fn run(
                 schema.as_deref(),
                 Path::new(&output),
                 sample,
+                categorical_top_k,
                 config_path,
             )
             .await
@@ -93,6 +95,7 @@ pub async fn run(
             seed,
             format,
             enforce_min_max_values,
+            no_schema_qualifier,
         } => cmd::run_generate(
             &models,
             &rules,
@@ -100,7 +103,10 @@ pub async fn run(
             rows,
             seed,
             &format,
-            enforce_min_max_values,
+            cmd::GenerateFlags {
+                enforce_min_max_values,
+                no_schema_qualifier,
+            },
         ),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
     };
@@ -258,13 +264,49 @@ fn split_tables(tables: &str) -> Vec<String> {
         .collect()
 }
 
+/// Shared `--schema` resolution for train and rules-draft: an explicit
+/// non-empty value wins, otherwise the connection default schema.
+fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String {
+    match explicit {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => connection_default,
+    }
+}
+
+async fn resolved_side_schema(
+    explicit: Option<&str>,
+    conn: &mut (dyn crate::backend::DbConn + Send),
+    url: &str,
+    name: &str,
+) -> Result<String, String> {
+    if explicit.map(|s| !s.is_empty()).unwrap_or(false) {
+        Ok(resolve_schema(explicit, String::new()))
+    } else {
+        Ok(resolve_schema(
+            explicit,
+            crate::delta_diff::side_schema_from_conn(conn, url, name).await?,
+        ))
+    }
+}
+
 #[cfg(feature = "synth")]
+const FULL_MODEL_SIZE_WARN_BYTES: u64 = 10 * 1024 * 1024;
+const ORACLE_DRIVER_PREFETCH_CAP: usize = 100;
+
+/// Pure-Rust Oracle driver silently stops at 100 prefetched rows. A sample
+/// that lands exactly on that cap is treated as truncated so train can warn
+/// and record `provenance.truncated`.
+fn sample_may_be_truncated(scheme: &str, row_count: usize) -> bool {
+    scheme.eq_ignore_ascii_case("oracle") && row_count == ORACLE_DRIVER_PREFETCH_CAP
+}
+
 async fn run_train(
     name: Option<String>,
     tables: &str,
     schema: Option<&str>,
     output_dir: &Path,
     sample: usize,
+    categorical_top_k: cmd::CategoricalTopK,
     config_path: Option<String>,
 ) -> Result<(), String> {
     let tables = split_tables(tables);
@@ -284,13 +326,7 @@ async fn run_train(
         .map(|i| side.connection_url[..i].to_string())
         .unwrap_or_else(|| "mysql".to_string());
 
-    let schema = match schema {
-        Some(s) => s.to_string(),
-        None => {
-            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
-                .await?
-        }
-    };
+    let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
 
     for table in &tables {
         let (col_sql, idx_sql, sample_sql) = {
@@ -329,18 +365,45 @@ async fn run_train(
             &result.columns,
             &result.rows,
             Some(&data_types),
+            categorical_top_k.cap(),
         );
-        let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows, pk)?;
+        let (mut model, skipped) = cmd::build_model(
+            table,
+            &scheme,
+            &profile,
+            &result.rows,
+            pk,
+            Some(schema.clone()),
+        )?;
         for col in &skipped {
             eprintln!(
                 "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",
                 table, col
             );
         }
+        if sample_may_be_truncated(&scheme, result.row_count) {
+            eprintln!(
+                "warning: Oracle driver truncated the sample of table '{}' at {} rows; \
+                 fitted distributions may be distorted",
+                table, ORACLE_DRIVER_PREFETCH_CAP
+            );
+            model.provenance.truncated = true;
+        }
 
         let model_path = output_dir.join(format!("{}.model.json", table));
         let profile_path = output_dir.join(format!("{}.profile.json", table));
         model.save(&model_path)?;
+        if categorical_top_k == cmd::CategoricalTopK::Full {
+            if let Ok(meta) = std::fs::metadata(&model_path) {
+                if meta.len() > FULL_MODEL_SIZE_WARN_BYTES {
+                    eprintln!(
+                        "warning: {} is {:.1} MiB; --categorical-top-k full stored every dictionary level and the file exceeds 10 MiB",
+                        model_path.display(),
+                        meta.len() as f64 / (1024.0 * 1024.0)
+                    );
+                }
+            }
+        }
         profile.save(&profile_path)?;
         let pk_note = if model.pk.is_empty() {
             String::new()
@@ -379,15 +442,14 @@ async fn run_rules_draft(
     let side = resolve_connection(&raw, &name)?;
     let mut conn = connect(&side).await?;
 
-    // 与 train 的 --schema 语义一致：显式指定优先，否则取连接默认 schema，
-    // 保证 FK 发现与训练看到同一张表
-    let schema = match schema {
-        Some(s) => s,
-        None => {
-            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
-                .await?
-        }
-    };
+    // train 与 rules-draft 共用 resolve_schema：显式 --schema 优先，否则连接默认。
+    let schema = resolved_side_schema(
+        schema.as_deref(),
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+    )
+    .await?;
 
     let fk_sql = conn.dialect().foreign_keys_sql(&schema);
     let result = conn
@@ -416,6 +478,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_resolve_schema_from_connection_default_when_unspecified() {
+        assert_eq!(resolve_schema(None, "public".to_string()), "public");
+        assert_eq!(resolve_schema(Some(""), "public".to_string()), "public");
+        assert_eq!(resolve_schema(Some("other"), "public".to_string()), "other");
+    }
+
+    #[test]
+    fn should_flag_oracle_sample_at_driver_cap() {
+        assert!(sample_may_be_truncated("oracle", 100));
+        assert!(sample_may_be_truncated("Oracle", 100));
+    }
+
+    #[test]
+    fn should_not_flag_oracle_sample_below_cap() {
+        assert!(!sample_may_be_truncated("oracle", 99));
+        assert!(!sample_may_be_truncated("oracle", 101));
+        assert!(!sample_may_be_truncated("oracle", 0));
+    }
+
+    #[test]
+    fn should_not_flag_non_oracle_sample_of_100() {
+        assert!(!sample_may_be_truncated("mysql", 100));
+        assert!(!sample_may_be_truncated("gaussdb", 100));
+        assert!(!sample_may_be_truncated("duckdb", 100));
+    }
+
+    #[test]
     fn split_tables_trims_and_skips_empty() {
         assert_eq!(
             split_tables(" a , b,,  c "),
@@ -434,6 +523,7 @@ mod tests {
                 schema: None,
                 output: ".synth".to_string(),
                 sample: 1000,
+                categorical_top_k: cmd::CategoricalTopK::Limit(50),
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );
@@ -459,6 +549,7 @@ mod tests {
                 seed: None,
                 format: "csv".to_string(),
                 enforce_min_max_values: true,
+                no_schema_qualifier: false,
             }),
             ("generate".to_string(), "models=m; rules=r.yaml".to_string())
         );

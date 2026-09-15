@@ -11,6 +11,37 @@ use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Cap on categorical `top_values` kept while training. `full` stores every
+/// observed level; the default of 50 matches the historical hard cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoricalTopK {
+    Limit(usize),
+    Full,
+}
+
+impl CategoricalTopK {
+    pub fn cap(self) -> Option<usize> {
+        match self {
+            Self::Limit(n) => Some(n),
+            Self::Full => None,
+        }
+    }
+}
+
+fn parse_categorical_top_k(s: &str) -> Result<CategoricalTopK, String> {
+    if s.eq_ignore_ascii_case("full") {
+        return Ok(CategoricalTopK::Full);
+    }
+    let n: usize = s.parse().map_err(|_| {
+        format!("invalid --categorical-top-k '{s}': expected a positive integer or 'full'")
+    })?;
+    if n == 0 {
+        Err("--categorical-top-k must be a positive integer or 'full'".to_string())
+    } else {
+        Ok(CategoricalTopK::Limit(n))
+    }
+}
+
 // ─── CLI 参数 ───────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -42,6 +73,10 @@ pub enum SynthCommand {
         /// Max rows sampled per table
         #[arg(long, default_value_t = 10_000)]
         sample: usize,
+
+        /// Categorical top_values cap (`N` or `full`; default 50)
+        #[arg(long, default_value = "50", value_parser = parse_categorical_top_k)]
+        categorical_top_k: CategoricalTopK,
     },
 
     /// Draft a rules YAML from database foreign keys
@@ -102,6 +137,10 @@ pub enum SynthCommand {
             default_value_t = true
         )]
         enforce_min_max_values: bool,
+
+        /// Omit schema qualifiers from SQL export (legacy `INSERT INTO t`)
+        #[arg(long, default_value_t = false)]
+        no_schema_qualifier: bool,
     },
 
     /// Validate a trained model file
@@ -120,6 +159,7 @@ pub(crate) fn build_model(
     profile: &TableProfile,
     rows: &[Vec<serde_json::Value>],
     pk: Vec<String>,
+    schema: Option<String>,
 ) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
@@ -226,7 +266,7 @@ pub(crate) fn build_model(
         version: 1,
         table: table.to_string(),
         dialect: dialect.to_string(),
-        schema: None,
+        schema,
         provenance: Provenance {
             source: "native".to_string(),
             converter_version: None,
@@ -382,6 +422,11 @@ pub(crate) fn load_profiles(dir: &Path) -> Result<HashMap<String, TableProfile>,
 
 // ─── 本地命令（无 DB）──────────────────────────────────────────────────
 
+pub struct GenerateFlags {
+    pub enforce_min_max_values: bool,
+    pub no_schema_qualifier: bool,
+}
+
 pub fn run_generate(
     models_dir: &str,
     rules_path: &str,
@@ -389,7 +434,7 @@ pub fn run_generate(
     rows_per_table: Option<usize>,
     seed: Option<u64>,
     format: &str,
-    enforce_min_max_values: bool,
+    flags: GenerateFlags,
 ) -> Result<(), String> {
     let models_dir = Path::new(models_dir);
     let rules_path = Path::new(rules_path);
@@ -418,7 +463,7 @@ pub fn run_generate(
     let config = GeneratorConfig {
         rows_per_table: rows_map,
         seed,
-        enforce_min_max_values,
+        enforce_min_max_values: flags.enforce_min_max_values,
     };
 
     let data = generate(&models, &rules, &config)?;
@@ -431,10 +476,16 @@ pub fn run_generate(
         other => return Err(format!("unsupported format: {}", other)),
     };
 
+    let schemas = if flags.no_schema_qualifier {
+        HashMap::new()
+    } else {
+        data.schemas.clone()
+    };
     let payload = crate::synth::export::ExportPayload {
         tables: &data.tables,
         columns: &data.columns,
         dialect: &data.dialect,
+        schemas,
     };
     export(&payload, &export_format, output_dir)?;
 
@@ -532,14 +583,143 @@ mod tests {
                 tables,
                 output,
                 sample,
+                categorical_top_k,
                 ..
             } => {
                 assert_eq!(tables, "users,orders");
                 assert_eq!(output, ".synth");
                 assert_eq!(sample, 10_000);
+                assert_eq!(categorical_top_k, CategoricalTopK::Limit(50));
             }
             other => panic!("expected Train, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_keep_default_top_k_behaviour() {
+        let cmd = parse(&["synth", "train", "--tables", "t"]);
+        match cmd {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => {
+                assert_eq!(categorical_top_k, CategoricalTopK::Limit(50));
+                assert_eq!(categorical_top_k.cap(), Some(50));
+            }
+            other => panic!("expected Train, got {:?}", other),
+        }
+
+        let full = parse(&[
+            "synth",
+            "train",
+            "--tables",
+            "t",
+            "--categorical-top-k",
+            "full",
+        ]);
+        match full {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => {
+                assert_eq!(categorical_top_k, CategoricalTopK::Full);
+                assert_eq!(categorical_top_k.cap(), None);
+            }
+            other => panic!("expected Train, got {:?}", other),
+        }
+
+        let capped = parse(&[
+            "synth",
+            "train",
+            "--tables",
+            "t",
+            "--categorical-top-k",
+            "12",
+        ]);
+        match capped {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => assert_eq!(categorical_top_k, CategoricalTopK::Limit(12)),
+            other => panic!("expected Train, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn should_cover_all_dictionary_levels_with_full_top_k() {
+        const LEVELS: usize = 500;
+        const GEN_ROWS: usize = 10_000;
+        let samples: Vec<Value> = (0..LEVELS)
+            .flat_map(|i| std::iter::repeat_n(Value::from(format!("L{i:03}")), 20))
+            .collect();
+        let col = crate::synth::profile::ColumnProfile::from_samples_typed(&samples, None, None);
+        let top = col.top_values.as_ref().expect("top_values");
+        assert_eq!(top.len(), LEVELS);
+
+        let mut columns = HashMap::new();
+        columns.insert("code".to_string(), col);
+        let profile = TableProfile {
+            table: "dict".to_string(),
+            row_count: samples.len(),
+            column_order: vec!["code".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("dict", "mysql", &profile, &[], vec![], None).unwrap();
+        assert!(skipped.is_empty());
+
+        let mut models = HashMap::new();
+        models.insert("dict".to_string(), model);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![crate::synth::rules::TableRule {
+                name: "dict".to_string(),
+                columns: HashMap::new(),
+                rows: Some(GEN_ROWS),
+                relationships: vec![],
+                strategy: crate::synth::rules::TableStrategy::default(),
+            }],
+        };
+        let data = generate(
+            &models,
+            &rules,
+            &GeneratorConfig {
+                rows_per_table: HashMap::from([("dict".to_string(), GEN_ROWS)]),
+                seed: Some(42),
+                enforce_min_max_values: true,
+            },
+        )
+        .unwrap();
+        let rows = data.tables.get("dict").expect("dict rows");
+        assert_eq!(rows.len(), GEN_ROWS);
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let key = row[0].as_str().expect("categorical value").to_string();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        assert!(
+            counts.len() >= 495,
+            "full top-k should cover ≥495 of 500 levels, got {}",
+            counts.len()
+        );
+
+        let n = GEN_ROWS as f64;
+        let p = 1.0 / LEVELS as f64;
+        let mut tv = 0.0;
+        for i in 0..LEVELS {
+            let key = format!("L{i:03}");
+            let q = *counts.get(&key).unwrap_or(&0) as f64 / n;
+            assert!(
+                (q - p).abs() < 0.05,
+                "level {key}: generated share {q} vs train {p}"
+            );
+            tv += (p - q).abs();
+        }
+        tv /= 2.0;
+        // Multinomial E[TV] ≈ 0.09 for 500 levels / 10k rows, so the sharp
+        // 0.05 overall bound is not stable; a 50-cap model still lands near
+        // TV 0.9 and fails both coverage and this 0.15 ceiling.
+        assert!(
+            tv < 0.15,
+            "TV distance {tv} should stay well below a 50-cap model (~0.9)"
+        );
     }
 
     #[test]
@@ -554,6 +734,7 @@ mod tests {
                 rows,
                 seed,
                 format,
+                no_schema_qualifier,
                 ..
             } => {
                 assert_eq!(models, "m");
@@ -561,7 +742,23 @@ mod tests {
                 assert_eq!(rows, Some(42));
                 assert_eq!(seed, Some(7));
                 assert_eq!(format, "sql");
+                assert!(!no_schema_qualifier);
             }
+            other => panic!("expected Generate, got {:?}", other),
+        }
+
+        let flagged = parse(&[
+            "synth",
+            "generate",
+            "--format",
+            "sql",
+            "--no-schema-qualifier",
+        ]);
+        match flagged {
+            SynthCommand::Generate {
+                no_schema_qualifier,
+                ..
+            } => assert!(no_schema_qualifier),
             other => panic!("expected Generate, got {:?}", other),
         }
     }
@@ -624,8 +821,17 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model(
+            "t",
+            "mysql",
+            &profile,
+            &[],
+            vec![],
+            Some("sales".to_string()),
+        )
+        .unwrap();
         assert!(skipped.is_empty());
+        assert_eq!(model.schema.as_deref(), Some("sales"));
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
         assert_eq!(model.copula.column_order, vec!["a", "b", "c"]);
@@ -641,7 +847,7 @@ mod tests {
     #[test]
     fn build_model_rejects_empty_profile() {
         let profile = TableProfile::from_rows("t", &[], &[]);
-        assert!(build_model("t", "mysql", &profile, &[], vec![]).is_err());
+        assert!(build_model("t", "mysql", &profile, &[], vec![], None).is_err());
     }
 
     #[test]
@@ -656,7 +862,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("status").unwrap();
         match &col.marginal {
@@ -704,7 +910,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("flag").unwrap();
         let generated = col.marginal.inverse_cdf(0.01);
@@ -729,7 +935,7 @@ mod tests {
         )]);
         profile.save(&dir.join("users.profile.json")).unwrap();
 
-        let (model, _) = build_model("users", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("users", "mysql", &profile, &[], vec![], None).unwrap();
         model.save(&dir.join("users.model.json")).unwrap();
 
         let loaded = load_profiles(&dir).unwrap();
@@ -763,7 +969,7 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
@@ -789,7 +995,7 @@ mod tests {
         ];
         let profile = TableProfile::from_rows("t", &columns, &rows);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id", "v3"]);
         let r = model.copula.correlation[0][1];
@@ -812,7 +1018,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         let col = model.columns.get("id").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -829,7 +1035,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         let col = model.columns.get("v").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -862,6 +1068,7 @@ mod tests {
             &profile,
             &[],
             vec!["a".to_string(), "b".to_string()],
+            None,
         )
         .unwrap();
         assert_eq!(model.pk, vec!["a", "b"]);
@@ -884,6 +1091,7 @@ mod tests {
             &profile,
             &[],
             vec!["a".to_string(), "ghost".to_string()],
+            None,
         )
         .unwrap();
         assert_eq!(model.pk, vec!["a"]);
@@ -928,7 +1136,7 @@ mod tests {
                 Value::from("20241231"),
             ],
         )]);
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("biz_date").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));
@@ -955,7 +1163,7 @@ mod tests {
             column_order: vec!["amt".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(model.columns.get("amt").unwrap().decimal_scale, Some(4));
     }
@@ -966,6 +1174,7 @@ mod tests {
         let col = crate::synth::profile::ColumnProfile::from_samples_typed(
             &samples,
             Some("numeric(16,2)"),
+            Some(crate::synth::profile::TOP_VALUES_CAP),
         );
         let mut columns = std::collections::HashMap::new();
         columns.insert("amt".to_string(), col);
@@ -975,7 +1184,7 @@ mod tests {
             column_order: vec!["amt".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("amt").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Numerical));
@@ -988,6 +1197,7 @@ mod tests {
         let col = crate::synth::profile::ColumnProfile::from_samples_typed(
             &samples,
             Some("timestamp without time zone"),
+            Some(crate::synth::profile::TOP_VALUES_CAP),
         );
         let mut columns = std::collections::HashMap::new();
         columns.insert("ts".to_string(), col);
@@ -997,7 +1207,7 @@ mod tests {
             column_order: vec!["ts".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("ts").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));
@@ -1135,7 +1345,13 @@ mod tests {
             types.insert(name.to_string(), ty.to_string());
         }
         (
-            TableProfile::from_rows_typed(table, &names, &rows, Some(&types)),
+            TableProfile::from_rows_typed(
+                table,
+                &names,
+                &rows,
+                Some(&types),
+                Some(crate::synth::profile::TOP_VALUES_CAP),
+            ),
             rows,
         )
     }
@@ -1192,7 +1408,7 @@ mod tests {
             "t1",
             &[("created_at", "timestamp without time zone", values)],
         );
-        let (model, skipped) = build_model("t1", "gaussdb", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t1", "gaussdb", &profile, &rows, vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("created_at").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));
@@ -1223,7 +1439,7 @@ mod tests {
             values.push(Value::from(format!("{year}-06-15")));
         }
         let (profile, rows) = typed_profile("t1", &[("created_at", "date", values)]);
-        let (model, skipped) = build_model("t1", "mysql", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t1", "mysql", &profile, &rows, vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("created_at").unwrap();
         let fmt = col.datetime_format.clone().expect("date format");
@@ -1267,7 +1483,7 @@ mod tests {
                 ("amount", "numeric", amounts),
             ],
         );
-        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
         assert!(skipped.is_empty());
         let order = &model.copula.column_order;
         let i_dt = order.iter().position(|c| c == "created_at").unwrap();
@@ -1292,7 +1508,7 @@ mod tests {
             .collect();
         let (profile, rows) = typed_profile("t", &[("biz_date", "date", values)]);
         assert!(profile.columns["biz_date"].datetime_format.is_none());
-        let (model, skipped) = build_model("t", "oracle", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t", "oracle", &profile, &rows, vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("biz_date").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));
