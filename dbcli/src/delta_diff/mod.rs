@@ -536,6 +536,8 @@ async fn execute_diff_inner(
             .warnings
             .push("sample/export row fetch ran after snapshot commit".into());
     }
+    // issue #79：直方图必须在 hydrate 之后计算（hydrate 可能翻转 HashCount→Columns）
+    report.modified_columns = sample::compute_modified_columns(&report);
     if report.sample_diffs.len() > 100_000 {
         report.warnings.push(format!(
             "diff row count {} exceeds 100000; memory and export may be large",

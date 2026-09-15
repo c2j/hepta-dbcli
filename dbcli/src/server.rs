@@ -1057,6 +1057,8 @@ impl DbMcp {
 
         match diff_result {
             Ok(mut report) => {
+                report.modified_columns =
+                    crate::delta_diff::sample::compute_modified_columns(&report);
                 let mut export_path = None;
                 if let (Some(path), Some(fmt)) = (params.export.as_deref(), export_plan) {
                     match crate::delta_diff::export::render_export(

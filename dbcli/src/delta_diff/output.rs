@@ -41,7 +41,7 @@ pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
 /// 汇总段投影：key/value 行
 pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
     let s = &report.summary;
-    let rows: Vec<Vec<Value>> = vec![
+    let mut rows: Vec<Vec<Value>> = vec![
         kv("strategy", &report.strategy),
         kv("consistency", &report.consistency),
         kv("hash_algorithm", &report.hash_algorithm),
@@ -58,9 +58,15 @@ pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
         kv_num("missing_left", s.missing_left),
         kv_num("missing_right", s.missing_right),
         kv_num("modified", s.modified),
-        kv("diff_rate", &format!("{:.4}%", s.diff_rate * 100.0)),
-        kv_num("queries_total", report.perf.queries_total),
     ];
+    // issue #79 §4.1：列级变化直方图（count 降序；keyless / 无 Modified 行时整个块省略）
+    if let Some(cols) = &report.modified_columns {
+        for c in cols {
+            rows.push(kv_num(&format!("modified_by_column[{}]", c.name), c.count));
+        }
+    }
+    rows.push(kv("diff_rate", &format!("{:.4}%", s.diff_rate * 100.0)));
+    rows.push(kv_num("queries_total", report.perf.queries_total));
     QueryResult {
         columns: vec!["metric".into(), "value".into()],
         row_count: rows.len(),
@@ -324,6 +330,31 @@ mod tests {
             backslash_escape: false,
             modified_columns: None,
         }
+    }
+
+    #[test]
+    fn summary_projection_includes_modified_column_histogram_rows() {
+        let mut r = keyed_report(); // 既有 fixture：1 Modified 改 cjsl(10→12)
+        r.modified_columns = Some(vec![ColumnChangeCount {
+            name: "cjsl".into(),
+            count: 1,
+        }]);
+        let qr = summary_to_query_result(&r);
+        let hit = qr
+            .rows
+            .iter()
+            .find(|row| row[0] == "modified_by_column[cjsl]");
+        assert_eq!(hit.map(|row| row[1].clone()), Some(Value::from(1)));
+    }
+
+    #[test]
+    fn summary_projection_omits_histogram_when_none() {
+        let r = report_with_diff(); // 无 Modified 行 → modified_columns 为 None
+        let qr = summary_to_query_result(&r);
+        assert!(!qr
+            .rows
+            .iter()
+            .any(|row| row[0].to_string().starts_with("modified_by_column")));
     }
 
     #[test]
