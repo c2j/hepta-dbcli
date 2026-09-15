@@ -162,6 +162,31 @@ fn is_numeric_sql_type(data_type: &str) -> bool {
     )
 }
 
+/// SQL types that are integers by declaration, so a whole-number sample is not
+/// a coincidence and the column must keep integer output.
+fn is_integer_sql_type(data_type: &str) -> bool {
+    matches!(
+        sql_type_base(data_type).as_str(),
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "serial"
+            | "bigserial"
+            | "smallserial"
+            | "utinyint"
+            | "usmallint"
+            | "uinteger"
+            | "ubigint"
+    )
+}
+
 fn is_datetime_sql_type(data_type: &str) -> bool {
     let base = sql_type_base(data_type);
     // `starts_with("timestamp")` covers `timestamp(6)` / `timestamp with time
@@ -382,10 +407,21 @@ impl ColumnProfile {
             }
         }
 
-        let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
-            && parsed_nums.len() == non_null.len()
+        let samples_integral = parsed_nums.len() == non_null.len()
             && !parsed_nums.is_empty()
             && parsed_nums.iter().all(|f| f.fract() == 0.0);
+        let schema_scale = data_type.and_then(sql_type_scale);
+        let schema_integer = data_type.map(is_integer_sql_type).unwrap_or(false);
+        // A declared non-zero scale makes the column a scaled decimal even when
+        // this sample happens to hold only whole values (`"1.0000"` parses to
+        // 1.0); without DDL information the sample decides.
+        let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
+            && match (schema_integer, schema_scale) {
+                (true, _) => true,
+                (false, Some(0)) => true,
+                (false, Some(_)) => false,
+                (false, None) => samples_integral,
+            };
 
         let is_repeated_low_cardinality_numeric = logical_type == "numerical"
             && cardinality > 1
@@ -925,8 +961,10 @@ mod tests {
             serde_json::json!(2),
             serde_json::json!(3),
         ];
+        // A declared integer type keeps integer output; the declared scale of a
+        // DECIMAL is covered by should_learn_scale_for_whole_number_samples_of_a_scaled_column.
         let int_profile =
-            ColumnProfile::from_samples_typed(&ints, Some("decimal(18,4)"), Some(TOP_VALUES_CAP));
+            ColumnProfile::from_samples_typed(&ints, Some("bigint"), Some(TOP_VALUES_CAP));
         assert_eq!(int_profile.logical_type, "numerical");
         assert!(int_profile.is_integer);
         assert_eq!(int_profile.decimal_scale, None);
@@ -938,5 +976,63 @@ mod tests {
         let date_profile = ColumnProfile::from_samples(&dates);
         assert_eq!(date_profile.logical_type, "datetime");
         assert_eq!(date_profile.decimal_scale, None);
+    }
+
+    #[test]
+    fn should_learn_scale_for_whole_number_samples_of_a_scaled_column() {
+        // A DECIMAL(18,4) column whose sample happens to contain only whole
+        // values is still a scaled column: the DDL scale must win over the
+        // fract()==0 heuristic, which otherwise degrades it to i64 output.
+        let strings: Vec<Value> = ["1.0000", "2.0000", "3.0000"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let from_strings = ColumnProfile::from_samples_typed(
+            &strings,
+            Some("decimal(18,4)"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert!(!from_strings.is_integer);
+        assert_eq!(from_strings.decimal_scale, Some(4));
+
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let from_numbers = ColumnProfile::from_samples_typed(
+            &numbers,
+            Some("numeric(16,2)"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert!(!from_numbers.is_integer);
+        assert_eq!(from_numbers.decimal_scale, Some(2));
+    }
+
+    #[test]
+    fn should_treat_integer_ddl_types_as_integers() {
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2), Value::from(3)];
+        for ty in [
+            "bigint",
+            "int",
+            "smallint",
+            "bigint unsigned",
+            "int4",
+            "serial",
+            "numeric(10,0)",
+            "decimal(18,0)",
+        ] {
+            let profile =
+                ColumnProfile::from_samples_typed(&numbers, Some(ty), Some(TOP_VALUES_CAP));
+            assert!(profile.is_integer, "type '{ty}' must stay integer");
+            assert_eq!(
+                profile.decimal_scale, None,
+                "type '{ty}' must not carry a scale"
+            );
+        }
+    }
+
+    #[test]
+    fn should_still_infer_integer_from_whole_samples_without_ddl() {
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2)];
+        let profile = ColumnProfile::from_samples(&numbers);
+        assert!(profile.is_integer);
+        assert_eq!(profile.decimal_scale, None);
     }
 }
