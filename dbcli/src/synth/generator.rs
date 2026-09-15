@@ -1772,4 +1772,104 @@ mod tests {
         let result = generate(&models, &rules, &config).unwrap();
         assert_eq!(result.columns.get("users"), Some(&vec!["id".to_string()]));
     }
+
+    fn zero_null_rate_snapshot() -> GeneratedData {
+        // Two tables, mixed None/Some(0.0) null_rate, FK sampling + copula.
+        // Captured before null-injection landed so AC2 can lock byte identity.
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let mut order_columns = HashMap::new();
+        order_columns.insert(
+            "amount".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 10.0,
+                    scale: 2.0,
+                }),
+                ..Default::default()
+            },
+        );
+        order_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "orders".to_string(),
+            TableModel {
+                version: 1,
+                table: "orders".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns: order_columns,
+                copula: CopulaInfo {
+                    column_order: vec!["amount".to_string(), "user_id".to_string()],
+                    correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule("users", vec![]),
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        generate(&models, &rules, &config(&["users", "orders"], 4)).unwrap()
+    }
+
+    #[test]
+    fn should_keep_zero_null_rate_output_byte_identical() {
+        let result = zero_null_rate_snapshot();
+        let users = serde_json::to_string(result.tables.get("users").unwrap()).unwrap();
+        let orders = serde_json::to_string(result.tables.get("orders").unwrap()).unwrap();
+        // Captured from this test on the pre-null-injection generator
+        // (seed 42, 4 rows, mixed None/Some(0.0) null_rate, FK + copula).
+        assert_eq!(
+            users,
+            "[[2.3076754763602025],[-0.5264344435639146],[-0.48212996526018514],[-0.07395728769978405]]"
+        );
+        assert_eq!(
+            orders,
+            "[[8.56627954969241,-0.48212996526018514],[9.248506620196224,-0.48212996526018514],[8.233932622046893,2.3076754763602025],[7.009810102099152,-0.07395728769978405]]"
+        );
+    }
 }
