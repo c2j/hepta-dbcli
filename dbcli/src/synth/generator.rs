@@ -293,16 +293,45 @@ pub fn generate(
     })
 }
 
-fn quantize(value: f64, scale: u8) -> f64 {
+fn round_to_scale(value: f64, scale: u8, strategy: rust_decimal::RoundingStrategy) -> f64 {
     use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-    use rust_decimal::{Decimal, RoundingStrategy};
+    use rust_decimal::Decimal;
 
     let Some(dec) = Decimal::from_f64(value) else {
         return value;
     };
     let dp = u32::from(scale).min(Decimal::MAX_SCALE);
-    let rounded = dec.round_dp_with_strategy(dp, RoundingStrategy::MidpointAwayFromZero);
+    let rounded = dec.round_dp_with_strategy(dp, strategy);
     rounded.to_f64().unwrap_or(value)
+}
+
+/// Quantize to `scale` decimals, half away from zero.
+fn quantize(value: f64, scale: u8) -> f64 {
+    round_to_scale(
+        value,
+        scale,
+        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+    )
+}
+
+/// The tightest on-grid interval covering `[min, max]`: smallest grid point
+/// `>= min` and largest grid point `<= max`. Clamping a quantized value to
+/// these keeps it both on the output grid and inside the trained range —
+/// clamping to raw `min`/`max` after quantization would let half-up rounding
+/// push a value past the range (e.g. max 1.225 at scale 2 rounding up to 1.23).
+fn grid_bounds(min: f64, max: f64, scale: u8) -> (f64, f64) {
+    (
+        round_to_scale(
+            min,
+            scale,
+            rust_decimal::RoundingStrategy::ToPositiveInfinity,
+        ),
+        round_to_scale(
+            max,
+            scale,
+            rust_decimal::RoundingStrategy::ToNegativeInfinity,
+        ),
+    )
 }
 
 fn gen_column_value(
@@ -363,15 +392,38 @@ fn gen_column_value(
                     }
                 }
             }
-            if column_model.and_then(|c| c.rounding) == Some(0) {
-                Value::from(generated.round() as i64)
-            } else if let Some(scale) = column_model
+            let is_integer_column = column_model.and_then(|c| c.rounding) == Some(0);
+            let decimal_scale = column_model
                 .filter(|c| matches!(c.logical_type, crate::synth::model::LogicalType::Numerical))
-                .and_then(|c| c.decimal_scale)
-            {
-                Value::from(quantize(generated, scale))
+                .and_then(|c| c.decimal_scale);
+            if !is_integer_column && decimal_scale.is_none() {
+                return Value::from(generated);
+            }
+
+            let scale = if is_integer_column {
+                0
             } else {
-                Value::from(generated)
+                decimal_scale.unwrap_or(0)
+            };
+            let mut snapped = if is_integer_column {
+                generated.round()
+            } else {
+                quantize(generated, scale)
+            };
+            if enforce_min_max_values {
+                if let Some((min, max)) = column_model.and_then(|c| Some((c.min?, c.max?))) {
+                    let (lo, hi) = grid_bounds(min, max, scale);
+                    // Degenerate ranges (no grid point inside [min, max]) keep
+                    // the pre-quantization clip result.
+                    if lo <= hi {
+                        snapped = snapped.clamp(lo, hi);
+                    }
+                }
+            }
+            if is_integer_column {
+                Value::from(snapped as i64)
+            } else {
+                Value::from(snapped)
             }
         }
         None => Value::Null,
@@ -2622,5 +2674,62 @@ mod tests {
             let s = row[0].as_str().expect("legacy datetime stays a string");
             assert!(s == "2024-01-01" || s == "2024-06-01");
         }
+    }
+
+    fn scaled_model(scale: u8, min: f64, max: f64, loc: f64) -> ColumnModel {
+        ColumnModel {
+            logical_type: LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            decimal_scale: Some(scale),
+            datetime_format: None,
+            min: Some(min),
+            max: Some(max),
+            null_rate: Some(0.0),
+            marginal: Marginal::Uniform(crate::synth::marginal::UniformParams {
+                low: loc,
+                high: loc,
+            }),
+        }
+    }
+
+    fn integer_model(min: f64, max: f64, loc: f64) -> ColumnModel {
+        ColumnModel {
+            rounding: Some(0),
+            ..scaled_model(0, min, max, loc)
+        }
+    }
+
+    #[test]
+    fn should_keep_quantized_values_within_training_max() {
+        // Training max sits between two scale-2 grid points (1.22, 1.23);
+        // rounding the clipped value up would emit 1.23 and violate the range.
+        let m = scaled_model(2, 1.0, 1.225, 1.225);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1.22));
+        assert!(value.as_f64().unwrap() <= 1.225);
+    }
+
+    #[test]
+    fn should_keep_quantized_values_within_training_min() {
+        let m = scaled_model(2, 1.225, 2.0, 1.225);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1.23));
+        assert!(value.as_f64().unwrap() >= 1.225);
+    }
+
+    #[test]
+    fn should_keep_rounded_integers_within_training_max() {
+        let m = integer_model(0.0, 1.5, 1.5);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1));
+    }
+
+    #[test]
+    fn should_leave_quantized_values_alone_without_min_max() {
+        let mut m = scaled_model(2, 0.0, 0.0, 1.225);
+        m.min = None;
+        m.max = None;
+        assert_eq!(gen_column_value(Some(&m), 0.5, true), Value::from(1.23));
     }
 }
