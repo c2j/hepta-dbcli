@@ -296,8 +296,15 @@ const ORACLE_DRIVER_PREFETCH_CAP: usize = 100;
 /// Pure-Rust Oracle driver silently stops at 100 prefetched rows. A sample
 /// that lands exactly on that cap is treated as truncated so train can warn
 /// and record `provenance.truncated`.
-fn sample_may_be_truncated(scheme: &str, row_count: usize) -> bool {
-    scheme.eq_ignore_ascii_case("oracle") && row_count == ORACLE_DRIVER_PREFETCH_CAP
+///
+/// `requested_sample` is the table's `--sample` value: asking for 100 rows (or
+/// fewer) makes the cap the caller's own limit, so it is not a truncation.
+/// A table that genuinely holds exactly 100 rows still produces a false
+/// positive when more were requested - that is inherent to the heuristic.
+fn sample_may_be_truncated(scheme: &str, row_count: usize, requested_sample: usize) -> bool {
+    scheme.eq_ignore_ascii_case("oracle")
+        && row_count == ORACLE_DRIVER_PREFETCH_CAP
+        && requested_sample > ORACLE_DRIVER_PREFETCH_CAP
 }
 
 async fn run_train(
@@ -381,7 +388,7 @@ async fn run_train(
                 table, col
             );
         }
-        if sample_may_be_truncated(&scheme, result.row_count) {
+        if sample_may_be_truncated(&scheme, result.row_count, sample) {
             eprintln!(
                 "warning: Oracle driver truncated the sample of table '{}' at {} rows; \
                  fitted distributions may be distorted",
@@ -486,22 +493,33 @@ mod tests {
 
     #[test]
     fn should_flag_oracle_sample_at_driver_cap() {
-        assert!(sample_may_be_truncated("oracle", 100));
-        assert!(sample_may_be_truncated("Oracle", 100));
+        assert!(sample_may_be_truncated("oracle", 100, 10_000));
+        assert!(sample_may_be_truncated("Oracle", 100, 10_000));
     }
 
     #[test]
     fn should_not_flag_oracle_sample_below_cap() {
-        assert!(!sample_may_be_truncated("oracle", 99));
-        assert!(!sample_may_be_truncated("oracle", 101));
-        assert!(!sample_may_be_truncated("oracle", 0));
+        assert!(!sample_may_be_truncated("oracle", 99, 10_000));
+        assert!(!sample_may_be_truncated("oracle", 101, 10_000));
+        assert!(!sample_may_be_truncated("oracle", 0, 10_000));
     }
 
     #[test]
     fn should_not_flag_non_oracle_sample_of_100() {
-        assert!(!sample_may_be_truncated("mysql", 100));
-        assert!(!sample_may_be_truncated("gaussdb", 100));
-        assert!(!sample_may_be_truncated("duckdb", 100));
+        assert!(!sample_may_be_truncated("mysql", 100, 10_000));
+        assert!(!sample_may_be_truncated("gaussdb", 100, 10_000));
+        assert!(!sample_may_be_truncated("duckdb", 100, 10_000));
+    }
+
+    // An explicit `--sample 100` (or less) means the cap is the user's own
+    // request, not the driver silently cutting the result short: warning about
+    // a "truncated" sample would be false.
+    #[test]
+    fn should_not_flag_oracle_when_the_cap_was_requested() {
+        assert!(!sample_may_be_truncated("oracle", 100, 100));
+        assert!(!sample_may_be_truncated("oracle", 100, 5));
+        assert!(sample_may_be_truncated("oracle", 100, 101));
+        assert!(sample_may_be_truncated("oracle", 100, 10_000));
     }
 
     #[test]
