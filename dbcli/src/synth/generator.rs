@@ -1245,18 +1245,18 @@ fn literal_in_marginal_domain(
         crate::synth::model::LogicalType::Datetime
     ) {
         let format = column_model.datetime_format.as_deref();
-        return crate::synth::datetime::parse_to_epoch(&Value::String(literal.to_string()), format)
-            .ok_or_else(|| {
-                format!(
-                    "table '{}' column '{}': cannot read '{}' as a datetime{}",
-                    table_name,
-                    col_name,
-                    literal,
-                    format
-                        .map(|f| format!(" with format '{}'", f))
-                        .unwrap_or_default()
-                )
-            });
+        let value = Value::String(literal.to_string());
+        return datetime_literal_epoch(&value, format).ok_or_else(|| {
+            format!(
+                "table '{}' column '{}': cannot read '{}' as a datetime{}",
+                table_name,
+                col_name,
+                literal,
+                format
+                    .map(|f| format!(" with format '{}'", f))
+                    .unwrap_or_default()
+            )
+        });
     }
 
     literal.parse::<f64>().map_err(|_| {
@@ -1505,12 +1505,12 @@ fn apply_fixed_range(
         ));
     }
 
-    let numeric = column_model
-        .map(|c| {
-            !(matches!(c.logical_type, crate::synth::model::LogicalType::Datetime)
-                && c.datetime_format.is_some())
-        })
-        .unwrap_or(true);
+    // A datetime column with a stored format generates *text*, so the range
+    // check must convert both sides to epoch seconds instead of comparing the
+    // formatted strings lexicographically.
+    let datetime_format = column_model
+        .filter(|c| matches!(c.logical_type, crate::synth::model::LogicalType::Datetime))
+        .and_then(|c| c.datetime_format.as_deref());
 
     let mut rng = column_value_rng(config.seed, table_name, col_name, "range");
     let mut total_attempts = 0usize;
@@ -1525,7 +1525,7 @@ fn apply_fixed_range(
                 rng.gen::<f64>(),
                 config.enforce_min_max_values,
             );
-            match value_in_range(&candidate, range, numeric) {
+            match value_in_range(&candidate, range, datetime_format) {
                 Some(true) => {
                     row[col_idx] = candidate;
                     accepted = true;
@@ -1562,22 +1562,44 @@ fn apply_fixed_range(
     Ok(())
 }
 
-fn value_in_range(value: &Value, range: &[Value; 2], numeric: bool) -> Option<bool> {
-    let low_ok = compare_endpoint(&range[0], value, numeric)?;
-    let high_ok = compare_endpoint(value, &range[1], numeric)?;
+/// Closed-interval check for rejection mode. A datetime column with a stored
+/// format is compared in epoch seconds, the same domain `copula_conditional`
+/// uses, so a value on the end date is not rejected merely because its text
+/// sorts after a date-only endpoint.
+fn value_in_range(
+    value: &Value,
+    range: &[Value; 2],
+    datetime_format: Option<&str>,
+) -> Option<bool> {
+    let compare = |a: &Value, b: &Value| -> Option<Ordering> {
+        match datetime_format {
+            Some(format) => {
+                let x = datetime_literal_epoch(a, Some(format))?;
+                let y = datetime_literal_epoch(b, Some(format))?;
+                x.partial_cmp(&y)
+            }
+            None => {
+                let x = value_as_f64(a)?;
+                let y = value_as_f64(b)?;
+                x.partial_cmp(&y)
+            }
+        }
+    };
+    let low_ok = compare(&range[0], value)?;
+    let high_ok = compare(value, &range[1])?;
     Some(low_ok != Ordering::Greater && high_ok != Ordering::Greater)
 }
 
-fn compare_endpoint(a: &Value, b: &Value, numeric: bool) -> Option<Ordering> {
-    if numeric {
-        let x = value_as_f64(a)?;
-        let y = value_as_f64(b)?;
-        x.partial_cmp(&y)
-    } else {
-        let x = a.as_str()?;
-        let y = b.as_str()?;
-        Some(x.cmp(y))
+/// Epoch seconds for a datetime literal or generated value. The column's own
+/// format wins; a generic ISO-ish shape is accepted as a fallback so
+/// `"2026-01-31"` works on a `%Y-%m-%d %H:%M:%S` column. A bare number is
+/// already epoch seconds, which is how `copula_conditional` reads endpoints.
+fn datetime_literal_epoch(literal: &Value, format: Option<&str>) -> Option<f64> {
+    if literal.is_number() {
+        return literal.as_f64();
     }
+    crate::synth::datetime::parse_to_epoch(literal, format)
+        .or_else(|| crate::synth::datetime::parse_to_epoch(literal, None))
 }
 
 fn value_as_f64(value: &Value) -> Option<f64> {
@@ -4853,6 +4875,199 @@ tables:
                 double.round_dp(12),
                 (amount * rust_decimal::Decimal::TWO).round_dp(12),
                 "derived column must stay consistent with its inputs"
+            );
+        }
+    }
+
+    fn datetime_model(table: &str, column: &str, format: &str, loc: f64, scale: f64) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Datetime,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: Some(format.to_string()),
+                marginal: Marginal::Normal(NormalParams { loc, scale }),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![column.to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        }
+    }
+
+    #[test]
+    fn should_compare_a_datetime_fixed_range_in_epochs_not_as_text() {
+        // `%d/%m/%Y` endpoints compared as text instead of as instants: the
+        // high endpoint "31/01/2026" sorts below every February/December text
+        // ("01/02/2026" < "31/01/2026" because '1' < '3'), so dates *outside*
+        // the range leak through. The marginal is centred on 2026-01-15 with a
+        // 10-day scale, so roughly 5% of the sample lands after 01-31 and must
+        // be rejected.
+        const FORMAT: &str = "%d/%m/%Y";
+        let epoch = |s: &str| {
+            crate::synth::datetime::parse_to_epoch(&Value::from(s), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{s} must parse"))
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "t".to_string(),
+            datetime_model(
+                "t",
+                "created_at",
+                FORMAT,
+                epoch("15/01/2026"),
+                10.0 * 86_400.0,
+            ),
+        );
+
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "created_at".to_string(),
+            crate::synth::rules::ColumnRule {
+                fixed_range: Some([Value::from("01/01/2026"), Value::from("31/01/2026")]),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 400)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let low = epoch("01/01/2026");
+        let high = epoch("31/01/2026");
+        let mut leaked = Vec::new();
+        for row in rows {
+            let text = row[0].as_str().expect("a datetime with a format is text");
+            let value = crate::synth::datetime::parse_to_epoch(&Value::from(text), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{text} must parse"));
+            if value < low || value > high {
+                leaked.push(text.to_string());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "{} of {} rows fell outside {:?}: {:?}",
+            leaked.len(),
+            rows.len(),
+            ("01/01/2026", "31/01/2026"),
+            &leaked[..leaked.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn should_accept_a_date_only_endpoint_on_a_datetime_column() {
+        // `fixed_range: ["2026-01-01", "2026-01-31"]` on a
+        // `%Y-%m-%d %H:%M:%S` column is the documented shape. A date-only
+        // endpoint means midnight, so the range is a closed interval of
+        // instants: [01-01 00:00:00, 01-31 00:00:00].
+        const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+        let epoch = |s: &str| {
+            crate::synth::datetime::parse_to_epoch(&Value::from(s), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{s} must parse"))
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "t".to_string(),
+            datetime_model(
+                "t",
+                "created_at",
+                FORMAT,
+                epoch("2026-01-15 12:00:00"),
+                5.0 * 86_400.0,
+            ),
+        );
+
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "created_at".to_string(),
+            crate::synth::rules::ColumnRule {
+                fixed_range: Some([Value::from("2026-01-01"), Value::from("2026-01-31")]),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let text = row[0].as_str().expect("a datetime with a format is text");
+            let value = crate::synth::datetime::parse_to_epoch(&Value::from(text), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{text} must parse"));
+            assert!(
+                (epoch("2026-01-01 00:00:00")..=epoch("2026-01-31 00:00:00")).contains(&value),
+                "{text} is outside the closed range"
+            );
+        }
+    }
+
+    #[test]
+    fn should_accept_a_date_only_endpoint_for_copula_conditional_too() {
+        // `copula_conditional` converts endpoints through
+        // `literal_in_marginal_domain`, so the two modes must accept the same
+        // documented shape instead of one of them demanding the column's own
+        // format ("cannot read '2026-01-01' as a datetime with format
+        // '%Y-%m-%d %H:%M:%S'").
+        const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+        let epoch = |s: &str| {
+            crate::synth::datetime::parse_to_epoch(&Value::from(s), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{s} must parse"))
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "t".to_string(),
+            datetime_model(
+                "t",
+                "created_at",
+                FORMAT,
+                epoch("2026-01-15 12:00:00"),
+                5.0 * 86_400.0,
+            ),
+        );
+
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(
+            "created_at".to_string(),
+            crate::synth::rules::ColumnRule {
+                fixed_range: Some([Value::from("2026-01-01"), Value::from("2026-01-31")]),
+                mode: crate::synth::rules::ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let text = row[0].as_str().expect("a datetime with a format is text");
+            let value = crate::synth::datetime::parse_to_epoch(&Value::from(text), Some(FORMAT))
+                .unwrap_or_else(|| panic!("{text} must parse"));
+            assert!(
+                (epoch("2026-01-01 00:00:00")..=epoch("2026-01-31 00:00:00")).contains(&value),
+                "{text} is outside the closed range"
             );
         }
     }
