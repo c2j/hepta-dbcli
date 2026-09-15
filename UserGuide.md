@@ -1006,6 +1006,28 @@ tables:
 - 冲突校验（加载期，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、表达式引用未知列、derive 成环。
 - 不含 `derive` 的 rules 输出与之前逐字节一致。
 
+#### 分支覆盖率（`branches`，issue #70）
+
+```yaml
+tables:
+  - name: orders
+    branches:
+      - id: paid                 # 报告里的标识
+        predicate: "status == 'A'"   # 布尔表达式（白名单同 derive）
+        target_ratio: 0.30        # 目标命中比例
+        tolerance: 0.02           # 可选，默认 0.05
+        repair:
+          set:
+            status: "A"           # 把未命中行改写成这些字面量
+          linked_derive_recompute: true
+```
+
+- 时机：`derive` 之后的最后一个阶段。先度量谓词命中率，未达目标就改写未命中的行，再重算 `derive`，最多 10 轮；命中率进入报告（stdout 为 Pass，stderr 为 `warning:` 的 Warn/Fail），**不阻断主流程退出码**（exit 仍为 0）。
+- 改写行的选择是确定性的：在未命中行里按等距抽取，避免把改动堆在表头；`set` 只能让行**命中**谓词，因此只从下方补齐，超出目标不会被「反向撤销」。
+- 可写列白名单（加载期报错，错误含表名与列名）：不能写 FK 列、被其它表 `references` 的父键、`derive` 目标列、以及被 `fixed`/`values`/`fixed_range` 钉住的列。
+- 一轮下来命中率没有任何变化（典型是 `set` 写的列与谓词无关）会立即停止并报 Warn，不会空转到 10 轮；若**所有**行都无法求值（例如字符串列写了 `predicate: "name == 1"`），直接报错而不是伪装成 0% 覆盖。
+- 与影子数据的差异（诚实说明）：本实现只做 `set` 补齐与 `derive` 联动重算，**不做** `derive` 表达式形式的 `set`、不做多轮最小扰动选行、不做「反向撤销」。不含 `branches` 的 rules 输出与之前逐字节一致。
+
 #### rules-draft：隐式引用推断与规则挖掘
 
 - **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship（`unique: true`），与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。

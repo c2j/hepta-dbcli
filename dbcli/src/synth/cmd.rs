@@ -720,6 +720,26 @@ pub fn run_generate(
     };
     export(&payload, &export_format, output_dir)?;
 
+    for outcome in &data.branches {
+        let line = format!(
+            "branch '{}': target {:.3}, actual {:.3} ({:?}, {} round(s), {} row(s) rewritten, {} evaluation failure(s))",
+            outcome.id,
+            outcome.target_ratio,
+            outcome.actual_ratio,
+            outcome.status,
+            outcome.rounds,
+            outcome.flips,
+            outcome.failed_evaluations
+        );
+        match outcome.status {
+            crate::synth::generator::CoverageStatus::Pass => println!("{}", line),
+            // A missed coverage target is a warning, not a failed generation
+            // (plan §7 D2); the exit code stays 0.
+            crate::synth::generator::CoverageStatus::Warn
+            | crate::synth::generator::CoverageStatus::Fail => eprintln!("warning: {}", line),
+        }
+    }
+
     println!(
         "Generation complete. Data saved to {}",
         output_dir.display()
@@ -1032,6 +1052,7 @@ mod tests {
                 name: "dict".to_string(),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 rows: Some(GEN_ROWS),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1132,6 +1153,7 @@ mod tests {
                 name: "orders".to_string(),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 rows: Some(2),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1736,6 +1758,7 @@ mod tests {
                 name: table.clone(),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 rows: Some(rows),
                 relationships: vec![],
                 strategy: Default::default(),

@@ -32,6 +32,34 @@ pub struct GeneratedData {
     pub columns: HashMap<String, Vec<String>>,
     pub dialect: String,
     pub schemas: HashMap<String, String>,
+    /// Branch coverage after repair, one entry per `branches[]` rule.
+    pub branches: Vec<BranchOutcome>,
+}
+
+/// Coverage state of one branch after the repair loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageStatus {
+    /// Within `target_ratio ± tolerance`.
+    Pass,
+    /// Repaired as far as the rules allowed, but still off target.
+    Warn,
+    /// No row could be rewritten (misconfigured predicate or repair).
+    Fail,
+}
+
+/// Result of measuring and repairing one `branches[]` rule.
+#[derive(Debug, Clone)]
+pub struct BranchOutcome {
+    pub id: String,
+    pub target_ratio: f64,
+    pub actual_ratio: f64,
+    pub status: CoverageStatus,
+    /// Repair rounds executed (0 when the branch was already covered).
+    pub rounds: usize,
+    /// Rows rewritten across all rounds.
+    pub flips: usize,
+    /// Rows whose predicate could not be evaluated.
+    pub failed_evaluations: usize,
 }
 
 struct RelPool {
@@ -75,6 +103,7 @@ pub fn generate(
     .map_err(|e| format!("cycle detected: {}", e))?;
 
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
+    let mut branch_outcomes: Vec<BranchOutcome> = Vec::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
@@ -306,6 +335,16 @@ pub fn generate(
         // earlier phase produced.
         apply_derive_rules(&mut rows, table_name, rule, model, column_order)?;
 
+        // Phase 6 (plan §1): branch coverage repair, restricted to the
+        // flippable columns (never FK, referenced, derived or pinned).
+        branch_outcomes.extend(apply_branch_repair(
+            &mut rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+        )?);
+
         for (col_idx, col_name) in column_order.iter().enumerate() {
             let values: Vec<Value> = rows
                 .iter()
@@ -329,6 +368,7 @@ pub fn generate(
         columns: table_columns,
         dialect,
         schemas: table_schemas,
+        branches: branch_outcomes,
     })
 }
 
@@ -557,6 +597,280 @@ fn column_value_rng(
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::rngs::StdRng::from_entropy(),
     }
+}
+
+/// Measure every `branches[]` predicate and rewrite rows until each target is
+/// met, in at most `rules::MAX_REPAIR_ROUNDS` rounds (issue #70).
+///
+/// Only `repair.set` literals are written; a branch whose predicate does not
+/// depend on those columns cannot make progress and is reported as `Fail`
+/// instead of looping or silently passing.
+fn apply_branch_repair(
+    rows: &mut [Vec<Value>],
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    column_order: &[String],
+) -> Result<Vec<BranchOutcome>, String> {
+    if rule.branches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let index_of: HashMap<&str, usize> = column_order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+
+    let mut prepared = Vec::with_capacity(rule.branches.len());
+    for branch in &rule.branches {
+        let predicate = crate::synth::expr::Expr::parse(&branch.predicate).map_err(|e| {
+            format!(
+                "table '{}' branch '{}': predicate '{}' rejected: {}",
+                table_name, branch.id, branch.predicate, e
+            )
+        })?;
+        for name in predicate.referenced_columns() {
+            if !index_of.contains_key(name.as_str()) {
+                return Err(format!(
+                    "table '{}' branch '{}': predicate references unknown column '{}'",
+                    table_name, branch.id, name
+                ));
+            }
+        }
+
+        let derived: std::collections::HashSet<&str> = rule
+            .derive
+            .iter()
+            .map(|entry| entry.column.as_str())
+            .collect();
+        let mut assignments = Vec::with_capacity(branch.repair.set.len());
+        for (column, literal) in &branch.repair.set {
+            let Some(&index) = index_of.get(column.as_str()) else {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set targets unknown column '{}'",
+                    table_name, branch.id, column
+                ));
+            };
+            if rule.relationships.iter().any(|rel| &rel.pk == column) {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write FK column '{}' (referential integrity)",
+                    table_name, branch.id, column
+                ));
+            }
+            if rule
+                .relationships
+                .iter()
+                .flat_map(|rel| rel.references.iter())
+                .any(|target| target == &format!("{}.{}", table_name, column))
+            {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write parent key '{}' referenced by another table",
+                    table_name, branch.id, column
+                ));
+            }
+            if derived.contains(column.as_str()) {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write derived column '{}'",
+                    table_name, branch.id, column
+                ));
+            }
+            if rule
+                .columns
+                .get(column)
+                .is_some_and(|column_rule| column_rule.has_column_override())
+            {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write pinned column '{}'",
+                    table_name, branch.id, column
+                ));
+            }
+            assignments.push((
+                index,
+                typed_literal(literal, model.columns.get(column.as_str())),
+            ));
+        }
+
+        prepared.push((branch, predicate, assignments));
+    }
+
+    // A predicate that cannot be evaluated on a single row is a type or
+    // column mistake (e.g. `bs == \'1\'` against a numeric column), not an
+    // uncovered branch. Fail loudly instead of reporting 0% coverage.
+    for (branch, predicate, _) in &prepared {
+        if rows.is_empty() {
+            break;
+        }
+        let (matching, failures) = measure_predicate(rows, predicate, &index_of);
+        if failures == rows.len() {
+            let sample = rows.first().map(|row| {
+                predicate.eval_bool(&|name: &str| {
+                    index_of
+                        .get(name)
+                        .and_then(|index| row.get(*index))
+                        .cloned()
+                })
+            });
+            let detail = match sample {
+                Some(Err(error)) => error.to_string(),
+                _ => "unknown evaluation error".to_string(),
+            };
+            return Err(format!(
+                "table '{}' branch '{}': predicate '{}' could not be evaluated on any of the {} generated row(s): {}",
+                table_name,
+                branch.id,
+                branch.predicate,
+                rows.len(),
+                detail
+            ));
+        }
+        let _ = matching;
+    }
+
+    let mut outcomes: Vec<BranchOutcome> = prepared
+        .iter()
+        .map(|(branch, _, _)| BranchOutcome {
+            id: branch.id.clone(),
+            target_ratio: branch.target_ratio,
+            actual_ratio: 0.0,
+            status: CoverageStatus::Warn,
+            rounds: 0,
+            flips: 0,
+            failed_evaluations: 0,
+        })
+        .collect();
+
+    let mut rounds_used = 0usize;
+    for _round in 0..crate::synth::rules::MAX_REPAIR_ROUNDS {
+        let mut touched = 0usize;
+
+        for (position, (branch, predicate, assignments)) in prepared.iter().enumerate() {
+            let (matching, failures) = measure_predicate(rows, predicate, &index_of);
+            let row_count = rows.len().max(1);
+            let actual = matching as f64 / row_count as f64;
+            let tolerance = branch
+                .tolerance
+                .unwrap_or(crate::synth::rules::DEFAULT_BRANCH_TOLERANCE);
+
+            outcomes[position].actual_ratio = actual;
+            outcomes[position].failed_evaluations = failures;
+
+            if (actual - branch.target_ratio).abs() <= tolerance {
+                continue;
+            }
+
+            let wanted = (branch.target_ratio * row_count as f64).round() as usize;
+            if wanted <= matching {
+                // `set` can only make new rows match; overshoot is reported,
+                // never silently "fixed" by writing values we cannot derive.
+                continue;
+            }
+
+            let candidates: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| !predicate_matches(predicate, row, &index_of))
+                .map(|(index, _)| index)
+                .collect();
+            let needed = (wanted - matching).min(candidates.len());
+            if needed == 0 {
+                continue;
+            }
+
+            // Spread the rewrites over the candidate list instead of
+            // clustering them on the first rows.
+            for pick in 0..needed {
+                let offset = pick * candidates.len() / needed;
+                let candidate = candidates[offset.min(candidates.len() - 1)];
+                for (index, value) in assignments {
+                    rows[candidate][*index] = value.clone();
+                }
+                outcomes[position].flips += 1;
+                touched += 1;
+            }
+        }
+
+        if touched == 0 {
+            break;
+        }
+        rounds_used += 1;
+
+        // A repair that cannot move any predicate (typically `set` writing
+        // columns the predicate does not read) must stop instead of burning
+        // the remaining rounds.
+        let progressed = prepared
+            .iter()
+            .enumerate()
+            .any(|(position, (_, predicate, _))| {
+                let (matching, _) = measure_predicate(rows, predicate, &index_of);
+                let actual = matching as f64 / rows.len().max(1) as f64;
+                (actual - outcomes[position].actual_ratio).abs() > f64::EPSILON
+            });
+        if !progressed {
+            break;
+        }
+
+        // `derive` is idempotent and may read a column the repair just wrote.
+        apply_derive_rules(rows, table_name, rule, model, column_order)?;
+    }
+
+    for (position, (branch, predicate, _)) in prepared.iter().enumerate() {
+        let (matching, failures) = measure_predicate(rows, predicate, &index_of);
+        let row_count = rows.len().max(1);
+        let actual = matching as f64 / row_count as f64;
+        let tolerance = branch
+            .tolerance
+            .unwrap_or(crate::synth::rules::DEFAULT_BRANCH_TOLERANCE);
+        outcomes[position].actual_ratio = actual;
+        outcomes[position].failed_evaluations = failures;
+        outcomes[position].rounds = rounds_used;
+        outcomes[position].status = if (actual - branch.target_ratio).abs() <= tolerance {
+            CoverageStatus::Pass
+        } else if outcomes[position].flips > 0 {
+            CoverageStatus::Warn
+        } else {
+            CoverageStatus::Fail
+        };
+    }
+
+    Ok(outcomes)
+}
+
+fn measure_predicate(
+    rows: &[Vec<Value>],
+    predicate: &crate::synth::expr::Expr,
+    index_of: &HashMap<&str, usize>,
+) -> (usize, usize) {
+    let mut matching = 0usize;
+    let mut failures = 0usize;
+    for row in rows {
+        match predicate.eval_bool(&|name: &str| {
+            index_of
+                .get(name)
+                .and_then(|index| row.get(*index))
+                .cloned()
+        }) {
+            Ok(true) => matching += 1,
+            Ok(false) => {}
+            Err(_) => failures += 1,
+        }
+    }
+    (matching, failures)
+}
+
+fn predicate_matches(
+    predicate: &crate::synth::expr::Expr,
+    row: &[Value],
+    index_of: &HashMap<&str, usize>,
+) -> bool {
+    predicate
+        .eval_bool(&|name: &str| {
+            index_of
+                .get(name)
+                .and_then(|index| row.get(*index))
+                .cloned()
+        })
+        .unwrap_or(false)
 }
 
 /// Overwrite derived columns with `expr` evaluated over the finished row
@@ -1216,6 +1530,7 @@ mod tests {
             name: table.to_string(),
             columns: HashMap::new(),
             derive: vec![],
+            branches: vec![],
             rows: None,
             relationships,
             strategy: TableStrategy::default(),
@@ -1976,6 +2291,7 @@ mod tests {
             name: "orders".to_string(),
             columns: HashMap::new(),
             derive: vec![],
+            branches: vec![],
             rows: Some(10_000),
             relationships: vec![Relationship {
                 pk: "user_id".to_string(),
@@ -2184,6 +2500,7 @@ mod tests {
                 name: "users".to_string(),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Zipf,
@@ -2308,6 +2625,7 @@ mod tests {
                     name: "orders".to_string(),
                     columns: HashMap::new(),
                     derive: vec![],
+                    branches: vec![],
                     rows: None,
                     relationships: vec![Relationship {
                         pk: "total".to_string(),
@@ -4127,6 +4445,281 @@ tables:
         let err =
             generate(&models, &rules, &config(&["t"], 10)).expect_err("unknown column must fail");
         assert!(err.contains("ghost"), "error must name the column: {err}");
+    }
+
+    // ─── branches（#70 覆盖修复）─────────────────────────────────────────
+
+    /// `status` with the given values/weights plus a numeric `amount`.
+    fn binary_model(values: &[&str], weights: &[f64]) -> HashMap<String, TableModel> {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "status".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: values.iter().map(|value| value.to_string()).collect(),
+                    weights: weights.to_vec(),
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "amount".to_string(),
+            numerical_model("t", "amount", 0.0, 1.0).columns["amount"].clone(),
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["status".to_string(), "amount".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+        };
+        HashMap::from([("t".to_string(), model)])
+    }
+
+    fn branch_rules(target: f64, tolerance: Option<f64>, set: &[(&str, &str)]) -> SynthRules {
+        let mut table = single_rule("t", vec![]);
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "paid".to_string(),
+            predicate: "status == 'A'".to_string(),
+            target_ratio: target,
+            tolerance,
+            repair: crate::synth::rules::BranchRepair {
+                set: set
+                    .iter()
+                    .map(|(column, value)| (column.to_string(), value.to_string()))
+                    .collect(),
+                linked_derive_recompute: true,
+            },
+        });
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        }
+    }
+
+    fn ratio_of(data: &GeneratedData, value: &str) -> f64 {
+        let rows = data.tables.get("t").unwrap();
+        let hits = rows
+            .iter()
+            .filter(|row| row[0] == Value::String(value.to_string()))
+            .count();
+        hits as f64 / rows.len() as f64
+    }
+
+    #[test]
+    fn should_repair_branch_coverage_up_to_the_target() {
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let rules = branch_rules(0.8, Some(0.02), &[("status", "A")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 1000)).unwrap();
+        let outcome = &data.branches[0];
+
+        assert_eq!(outcome.status, CoverageStatus::Pass, "{outcome:?}");
+        assert!(
+            (ratio_of(&data, "A") - 0.8).abs() <= 0.02,
+            "actual A ratio {} is outside tolerance",
+            ratio_of(&data, "A")
+        );
+        assert!(outcome.flips > 0, "rows must have been rewritten");
+        assert_eq!(outcome.failed_evaluations, 0);
+    }
+
+    #[test]
+    fn should_leave_rows_untouched_when_the_branch_is_already_covered() {
+        let models = binary_model(&["A", "B"], &[0.8, 0.2]);
+        let rules = branch_rules(0.8, Some(0.05), &[("status", "A")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 1000)).unwrap();
+        let outcome = &data.branches[0];
+
+        assert_eq!(outcome.status, CoverageStatus::Pass, "{outcome:?}");
+        assert_eq!(outcome.flips, 0, "a covered branch must not rewrite rows");
+    }
+
+    #[test]
+    fn should_recompute_derived_columns_after_a_repair() {
+        let mut models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        {
+            let model = models.get_mut("t").unwrap();
+            model.columns.insert(
+                "double".to_string(),
+                numerical_model("t", "double", 0.0, 1.0).columns["double"].clone(),
+            );
+            model.copula.column_order = vec![
+                "status".to_string(),
+                "amount".to_string(),
+                "double".to_string(),
+            ];
+            model.copula.correlation = vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ];
+        }
+
+        // `double` depends on `amount`, which the repair rewrites.
+        let mut table = single_rule("t", vec![]);
+        table.derive.push(crate::synth::rules::DeriveRule {
+            column: "double".to_string(),
+            expr: "amount * 2".to_string(),
+        });
+        // The predicate reads `amount`, the same column the repair writes, so
+        // the rewrite must also refresh everything derived from it.
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "big".to_string(),
+            predicate: "amount > 3".to_string(),
+            target_ratio: 0.8,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("amount".to_string(), "7.5".to_string())]),
+                linked_derive_recompute: true,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 600)).unwrap();
+        assert_eq!(data.branches[0].status, CoverageStatus::Pass);
+        for row in data.tables.get("t").unwrap() {
+            let amount = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let double = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                double.round_dp(12),
+                (amount * rust_decimal::Decimal::TWO).round_dp(12)
+            );
+        }
+    }
+
+    #[test]
+    fn should_report_a_branch_whose_repair_cannot_move_the_predicate() {
+        // `set` writes `amount`, but the predicate only reads `status`.
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let rules = branch_rules(0.8, Some(0.02), &[("amount", "1")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 1000)).unwrap();
+        let outcome = &data.branches[0];
+
+        assert_ne!(outcome.status, CoverageStatus::Pass, "{outcome:?}");
+        assert!(
+            outcome.rounds < crate::synth::rules::MAX_REPAIR_ROUNDS,
+            "the loop must stop as soon as a round makes no progress"
+        );
+    }
+
+    #[test]
+    fn should_fail_a_branch_that_needs_rows_it_cannot_write() {
+        // Every row matches and the target is 0: `set` cannot un-match rows.
+        let models = binary_model(&["A"], &[1.0]);
+        let rules = branch_rules(0.0, None, &[("status", "A")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        let outcome = &data.branches[0];
+
+        assert_eq!(outcome.status, CoverageStatus::Fail, "{outcome:?}");
+        assert_eq!(outcome.flips, 0);
+    }
+
+    #[test]
+    fn should_reject_branch_repair_on_a_fk_column() {
+        let mut models = HashMap::new();
+        models.insert(
+            "parent".to_string(),
+            numerical_model("parent", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "t".to_string(),
+            binary_model(&["A", "B"], &[0.5, 0.5]).remove("t").unwrap(),
+        );
+
+        let mut table = single_rule(
+            "t",
+            vec![Relationship {
+                pk: "amount".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+            }],
+        );
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "paid".to_string(),
+            predicate: "status == 'A'".to_string(),
+            target_ratio: 0.8,
+            tolerance: None,
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("amount".to_string(), "1".to_string())]),
+                linked_derive_recompute: false,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("parent", vec![]), table],
+        };
+
+        let err = generate(&models, &rules, &config(&["parent", "t"], 50))
+            .expect_err("repairing an FK column must fail");
+        assert!(err.contains("amount"), "error must name the column: {err}");
+        assert!(
+            err.contains("referential integrity"),
+            "error must explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn should_fail_a_branch_whose_predicate_matches_no_row_type() {
+        // `status` is a string column; comparing it to a number never
+        // evaluates. Reporting 0% coverage here would hide a real mistake.
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let mut table = single_rule("t", vec![]);
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "paid".to_string(),
+            predicate: "status == 1".to_string(),
+            target_ratio: 0.8,
+            tolerance: None,
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("status".to_string(), "A".to_string())]),
+                linked_derive_recompute: false,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let err = generate(&models, &rules, &config(&["t"], 50))
+            .expect_err("an unevaluable predicate must fail");
+        assert!(err.contains("paid"), "error must name the branch: {err}");
+        assert!(
+            err.contains("evaluated"),
+            "error must explain the predicate could not run: {err}"
+        );
+    }
+
+    #[test]
+    fn should_keep_output_byte_identical_without_branch_rules() {
+        let models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 4)).unwrap();
+        assert!(data.branches.is_empty());
+        let rows = serde_json::to_string(data.tables.get("t").unwrap()).unwrap();
+        assert_eq!(rows, "[[\"A\",-0.803943491589223],[\"B\",-0.19184861516094998],[\"A\",-0.8762332024966213],[\"B\",-1.4398776414381587]]");
     }
 
     #[test]

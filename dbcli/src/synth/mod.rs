@@ -1025,6 +1025,7 @@ fn rules_from_models(
                 rows: Some(rows),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::Uniform,
             })

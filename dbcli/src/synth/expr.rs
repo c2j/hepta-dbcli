@@ -681,9 +681,30 @@ fn eval(node: &Node, lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value
             arith(*op, left, right)
         }
         Node::Compare(op, left, right) => {
-            let left = eval(left, lookup)?;
-            let right = eval(right, lookup)?;
-            compare(*op, left, right)
+            let mut left_value = eval(left, lookup)?;
+            let mut right_value = eval(right, lookup)?;
+
+            // Literal-level coercion only: a quoted literal that parses as a
+            // number is compared numerically against a numeric operand, so
+            // `bs == '1'` works for a digit-holding VARCHAR trained as
+            // numerical. Column *data* is never coerced, so `name == 1` on a
+            // string column stays a mixed-type error.
+            if let (Value::Number(_), Value::Str(text)) = (&left_value, &right_value) {
+                if matches!(right.as_ref(), Node::Str(_)) {
+                    if let Ok(number) = Decimal::from_str(text) {
+                        right_value = Value::Number(number);
+                    }
+                }
+            }
+            if let (Value::Str(text), Value::Number(_)) = (&left_value, &right_value) {
+                if matches!(left.as_ref(), Node::Str(_)) {
+                    if let Ok(number) = Decimal::from_str(text) {
+                        left_value = Value::Number(number);
+                    }
+                }
+            }
+
+            compare(*op, left_value, right_value)
         }
         Node::And(left, right) => match eval(left, lookup)? {
             Value::Bool(false) => Ok(Value::Bool(false)),
@@ -1003,6 +1024,44 @@ mod tests {
         assert!(!eval_bool("status == 'A'", &[("status", json!(null))]).expect("eval"));
         // A column missing from the row lookup behaves like SQL NULL.
         assert!(!eval_bool("qty == 5", &[]).expect("eval"));
+    }
+
+    #[test]
+    fn should_compare_a_numeric_column_against_a_numeric_string_literal() {
+        // A VARCHAR column holding digits is trained as numerical, so
+        // `bs == '1'` is the natural way to write the predicate. A quoted
+        // literal that parses as a number is compared numerically.
+        let expr = Expr::parse("bs == '1'").unwrap();
+        assert!(expr
+            .eval_bool(&|_| Some(json!(1.0)))
+            .expect("numeric literal must compare"));
+        assert!(!expr.eval_bool(&|_| Some(json!(2.0))).unwrap());
+    }
+
+    #[test]
+    fn should_compare_a_string_column_against_a_string_literal_unchanged() {
+        let expr = Expr::parse("name == 'abc'").unwrap();
+        assert!(expr.eval_bool(&|_| Some(json!("abc"))).unwrap());
+    }
+
+    #[test]
+    fn should_still_reject_a_non_numeric_string_literal_against_a_number() {
+        let expr = Expr::parse("bs == 'abc'").unwrap();
+        let err = expr
+            .eval_bool(&|_| Some(json!(1.0)))
+            .expect_err("'abc' cannot be coerced to a number");
+        assert!(
+            matches!(err, ExprError::MixedTypeComparison { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn should_not_coerce_string_column_data_against_a_number_literal() {
+        // Coercion is limited to literals written in the expression; a string
+        // *column* compared to a number stays an error.
+        let expr = Expr::parse("name == 1").unwrap();
+        assert!(expr.eval_bool(&|_| Some(json!("1"))).is_err());
     }
 
     #[test]

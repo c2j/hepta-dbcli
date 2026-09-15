@@ -20,6 +20,10 @@ pub struct TableRule {
     /// is generated. Expressions are whitelisted by `synth::expr`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derive: Vec<DeriveRule>,
+    /// Branch coverage targets (issue #70): after generation, rows are
+    /// rewritten until each predicate hits `target_ratio`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<BranchRule>,
     pub relationships: Vec<Relationship>,
     #[serde(default)]
     pub strategy: TableStrategy,
@@ -94,6 +98,41 @@ pub struct DeriveRule {
     /// Arithmetic expression over other columns of the same table.
     pub expr: String,
 }
+
+/// One branch-coverage target (issue #70).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchRule {
+    /// Stable identifier used in reports.
+    pub id: String,
+    /// Boolean expression over the generated columns (`synth::expr` grammar).
+    pub predicate: String,
+    /// Share of rows the predicate should match.
+    pub target_ratio: f64,
+    /// Allowed absolute deviation from `target_ratio` (default 0.05).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<f64>,
+    #[serde(default)]
+    pub repair: BranchRepair,
+}
+
+/// How to rewrite rows that do not satisfy a branch yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BranchRepair {
+    /// Literal assignments keyed by column. Values are typed by the target
+    /// column's logical type, exactly like `columns.<name>.fixed`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Recompute `derive` columns on the touched rows (default false, but
+    /// derived columns are always recomputed because the pass is idempotent).
+    #[serde(default)]
+    pub linked_derive_recompute: bool,
+}
+
+/// Default branch tolerance when a rule does not set one.
+pub const DEFAULT_BRANCH_TOLERANCE: f64 = 0.05;
+
+/// Hard cap on repair rounds, mirroring shadow-seed's `max_rounds`.
+pub const MAX_REPAIR_ROUNDS: usize = 10;
 
 /// Marginal families a rules file may force on a column.
 pub const ALLOWED_MARGINALS: [&str; 6] =
@@ -272,6 +311,7 @@ impl SynthRules {
                 }
             }
             validate_derive_rules(table)?;
+            validate_branches(table)?;
 
             for rel in &table.relationships {
                 if rel.references.is_empty() {
@@ -284,6 +324,53 @@ impl SynthRules {
         }
         Ok(())
     }
+}
+
+/// `#70` branch rules: valid predicate, sane ratio/tolerance, unique ids and a
+/// repair that can actually change something.
+fn validate_branches(table: &TableRule) -> Result<(), String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for branch in &table.branches {
+        if !seen.insert(branch.id.as_str()) {
+            return Err(format!(
+                "table '{}': branch id '{}' is declared more than once",
+                table.name, branch.id
+            ));
+        }
+
+        crate::synth::expr::Expr::parse(&branch.predicate).map_err(|e| {
+            format!(
+                "table '{}' branch '{}': predicate '{}' rejected: {}",
+                table.name, branch.id, branch.predicate, e
+            )
+        })?;
+
+        if !branch.target_ratio.is_finite() || !(0.0..=1.0).contains(&branch.target_ratio) {
+            return Err(format!(
+                "table '{}' branch '{}': target_ratio {} must be within [0, 1]",
+                table.name, branch.id, branch.target_ratio
+            ));
+        }
+
+        if let Some(tolerance) = branch.tolerance {
+            if !tolerance.is_finite() || tolerance <= 0.0 || tolerance > 1.0 {
+                return Err(format!(
+                    "table '{}' branch '{}': tolerance {} must be within (0, 1]",
+                    table.name, branch.id, tolerance
+                ));
+            }
+        }
+
+        if branch.repair.set.is_empty() {
+            return Err(format!(
+                "table '{}' branch '{}': repair.set is empty, so the branch can never be repaired",
+                table.name, branch.id
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// `#70` derive rules: whitelist the expression, reject priority conflicts
@@ -528,6 +615,114 @@ tables:
     }
 
     #[test]
+    fn should_accept_branch_rules_with_known_shape() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.30
+        tolerance: 0.015
+        repair:
+          set:
+            status: "A"
+          linked_derive_recompute: true
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        let branch = &rules.tables[0].branches[0];
+        assert_eq!(branch.id, "paid");
+        assert_eq!(branch.target_ratio, 0.30);
+        assert_eq!(branch.tolerance, Some(0.015));
+        assert_eq!(branch.repair.set["status"], "A");
+        assert!(branch.repair.linked_derive_recompute);
+        rules.validate().unwrap();
+    }
+
+    #[test]
+    fn should_reject_branch_with_a_bad_predicate() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    branches:
+      - id: broken
+        predicate: "status =="
+        target_ratio: 0.3
+        repair: {set: {status: "A"}}
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("a broken predicate must fail");
+        assert!(err.contains("broken"), "error must name the branch: {err}");
+        assert!(
+            err.contains("status"),
+            "error must quote the predicate: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_branch_with_an_out_of_range_target_ratio() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 1.5
+        repair: {set: {status: "A"}}
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("target_ratio > 1 must fail");
+        assert!(
+            err.contains("target_ratio"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_branch_with_an_empty_repair_set() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.3
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("an empty repair.set must fail");
+        assert!(
+            err.contains("repair.set"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_duplicate_branch_ids() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.3
+        repair: {set: {status: "A"}}
+      - id: paid
+        predicate: "status == 'B'"
+        target_ratio: 0.3
+        repair: {set: {status: "B"}}
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("duplicate ids must fail");
+        assert!(err.contains("paid"), "error must name the branch: {err}");
+    }
+
+    #[test]
     fn should_reject_derive_with_a_disallowed_expression_node() {
         let yaml = r#"
 version: "1"
@@ -607,6 +802,7 @@ tables:
                 name: "t".to_string(),
                 columns: HashMap::new(),
                 derive: vec![],
+                branches: vec![],
                 rows: None,
                 relationships: vec![Relationship {
                     pk: "id".to_string(),
@@ -728,6 +924,7 @@ tables:
                     },
                 )]),
                 derive: vec![],
+                branches: vec![],
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Uniform,
@@ -1008,6 +1205,7 @@ tables:
                         },
                     )]),
                     derive: vec![],
+                    branches: vec![],
                     rows: None,
                     relationships: vec![],
                     strategy: TableStrategy::Uniform,
