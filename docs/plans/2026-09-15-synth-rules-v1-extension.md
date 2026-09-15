@@ -115,6 +115,85 @@ tables:
   不引入表达式求值；#70 的 predicate 表达式是超集）。
 - `values` 权重和必须 ≈ 1.0（±1e-6），全部 > 0。
 
+### 2.1 冻结的 Rust 类型
+
+```rust
+// rules.rs
+pub struct ColumnRule {
+    pub null_rate: Option<f64>,          // 既有
+    pub marginal: Option<String>,        // 既有
+    pub fixed: Option<String>,           // 新增：字面量，按 logical_type 类型化
+    pub values: Option<ValuePool>,       // 新增
+    pub fixed_range: Option<[serde_json::Value; 2]>, // 新增：[low, high]，闭区间
+    pub mode: ColumnMode,                // 新增，默认 Rejection
+}
+
+/// YAML 两种形态：`values: {a: 0.7, b: 0.3}`（加权）与 `values: [a, b]`（均匀）。
+/// 加权形态用 BTreeMap 而非 HashMap，保证迭代顺序确定（同 seed 可复现）。
+#[serde(untagged)]
+pub enum ValuePool {
+    Weighted(std::collections::BTreeMap<String, f64>),
+    Uniform(Vec<String>),
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum ColumnMode { Rejection, CopulaConditional }   // Default = Rejection
+```
+
+`fixed_range` 用 `serde_json::Value` 两端，兼容日期字符串（`"2026-01-01"`）与数值
+（`1.0`），避免「数值必须加引号」的伪约束。
+
+### 2.2 表达式引擎契约（`synth/expr.rs`，#70）
+
+语法（**冻结**，不得扩展）：
+
+```
+expr    := or
+or      := and ( "||" and )*
+and     := cmp ( "&&" cmp )*
+cmp     := add ( ("==" | "!=" | "<=" | ">=" | "<" | ">") add )?
+add     := mul ( ("+" | "-") mul )*
+mul     := unary ( ("*" | "/" | "%") unary )*
+unary   := "-" unary | primary
+primary := number | string | column | "(" expr ")"
+number  := 十进制字面量，解析为 rust_decimal::Decimal
+string  := '单引号'（仅用于比较）
+column  := 标识符
+```
+
+**必须拒绝**（加载期 fail-fast，错误信息要指明违规节点）：
+
+- 函数调用 `min(price, qty)`
+- 属性访问 `price.__class__`
+- 下标访问 `cols[0]`
+- 未知列（列名集合由调用方提供）
+- 引号外出现的任何其他字符
+
+**语义**：
+
+- 算术全用 `rust_decimal::Decimal`，禁止 f64 往返，`0.1 * 3 == 0.3` 必须精确成立；
+- 除零是错误（不是 panic，不是 Inf）；
+- 与 NULL 的任何比较结果都是 false；
+- 比较两侧类型不匹配（字符串 vs 数值）是错误。
+
+**API 形状**（签名可微调，能力必须齐备）：
+
+```rust
+pub struct Expr { .. }
+impl Expr {
+    /// 只做语法 + 白名单校验，不接触列名。
+    pub fn parse(src: &str) -> Result<Expr, ExprError>;
+    /// 引用列存在性校验（加载期）。
+    pub fn check_columns(&self, known: &std::collections::BTreeSet<String>) -> Result<(), ExprError>;
+    /// 求值；lookup 返回该列的 JSON 值。返回 bool 用于 predicate。
+    pub fn eval_bool(&self, lookup: &dyn Fn(&str) -> Option<serde_json::Value>) -> Result<bool, ExprError>;
+    /// 求值；返回 Decimal 结果用于 derive。
+    pub fn eval_decimal(&self, lookup: &dyn Fn(&str) -> Option<serde_json::Value>) -> Result<rust_decimal::Decimal, ExprError>;
+}
+```
+
+模块必须是纯函数式的（无 I/O、无全局状态），`#70` 接线阶段直接调用。
+
 ---
 
 ## 3. 配置期校验矩阵（`rules.rs::validate`，fail-fast，错误信息必须含表名+列名）
