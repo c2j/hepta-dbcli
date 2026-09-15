@@ -11,6 +11,37 @@ use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Cap on categorical `top_values` kept while training. `full` stores every
+/// observed level; the default of 50 matches the historical hard cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoricalTopK {
+    Limit(usize),
+    Full,
+}
+
+impl CategoricalTopK {
+    pub fn cap(self) -> Option<usize> {
+        match self {
+            Self::Limit(n) => Some(n),
+            Self::Full => None,
+        }
+    }
+}
+
+fn parse_categorical_top_k(s: &str) -> Result<CategoricalTopK, String> {
+    if s.eq_ignore_ascii_case("full") {
+        return Ok(CategoricalTopK::Full);
+    }
+    let n: usize = s.parse().map_err(|_| {
+        format!("invalid --categorical-top-k '{s}': expected a positive integer or 'full'")
+    })?;
+    if n == 0 {
+        Err("--categorical-top-k must be a positive integer or 'full'".to_string())
+    } else {
+        Ok(CategoricalTopK::Limit(n))
+    }
+}
+
 // ─── CLI 参数 ───────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -42,6 +73,10 @@ pub enum SynthCommand {
         /// Max rows sampled per table
         #[arg(long, default_value_t = 10_000)]
         sample: usize,
+
+        /// Categorical top_values cap (`N` or `full`; default 50)
+        #[arg(long, default_value = "50", value_parser = parse_categorical_top_k)]
+        categorical_top_k: CategoricalTopK,
     },
 
     /// Draft a rules YAML from database foreign keys
@@ -472,14 +507,143 @@ mod tests {
                 tables,
                 output,
                 sample,
+                categorical_top_k,
                 ..
             } => {
                 assert_eq!(tables, "users,orders");
                 assert_eq!(output, ".synth");
                 assert_eq!(sample, 10_000);
+                assert_eq!(categorical_top_k, CategoricalTopK::Limit(50));
             }
             other => panic!("expected Train, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_keep_default_top_k_behaviour() {
+        let cmd = parse(&["synth", "train", "--tables", "t"]);
+        match cmd {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => {
+                assert_eq!(categorical_top_k, CategoricalTopK::Limit(50));
+                assert_eq!(categorical_top_k.cap(), Some(50));
+            }
+            other => panic!("expected Train, got {:?}", other),
+        }
+
+        let full = parse(&[
+            "synth",
+            "train",
+            "--tables",
+            "t",
+            "--categorical-top-k",
+            "full",
+        ]);
+        match full {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => {
+                assert_eq!(categorical_top_k, CategoricalTopK::Full);
+                assert_eq!(categorical_top_k.cap(), None);
+            }
+            other => panic!("expected Train, got {:?}", other),
+        }
+
+        let capped = parse(&[
+            "synth",
+            "train",
+            "--tables",
+            "t",
+            "--categorical-top-k",
+            "12",
+        ]);
+        match capped {
+            SynthCommand::Train {
+                categorical_top_k, ..
+            } => assert_eq!(categorical_top_k, CategoricalTopK::Limit(12)),
+            other => panic!("expected Train, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn should_cover_all_dictionary_levels_with_full_top_k() {
+        const LEVELS: usize = 500;
+        const GEN_ROWS: usize = 10_000;
+        let samples: Vec<Value> = (0..LEVELS)
+            .flat_map(|i| std::iter::repeat_n(Value::from(format!("L{i:03}")), 20))
+            .collect();
+        let col = crate::synth::profile::ColumnProfile::from_samples_typed(&samples, None, None);
+        let top = col.top_values.as_ref().expect("top_values");
+        assert_eq!(top.len(), LEVELS);
+
+        let mut columns = HashMap::new();
+        columns.insert("code".to_string(), col);
+        let profile = TableProfile {
+            table: "dict".to_string(),
+            row_count: samples.len(),
+            column_order: vec!["code".to_string()],
+            columns,
+        };
+        let (model, skipped) = build_model("dict", "mysql", &profile, &[], vec![]).unwrap();
+        assert!(skipped.is_empty());
+
+        let mut models = HashMap::new();
+        models.insert("dict".to_string(), model);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![crate::synth::rules::TableRule {
+                name: "dict".to_string(),
+                columns: HashMap::new(),
+                rows: Some(GEN_ROWS),
+                relationships: vec![],
+                strategy: crate::synth::rules::TableStrategy::default(),
+            }],
+        };
+        let data = generate(
+            &models,
+            &rules,
+            &GeneratorConfig {
+                rows_per_table: HashMap::from([("dict".to_string(), GEN_ROWS)]),
+                seed: Some(42),
+                enforce_min_max_values: true,
+            },
+        )
+        .unwrap();
+        let rows = data.tables.get("dict").expect("dict rows");
+        assert_eq!(rows.len(), GEN_ROWS);
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let key = row[0].as_str().expect("categorical value").to_string();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        assert!(
+            counts.len() >= 495,
+            "full top-k should cover ≥495 of 500 levels, got {}",
+            counts.len()
+        );
+
+        let n = GEN_ROWS as f64;
+        let p = 1.0 / LEVELS as f64;
+        let mut tv = 0.0;
+        for i in 0..LEVELS {
+            let key = format!("L{i:03}");
+            let q = *counts.get(&key).unwrap_or(&0) as f64 / n;
+            assert!(
+                (q - p).abs() < 0.05,
+                "level {key}: generated share {q} vs train {p}"
+            );
+            tv += (p - q).abs();
+        }
+        tv /= 2.0;
+        // Multinomial E[TV] ≈ 0.09 for 500 levels / 10k rows, so the sharp
+        // 0.05 overall bound is not stable; a 50-cap model still lands near
+        // TV 0.9 and fails both coverage and this 0.15 ceiling.
+        assert!(
+            tv < 0.15,
+            "TV distance {tv} should stay well below a 50-cap model (~0.9)"
+        );
     }
 
     #[test]
@@ -885,6 +1049,7 @@ mod tests {
         let col = crate::synth::profile::ColumnProfile::from_samples_typed(
             &samples,
             Some("numeric(16,2)"),
+            Some(crate::synth::profile::TOP_VALUES_CAP),
         );
         let mut columns = std::collections::HashMap::new();
         columns.insert("amt".to_string(), col);
@@ -907,6 +1072,7 @@ mod tests {
         let col = crate::synth::profile::ColumnProfile::from_samples_typed(
             &samples,
             Some("timestamp without time zone"),
+            Some(crate::synth::profile::TOP_VALUES_CAP),
         );
         let mut columns = std::collections::HashMap::new();
         columns.insert("ts".to_string(), col);

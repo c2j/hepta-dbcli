@@ -55,6 +55,7 @@ pub async fn run(
             schema,
             output,
             sample,
+            categorical_top_k,
         } => {
             run_train(
                 name,
@@ -62,6 +63,7 @@ pub async fn run(
                 schema.as_deref(),
                 Path::new(&output),
                 sample,
+                categorical_top_k,
                 config_path,
             )
             .await
@@ -257,12 +259,15 @@ fn split_tables(tables: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "synth")]
+const FULL_MODEL_SIZE_WARN_BYTES: u64 = 10 * 1024 * 1024;
+
 async fn run_train(
     name: Option<String>,
     tables: &str,
     schema: Option<&str>,
     output_dir: &Path,
     sample: usize,
+    categorical_top_k: cmd::CategoricalTopK,
     config_path: Option<String>,
 ) -> Result<(), String> {
     let tables = split_tables(tables);
@@ -327,6 +332,7 @@ async fn run_train(
             &result.columns,
             &result.rows,
             Some(&data_types),
+            categorical_top_k.cap(),
         );
         let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows, pk)?;
         for col in &skipped {
@@ -339,6 +345,17 @@ async fn run_train(
         let model_path = output_dir.join(format!("{}.model.json", table));
         let profile_path = output_dir.join(format!("{}.profile.json", table));
         model.save(&model_path)?;
+        if categorical_top_k == cmd::CategoricalTopK::Full {
+            if let Ok(meta) = std::fs::metadata(&model_path) {
+                if meta.len() > FULL_MODEL_SIZE_WARN_BYTES {
+                    eprintln!(
+                        "warning: {} is {:.1} MiB; --categorical-top-k full stored every dictionary level and the file exceeds 10 MiB",
+                        model_path.display(),
+                        meta.len() as f64 / (1024.0 * 1024.0)
+                    );
+                }
+            }
+        }
         profile.save(&profile_path)?;
         let pk_note = if model.pk.is_empty() {
             String::new()
@@ -432,6 +449,7 @@ mod tests {
                 schema: None,
                 output: ".synth".to_string(),
                 sample: 1000,
+                categorical_top_k: cmd::CategoricalTopK::Limit(50),
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );

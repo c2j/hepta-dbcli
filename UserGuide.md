@@ -905,7 +905,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 | 子命令 | 参数 | 说明 |
 |--------|------|------|
-| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000） |
+| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample`、`--categorical-top-k` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000）；`--categorical-top-k N\|full` 控制分类列写入模型的档数（默认 50，与历史硬上限一致；`full` 不截断，模型文件超过 10 MiB 时打印警告） |
 | `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
 | `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100） |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |

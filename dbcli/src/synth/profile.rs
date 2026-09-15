@@ -34,7 +34,7 @@ pub struct ColumnProfile {
     pub datetime_format: Option<String>,
 }
 
-const TOP_VALUES_CAP: usize = 50;
+pub(crate) const TOP_VALUES_CAP: usize = 50;
 const NUMERIC_TOP_VALUES_MAX: usize = 50;
 
 fn is_unsupported_placeholder(s: &str) -> bool {
@@ -151,7 +151,7 @@ fn numerical_stats(nums: &[f64]) -> (Option<Value>, Option<Value>, Option<f64>, 
     )
 }
 
-fn frequency_top_values(non_null: &[&Value]) -> Option<Vec<(String, f64)>> {
+fn frequency_top_values(non_null: &[&Value], top_k: Option<usize>) -> Option<Vec<(String, f64)>> {
     if non_null.is_empty() {
         return None;
     }
@@ -176,7 +176,9 @@ fn frequency_top_values(non_null: &[&Value]) -> Option<Vec<(String, f64)>> {
         .map(|(k, c)| (k, c as f64 / non_null.len() as f64))
         .collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    entries.truncate(TOP_VALUES_CAP);
+    if let Some(cap) = top_k {
+        entries.truncate(cap);
+    }
     Some(entries)
 }
 
@@ -195,10 +197,14 @@ fn lookup_type<'a>(types: Option<&'a HashMap<String, String>>, name: &str) -> Op
 
 impl ColumnProfile {
     pub fn from_samples(samples: &[Value]) -> Self {
-        Self::from_samples_typed(samples, None)
+        Self::from_samples_typed(samples, None, Some(TOP_VALUES_CAP))
     }
 
-    pub fn from_samples_typed(samples: &[Value], data_type: Option<&str>) -> Self {
+    pub fn from_samples_typed(
+        samples: &[Value],
+        data_type: Option<&str>,
+        top_k: Option<usize>,
+    ) -> Self {
         let total = samples.len();
         let null_count = samples.iter().filter(|v| v.is_null()).count();
         let non_null: Vec<&Value> = samples.iter().filter(|v| !v.is_null()).collect();
@@ -308,7 +314,7 @@ impl ColumnProfile {
             || is_repeated_low_cardinality_numeric
             || (logical_type == "datetime" && mean.is_none() && !non_null.is_empty())
         {
-            frequency_top_values(&non_null)
+            frequency_top_values(&non_null, top_k)
         } else {
             None
         };
@@ -331,7 +337,7 @@ impl ColumnProfile {
 
 impl TableProfile {
     pub fn from_rows(table: &str, columns: &[String], rows: &[Vec<Value>]) -> Self {
-        Self::from_rows_typed(table, columns, rows, None)
+        Self::from_rows_typed(table, columns, rows, None, Some(TOP_VALUES_CAP))
     }
 
     pub fn from_rows_typed(
@@ -339,6 +345,7 @@ impl TableProfile {
         columns: &[String],
         rows: &[Vec<Value>],
         data_types: Option<&HashMap<String, String>>,
+        top_k: Option<usize>,
     ) -> Self {
         let row_count = rows.len();
         let mut column_profiles = HashMap::new();
@@ -350,7 +357,11 @@ impl TableProfile {
                 .collect();
             column_profiles.insert(
                 col_name.clone(),
-                ColumnProfile::from_samples_typed(&samples, lookup_type(data_types, col_name)),
+                ColumnProfile::from_samples_typed(
+                    &samples,
+                    lookup_type(data_types, col_name),
+                    top_k,
+                ),
             );
         }
 
@@ -525,14 +536,22 @@ mod tests {
             .iter()
             .map(|s| Value::from(*s))
             .collect();
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("character varying(8)"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("character varying(8)"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "datetime");
     }
 
     #[test]
     fn column_profile_all_null_numeric_schema_is_numerical() {
         let samples = vec![Value::Null, Value::Null, Value::Null];
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("numeric(16,2)"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("numeric(16,2)"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "numerical");
         assert_eq!(profile.null_rate, 1.0);
         assert!(profile.mean.is_none());
@@ -550,7 +569,8 @@ mod tests {
             "double unsigned",
             "int unsigned zerofill",
         ] {
-            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            let profile =
+                ColumnProfile::from_samples_typed(&samples, Some(ty), Some(TOP_VALUES_CAP));
             assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
         }
     }
@@ -559,7 +579,8 @@ mod tests {
     fn column_profile_duckdb_unsigned_types_are_numerical() {
         let samples = vec![Value::Null, Value::Null];
         for ty in ["UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT", "HUGEINT"] {
-            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            let profile =
+                ColumnProfile::from_samples_typed(&samples, Some(ty), Some(TOP_VALUES_CAP));
             assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
         }
     }
@@ -570,7 +591,11 @@ mod tests {
             .iter()
             .map(|s| Value::from(*s))
             .collect();
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("bigint unsigned"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("bigint unsigned"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "numerical");
     }
 
@@ -584,8 +609,11 @@ mod tests {
     #[test]
     fn column_profile_date_schema_overrides_empty_values() {
         let samples = vec![Value::Null, Value::Null];
-        let profile =
-            ColumnProfile::from_samples_typed(&samples, Some("timestamp without time zone"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp without time zone"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "datetime");
     }
 
@@ -654,9 +682,30 @@ mod tests {
         types.insert("amt".to_string(), "numeric(16,2)".to_string());
         types.insert("biz_date".to_string(), "character varying(8)".to_string());
 
-        let profile = TableProfile::from_rows_typed("t", &columns, &rows, Some(&types));
+        let profile =
+            TableProfile::from_rows_typed("t", &columns, &rows, Some(&types), Some(TOP_VALUES_CAP));
         assert_eq!(profile.columns["amt"].logical_type, "numerical");
         assert_eq!(profile.columns["biz_date"].logical_type, "datetime");
+    }
+
+    #[test]
+    fn should_keep_default_top_k_behaviour() {
+        // Unparameterised profiling still caps categorical top_values at 50.
+        let samples: Vec<Value> = (0..80)
+            .map(|i| Value::from(format!("v{}", i)))
+            .chain(std::iter::repeat_n(Value::from("common"), 20))
+            .collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        let top = profile.top_values.expect("top_values captured");
+        assert_eq!(top.len(), TOP_VALUES_CAP);
+        assert_eq!(top[0], ("common".to_string(), 0.2));
+
+        let typed = ColumnProfile::from_samples_typed(&samples, None, Some(TOP_VALUES_CAP));
+        assert_eq!(
+            typed.top_values.as_ref().map(Vec::len),
+            Some(TOP_VALUES_CAP)
+        );
     }
 
     #[test]
