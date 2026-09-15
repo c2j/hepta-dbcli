@@ -1,5 +1,5 @@
 use crate::synth::export::{export, ExportFormat};
-use crate::synth::generator::{generate, GeneratorConfig};
+use crate::synth::generator::{generate, generate_unique_primary_keys, GeneratorConfig};
 use crate::synth::marginal::{
     compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
     NormalParams,
@@ -697,7 +697,13 @@ pub fn run_generate(
         enforce_min_max_values: flags.enforce_min_max_values,
     };
 
-    let data = generate(&models, &rules, &config)?;
+    let data = if format == "sql" {
+        // Unique primary keys only matter where a relational constraint will
+        // be applied; see `generate_unique_primary_keys` (issue #82).
+        generate_unique_primary_keys(&models, &rules, &config)?
+    } else {
+        generate(&models, &rules, &config)?
+    };
 
     let export_format = match format {
         "csv" => ExportFormat::Csv,

@@ -54,6 +54,22 @@ with no baseline (`--strict`, and `--min-score`). `verify_m2.py` asserts:
 | #67 AC5 | two runs over the same inputs produce byte-identical report JSON (and the same seed regenerates byte-identical data) |
 | #67 AC6 | baseline files contain only aggregate payloads (numeric knots or `[value, frequency]` pairs), never a row record |
 
+## pk-uniqueness run (#82)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_pk.sh
+```
+
+It loads `fixture_pk.sql` (a 12-key integer primary key, a 20×20 composite
+primary key, and a 3-key non-numeric primary key), trains the tables, and then:
+
+| Acceptance | Check |
+|---|---|
+| #82 AC1 | `generate --format sql --rows 200` on the 12-key table succeeds and the SQL loads back into MySQL with 200 rows / 200 distinct `id`s (the surplus is extrapolated past the trained maximum) |
+| #82 AC2 | the composite primary key round-trips: 200 rows / 200 distinct `(region, slot)` tuples even though each member repeats alone |
+| #82 AC1 | the non-numeric key table cannot be extended: `generate --format sql --rows 10` fails and names the column and the row count |
+
 ## What is asserted
 
 | Issue | Check |

@@ -1,7 +1,9 @@
 use crate::synth::copula::GaussianCopula;
 use crate::synth::fk_pool::{FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
-use crate::synth::rules::{ColumnMode, PoolStrategy, SynthRules, TableStrategy, ValuePool};
+use crate::synth::rules::{
+    ColumnMode, PoolStrategy, SynthRules, TableRule, TableStrategy, ValuePool,
+};
 use rand::Rng;
 use rand::SeedableRng;
 use serde_json::Value;
@@ -99,6 +101,27 @@ pub fn generate(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
     config: &GeneratorConfig,
+) -> Result<GeneratedData, String> {
+    generate_with(models, rules, config, false)
+}
+
+/// Like [`generate`], but forces every `model.pk` to be unique so the rows can
+/// be inserted into the source table. Only the SQL export uses this: CSV/JSONL
+/// have no key constraint, and changing their key draws would move the very
+/// distribution `synth report` scores (see UserGuide §主键唯一性).
+pub fn generate_unique_primary_keys(
+    models: &HashMap<String, TableModel>,
+    rules: &SynthRules,
+    config: &GeneratorConfig,
+) -> Result<GeneratedData, String> {
+    generate_with(models, rules, config, true)
+}
+
+fn generate_with(
+    models: &HashMap<String, TableModel>,
+    rules: &SynthRules,
+    config: &GeneratorConfig,
+    unique_primary_keys: bool,
 ) -> Result<GeneratedData, String> {
     let mut rng = if let Some(s) = config.seed {
         rand::rngs::StdRng::seed_from_u64(s)
@@ -345,6 +368,26 @@ pub fn generate(
             }
         }
 
+        // Issue #82: for the SQL export, `model.pk` is a real primary key even
+        // when no other table references it, so duplicated values cannot be
+        // inserted back. Enforced on the copula-generated values only; the
+        // explicit column-level overrides and branch repair below run later and
+        // are the user's choice.
+        if unique_primary_keys {
+            enforce_primary_key_uniqueness(
+                &mut rows,
+                &PkGuard {
+                    table_name,
+                    model,
+                    rule,
+                    column_order,
+                    config,
+                },
+                &mut rel_pools,
+                &mut rng,
+            )?;
+        }
+
         // Phase 4 (plan §1): column-level fixed / values / fixed_range
         // overrides run after copula/marginal, FK and NULL injection.
         apply_column_value_overrides(
@@ -413,6 +456,308 @@ pub fn generate(
         branches: branch_outcomes,
         value_pools: value_pool_outcomes,
     })
+}
+
+/// Per-table inputs the primary-key uniqueness pass needs, grouped so the
+/// entry point stays under clippy's argument limit.
+struct PkGuard<'a> {
+    table_name: &'a str,
+    model: &'a TableModel,
+    rule: &'a TableRule,
+    column_order: &'a [String],
+    config: &'a GeneratorConfig,
+}
+
+/// True when a primary-key column cannot supply a fresh value, so uniqueness
+/// is not enforceable here:
+/// - a `fixed` / `values` / `fixed_range` override is the user's explicit
+///   choice and wins over the primary-key contract (existing behaviour);
+/// - the column is a relationship pk (a foreign key child), whose uniqueness
+///   is governed by the pool strategy and referential integrity;
+/// - a zero-variance model (`min == max`) has no value space to redraw from.
+fn pk_column_is_frozen(guard: &PkGuard, column: &str) -> bool {
+    if guard
+        .rule
+        .columns
+        .get(column)
+        .is_some_and(|c| c.has_column_override())
+    {
+        return true;
+    }
+    if guard.rule.relationships.iter().any(|r| r.pk == column) {
+        return true;
+    }
+    guard
+        .model
+        .columns
+        .get(column)
+        .is_some_and(|c| matches!((c.min, c.max), (Some(lo), Some(hi)) if lo == hi))
+}
+
+/// Draw one fresh value for a primary-key column, from the parent pool when
+/// the column is also a foreign key (values must stay inside the referenced
+/// domain) and from its own marginal otherwise.
+fn sample_uniqueness_value(
+    column: &str,
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+) -> Value {
+    if let Some(rel) = rel_pools.iter_mut().find(|r| r.column == column) {
+        return rel
+            .pool
+            .sample_one(rel.strategy, rng)
+            .unwrap_or(Value::Null);
+    }
+    gen_column_value(
+        guard.model.columns.get(column),
+        rng.gen::<f64>(),
+        guard.config.enforce_min_max_values,
+    )
+}
+
+/// Number of distinct values the learned marginal can produce, when that is
+/// knowable (`None` = unbounded, e.g. a continuous marginal or a datetime
+/// epoch axis). Only the redraw-vs-extrapolate decision reads it.
+fn pk_value_space(model: &TableModel, column: &str) -> Option<usize> {
+    let col = model.columns.get(column)?;
+    if let crate::synth::marginal::Marginal::Categorical(p) = &col.marginal {
+        return Some(p.values.len());
+    }
+    let (min, max) = (col.min?, col.max?);
+    if !min.is_finite() || !max.is_finite() || max < min {
+        return None;
+    }
+    let step = match col.rounding {
+        Some(0) => 1.0,
+        _ => 10f64.powi(-(col.decimal_scale? as i32)),
+    };
+    if step <= 0.0 {
+        return None;
+    }
+    let span = (max - min) / step;
+    if !span.is_finite() || span < 0.0 || span > usize::MAX as f64 {
+        return None;
+    }
+    Some(span.round() as usize + 1)
+}
+
+/// Redraw the slot from the marginal until it holds an unseen value. Returns
+/// `false` when the budget runs out (the caller then extrapolates).
+fn redraw_unique(
+    slot: &mut Value,
+    column: &str,
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    for _ in 0..10_000 {
+        let candidate = sample_uniqueness_value(column, guard, rel_pools, rng);
+        if candidate.is_null() {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            *slot = candidate;
+            return true;
+        }
+    }
+    false
+}
+
+/// Extend a numeric or datetime primary key past its trained maximum with a
+/// deterministic sequence (`max + step`, `max + 2*step`, ...). Categorical
+/// (string) values have no safe extension, so they return `None` and the
+/// caller reports the impossibility.
+fn extrapolate_unique(
+    column: &str,
+    guard: &PkGuard,
+    extra: &mut usize,
+    seen: &mut std::collections::HashSet<String>,
+) -> Option<Value> {
+    let col = guard.model.columns.get(column)?;
+    loop {
+        *extra += 1;
+        if *extra > 10_000_000 {
+            return None;
+        }
+        let candidate = match col.logical_type {
+            crate::synth::model::LogicalType::Numerical => {
+                let base = col.max?;
+                let step = match col.rounding {
+                    Some(0) => 1.0,
+                    _ => col
+                        .decimal_scale
+                        .map(|scale| 10f64.powi(-(scale as i32)))
+                        .unwrap_or(1.0),
+                };
+                let value = base + step * (*extra as f64);
+                if col.rounding == Some(0) {
+                    Value::from(value as i64)
+                } else {
+                    Value::from(quantize(value, col.decimal_scale.unwrap_or(0)))
+                }
+            }
+            crate::synth::model::LogicalType::Datetime => {
+                let base = col.max?;
+                let value = base + *extra as f64;
+                match col.datetime_format.as_deref() {
+                    Some(fmt) => Value::String(crate::synth::datetime::format_epoch(value, fmt)?),
+                    None => Value::from(value),
+                }
+            }
+            crate::synth::model::LogicalType::Categorical => return None,
+        };
+        if seen.insert(candidate.to_string()) {
+            return Some(candidate);
+        }
+    }
+}
+
+/// Enforce `model.pk` uniqueness on the copula-generated values (issue #82).
+///
+/// A single-column primary key is rejection-redrawn like a referenced key, and
+/// when the observed value space is too small for the requested row count the
+/// surplus is extrapolated past the trained domain (integer ids continue the
+/// sequence, dates advance by seconds) so the export stays loadable rather
+/// than repeating keys. A composite primary key is redrawn by tuple. NULLs are
+/// not counted: a primary key is `NOT NULL` in any real schema, and excluding
+/// them keeps nullable-column fixtures unchanged.
+fn enforce_primary_key_uniqueness(
+    rows: &mut [Vec<Value>],
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+) -> Result<(), String> {
+    let PkGuard {
+        table_name,
+        model,
+        column_order,
+        ..
+    } = *guard;
+    let row_count = rows.len();
+    if row_count <= 1 || model.pk.is_empty() {
+        return Ok(());
+    }
+
+    // A pk column absent from `column_order` cannot be checked; the model's
+    // copula column set is the source of truth for what was generated.
+    let pk_indices: Vec<usize> = model
+        .pk
+        .iter()
+        .filter_map(|name| column_order.iter().position(|c| c == name))
+        .collect();
+    if pk_indices.is_empty() {
+        return Ok(());
+    }
+    let pk_names: Vec<&str> = pk_indices
+        .iter()
+        .map(|&index| column_order[index].as_str())
+        .collect();
+
+    if pk_indices.len() == 1 {
+        let index = pk_indices[0];
+        let column = pk_names[0];
+        if pk_column_is_frozen(guard, column) {
+            return Ok(());
+        }
+
+        // When the observed value space already fits the requested rows, redraw
+        // can fill every slot from the learned marginal. Otherwise (scale-up
+        // past the trained keys) the surplus is extrapolated past the domain.
+        let feasible = pk_value_space(model, column)
+            .map(|space| space >= row_count)
+            .unwrap_or(true);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut extra = 0usize;
+        for row in rows.iter_mut() {
+            if row[index].is_null() {
+                continue;
+            }
+            if seen.insert(row[index].to_string()) {
+                continue;
+            }
+            if feasible && redraw_unique(&mut row[index], column, guard, rel_pools, rng, &mut seen)
+            {
+                continue;
+            }
+            let candidate =
+                extrapolate_unique(column, guard, &mut extra, &mut seen).ok_or_else(|| {
+                    format!(
+                        "primary key column '{}.{}' cannot supply {row_count} unique values: \
+                         its observed space is exhausted and the marginal is not numeric or \
+                         datetime, so it cannot be extended; reduce --rows or drop the table \
+                         from the rules",
+                        table_name, column
+                    )
+                })?;
+            row[index] = candidate;
+        }
+        return Ok(());
+    }
+
+    // Composite primary key: members may repeat individually, only the tuple
+    // must be unique.
+    let frozen: Vec<bool> = pk_names
+        .iter()
+        .map(|name| pk_column_is_frozen(guard, name))
+        .collect();
+    if frozen.iter().all(|is_frozen| *is_frozen) {
+        return Ok(());
+    }
+
+    fn tuple_key(row: &[Value], pk_indices: &[usize]) -> Option<String> {
+        if pk_indices.iter().any(|&index| row[index].is_null()) {
+            return None;
+        }
+        Some(
+            pk_indices
+                .iter()
+                .map(|&index| row[index].to_string())
+                .collect::<Vec<String>>()
+                .join("\u{1f}"),
+        )
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows.iter_mut() {
+        let Some(key) = tuple_key(row, &pk_indices) else {
+            continue;
+        };
+        if seen.insert(key) {
+            continue;
+        }
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            if attempts >= 10_000 {
+                return Err(format!(
+                    "composite primary key ({}) on table '{}' exhausted its value space \
+                     after {attempts} redraws but {row_count} rows are requested; duplicated \
+                     primary keys cannot be inserted back into the source table",
+                    pk_names.join(", "),
+                    table_name
+                ));
+            }
+            for (slot, &index) in pk_indices.iter().enumerate() {
+                if frozen[slot] {
+                    continue;
+                }
+                let column = column_order[index].as_str();
+                let candidate = sample_uniqueness_value(column, guard, rel_pools, rng);
+                if !candidate.is_null() {
+                    row[index] = candidate;
+                }
+            }
+            if let Some(key) = tuple_key(row, &pk_indices) {
+                if seen.insert(key) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn round_to_scale(value: f64, scale: u8, strategy: rust_decimal::RoundingStrategy) -> f64 {
@@ -6110,5 +6455,236 @@ tables:
         let data = generate(&models, &rules, &config(&["t"], 3)).unwrap();
         let rows = serde_json::to_string(data.tables.get("t").unwrap()).unwrap();
         assert_eq!(rows, "[[-0.7745645303296556,0.1440950566134802,-0.8762332024966213],[1.0044406514899151,-0.803943491589223,-1.4398776414381587],[-2.1981105969970827,-0.19184861516094998,0.5787749357941152]]");
+    }
+
+    /// A single-column pk with fewer dictionary levels than requested rows is
+    /// impossible to make unique (issue #82): `generate` must fail fast and
+    /// name the column, not silently emit duplicate keys.
+    #[test]
+    fn should_reject_low_cardinality_primary_key_that_cannot_cover_rows() {
+        let mut model = categorical_model("t", "id");
+        model.pk = vec!["id".to_string()];
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let err = generate_unique_primary_keys(&models, &rules, &config(&["t"], 5))
+            .expect_err("low-cardinality primary key must error");
+        assert!(
+            err.contains("primary key column 't.id'"),
+            "error must name the primary key column: {err}"
+        );
+        assert!(err.contains('5'), "error must name the row count: {err}");
+    }
+
+    /// A numeric primary key with a bounded observed space still has to fill
+    /// more rows on scale-up (issue #82): the surplus continues past the
+    /// trained maximum instead of repeating keys or failing the run.
+    #[test]
+    fn should_extrapolate_numeric_primary_key_beyond_the_trained_maximum() {
+        let mut model = int_key_model("t", "id", 0.0);
+        let column = model.columns.get_mut("id").unwrap();
+        column.rounding = Some(0);
+        column.marginal = Marginal::Uniform(UniformParams {
+            low: 0.0,
+            high: 10.0,
+        });
+        column.min = Some(0.0);
+        column.max = Some(10.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config(&["t"], 25)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 25);
+        let distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            25,
+            "extrapolated primary keys must stay unique, got {} distinct of {}",
+            distinct.len(),
+            rows.len()
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row[0].as_i64().is_some_and(|value| value > 10)),
+            "the surplus keys must extend past the trained maximum"
+        );
+    }
+
+    /// Primary-key uniqueness is a SQL-export concern (issue #82): the plain
+    /// generator used for CSV/JSONL must keep its historical draws, so the
+    /// distribution `synth report` scores does not move.
+    #[test]
+    fn should_keep_duplicate_primary_keys_on_the_non_sql_path() {
+        let mut model = int_key_model("t", "id", 0.0);
+        let column = model.columns.get_mut("id").unwrap();
+        column.rounding = Some(0);
+        column.marginal = Marginal::Uniform(UniformParams {
+            low: 0.0,
+            high: 10.0,
+        });
+        column.min = Some(0.0);
+        column.max = Some(10.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 25)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert!(
+            distinct.len() < rows.len(),
+            "the non-SQL path must keep drawing with replacement"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row[0].as_i64().is_some_and(|value| value <= 10)),
+            "the non-SQL path must not extrapolate"
+        );
+    }
+
+    /// Composite primary key members may repeat individually; only the tuple
+    /// must be unique. `a` has two levels over six rows, so a per-column rule
+    /// would fail even though the tuple space is large enough.
+    #[test]
+    fn should_enforce_composite_primary_key_tuple_uniqueness() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "a".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["x".to_string(), "y".to_string()],
+                    weights: vec![0.5, 0.5],
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "b".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["1", "2", "3", "4", "5"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    weights: vec![0.2; 5],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config(&["t"], 6)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 6);
+        let tuples: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|row| format!("{}\u{1f}{}", row[0], row[1]))
+            .collect();
+        assert_eq!(
+            tuples.len(),
+            6,
+            "composite primary key tuples must be unique, got {} distinct of {}",
+            tuples.len(),
+            rows.len()
+        );
+        let first_distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert!(
+            first_distinct.len() < rows.len(),
+            "a composite member is allowed to repeat (proves tuple-level, not per-column, uniqueness)"
+        );
+    }
+
+    /// A composite pk whose members cannot cover the row count must fail fast.
+    #[test]
+    fn should_reject_composite_primary_key_that_cannot_cover_rows() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "a".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["only".to_string()],
+                    weights: vec![1.0],
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "b".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["only".to_string()],
+                    weights: vec![1.0],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let err = generate_unique_primary_keys(&models, &rules, &config(&["t"], 3))
+            .expect_err("impossible composite primary key must error");
+        assert!(
+            err.contains("composite primary key"),
+            "error must mention the composite primary key: {err}"
+        );
     }
 }
