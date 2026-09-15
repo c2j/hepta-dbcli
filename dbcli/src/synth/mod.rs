@@ -282,22 +282,62 @@ async fn run_train(
         .map(|i| side.connection_url[..i].to_string())
         .unwrap_or_else(|| "mysql".to_string());
 
+    let schema = match schema {
+        Some(s) => s.to_string(),
+        None => {
+            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
+                .await?
+        }
+    };
+
     for table in &tables {
-        let sql = {
+        let (col_sql, idx_sql, sample_sql) = {
             let dialect = conn.dialect();
-            dialect.add_limit(
-                &format!("SELECT * FROM {}", dialect.quote_table(schema, table)),
-                sample,
+            (
+                dialect.table_columns().to_string(),
+                dialect.table_indexes().to_string(),
+                dialect.add_limit(
+                    &format!(
+                        "SELECT * FROM {}",
+                        dialect.quote_table(Some(&schema), table)
+                    ),
+                    sample,
+                ),
             )
         };
+        let col_result =
+            crate::delta_diff::metadata::exec_or_inline(&mut *conn, &col_sql, &schema, table)
+                .await
+                .map_err(|e| format!("describe columns for '{}': {}", table, e))?;
+        let idx_result =
+            crate::delta_diff::metadata::exec_or_inline(&mut *conn, &idx_sql, &schema, table)
+                .await
+                .map_err(|e| format!("describe indexes for '{}': {}", table, e))?;
+        let data_types = cmd::parse_column_types(&col_result);
+        let pk: Vec<String> = cmd::parse_primary_key(&idx_result)
+            .into_iter()
+            .filter(|k| data_types.keys().any(|name| name.eq_ignore_ascii_case(k)))
+            .map(|k| {
+                data_types
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&k))
+                    .cloned()
+                    .unwrap_or(k)
+            })
+            .collect();
+
         let result = conn
-            .query(&sql)
+            .query(&sample_sql)
             .await
             .map_err(|e| format!("sample table '{}': {}", table, e))?;
 
-        let profile =
-            crate::synth::profile::TableProfile::from_rows(table, &result.columns, &result.rows);
-        let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows)?;
+        let profile = crate::synth::profile::TableProfile::from_rows_typed(
+            table,
+            &result.columns,
+            &result.rows,
+            Some(&data_types),
+        );
+        let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows, pk)?;
         for col in &skipped {
             eprintln!(
                 "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",
