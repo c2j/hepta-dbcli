@@ -816,78 +816,107 @@ fn read_json(path: &Path) -> Result<GeneratedTable, String> {
 }
 
 /// CSV fields come back as strings (the exporter does not record types);
-/// numeric parsing happens at scoring time, and an empty unquoted field is
-/// read as NULL while `""` is the empty string.
+/// numeric parsing happens at scoring time. An empty unquoted field is NULL
+/// while `""` is the empty string, which is why this is a small RFC 4180
+/// reader over the whole file rather than `csv::Reader`: the crate cannot tell
+/// those two apart, and quoted fields may contain the line break the record
+/// splitter would otherwise treat as a row.
 fn read_csv(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut lines = content.lines();
-    let header = match lines.next() {
-        Some(header) => parse_csv_line(header),
+    let records = parse_csv_records(&content);
+    let mut records = records.into_iter();
+    let columns: Vec<String> = match records.next() {
+        Some(header) => header
+            .into_iter()
+            .map(|field| field.unwrap_or_default())
+            .collect(),
         None => return Ok((Vec::new(), Vec::new())),
     };
-    let columns: Vec<String> = header
-        .into_iter()
-        .map(|field| field.unwrap_or_default())
-        .collect();
-    let mut rows = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(line);
-        rows.push(
-            fields
+    let rows = records
+        .map(|record| {
+            record
                 .into_iter()
                 .map(|field| match field {
                     Some(text) => Value::String(text),
                     None => Value::Null,
                 })
-                .collect(),
-        );
-    }
+                .collect()
+        })
+        .collect();
     Ok((columns, rows))
 }
 
-/// Minimal CSV reader for the exporter's output: `None` is an empty unquoted
-/// field (NULL), `Some("")` is a quoted empty string.
-fn parse_csv_line(line: &str) -> Vec<Option<String>> {
-    let mut fields = Vec::new();
-    let bytes: Vec<char> = line.chars().collect();
+/// Split CSV text into records of fields. `None` is an empty unquoted field
+/// (NULL), `Some("")` a quoted empty string, and a trailing newline does not
+/// produce an empty record.
+fn parse_csv_records(content: &str) -> Vec<Vec<Option<String>>> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut field_is_quoted = false;
+    let mut in_quotes = false;
     let mut i = 0;
-    while i <= bytes.len() {
-        if i < bytes.len() && bytes[i] == '"' {
-            // Quoted field: read to the closing quote, ``""`` is a literal quote.
-            let mut value = String::new();
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == '"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == '"' {
-                        value.push('"');
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quotes {
+            if c == '"' {
+                if chars.get(i + 1) == Some(&'"') {
+                    field.push('"');
+                    i += 2;
+                    continue;
                 }
-                value.push(bytes[i]);
+                in_quotes = false;
+                i += 1;
+                continue;
+            }
+            field.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' if field.is_empty() => {
+                in_quotes = true;
+                field_is_quoted = true;
                 i += 1;
             }
-            fields.push(Some(value));
-        } else {
-            let start = i;
-            while i < bytes.len() && bytes[i] != ',' {
+            ',' => {
+                record.push(field_value(&field, field_is_quoted));
+                field.clear();
+                field_is_quoted = false;
                 i += 1;
             }
-            let raw: String = bytes[start..i].iter().collect();
-            fields.push(if raw.is_empty() { None } else { Some(raw) });
+            '\n' | '\r' => {
+                // Consume CRLF as one break.
+                if c == '\r' && chars.get(i + 1) == Some(&'\n') {
+                    i += 1;
+                }
+                record.push(field_value(&field, field_is_quoted));
+                records.push(std::mem::take(&mut record));
+                field.clear();
+                field_is_quoted = false;
+                i += 1;
+            }
+            _ => {
+                field.push(c);
+                i += 1;
+            }
         }
-        if i >= bytes.len() {
-            break;
-        }
-        i += 1; // skip the separator
     }
-    fields
+    if !field.is_empty() || field_is_quoted || !record.is_empty() {
+        record.push(field_value(&field, field_is_quoted));
+        records.push(record);
+    }
+    records
+}
+
+fn field_value(field: &str, quoted: bool) -> Option<String> {
+    if field.is_empty() && !quoted {
+        None
+    } else {
+        Some(field.to_string())
+    }
 }
 
 // ─── Foreign keys ───────────────────────────────────────────────────────
@@ -1020,7 +1049,8 @@ pub fn evaluate_fk(
     }
     if items.is_empty() {
         return Section::Skipped {
-            reason: "no scorable foreign key (missing generated table or parent key pool)"
+            reason: "no scorable foreign key: include the parent table in --data, or pass \
+                     --against-db for real keys"
                 .to_string(),
         };
     }
@@ -1056,13 +1086,50 @@ pub fn fk_section_for_table(section: &Section<Vec<FkRate>>, table: &str) -> Sect
     }
 }
 
-/// Parent key pool from a trained model: its categorical value dictionary.
-/// Continuous marginals carry no discrete key pool, so those return `None`.
-pub fn model_key_pool(model: &TableModel, column: &str) -> Option<Vec<String>> {
-    match &model.columns.get(column)?.marginal {
-        Marginal::Categorical(params) => Some(params.values.clone()),
-        _ => None,
+/// Parent key pool taken from the *generated* parent table: the child must
+/// reference keys its parent actually produced. A model's value dictionary is
+/// not a substitute - after #66 a high-cardinality integer PK is a continuous
+/// marginal with no dictionary, and generated-parent keys are what the
+/// generated child should be checked against.
+pub fn generated_key_pools(
+    relations: &[FkRelation],
+    table_columns: &GeneratedColumns,
+    generated: &GeneratedTables,
+) -> ParentKeyPools {
+    let mut pools = HashMap::new();
+    for relation in relations {
+        let key = (
+            relation.parent_table.clone(),
+            relation.parent_column.clone(),
+        );
+        if pools.contains_key(&key) {
+            continue;
+        }
+        let Some(columns) = table_columns.get(&relation.parent_table) else {
+            continue;
+        };
+        let Some(rows) = generated.get(&relation.parent_table) else {
+            continue;
+        };
+        let Some(col_idx) = first_index(columns, &relation.parent_column) else {
+            continue;
+        };
+        let mut values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(col_idx))
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .collect();
+        values.sort();
+        values.dedup();
+        pools.insert(key, values);
     }
+    pools
 }
 
 #[cfg(test)]
@@ -1360,25 +1427,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_csv_line_reads_quotes_and_nulls() {
+    fn parse_csv_records_handles_quotes_nulls_and_embedded_newlines() {
+        let records = parse_csv_records("1,\"a,b\",\"\",2\nx,\"say \"\"hi\"\"\",,\n");
         assert_eq!(
-            parse_csv_line(r#"1,"a,b","",2"#),
+            records,
             vec![
-                Some("1".to_string()),
-                Some("a,b".to_string()),
-                Some(String::new()),
-                Some("2".to_string())
+                vec![
+                    Some("1".to_string()),
+                    Some("a,b".to_string()),
+                    Some(String::new()),
+                    Some("2".to_string())
+                ],
+                vec![
+                    Some("x".to_string()),
+                    Some(r#"say "hi""#.to_string()),
+                    None,
+                    None
+                ],
             ]
         );
-        assert_eq!(
-            parse_csv_line(r#"x,"say ""hi""",,"end""#),
-            vec![
-                Some("x".to_string()),
-                Some(r#"say "hi""#.to_string()),
-                None,
-                Some("end".to_string())
-            ]
-        );
+
+        // A newline inside a quoted field is part of the value, not a record
+        // break (the exporter quotes such fields).
+        let records = parse_csv_records("a,b\n\"line1\nline2\",2\n");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1][0], Some("line1\nline2".to_string()));
+        assert_eq!(records[1][1], Some("2".to_string()));
+
+        // CRLF files and a missing trailing newline both parse to one record.
+        assert_eq!(parse_csv_records("a,b\r\n1,2").len(), 2);
     }
 
     #[test]
@@ -1594,6 +1671,58 @@ mod tests {
     }
 
     #[test]
+    fn fk_pools_come_from_the_generated_parent_table() {
+        let relations = vec![FkRelation {
+            child_table: "orders".to_string(),
+            child_column: "user_id".to_string(),
+            parent_table: "users".to_string(),
+            parent_column: "id".to_string(),
+        }];
+        let table_columns = HashMap::from([
+            ("users".to_string(), vec!["id".to_string()]),
+            ("orders".to_string(), vec!["user_id".to_string()]),
+        ]);
+        let generated = HashMap::from([
+            (
+                "users".to_string(),
+                vec![
+                    vec![Value::from(1)],
+                    vec![Value::from(2)],
+                    vec![Value::from(2)],
+                ],
+            ),
+            (
+                "orders".to_string(),
+                vec![vec![Value::from(2)], vec![Value::from(9)]],
+            ),
+        ]);
+
+        let pools = generated_key_pools(&relations, &table_columns, &generated);
+        assert_eq!(
+            pools.get(&("users".to_string(), "id".to_string())).unwrap(),
+            &vec!["1".to_string(), "2".to_string()]
+        );
+
+        // Without the parent table in the generated data there is no pool, and
+        // the edge is skipped with a reason that says what to do.
+        let section = evaluate_fk(
+            &relations,
+            &table_columns,
+            &HashMap::from([("orders".to_string(), generated["orders"].clone())]),
+            &generated_key_pools(
+                &relations,
+                &table_columns,
+                &HashMap::from([("orders".to_string(), generated["orders"].clone())]),
+            ),
+            "generated",
+        );
+        match section {
+            Section::Skipped { reason } => assert!(reason.contains("--against-db"), "{reason}"),
+            other => panic!("expected skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn total_variation_is_bitwise_stable() {
         // Many keys: with a HashMap the summation order varies per call and
         // the score drifts in the last bits, which makes two runs of
@@ -1608,15 +1737,5 @@ mod tests {
                 "total_variation must be reproducible"
             );
         }
-    }
-
-    #[test]
-    fn model_key_pool_only_covers_categorical_columns() {
-        let model = model_of(&[categorical_column("kind"), numeric_column("amount")]);
-        assert_eq!(
-            model_key_pool(&model, "kind"),
-            Some(vec!["a".to_string(), "b".to_string()])
-        );
-        assert_eq!(model_key_pool(&model, "amount"), None);
     }
 }

@@ -914,9 +914,7 @@ fn pit_to_gaussian(val: &serde_json::Value, col_model: Option<&ColumnModel>) -> 
             marginal => {
                 // Every numeric marginal (Normal / Beta / Gamma / Uniform /
                 // Ecdf) routes through its own CDF, so the copula's Gaussian
-                // space always reflects the fitted shape. A missing arm here
-                // used to collapse the column to the constant 0.5 and report
-                // r = 0 against every other column.
+                // space always reflects the fitted shape.
                 let x = numeric_axis_value(val, model)?;
                 marginal.cdf(x).clamp(1e-12, 1.0 - 1e-12)
             }
@@ -1746,8 +1744,8 @@ mod tests {
     }
 
     /// A strictly monotone pair whose marginals are each fitted from their own
-    /// column must come out strongly correlated. The previous `_ => 0.5`
-    /// fallback collapsed non-Normal columns to a constant and reported r = 0.
+    /// column must come out strongly correlated: PIT must not degrade to a
+    /// constant that reports r = 0.
     fn assert_monotone_pair_correlates(a: &[f64], b: &[f64], fit: impl Fn(&[f64]) -> Marginal) {
         assert_eq!(a.len(), b.len());
         let columns = HashMap::from([

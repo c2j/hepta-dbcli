@@ -7,8 +7,11 @@ Usage: verify_m2.py OUT SCHEMA GOOD_CODE SECOND_CODE DEGRADED_CODE FK_DB_CODE \
 Checks the artifacts produced by run_m2.sh:
   * `train` wrote a holdout baseline per table, and it holds aggregate
     summaries only (no raw rows);
-  * `synth report` scored shapes and pairs offline, deterministically, and its
-    JSON stays machine-readable;
+  * #66 auto-selection is active on the trained model (the fixture's numeric
+    columns are not a blanket Normal);
+  * `synth report` scored shapes, pairs and the FK edge offline (against the
+    generated parent keys), deterministically, and its JSON stays
+    machine-readable;
   * a degraded numeric column is detected (score < 0.8 and >= 0.15 lower than
     the clean run) and trips --min-score (exit code != 0);
   * `--against-db` scores the foreign key against the live key pool at 1.0;
@@ -20,6 +23,10 @@ import os
 import sys
 
 TABLES = ("m1_verify_parent", "m1_verify_child")
+# Numeric columns whose model marginal must not be a blanket Normal: the
+# fixture's arithmetic progressions fit Uniform/ECDF (issue #66).
+AUTO_SELECTED_COLUMNS = ("id", "cjje", "whole_dec")
+PARAMETRIC_FAMILIES = {"uniform", "ecdf", "gamma", "beta"}
 ALLOWED_BASELINE_KEYS = {"schema_version", "table", "holdout_rows", "columns", "pairs"}
 SHIFTED_COLUMN = "cjje"
 
@@ -36,6 +43,24 @@ def load_json(path):
 def check(condition, message):
     if not condition:
         raise Failure(message)
+
+
+def check_marginals(out):
+    """The trained model must show auto-selection at work (#66)."""
+    model = load_json(os.path.join(out, "models", "m1_verify_parent.model.json"))
+    for name in AUTO_SELECTED_COLUMNS:
+        family = model["columns"][name]["marginal"]["name"]
+        check(
+            family in PARAMETRIC_FAMILIES,
+            f"{name}: marginal '{family}' outside {sorted(PARAMETRIC_FAMILIES)}; "
+            "auto-selection regressed to a blanket normal",
+        )
+    # Formatted datetimes keep Normal (auto-selection on the epoch axis is not
+    # part of #66).
+    check(
+        model["columns"]["trade_time"]["marginal"]["name"] == "norm",
+        "formatted datetime must keep the Normal epoch marginal",
+    )
 
 
 def check_baselines(out):
@@ -140,6 +165,7 @@ def main():
     strict_code = int(strict_code)
 
     try:
+        check_marginals(out)
         check_baselines(out)
 
         report = load_json(os.path.join(out, "report.json"))
@@ -175,6 +201,22 @@ def main():
         )
         check(degraded_code != 0, f"degraded data must fail --min-score, exit {degraded_code}")
 
+        # Foreign keys offline: the pool is the generated parent column, so a
+        # correct generator scores 1.0 without --against-db.
+        child_offline = table_by_name(report, "m1_verify_child")
+        offline_fk = child_offline["fk"]
+        check(
+            offline_fk["status"] == "scored",
+            f"offline fk section must be scored from generated keys: {offline_fk}",
+        )
+        offline_rate = offline_fk["items"][0]
+        check(offline_rate["source"] == "generated", f"fk source {offline_rate['source']}")
+        check(
+            abs(offline_rate["rate"] - 1.0) < 1e-9,
+            f"generated child must reference generated parent keys, rate {offline_rate['rate']}",
+        )
+        check(not offline_rate["warn"], "offline FK rate 1.0 must not warn")
+
         # Foreign keys against the live key pool.
         db_report = load_json(os.path.join(out, "report_db.json"))
         check(fk_db_code == 0, f"--against-db exit {fk_db_code}")
@@ -209,7 +251,10 @@ def main():
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
 
-    print("M2 assertions: baselines, shapes, pairs, degradation, fk, skip/strict OK")
+    print(
+        "M2 assertions: marginals, baselines, shapes, pairs, degradation, "
+        "fk (generated + database), skip/strict OK"
+    )
     return 0
 
 

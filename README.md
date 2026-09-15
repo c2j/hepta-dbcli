@@ -351,7 +351,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 # Score generated data against the holdout baseline `train` recorded
 hepta_dbcli synth report --models .synth --data synth-out \
-  --rules synth-rules.yaml --min-score 0.85   # --against-db for real FK key pools
+  --rules synth-rules.yaml --min-score 0.85   # --against-db for real DB key pools
 ```
 
 `train` samples each numeric column (Normal / Beta / Gamma / Uniform / ECDF) and
@@ -361,7 +361,8 @@ in the rules YAML forces a family instead. It also writes
 `<table>.report-baseline.json` (quantile knots, value frequencies, pair
 statistics; no raw rows), which lets `synth report` score a model offline:
 `1-KS` per numeric column, `1-TV` per categorical column, Pearson/joint TV per
-column pair, and FK join rates. Categorical columns with more than 50 levels are
+column pair, and FK join rates (against the generated parent keys, or the live
+database with `--against-db`). Categorical columns with more than 50 levels are
 reported but left out of the average, since total variation over hundreds of
 levels is sampling noise rather than fidelity; a models directory without a
 baseline reports `skipped` (exit 0) unless `--strict` is set.

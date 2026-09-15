@@ -761,6 +761,21 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         }
     }
 
+    if options.strict {
+        let mut without_data: Vec<&String> = models
+            .keys()
+            .filter(|table| !table_rows.contains_key(*table))
+            .collect();
+        without_data.sort();
+        if !without_data.is_empty() {
+            return Err(format!(
+                "--strict: no generated data for {:?} (pass --data including those tables, or \
+                 narrow --models)",
+                without_data
+            ));
+        }
+    }
+
     let relations = rules.as_ref().map(fk_relations).unwrap_or_default();
     let (parent_pools, fk_source) = match options.against_db.as_deref() {
         Some(connection) => {
@@ -771,7 +786,12 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
                 "database",
             )
         }
-        None => (model_key_pools(&relations, &models), "model"),
+        // Without a database the pool is the generated parent column, so the
+        // check is "does the child reference keys its parent actually made".
+        None => (
+            crate::synth::quality::generated_key_pools(&relations, &table_columns, &table_rows),
+            "generated",
+        ),
     };
     let fk: Section<Vec<FkRate>> = evaluate_fk(
         &relations,
@@ -781,21 +801,35 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         fk_source,
     );
 
-    let mut table_names: Vec<&String> = table_rows.keys().collect();
+    // Every model gets a row in the report. A table whose data is missing is
+    // reported as `skipped` instead of silently absent, so `--min-score` can
+    // never average away a table that was not scored at all.
+    let mut table_names: Vec<&String> = models.keys().collect();
     table_names.sort();
     let mut tables = Vec::new();
     for table in table_names {
         let Some(model) = models.get(table) else {
             continue;
         };
-        let columns = table_columns.get(table).cloned().unwrap_or_default();
+        let (Some(columns), Some(rows)) = (table_columns.get(table), table_rows.get(table)) else {
+            let reason = match options.data.as_deref() {
+                Some(dir) => format!(
+                    "no generated data for table '{}' in {}",
+                    table,
+                    Path::new(dir).display()
+                ),
+                None => format!("no generated data for table '{}'", table),
+            };
+            tables.push(missing_data_quality(table, &reason));
+            continue;
+        };
         let table_fk = crate::synth::quality::fk_section_for_table(&fk, table);
         tables.push(evaluate_table(
             table,
             model,
             baselines.get(table),
-            &columns,
-            &table_rows[table],
+            columns,
+            rows,
             table_fk,
         ));
     }
@@ -829,6 +863,26 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
     Ok(())
 }
 
+/// Report entry for a table whose generated data is missing: every section is
+/// skipped with the same reason, so the omission is visible in the JSON.
+fn missing_data_quality(table: &str, reason: &str) -> crate::synth::quality::TableQuality {
+    use crate::synth::quality::TableQuality;
+    TableQuality {
+        table: table.to_string(),
+        rows: 0,
+        shapes: skipped_section(reason),
+        pairs: skipped_section(reason),
+        fk: skipped_section(reason),
+        score: None,
+    }
+}
+
+fn skipped_section<T>(reason: &str) -> crate::synth::quality::Section<T> {
+    crate::synth::quality::Section::Skipped {
+        reason: reason.to_string(),
+    }
+}
+
 /// Rules used for on-the-fly generation: every model becomes a table with the
 /// requested row count and no relationships (FKs come from `--rules`).
 fn rules_from_models(
@@ -850,29 +904,6 @@ fn rules_from_models(
             })
             .collect(),
     }
-}
-
-/// Parent key pools taken from the trained parent models (value dictionaries).
-fn model_key_pools(
-    relations: &[crate::synth::quality::FkRelation],
-    models: &HashMap<String, crate::synth::model::TableModel>,
-) -> crate::synth::quality::ParentKeyPools {
-    let mut pools = HashMap::new();
-    for relation in relations {
-        let Some(model) = models.get(&relation.parent_table) else {
-            continue;
-        };
-        if let Some(pool) = crate::synth::quality::model_key_pool(model, &relation.parent_column) {
-            pools.insert(
-                (
-                    relation.parent_table.clone(),
-                    relation.parent_column.clone(),
-                ),
-                pool,
-            );
-        }
-    }
-    pools
 }
 
 /// Parent key pools read from the live database (`select distinct`).
@@ -902,10 +933,13 @@ async fn load_real_key_pools(
     for (table, column) in wanted {
         let sql = {
             let dialect = conn.dialect();
+            // Ordered so the capped pool is reproducible instead of whatever
+            // the engine returns first.
             let query = format!(
-                "SELECT DISTINCT {} FROM {}",
+                "SELECT DISTINCT {} FROM {} ORDER BY {}",
                 dialect.quote_ident(&column),
-                dialect.quote_table(Some(&schema), &table)
+                dialect.quote_table(Some(&schema), &table),
+                dialect.quote_ident(&column)
             );
             dialect.add_limit(&query, KEY_POOL_LIMIT)
         };
@@ -913,7 +947,7 @@ async fn load_real_key_pools(
             .query(&sql)
             .await
             .map_err(|e| format!("read key pool {}.{}: {}", table, column, e))?;
-        let values = result
+        let values: Vec<String> = result
             .rows
             .iter()
             .filter_map(|row| row.first())
@@ -925,6 +959,12 @@ async fn load_real_key_pools(
                     .unwrap_or_else(|| value.to_string())
             })
             .collect();
+        if values.len() >= KEY_POOL_LIMIT {
+            eprintln!(
+                "warning: key pool {}.{} hit the {} key cap; join rates are computed against a truncated pool",
+                table, column, KEY_POOL_LIMIT
+            );
+        }
         pools.insert((table, column), values);
     }
     Ok(pools)
@@ -1202,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn report_scores_generated_data_against_the_baseline() {
-        // Period-3 values: the 1-in-10 holdout still sees every level.
+        // Period-3 values: every level must reach the holdout sample.
         let training = report_rows(1000, |i| ["a", "b", "c"][i % 3]);
         let models_dir = report_fixture_dir("scored", &training, true);
 
@@ -1459,10 +1499,14 @@ mod tests {
         assert_eq!(items[0].hits, 2);
         assert_eq!(items[0].keys, 3);
         assert!(items[0].warn, "2/3 is below the 0.99 threshold");
-        assert_eq!(items[0].source, "model");
+        assert_eq!(items[0].source, "generated");
+        // The parent pool is what the generated parent actually produced
+        // (1,2,3 in the fixture), not a model value dictionary.
+        assert_eq!(items[0].hits, 2);
 
         // The parent table owns no FK edge and is skipped rather than shown
         // with the child's numbers.
+        assert_eq!(orders.rows, 3, "the report counts generated rows");
         let users = report
             .tables
             .iter()
@@ -1472,6 +1516,84 @@ mod tests {
             users.fk,
             crate::synth::quality::Section::Skipped { .. }
         ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn report_lists_tables_whose_generated_data_is_missing() {
+        // A model with no data file must appear in the JSON as skipped, so a
+        // --min-score gate cannot pass by averaging away an unscored table.
+        let root = std::env::temp_dir().join("synth-report-missing-data");
+        let models_dir = root.join("models");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let main_model = report_fixture_model();
+        main_model.save(&models_dir.join("t.model.json")).unwrap();
+        let other_model = categorical_model("other", &[("id", &["1", "2"])]);
+        other_model
+            .save(&models_dir.join("other.model.json"))
+            .unwrap();
+        // Both tables have a baseline, so --strict fails on the missing data
+        // rather than on the baseline check.
+        let training = report_rows(200, |i| ["a", "b", "c"][i % 3]);
+        crate::synth::quality::build_baseline(
+            "t",
+            &main_model,
+            &training,
+            &[0, 1],
+            crate::synth::quality::DEFAULT_HOLDOUT_RATIO,
+        )
+        .unwrap()
+        .save(&models_dir.join("t.report-baseline.json"))
+        .unwrap();
+        crate::synth::quality::build_baseline(
+            "other",
+            &other_model,
+            &[(0..100)
+                .map(|i| vec![serde_json::Value::from(format!("{}", i % 2 + 1))])
+                .collect::<Vec<_>>()][0],
+            &[0],
+            crate::synth::quality::DEFAULT_HOLDOUT_RATIO,
+        )
+        .unwrap()
+        .save(&models_dir.join("other.report-baseline.json"))
+        .unwrap();
+        write_generated_jsonl(&data_dir, &report_rows(100, |i| ["a", "b", "c"][i % 3]));
+        let output = root.join("report.json");
+
+        run_report(
+            report_options(&models_dir, &data_dir, Some(output.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let report: crate::synth::quality::QualityReport =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        let other = report
+            .tables
+            .iter()
+            .find(|table| table.table == "other")
+            .expect("the data-less table must still be listed");
+        assert_eq!(other.rows, 0);
+        let crate::synth::quality::Section::Skipped { reason } = &other.shapes else {
+            panic!("expected skipped shapes, got {:?}", other.shapes);
+        };
+        assert!(reason.contains("no generated data"), "{reason}");
+        assert!(matches!(
+            other.fk,
+            crate::synth::quality::Section::Skipped { .. }
+        ));
+        assert!(other.score.is_none(), "a table with no data has no score");
+
+        // --strict turns the omission into an error.
+        let mut options = report_options(&models_dir, &data_dir, None);
+        options.strict = true;
+        let err = run_report(options, None).await.unwrap_err();
+        assert!(err.contains("no generated data"), "{err}");
 
         std::fs::remove_dir_all(&root).ok();
     }

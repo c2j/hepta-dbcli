@@ -46,11 +46,11 @@ no baseline. `verify_m2.py` asserts:
 
 | Issue | Check |
 |---|---|
-| #66 | auto-selection picks a fitting family per column (the fixture's arithmetic columns land on `uniform`/`ecdf`, not a forced `normal`) |
+| #66 | the trained model is not a blanket Normal: `m1_verify_parent.{id,cjje,whole_dec}` are `uniform`/`ecdf`/`gamma`/`beta`, while the formatted `trade_time` keeps its Normal epoch marginal |
 | #67 AC1 | the report carries `shapes` / `pairs` / `fk` sections and an overall score in `(0, 1)` |
 | #67 AC2 | shifting `cjje` by +10000 drops that column below 0.8 (>= 0.15 below the clean run) and fails `--min-score` with a non-zero exit code |
-| #67 AC4 | `--against-db` scores `m1_verify_child.parent_id -> m1_verify_parent.id` against the live pool at rate 1.0, source `database`, no warn |
-| #67 AC3 | a models directory without a baseline yields `status: skipped` with a reason and exit code 0; `--strict` fails |
+| #67 AC4 | offline, the FK edge is scored at rate 1.0 against the **generated parent keys** (`source: "generated"`); with `--against-db` it is scored against the live pool (`source: "database"`) and still 1.0 with no warn |
+| #67 AC3 | a models directory without a baseline yields `status: skipped` with a reason and exit code 0; `--strict` fails. A model with no generated data is listed as a skipped table (not silently absent) and also fails `--strict` |
 | #67 AC5 | two runs over the same inputs produce byte-identical report JSON (and the same seed regenerates byte-identical data) |
 | #67 AC6 | baseline files contain only aggregate payloads (numeric knots or `[value, frequency]` pairs), never a row record |
 
