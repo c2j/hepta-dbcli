@@ -597,20 +597,18 @@ async fn run_rules_draft(
     });
 
     // Primary keys come from the trained models; without them the heuristic
-    // simply cannot tell a child key from a reference (issue #76-E). Swallowing
-    // the error would run the heuristic with an empty map and invent references
-    // out of primary keys, so the failure is reported.
+    // simply cannot tell a child key from a reference (issue #76-E), so a
+    // failure here is reported instead of silently degrading the draft.
     let primary_keys = match load_primary_keys(models_dir) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!(
-                "warning: ignoring trained models (implicit relationship detection \
-                 may invent references): {}",
-                e
-            );
+            eprintln!("warning: ignoring trained models: {}", e);
             HashMap::new()
         }
     };
+    if let Some(warning) = implicit_fk_warning(&primary_keys, &profiles, models_dir) {
+        eprintln!("warning: {}", warning);
+    }
 
     let (rules, inferred) = crate::synth::rules_draft::generate_draft_with_implicit(
         &tables,
@@ -741,6 +739,27 @@ fn write_report_baseline(
         path.display()
     );
     Ok(())
+}
+
+/// The implicit-FK heuristic skips a child column that is its own primary key,
+/// and it can only know the primary keys from the trained models. Profiles
+/// without models (for example a directory holding only `*.profile.json`) leave
+/// that guard inert, so the draft can invent a reference such as
+/// `orders.id -> users.id`. Returns the warning to print in that case.
+fn implicit_fk_warning(
+    primary_keys: &HashMap<String, String>,
+    profiles: &HashMap<String, crate::synth::profile::TableProfile>,
+    models_dir: &Path,
+) -> Option<String> {
+    if primary_keys.is_empty() && !profiles.is_empty() {
+        return Some(format!(
+            "trained profiles in {} carry no primary keys; implicit relationship \
+             detection cannot skip a child key and may invent references \
+             (retrain with `synth train` to restore it)",
+            models_dir.display()
+        ));
+    }
+    None
 }
 
 /// Primary key per table, as recorded by `synth train`. Errors are returned
@@ -1122,6 +1141,37 @@ const KEY_POOL_LIMIT: usize = 100_000;
 mod tests {
     use super::*;
 
+    fn profile_for(table: &str) -> crate::synth::profile::TableProfile {
+        serde_json::from_value(serde_json::json!({
+            "table": table,
+            "row_count": 10,
+            "columns": {}
+        }))
+        .expect("test profile")
+    }
+
+    #[test]
+    fn should_warn_when_profiles_run_without_primary_keys() {
+        let profiles = HashMap::from([("orders".to_string(), profile_for("orders"))]);
+        let warning =
+            implicit_fk_warning(&HashMap::new(), &profiles, Path::new("/nonexistent/.synth"))
+                .expect("profiles without models must warn");
+        assert!(
+            warning.contains("may invent references"),
+            "warning must name the consequence: {warning}"
+        );
+    }
+
+    #[test]
+    fn should_not_warn_when_primary_keys_or_profiles_are_present() {
+        let profiles = HashMap::from([("orders".to_string(), profile_for("orders"))]);
+        let keys = HashMap::from([("orders".to_string(), "order_id".to_string())]);
+        assert!(implicit_fk_warning(&keys, &profiles, Path::new(".synth")).is_none());
+        // No profiles at all: inference never runs, so there is nothing to warn about.
+        assert!(
+            implicit_fk_warning(&HashMap::new(), &HashMap::new(), Path::new(".synth")).is_none()
+        );
+    }
     #[test]
     fn should_error_when_a_models_directory_is_missing() {
         let dir = tempfile::tempdir().unwrap();
