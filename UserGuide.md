@@ -810,7 +810,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 | `--export-rows` | 导出文件带完整左右行值（`.sql` 自动打开） |
 | `--no-fetch-sample` | keyless 比对不要回查真实行 |
 
-summary 中 Modified 行会附列级变化直方图（`modified_by_column[列名]` 计数行，count 降序）：变化判定与终端一致（数值标度差异如 `12150.0` vs `12150` 不算变化），因此直方图计数之和可能小于 `modified` 总数。keyless（hash-count）比对没有列可比，不生成直方图、样本不做列多样化；`--summary-only` 同样输出直方图。
+summary 中 Modified 行会附列级变化直方图（`modified_by_column[列名]` 计数行，count 降序）。计数含义是「该列发生变化的 Modified 行数」，**不是** `modified` 的拆分：数值标度差异（如 `12150.0` vs `12150`，变化判定与终端一致）不算变化，计数之和可能小于 `modified`；一行改多列时计数之和会大于 `modified`。keyless（hash-count）比对没有列可比，不生成直方图、样本不做列多样化；`--summary-only` 同样输出直方图。
 
 CSV 第一列为 `deltadiff_type`：`only_left` / `only_right` / `modified_left` / `modified_right`。`NUMBER`/`NUMERIC`/`DECIMAL` 按声明精度输出。无主键（hash-count）CSV 列为 `deltadiff_type,hash,left_count,right_count`。
 
