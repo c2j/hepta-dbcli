@@ -302,6 +302,10 @@ pub fn generate(
             &referenced_targets,
         )?;
 
+        // Phase 5 (plan §1): derived columns run last, over the values every
+        // earlier phase produced.
+        apply_derive_rules(&mut rows, table_name, rule, model, column_order)?;
+
         for (col_idx, col_name) in column_order.iter().enumerate() {
             let values: Vec<Value> = rows
                 .iter()
@@ -553,6 +557,169 @@ fn column_value_rng(
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::rngs::StdRng::from_entropy(),
     }
+}
+
+/// Overwrite derived columns with `expr` evaluated over the finished row
+/// (issue #70). Derive rules are applied in dependency order, so a rule may
+/// reference a column another rule produced.
+fn apply_derive_rules(
+    rows: &mut [Vec<Value>],
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    column_order: &[String],
+) -> Result<(), String> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    if rule.derive.is_empty() {
+        return Ok(());
+    }
+
+    let index_of: HashMap<&str, usize> = column_order
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+
+    // Kahn over the derive graph: a target waits for the derive columns it
+    // references (cycles were already rejected by `rules.validate`).
+    let mut parsed: HashMap<&str, crate::synth::expr::Expr> = HashMap::new();
+    for derive in &rule.derive {
+        let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+            format!(
+                "table '{}' derive '{}': expression '{}' rejected: {}",
+                table_name, derive.column, derive.expr, e
+            )
+        })?;
+        parsed.insert(derive.column.as_str(), expr);
+    }
+
+    // Repeatedly take whatever is ready; `n` is tiny and this keeps the
+    // dependency rule readable.
+    let mut ordered: Vec<&str> = Vec::with_capacity(rule.derive.len());
+    let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for derive in &rule.derive {
+            let name = derive.column.as_str();
+            if done.contains(name) {
+                continue;
+            }
+            let Some(expr) = parsed.get(name) else {
+                continue;
+            };
+            let ready = expr.referenced_columns().iter().all(|referenced| {
+                !parsed.contains_key(referenced.as_str()) || done.contains(referenced.as_str())
+            });
+            if ready {
+                ordered.push(name);
+                done.insert(name);
+                progress = true;
+            }
+        }
+    }
+
+    if ordered.len() != rule.derive.len() {
+        let mut unresolved: Vec<&str> = rule
+            .derive
+            .iter()
+            .map(|derive| derive.column.as_str())
+            .filter(|name| !done.contains(name))
+            .collect();
+        unresolved.sort_unstable();
+        return Err(format!(
+            "table '{}': derive rules form a cycle involving {}",
+            table_name,
+            unresolved.join(", ")
+        ));
+    }
+
+    // Referenced columns must exist in this table; `.` is rejected by the
+    // expression grammar, so a name here is always a local column.
+    for (target, expr) in &parsed {
+        for name in expr.referenced_columns() {
+            if !index_of.contains_key(name.as_str()) {
+                return Err(format!(
+                    "table '{}' derive '{}': unknown column '{}'",
+                    table_name, target, name
+                ));
+            }
+        }
+        if !index_of.contains_key(target) {
+            return Err(format!(
+                "table '{}' derive '{}': unknown target column",
+                table_name, target
+            ));
+        }
+    }
+
+    for target in ordered {
+        let Some(&col_idx) = index_of.get(target) else {
+            return Err(format!(
+                "table '{}': derive target '{}' vanished",
+                table_name, target
+            ));
+        };
+        let expr = parsed
+            .get(target)
+            .ok_or_else(|| format!("table '{}': derive '{}' was not parsed", table_name, target))?;
+        let column_model = model.columns.get(target);
+        let is_integer = column_model.and_then(|column| column.rounding) == Some(0);
+        let scale = column_model.and_then(|column| column.decimal_scale);
+
+        for row in rows.iter_mut() {
+            let evaluated = {
+                let lookup = |name: &str| -> Option<Value> {
+                    index_of
+                        .get(name)
+                        .and_then(|index| row.get(*index))
+                        .cloned()
+                };
+                expr.eval_decimal(&lookup)
+            };
+
+            let value = evaluated.map_err(|e| {
+                format!(
+                    "table '{}' derive '{}': {} (value left unchanged for this row)",
+                    table_name, target, e
+                )
+            })?;
+
+            let number = if is_integer {
+                let rounded = value.round();
+                let as_i64 = rounded.to_i64().ok_or_else(|| {
+                    format!(
+                        "table '{}' derive '{}': result {} does not fit an integer column",
+                        table_name, target, rounded
+                    )
+                })?;
+                Value::Number(as_i64.into())
+            } else {
+                let as_f64 = value.to_f64().ok_or_else(|| {
+                    format!(
+                        "table '{}' derive '{}': result {} is out of range for a double",
+                        table_name, target, value
+                    )
+                })?;
+                let quantized = match scale {
+                    Some(scale) => quantize(as_f64, scale),
+                    None => as_f64,
+                };
+                serde_json::Number::from_f64(quantized)
+                    .map(Value::Number)
+                    .ok_or_else(|| {
+                        format!(
+                            "table '{}' derive '{}': result {} is not a finite number",
+                            table_name, target, quantized
+                        )
+                    })?
+            };
+            row[col_idx] = number;
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve a rules literal into the numeric domain the marginal was fitted on:
@@ -1048,6 +1215,7 @@ mod tests {
         TableRule {
             name: table.to_string(),
             columns: HashMap::new(),
+            derive: vec![],
             rows: None,
             relationships,
             strategy: TableStrategy::default(),
@@ -1807,6 +1975,7 @@ mod tests {
         let orders = TableRule {
             name: "orders".to_string(),
             columns: HashMap::new(),
+            derive: vec![],
             rows: Some(10_000),
             relationships: vec![Relationship {
                 pk: "user_id".to_string(),
@@ -2014,6 +2183,7 @@ mod tests {
             tables: vec![TableRule {
                 name: "users".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Zipf,
@@ -2137,6 +2307,7 @@ mod tests {
                 TableRule {
                     name: "orders".to_string(),
                     columns: HashMap::new(),
+                    derive: vec![],
                     rows: None,
                     relationships: vec![Relationship {
                         pk: "total".to_string(),
@@ -3832,5 +4003,142 @@ tables:
             rows, "[[-0.7745645303296556,-1.0475389209122454],[1.0044406514899151,0.8203717137465105],[-2.1981105969970827,-2.360240735362993],[0.1440950566134802,-0.4979425620572897]]",
             "unexpected unpinned snapshot"
         );
+    }
+
+    // ─── derive（#70 派生列）────────────────────────────────────────────
+
+    fn three_column_model(total: ColumnModel) -> HashMap<String, TableModel> {
+        let mut columns = HashMap::new();
+        for name in ["price", "qty"] {
+            columns.insert(
+                name.to_string(),
+                numerical_model("t", name, 0.0, 1.0).columns[name].clone(),
+            );
+        }
+        columns.insert("total".to_string(), total);
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["price".to_string(), "qty".to_string(), "total".to_string()],
+                correlation: vec![
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                ],
+            },
+        };
+        HashMap::from([("t".to_string(), model)])
+    }
+
+    fn plain_total_model() -> ColumnModel {
+        numerical_model("t", "total", 0.0, 1.0).columns["total"].clone()
+    }
+
+    fn derive_rules(entries: &[(&str, &str)]) -> SynthRules {
+        let mut table = single_rule("t", vec![]);
+        for (column, expr) in entries {
+            table.derive.push(crate::synth::rules::DeriveRule {
+                column: column.to_string(),
+                expr: expr.to_string(),
+            });
+        }
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        }
+    }
+
+    #[test]
+    fn should_derive_column_as_an_exact_function_of_other_columns() {
+        let models = three_column_model(plain_total_model());
+        let rules = derive_rules(&[("total", "price * qty")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 500)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let price = rust_decimal::Decimal::from_f64_retain(row[0].as_f64().unwrap()).unwrap();
+            let qty = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let total = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                total.round_dp(12),
+                (price * qty).round_dp(12),
+                "row {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_derive_in_dependency_order() {
+        let mut model = three_column_model(plain_total_model()).remove("t").unwrap();
+        model.columns.remove("total");
+        for name in ["b", "c"] {
+            model.columns.insert(
+                name.to_string(),
+                numerical_model("t", name, 0.0, 1.0).columns[name].clone(),
+            );
+        }
+        model.copula.column_order = vec![
+            "price".to_string(),
+            "qty".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ];
+        model.copula.correlation = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let models = HashMap::from([("t".to_string(), model)]);
+        // Declared out of order: `c` depends on `b`.
+        let rules = derive_rules(&[("c", "b + 1"), ("b", "price * 2")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let price = rust_decimal::Decimal::from_f64_retain(row[0].as_f64().unwrap()).unwrap();
+            let b = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            let c = rust_decimal::Decimal::from_f64_retain(row[3].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                b.round_dp(12),
+                (price * rust_decimal::Decimal::TWO).round_dp(12)
+            );
+            assert_eq!(
+                c.round_dp(12),
+                (b + rust_decimal::Decimal::ONE).round_dp(12)
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_derive_referencing_an_unknown_column() {
+        let models = three_column_model(plain_total_model());
+        let rules = derive_rules(&[("total", "price * ghost")]);
+
+        let err =
+            generate(&models, &rules, &config(&["t"], 10)).expect_err("unknown column must fail");
+        assert!(err.contains("ghost"), "error must name the column: {err}");
+    }
+
+    #[test]
+    fn should_keep_output_byte_identical_without_derive_rules() {
+        let models = three_column_model(plain_total_model());
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 3)).unwrap();
+        let rows = serde_json::to_string(data.tables.get("t").unwrap()).unwrap();
+        assert_eq!(rows, "[[-0.7745645303296556,0.1440950566134802,-0.8762332024966213],[1.0044406514899151,-0.803943491589223,-1.4398776414381587],[-2.1981105969970827,-0.19184861516094998,0.5787749357941152]]");
     }
 }

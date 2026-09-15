@@ -1031,6 +1031,7 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: "dict".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
                 rows: Some(GEN_ROWS),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1130,6 +1131,7 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: "orders".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
                 rows: Some(2),
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),
@@ -1733,6 +1735,7 @@ mod tests {
             tables: vec![crate::synth::rules::TableRule {
                 name: table.clone(),
                 columns: HashMap::new(),
+                derive: vec![],
                 rows: Some(rows),
                 relationships: vec![],
                 strategy: Default::default(),

@@ -22,6 +22,7 @@ pub fn generate_rules_draft(
             TableRule {
                 name: table.clone(),
                 columns: std::collections::HashMap::new(),
+                derive: vec![],
                 rows: None,
                 relationships: vec![],
                 strategy: crate::synth::rules::TableStrategy::default(),

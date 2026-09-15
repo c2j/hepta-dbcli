@@ -16,6 +16,10 @@ pub struct TableRule {
     /// over the values learned during training.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub columns: HashMap<String, ColumnRule>,
+    /// Derived columns (issue #70): `column = expr`, evaluated after the row
+    /// is generated. Expressions are whitelisted by `synth::expr`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derive: Vec<DeriveRule>,
     pub relationships: Vec<Relationship>,
     #[serde(default)]
     pub strategy: TableStrategy,
@@ -80,6 +84,15 @@ impl ColumnMode {
     fn is_rejection(&self) -> bool {
         matches!(self, Self::Rejection)
     }
+}
+
+/// One `column = expr` derivation (issue #70).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeriveRule {
+    /// Column to overwrite with the evaluated expression.
+    pub column: String,
+    /// Arithmetic expression over other columns of the same table.
+    pub expr: String,
 }
 
 /// Marginal families a rules file may force on a column.
@@ -258,6 +271,8 @@ impl SynthRules {
                     }
                 }
             }
+            validate_derive_rules(table)?;
+
             for rel in &table.relationships {
                 if rel.references.is_empty() {
                     return Err(format!(
@@ -269,6 +284,104 @@ impl SynthRules {
         }
         Ok(())
     }
+}
+
+/// `#70` derive rules: whitelist the expression, reject priority conflicts
+/// and detect cycles in the derive graph.
+fn validate_derive_rules(table: &TableRule) -> Result<(), String> {
+    let mut referenced: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for derive in &table.derive {
+        if !seen.insert(derive.column.as_str()) {
+            return Err(format!(
+                "table '{}': derive lists column '{}' more than once",
+                table.name, derive.column
+            ));
+        }
+
+        if let Some(column_rule) = table.columns.get(&derive.column) {
+            if column_rule.has_column_override() {
+                return Err(format!(
+                    "table '{}' column '{}': a derived column cannot also use 'fixed'/'values'/'fixed_range'",
+                    table.name, derive.column
+                ));
+            }
+        }
+
+        if table
+            .relationships
+            .iter()
+            .any(|rel| rel.pk == derive.column)
+        {
+            return Err(format!(
+                "table '{}' column '{}': a derived column cannot be a relationship pk (referential integrity)",
+                table.name, derive.column
+            ));
+        }
+
+        let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+            format!(
+                "table '{}' derive '{}': expression '{}' rejected: {}",
+                table.name, derive.column, derive.expr, e
+            )
+        })?;
+        referenced.insert(derive.column.as_str(), expr.referenced_columns());
+    }
+
+    // Cycle detection over derive columns only: an edge target -> referenced
+    // means "target depends on referenced".
+    let mut indegree: std::collections::BTreeMap<&str, usize> =
+        referenced.keys().map(|key| (*key, 0)).collect();
+    let mut dependents: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (target, deps) in &referenced {
+        for dep in deps {
+            if referenced.contains_key(dep.as_str()) {
+                if let Some(count) = indegree.get_mut(target) {
+                    *count += 1;
+                }
+                dependents.entry(dep.as_str()).or_default().push(target);
+            }
+        }
+    }
+
+    let mut ready: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(key, _)| *key)
+        .collect();
+    let mut resolved = 0usize;
+    while let Some(node) = ready.pop() {
+        resolved += 1;
+        if let Some(next) = dependents.get(node) {
+            for target in next {
+                if let Some(count) = indegree.get_mut(*target) {
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.push(target);
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved != referenced.len() {
+        let mut cycle: Vec<&str> = indegree
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(key, _)| *key)
+            .collect();
+        cycle.sort_unstable();
+        return Err(format!(
+            "table '{}': derive rules form a cycle involving {}",
+            table.name,
+            cycle.join(", ")
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_fixed_range(
@@ -395,12 +508,105 @@ tables:
     }
 
     #[test]
+    fn should_accept_derive_rules_with_known_shape() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      total:
+        null_rate: 0.0
+    derive:
+      - column: total
+        expr: "price * qty"
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rules.tables[0].derive.len(), 1);
+        assert_eq!(rules.tables[0].derive[0].column, "total");
+        assert_eq!(rules.tables[0].derive[0].expr, "price * qty");
+    }
+
+    #[test]
+    fn should_reject_derive_with_a_disallowed_expression_node() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    derive:
+      - column: total
+        expr: "min(price, qty)"
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("function calls must be rejected");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("total"), "error must name the target: {err}");
+        assert!(
+            err.contains("function call"),
+            "error must name the offending node: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_derive_on_a_column_that_is_also_fixed() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      total:
+        fixed: "1"
+    derive:
+      - column: total
+        expr: "price * qty"
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("fixed + derive must conflict");
+        assert!(err.contains("total"), "error must name the column: {err}");
+        assert!(err.contains("fixed"), "error must explain the clash: {err}");
+    }
+
+    #[test]
+    fn should_reject_derive_cycles() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    derive:
+      - column: a
+        expr: "b + 1"
+      - column: b
+        expr: "a + 1"
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("a derive cycle must fail");
+        assert!(err.contains("cycle"), "error must say cycle: {err}");
+    }
+
+    #[test]
+    fn should_accept_derive_chains_in_dependency_order() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    derive:
+      - column: c
+        expr: "b + 1"
+      - column: b
+        expr: "price * 2"
+    relationships: []
+"#;
+        validate_yaml(yaml).expect("acyclic derive chain is valid");
+    }
+
+    #[test]
     fn rules_validate_catches_empty_references() {
         let rules = SynthRules {
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "t".to_string(),
                 columns: HashMap::new(),
+                derive: vec![],
                 rows: None,
                 relationships: vec![Relationship {
                     pk: "id".to_string(),
@@ -521,6 +727,7 @@ tables:
                         ..Default::default()
                     },
                 )]),
+                derive: vec![],
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Uniform,
@@ -800,6 +1007,7 @@ tables:
                             ..Default::default()
                         },
                     )]),
+                    derive: vec![],
                     rows: None,
                     relationships: vec![],
                     strategy: TableStrategy::Uniform,

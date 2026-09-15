@@ -989,6 +989,23 @@ tables:
 
 `copula_conditional` 只能配 `fixed` 或 `fixed_range`（`values` 是逐行独立的，没有可条件化的量）。被 pin 的列不再做 min/max 裁剪，用户的区间优先。示例：把 `occurred_at` 钉到 2026-01-05..01-10、且它与 `event_id` 相关系数 0.77 时，生成的 `event_id` 会跟着下移（均值 10.9 → 4.9），而不是独立重采样。
 
+#### 派生列（`derive`，issue #70）
+
+```yaml
+tables:
+  - name: line_items
+    derive:
+      - column: total          # 覆盖该列：total = price * qty * 2 + 0.01
+        expr: "price * qty * 2 + 0.01"
+```
+
+- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& || !`）、单引号字符串（仅用于比较）。**函数调用、属性访问、下标一律拒绝**（加载期报错并指出违规节点）。
+- 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，不会 panic。
+- 时机：**所有列生成（含 copula、FK、NULL、`fixed`/`values`/`fixed_range`）之后统一求值**，因此表达式读到的是最终值；`derive` 之间按依赖顺序求值（`c = b + 1`、`b = price * 2` 可以声明为任意顺序），成环在加载期报错。
+- 输出按目标列的类型量化：整数列取整为 i64；带 `decimal_scale` 的列量化到该标度（避免 `110.16999999999999` 这类二进制尾差写入 CSV/SQL）。
+- 冲突校验（加载期，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、表达式引用未知列、derive 成环。
+- 不含 `derive` 的 rules 输出与之前逐字节一致。
+
 #### rules-draft：隐式引用推断与规则挖掘
 
 - **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship（`unique: true`），与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。
