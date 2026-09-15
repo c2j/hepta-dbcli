@@ -139,6 +139,17 @@ fn build_levels(rows: &[Vec<Value>], column: usize, max_levels: usize) -> Option
     if display.len() < 2 {
         return None;
     }
+
+    // Identity guard (issue #69, "高基数数值不做（误报率高）"): on a small
+    // sample a unique-ish key stays under `max_levels` and then "proves" a
+    // rule for every one of its values (`id=1 => note='a'`), because a key
+    // maps to exactly one row. A column whose distinct values cover more than
+    // half of its non-NULL rows behaves like an identifier, so it is excluded.
+    let non_null = row_levels.iter().filter(|l| **l != NULL_LEVEL).count();
+    if display.len().saturating_mul(2) > non_null {
+        return None;
+    }
+
     Some(Levels {
         display,
         row_levels,
@@ -375,6 +386,43 @@ mod tests {
             rows.push(vec![json!("0"), json!(if i < 2000 { "0" } else { "1" })]);
         }
         rows
+    }
+
+    #[test]
+    fn should_skip_identity_like_columns_on_small_samples() {
+        // 20 rows where `id` is unique: every id implies exactly one `tag`,
+        // which is an identity mapping (a key), not a business rule. Found by
+        // running `rules-draft --mine` against a real MySQL table.
+        let mut rows = Vec::new();
+        for i in 0..20 {
+            rows.push(vec![json!(i), json!(if i % 2 == 0 { "x" } else { "y" })]);
+        }
+        let report = mine_candidates(&columns(&["id", "tag"]), &rows, &config());
+        assert!(
+            report.candidates.is_empty(),
+            "identity-like columns must not produce candidates: {:?}",
+            report.candidates
+        );
+    }
+
+    #[test]
+    fn should_keep_low_cardinality_columns_on_small_samples() {
+        let mut rows = Vec::new();
+        for i in 0..20 {
+            rows.push(vec![
+                json!(if i < 15 { "1" } else { "2" }),
+                json!(if i < 15 { "0" } else { "9" }),
+            ]);
+        }
+        let report = mine_candidates(&columns(&["bs", "yhs"]), &rows, &config());
+        assert!(
+            report
+                .candidates
+                .iter()
+                .any(|c| c.column == "bs" && c.implies_column == "yhs"),
+            "a repeated 2-level column must still participate: {:?}",
+            report.candidates
+        );
     }
 
     #[test]
