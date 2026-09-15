@@ -294,9 +294,9 @@ impl Expr {
 
 ### 尚未完成的串行项
 
-1. **#70 `rules[].set` / `branches` 覆盖修复循环**：`derive` 与表达式引擎已接线（见下），但条件行规则、`target_ratio` 覆盖率三态、翻行修复循环与 V11（可翻列白名单）尚未实现。
-2. **#76-C 生成后 WARN**：值池权重与 rule ratio 的实际占比校验，并入 `quality.rs` / `report`。
-3. **#76-B / #76-D**：按本文结论并入 #70，不单独实现。
+1. **#76-C 生成后 WARN**：值池权重与 branch ratio 的实际占比校验并入 `quality.rs` / `report`（目前 branch 命中率已在 `synth generate` 输出中报告，但尚未进入 `synth report` 的打分）。
+2. **#76-B**：其「结构化 `when` + `set`」已被 #70 的 `branches[].predicate + repair.set` 覆盖（谓词是表达式超集），不再单独实现；若要保留 `ratio` 语义，用 `branches[].target_ratio`。
+3. **#76-D**：完全由 #70 的 `derive` 覆盖。
 
 ### 后续增量（2026-09-15，第二轮）
 
