@@ -110,7 +110,25 @@ pub fn generate(
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
-        let uniform_samples = copula.sample(row_count, table_seed(config.seed, table_name));
+
+        // `mode: copula_conditional` replaces the plain draw: the pinned
+        // columns take a fixed/range quantile and every other column is drawn
+        // from the conditional distribution, so the learned correlation with
+        // the pinned column survives.
+        let pins = conditional_pins(table_name, rule, model, column_order, row_count, config)?;
+        let uniform_samples = if pins.is_empty() {
+            copula.sample(row_count, table_seed(config.seed, table_name))
+        } else {
+            copula
+                .sample_with_fixed_uniform_rows(
+                    row_count,
+                    &pins,
+                    table_seed(config.seed, table_name),
+                )
+                .map_err(|e| format!("table '{}': {}", table_name, e))?
+        };
+        let pinned_columns: std::collections::HashSet<usize> =
+            pins.iter().map(|(index, _)| *index).collect();
 
         let null_rates: Vec<f64> = column_order
             .iter()
@@ -180,7 +198,9 @@ pub fn generate(
                 row.push(gen_column_value(
                     model.columns.get(col_name),
                     uniform_val,
-                    config.enforce_min_max_values,
+                    // A conditional pin is an explicit user range: clipping it
+                    // to the trained min/max would undo it.
+                    config.enforce_min_max_values && !pinned_columns.contains(&col_idx),
                 ));
             }
 
@@ -535,6 +555,150 @@ fn column_value_rng(
     }
 }
 
+/// Resolve a rules literal into the numeric domain the marginal was fitted on:
+/// a plain number for numerical columns, epoch seconds for datetime ones.
+fn literal_in_marginal_domain(
+    table_name: &str,
+    col_name: &str,
+    literal: &str,
+    column_model: Option<&crate::synth::model::ColumnModel>,
+) -> Result<f64, String> {
+    let Some(column_model) = column_model else {
+        return Err(format!(
+            "table '{}' column '{}': no trained column model, cannot condition on '{}'",
+            table_name, col_name, literal
+        ));
+    };
+
+    if matches!(
+        column_model.logical_type,
+        crate::synth::model::LogicalType::Datetime
+    ) {
+        let format = column_model.datetime_format.as_deref();
+        return crate::synth::datetime::parse_to_epoch(&Value::String(literal.to_string()), format)
+            .ok_or_else(|| {
+                format!(
+                    "table '{}' column '{}': cannot read '{}' as a datetime{}",
+                    table_name,
+                    col_name,
+                    literal,
+                    format
+                        .map(|f| format!(" with format '{}'", f))
+                        .unwrap_or_default()
+                )
+            });
+    }
+
+    literal.parse::<f64>().map_err(|_| {
+        format!(
+            "table '{}' column '{}': '{}' is not a number",
+            table_name, col_name, literal
+        )
+    })
+}
+
+/// A `fixed_range` endpoint, which may be a YAML number or a quoted string.
+fn range_endpoint_in_marginal_domain(
+    table_name: &str,
+    col_name: &str,
+    endpoint: &serde_json::Value,
+    column_model: Option<&crate::synth::model::ColumnModel>,
+) -> Result<f64, String> {
+    match endpoint {
+        serde_json::Value::Number(number) => number.as_f64().ok_or_else(|| {
+            format!(
+                "table '{}' column '{}': fixed_range endpoint {} is not a finite number",
+                table_name, col_name, number
+            )
+        }),
+        serde_json::Value::String(text) => {
+            literal_in_marginal_domain(table_name, col_name, text, column_model)
+        }
+        other => Err(format!(
+            "table '{}' column '{}': fixed_range endpoint {} must be a number or a string",
+            table_name, col_name, other
+        )),
+    }
+}
+
+/// Uniforms to pin the copula draw to, one vector per conditional column.
+///
+/// `mode: copula_conditional` means "draw the other columns *given* this
+/// column". `fixed` pins the same quantile for every row; `fixed_range` draws
+/// a quantile uniformly inside `[F(low), F(high)]`, which turns the column's
+/// marginal into its truncation to the range (issue #68).
+fn conditional_pins(
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    column_order: &[String],
+    row_count: usize,
+    config: &GeneratorConfig,
+) -> Result<Vec<(usize, Vec<f64>)>, String> {
+    let mut pins = Vec::new();
+
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let Some(column_rule) = rule.columns.get(col_name) else {
+            continue;
+        };
+        if column_rule.mode != ColumnMode::CopulaConditional {
+            continue;
+        }
+
+        let column_model = model.columns.get(col_name);
+        let Some(marginal) = column_model.map(|column| &column.marginal) else {
+            return Err(format!(
+                "table '{}' column '{}': mode 'copula_conditional' needs a trained column model",
+                table_name, col_name
+            ));
+        };
+        if matches!(marginal, crate::synth::marginal::Marginal::Categorical(_)) {
+            return Err(format!(
+                "table '{}' column '{}': mode 'copula_conditional' needs an invertible numeric marginal; a categorical column has no CDF",
+                table_name, col_name
+            ));
+        }
+
+        let uniforms: Vec<f64> = if let Some(fixed) = &column_rule.fixed {
+            let value = literal_in_marginal_domain(table_name, col_name, fixed, column_model)?;
+            vec![clamp_unit(marginal.cdf(value)); row_count]
+        } else if let Some(range) = &column_rule.fixed_range {
+            let low =
+                range_endpoint_in_marginal_domain(table_name, col_name, &range[0], column_model)?;
+            let high =
+                range_endpoint_in_marginal_domain(table_name, col_name, &range[1], column_model)?;
+            let low_u = clamp_unit(marginal.cdf(low));
+            let high_u = clamp_unit(marginal.cdf(high));
+            if high_u <= low_u {
+                return Err(format!(
+                    "table '{}' column '{}': fixed_range covers no probability mass in the trained marginal; the range lies outside the observed values",
+                    table_name, col_name
+                ));
+            }
+            // Independent stream per column, so pinning does not disturb any
+            // other column's draws.
+            let mut rng = column_value_rng(config.seed, table_name, col_name, "range");
+            (0..row_count)
+                .map(|_| clamp_unit(low_u + rng.gen::<f64>() * (high_u - low_u)))
+                .collect()
+        } else {
+            return Err(format!(
+                "table '{}' column '{}': mode 'copula_conditional' needs a 'fixed' value or a 'fixed_range'",
+                table_name, col_name
+            ));
+        };
+
+        pins.push((col_idx, uniforms));
+    }
+
+    Ok(pins)
+}
+
+fn clamp_unit(value: f64) -> f64 {
+    const EPS: f64 = 1e-12;
+    value.clamp(EPS, 1.0 - EPS)
+}
+
 fn apply_column_value_overrides(
     rows: &mut [Vec<Value>],
     table_name: &str,
@@ -552,13 +716,6 @@ fn apply_column_value_overrides(
             continue;
         }
 
-        if column_rule.mode == ColumnMode::CopulaConditional {
-            return Err(format!(
-                "table '{}' column '{}': mode 'copula_conditional' is not implemented yet",
-                table_name, col_name
-            ));
-        }
-
         // The frozen validation matrix (V3/V4) covers fixed/values; this
         // generator-side guard keeps fixed_range (and any caller that skips
         // validate) from silently corrupting referential integrity.
@@ -570,6 +727,20 @@ fn apply_column_value_overrides(
                 "table '{}' column '{}': fixed/values/fixed_range cannot be applied to a column that participates in a relationship",
                 table_name, col_name
             ));
+        }
+
+        if column_rule.mode == ColumnMode::CopulaConditional {
+            // The value already comes from the conditional copula draw (the
+            // phase-4 rejection path must not redraw it). `fixed` is rewritten
+            // with the exact literal so typo-level float drift cannot leak
+            // into a partition key; it consumes no randomness.
+            if let Some(fixed) = &column_rule.fixed {
+                let value = typed_literal(fixed, model.columns.get(col_name));
+                for row in rows.iter_mut() {
+                    row[col_idx] = value.clone();
+                }
+            }
+            continue;
         }
 
         if let Some(fixed) = &column_rule.fixed {
@@ -3471,6 +3642,195 @@ tables:
         assert!(
             err.contains("copula_conditional"),
             "error must suggest copula_conditional: {err}"
+        );
+    }
+
+    // ─── copula_conditional（#68 条件采样）─────────────────────────────
+
+    /// Two correlated standard-normal columns `a` and `b`.
+    fn correlated_pair(rho: f64) -> (TableModel, HashMap<String, TableModel>) {
+        let mut columns = HashMap::new();
+        for name in ["a", "b"] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Numerical,
+                    marginal: Marginal::Normal(NormalParams {
+                        loc: 0.0,
+                        scale: 1.0,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, rho], vec![rho, 1.0]],
+            },
+        };
+        (model.clone(), HashMap::from([("t".to_string(), model)]))
+    }
+
+    fn conditional_rule(column: &str, rule: ColumnRule) -> SynthRules {
+        let mut table = single_rule("t", vec![]);
+        table.columns.insert(column.to_string(), rule);
+        SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        }
+    }
+
+    fn column_stats(data: &GeneratedData, table: &str, column: usize) -> (f64, f64, f64) {
+        let rows = data.tables.get(table).unwrap();
+        let values: Vec<f64> = rows
+            .iter()
+            .map(|row| row[column].as_f64().unwrap())
+            .collect();
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        (min, max, mean)
+    }
+
+    #[test]
+    fn should_truncate_pinned_column_to_the_conditional_range() {
+        let (_, models) = correlated_pair(0.9);
+        let rules = conditional_rule(
+            "a",
+            ColumnRule {
+                fixed_range: Some([Value::from(-1.0), Value::from(1.0)]),
+                mode: ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+
+        let data = generate(&models, &rules, &config(&["t"], 3000)).unwrap();
+        let (min, max, _) = column_stats(&data, "t", 0);
+        assert!(
+            min >= -1.0 && max <= 1.0,
+            "pinned column escaped the range: [{min}, {max}]"
+        );
+        // The range is symmetric, so the pinned column still centres on 0.
+        assert!(min < -0.5 && max > 0.5, "range not covered: [{min}, {max}]");
+    }
+
+    #[test]
+    fn should_condition_other_columns_on_the_pinned_value() {
+        // b = 0.9 * a + noise. Pinning a at its 90th percentile (+1.2816)
+        // must drag b's mean to roughly 0.9 * 1.2816 ≈ 1.15, which plain
+        // independent sampling (mean ≈ 0) cannot produce.
+        let (_, models) = correlated_pair(0.9);
+        let rules = conditional_rule(
+            "a",
+            ColumnRule {
+                fixed: Some("1.2816".to_string()),
+                mode: ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+
+        let data = generate(&models, &rules, &config(&["t"], 4000)).unwrap();
+        let (a_min, a_max, _) = column_stats(&data, "t", 0);
+        assert_eq!(
+            (a_min, a_max),
+            (1.2816, 1.2816),
+            "fixed value must be exact"
+        );
+
+        let (_, _, b_mean) = column_stats(&data, "t", 1);
+        assert!(
+            (b_mean - 1.15).abs() < 0.1,
+            "conditioned mean of b was {b_mean}, expected ≈1.15"
+        );
+    }
+
+    #[test]
+    fn should_apply_the_conditional_pin_to_every_row_deterministically() {
+        let (_, models) = correlated_pair(0.5);
+        let rules = conditional_rule(
+            "a",
+            ColumnRule {
+                fixed_range: Some([Value::from(-0.5), Value::from(0.5)]),
+                mode: ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+
+        let first = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        let second = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        assert_eq!(
+            serde_json::to_string(first.tables.get("t").unwrap()).unwrap(),
+            serde_json::to_string(second.tables.get("t").unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn should_reject_copula_conditional_on_a_categorical_column() {
+        let models = HashMap::from([("t".to_string(), categorical_model("t", "status"))]);
+        let rules = conditional_rule(
+            "status",
+            ColumnRule {
+                fixed: Some("a".to_string()),
+                mode: ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("categorical conditioning must fail");
+        assert!(err.contains("status"), "error must name the column: {err}");
+        assert!(err.contains("categorical"), "error must be explicit: {err}");
+    }
+
+    #[test]
+    fn should_reject_copula_conditional_range_outside_the_trained_marginal() {
+        let (_, models) = correlated_pair(0.5);
+        let rules = conditional_rule(
+            "a",
+            ColumnRule {
+                fixed_range: Some([Value::from(10.0), Value::from(20.0)]),
+                mode: ColumnMode::CopulaConditional,
+                ..Default::default()
+            },
+        );
+
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("an unreachable range must fail");
+        assert!(err.contains('a'), "error must name the column: {err}");
+        assert!(
+            err.contains("probability mass"),
+            "error must explain the cause: {err}"
+        );
+    }
+
+    #[test]
+    fn should_keep_unpinned_output_byte_identical_when_no_conditional_mode_is_set() {
+        // Guard: adding the conditional path must not perturb tables that do
+        // not use it.
+        let (_, models) = correlated_pair(0.9);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 4)).unwrap();
+        let rows = serde_json::to_string(data.tables.get("t").unwrap()).unwrap();
+        assert_eq!(
+            rows, "[[-0.7745645303296556,-1.0475389209122454],[1.0044406514899151,0.8203717137465105],[-2.1981105969970827,-2.360240735362993],[0.1440950566134802,-0.4979425620572897]]",
+            "unexpected unpinned snapshot"
         );
     }
 }

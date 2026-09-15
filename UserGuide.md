@@ -882,9 +882,13 @@ cargo build --release -p polar-mysql --no-default-features --features "oracle-rs
 # 1. 训练：采样真实数据，拟合每列边际分布 + Copula 相关矩阵
 hepta_dbcli synth train --name dev --tables users,orders --output .synth
 
-# 2. 起草规则：从数据库外键自动生成 YAML 规则草案
+# 2. 起草规则：从数据库外键自动生成 YAML 规则草案（--models 存在时额外做隐式引用推断）
 hepta_dbcli synth rules-draft --name dev --tables users,orders \
   --models .synth --output synth-rules.yaml
+# 2b. 顺带挖掘条件业务规则候选（只输出注释，永不自动启用）
+hepta_dbcli synth rules-draft --name dev --tables users,orders \
+  --models .synth --output synth-rules.yaml \
+  --mine --mine-confidence 0.95 --mine-support 0.05 --emit-candidates candidates.txt
 
 # 3. 生成：按模型与规则批量产出合成数据
 hepta_dbcli synth generate --models .synth --rules synth-rules.yaml \
@@ -932,6 +936,15 @@ tables:
         null_rate: 0.20          # 覆盖该列训练得到的 NULL 比例；0.0 = 从不 NULL
       score:
         marginal: gamma          # 强制该列边际族：normal/beta/gamma/uniform/ecdf/categorical
+      part_date:
+        fixed: "20240101"        # 全表同值（数值字面量按列类型输出，SQL 里不带引号）
+      status:
+        values:                  # 加权值池；也支持等权写法 values: [normal, peak]
+          normal: 0.7
+          peak: 0.3
+      created_at:
+        fixed_range: ["2026-01-01", "2026-01-31"]   # 闭区间，端点可为数值/日期字符串
+        mode: rejection          # rejection（默认）| copula_conditional
     relationships: []
   - name: orders
     strategy: zipf               # 子表按 Zipf 偏置引用父表键；weighted 按父列观测频次（或分类边际权重）采样
@@ -956,6 +969,33 @@ tables:
 |------|------|
 | `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
 | `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
+
+#### 列级固定值与区间（`fixed` / `values` / `fixed_range`）
+
+| 字段 | 行为 |
+|------|------|
+| `fixed: <字面量>` | 该列全表取同一值。按列的逻辑类型输出：数值列的数值字面量在 JSON/SQL 中都是数值（分区键不会被引号包裹），日期时间列会按模型的 `datetime_format` 解析成 epoch 再定位 |
+| `values: {值: 权重}` 或 `values: [值, ...]` | 逐行独立按权重/等权取值；省略权重即等权。加权池用有序映射，保证同 seed 可复现 |
+| `fixed_range: [low, high]` | 闭区间。数值与可解析的日期时间列都支持；`low > high`、端点类型不一致、或区间落在训练分布外都会在配置期/生成期报错 |
+
+`fixed` / `values` 与以下组合会被拒绝（错误含表名与列名）：两者并存、与该列 `null_rate > 0` 并存、该列是被其他表 `references` 的父键、该列是 relationship 的 `pk`。
+
+区间约束有两条路径，取舍如下：
+
+| `mode` | 机制 | 保真 | 代价 |
+|--------|------|------|------|
+| `rejection`（默认） | 正常采样后校验，落在区间外就用该列自己的独立流重抽 | 保留原始边际形状（截断分布） | 区间概率质量越小时越慢；单值超过 10000 次重抽或区间内质量 < 1% 直接报错（不会静默截断行数） |
+| `copula_conditional` | 把该列钉到 `z = Φ⁻¹(F(x))`（区间则逐行取 `[F(low), F(high)]` 内的分位数），**其余列按条件多元正态分布采样** | 同样落在区间内，且**保留与被固定列的相关结构** | 需要可逆的数值/日期边际（分类列报错）；固定维度的协方差子矩阵奇异时报错 |
+
+`copula_conditional` 只能配 `fixed` 或 `fixed_range`（`values` 是逐行独立的，没有可条件化的量）。被 pin 的列不再做 min/max 裁剪，用户的区间优先。示例：把 `occurred_at` 钉到 2026-01-05..01-10、且它与 `event_id` 相关系数 0.77 时，生成的 `event_id` 会跟着下移（均值 10.9 → 4.9），而不是独立重采样。
+
+#### rules-draft：隐式引用推断与规则挖掘
+
+- **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship（`unique: true`），与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。
+- **条件规则挖掘**（`--mine`，默认关闭）：对类别列对 `(A, B)`，统计每个高频值 `a` 下 `B` 的条件分布与边缘分布的 TV 距离，`TV > --mine-support` 且最大条件取值占比 `≥ --mine-confidence` 时输出候选 `A=a => B=b`（附 confidence / support）。
+  - 候选**只写入 YAML 注释或 `--emit-candidates` 指定文件，永不自动启用**；不传 `--mine` 时 draft 输出与之前完全一致。
+  - 唯一值占该列非 NULL 行数过半的列（id、单据号等）视为标识符不参与，避免小样本上「每个取值都蕴含一条规则」的伪候选；`--mine-max-pairs` 限制列对数量（超出会记录并截断）；同输入同参数候选清单逐位一致。
+  - 挖掘结果是**相关性观测，不是因果**，也未必是业务约束；启用前请人工确认，把它当作 `rules` / `columns` 的候选来源而不是自动配置。
 
 ### 10.5 语义与限制
 

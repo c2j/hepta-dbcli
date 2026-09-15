@@ -44,7 +44,8 @@ pub struct ColumnRule {
     /// Closed interval `[low, high]`; out-of-range draws are rejection-redrawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_range: Option<[serde_json::Value; 2]>,
-    /// Conditional sampling mode. `copula_conditional` is not implemented yet.
+    /// Conditional sampling mode: the copula draw is conditioned on this
+    /// column's `fixed` value or `fixed_range` (issue #68).
     #[serde(default, skip_serializing_if = "ColumnMode::is_rejection")]
     pub mode: ColumnMode,
 }
@@ -239,13 +240,22 @@ impl SynthRules {
                     validate_fixed_range(&table.name, column, range)?;
                 }
 
-                // `copula_conditional` is scheduled after this PR; reject it
-                // rather than silently degrading to rejection sampling.
+                // `copula_conditional` conditions the copula draw on this
+                // column, so it needs exactly one pinned value or range. A
+                // row-independent `values` pool has nothing to condition on.
                 if rule.mode == ColumnMode::CopulaConditional {
-                    return Err(format!(
-                        "table '{}' column '{}': mode 'copula_conditional' is not implemented yet",
-                        table.name, column
-                    ));
+                    if rule.values.is_some() {
+                        return Err(format!(
+                            "table '{}' column '{}': mode 'copula_conditional' cannot be combined with a 'values' pool (a pool is row-independent)",
+                            table.name, column
+                        ));
+                    }
+                    if rule.fixed.is_none() && rule.fixed_range.is_none() {
+                        return Err(format!(
+                            "table '{}' column '{}': mode 'copula_conditional' needs a 'fixed' value or a 'fixed_range' to condition on",
+                            table.name, column
+                        ));
+                    }
                 }
             }
             for rel in &table.relationships {
@@ -646,24 +656,57 @@ tables:
     }
 
     #[test]
-    fn should_reject_copula_conditional_mode_until_implemented() {
+    fn should_accept_copula_conditional_with_fixed_range() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      part_date:
+        fixed_range: [20240101, 20240131]
+        mode: copula_conditional
+    relationships: []
+"#;
+        validate_yaml(yaml).expect("copula_conditional with a range is valid");
+    }
+
+    #[test]
+    fn should_reject_copula_conditional_without_a_pin() {
         let yaml = r#"
 version: "1"
 tables:
   - name: orders
     columns:
       amount:
-        fixed_range: [1, 5]
         mode: copula_conditional
     relationships: []
 "#;
-        let err = validate_yaml(yaml).expect_err("copula_conditional must fail for now");
+        let err = validate_yaml(yaml).expect_err("a mode without a pin must fail");
         assert!(err.contains("orders"), "error must name the table: {err}");
         assert!(err.contains("amount"), "error must name the column: {err}");
         assert!(
-            err.contains("not implemented"),
-            "error must say not implemented: {err}"
+            err.contains("copula_conditional") && err.contains("fixed"),
+            "error must explain what is missing: {err}"
         );
+    }
+
+    #[test]
+    fn should_reject_copula_conditional_with_value_pool() {
+        // A weighted pool is row-independent, so there is nothing to condition
+        // the copula on.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      status:
+        values: [a, b]
+        mode: copula_conditional
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("values + copula_conditional must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("status"), "error must name the column: {err}");
     }
 
     #[test]

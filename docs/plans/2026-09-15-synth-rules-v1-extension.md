@@ -293,10 +293,30 @@ impl Expr {
 
 ### 尚未完成的串行项
 
-1. **#68 copula_conditional 接线**：数学已就绪（`GaussianCopula::sample_with_fixed_z` / `sample_with_fixed_uniforms`），需要把 `mode: copula_conditional` 从「显式报错」换成生成期条件采样（固定列定位 `z_i`，其余维度取自条件分布）。
-2. **#70 接线与修复循环**：`expr.rs` 已可独立使用，但 `derive` / `rules[].set` / `branches` 尚未进入 `rules.rs` schema 与 `generator.rs` 管线（V7-V11 未实现）。
-3. **#76-C 生成后 WARN**：值池权重与 rule ratio 的实际占比校验，并入 `quality.rs` / `report`。
-4. **#76-B / #76-D**：按本文结论并入 #70，不单独实现。
+1. **#70 接线与修复循环**：`expr.rs` 已可独立使用，但 `derive` / `rules[].set` / `branches` 尚未进入 `rules.rs` schema 与 `generator.rs` 管线（V7-V11 未实现）。
+2. **#76-C 生成后 WARN**：值池权重与 rule ratio 的实际占比校验，并入 `quality.rs` / `report`。
+3. **#76-B / #76-D**：按本文结论并入 #70，不单独实现。
+
+### 后续增量（2026-09-15，第二轮）
+
+| 提交 | 范围 |
+|---|---|
+| （见 git log） | MySQL 容器验证 + `mine` 同一性列守卫 |
+| （见 git log） | #68 `copula_conditional` 接线：`sample_with_fixed_z_rows` / `sample_with_fixed_uniform_rows` + 生成器 pin |
+
+**#68 copula_conditional 验收（真实 CLI，MySQL 8.4 训练出的 `events` 模型，seed 42，500 行）**
+
+| 需求 | 检查 | 观察结果 |
+|---|---|---|
+| 条件采样数学 | `sample_with_fixed_z_rows`：一半行 pin `z=1`、一半 `z=-1`，相关系数 0.8 | 条件均值 0.81 / -0.80 |
+| 区间落点 | `occurred_at.fixed_range` = [2026-01-05, 2026-01-10]，`mode: copula_conditional` | 500/500 落在区间内（min 01-05 00:04，max 01-09 23:39） |
+| **相关性保留**（issue 的反超点） | 同一模型不设规则做基线对比 | 基线：日期跨 01-02–03-17，`event_id` 均值 10.86 / 20 个不同值；条件化后：均值 **4.86** / 15 个不同值——`event_id` 跟随被固定的日期下移，说明是**条件分布**而非独立重采样 |
+| 其他列不受损 | 条件化生成里的 `amount` | 380 个不同值，未被固定列冻结 |
+| 确定性 | 同 seed 两次生成 | 测试内逐字节一致 |
+| 无效配置 | categorical 列 + `copula_conditional` / 区间在训练分布外 / 无 pin / 与 `values` 并用 | 均 fail-fast 且错误信息含表名+列名 |
+
+**#69 挖掘质量修复（MySQL 验证发现）**：对 20 行表，`id` 这类唯一列低于 50 级上限，会为每个取值产出一条「规则」（171 条候选里绝大多数是 `trades.id=1 => trades.note='a'`）。现增加「唯一值占非 NULL 行数过半即视为标识符」的守卫，同一 fixture 降到 7 条且全部是真实规则（`bs='1' => yhs='0.00'`，confidence 1.0 / support 0.75）。
+
 
 ### 环境限制（未验证项）
 

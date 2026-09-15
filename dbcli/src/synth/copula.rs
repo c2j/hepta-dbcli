@@ -2,6 +2,9 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
 
+/// `(free dimensions, Σ_BA Σ_AA⁻¹, Σ_BB − Σ_BA Σ_AA⁻¹ Σ_AB)`.
+type ConditionalSetup = (Vec<usize>, Vec<Vec<f64>>, Vec<Vec<f64>>);
+
 pub struct GaussianCopula {
     dimension: usize,
     matrix: Vec<Vec<f64>>,
@@ -65,77 +68,44 @@ impl GaussianCopula {
         fixed: &[(usize, f64)],
         seed: Option<u64>,
     ) -> Result<Vec<Vec<f64>>, String> {
-        let mut pinned: Vec<Option<f64>> = vec![None; self.dimension];
-        for (index, z) in fixed {
-            if *index >= self.dimension {
-                return Err(format!(
-                    "fixed dimension {} is out of range for a {}-dimensional copula",
-                    index, self.dimension
-                ));
-            }
-            if pinned[*index].is_some() {
-                return Err(format!("duplicate fixed dimension {}", index));
-            }
-            if !z.is_finite() {
-                return Err(format!("fixed dimension {} has a non-finite z", index));
-            }
-            pinned[*index] = Some(*z);
-        }
-
-        let free: Vec<usize> = (0..self.dimension)
-            .filter(|index| pinned[*index].is_none())
+        // One pinned z for every row: broadcast and reuse the per-row entry
+        // point so both APIs share validation and error messages.
+        let rows: Vec<(usize, Vec<f64>)> = fixed
+            .iter()
+            .map(|(index, z)| (*index, vec![*z; n]))
             .collect();
+        self.sample_with_fixed_z_rows(n, &rows, seed)
+    }
 
-        // No free dimension: nothing left to sample, so no RNG is consumed.
-        if free.is_empty() {
-            let mut out = Vec::with_capacity(self.dimension);
-            for z in &pinned {
-                match z {
-                    Some(z) => out.push(vec![normal_cdf(*z); n]),
-                    None => {
-                        return Err(
-                            "internal error: a dimension is unpinned but nothing is free"
-                                .to_string(),
-                        )
+    /// Per-row variant of [`Self::sample_with_fixed_uniforms`]: each row of a
+    /// pinned dimension gets its own uniform, converted through the inverse
+    /// normal CDF. This is the entry point for `fixed_range` with
+    /// `mode: copula_conditional`, where the pinned column draws a different
+    /// quantile inside the range for every row.
+    pub fn sample_with_fixed_uniform_rows(
+        &self,
+        n: usize,
+        fixed: &[(usize, Vec<f64>)],
+        seed: Option<u64>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let mut zs = Vec::with_capacity(fixed.len());
+        for (index, us) in fixed {
+            let zs_for_dim: Vec<f64> = us
+                .iter()
+                .map(|u| {
+                    if *u > 0.0 && *u < 1.0 {
+                        Ok(normal_quantile(*u))
+                    } else {
+                        Err(format!(
+                            "fixed uniform for dimension {} must be in (0, 1), got {}",
+                            index, u
+                        ))
                     }
-                }
-            }
-            return Ok(out);
+                })
+                .collect::<Result<_, String>>()?;
+            zs.push((*index, zs_for_dim));
         }
-
-        let (mean, covariance) = self.conditional_moments(&pinned, &free)?;
-        let chol = cholesky_decomposition(&covariance);
-
-        let mut rng = if let Some(s) = seed {
-            rand::rngs::StdRng::seed_from_u64(s)
-        } else {
-            rand::rngs::StdRng::from_entropy()
-        };
-
-        let mut independent = Vec::with_capacity(free.len());
-        for _ in 0..free.len() {
-            let col: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
-            independent.push(col);
-        }
-
-        let mut out = vec![vec![0.0; n]; self.dimension];
-        for (dim, z) in pinned.iter().enumerate() {
-            if let Some(z) = z {
-                out[dim] = vec![normal_cdf(*z); n];
-            }
-        }
-
-        for t in 0..n {
-            for (i, free_dim) in free.iter().enumerate() {
-                let mut sum = mean[i];
-                for (j, ind_col) in independent.iter().enumerate().take(i + 1) {
-                    sum += chol[i][j] * ind_col[t];
-                }
-                out[*free_dim][t] = normal_cdf(sum);
-            }
-        }
-
-        Ok(out)
+        self.sample_with_fixed_z_rows(n, &zs, seed)
     }
 
     /// Convenience wrapper over [`Self::sample_with_fixed_z`]: pin dimensions
@@ -163,21 +133,18 @@ impl GaussianCopula {
     }
 
     /// `z_free | z_fixed = a` has mean `Σ_BA Σ_AA⁻¹ a` and covariance
-    /// `Σ_BB − Σ_BA Σ_AA⁻¹ Σ_AB`.
-    fn conditional_moments(
-        &self,
-        pinned: &[Option<f64>],
-        free: &[usize],
-    ) -> Result<(Vec<f64>, Vec<Vec<f64>>), String> {
-        let fixed: Vec<(usize, f64)> = pinned
-            .iter()
-            .enumerate()
-            .filter_map(|(index, z)| z.map(|z| (index, z)))
+    /// `Σ_BB − Σ_BA Σ_AA⁻¹ Σ_AB`. Returns the free dimensions plus the
+    /// constant pieces `(Σ_BA Σ_AA⁻¹, Σ_BB − Σ_BA Σ_AA⁻¹ Σ_AB)`, so a caller
+    /// with a different `a` per row only recomputes the (linear) mean.
+    fn conditional_setup(&self, fixed: &[usize]) -> Result<ConditionalSetup, String> {
+        let pinned: std::collections::BTreeSet<usize> = fixed.iter().copied().collect();
+        let free: Vec<usize> = (0..self.dimension)
+            .filter(|index| !pinned.contains(index))
             .collect();
 
         let mut sigma_aa = vec![vec![0.0; fixed.len()]; fixed.len()];
-        for (i, (row, _)) in fixed.iter().enumerate() {
-            for (j, (col, _)) in fixed.iter().enumerate() {
+        for (i, row) in fixed.iter().enumerate() {
+            for (j, col) in fixed.iter().enumerate() {
                 sigma_aa[i][j] = self.matrix[*row][*col];
             }
         }
@@ -186,38 +153,125 @@ impl GaussianCopula {
                 .to_string()
         })?;
 
-        let a: Vec<f64> = fixed.iter().map(|(_, z)| *z).collect();
-
         // Σ_BA Σ_AA⁻¹ is (free x fixed).
         let mut ba_inv = vec![vec![0.0; fixed.len()]; free.len()];
         for (i, row) in free.iter().enumerate() {
-            for j in 0..fixed.len() {
-                let mut sum = 0.0;
-                for k in 0..fixed.len() {
-                    sum += self.matrix[*row][fixed[k].0] * inv_aa[k][j];
-                }
+            for (j, inv_row) in inv_aa.iter().enumerate() {
+                let sum: f64 = fixed
+                    .iter()
+                    .zip(inv_row.iter())
+                    .map(|(k, coeff)| self.matrix[*row][*k] * coeff)
+                    .sum();
                 ba_inv[i][j] = sum;
             }
         }
 
-        let mean: Vec<f64> = ba_inv
-            .iter()
-            .map(|row| row.iter().zip(a.iter()).map(|(x, z)| x * z).sum())
-            .collect();
-
         // Σ_BB − (Σ_BA Σ_AA⁻¹) Σ_AB
         let mut covariance = vec![vec![0.0; free.len()]; free.len()];
-        for i in 0..free.len() {
-            for j in 0..free.len() {
-                let mut sum = 0.0;
-                for k in 0..fixed.len() {
-                    sum += ba_inv[i][k] * self.matrix[fixed[k].0][free[j]];
-                }
-                covariance[i][j] = self.matrix[free[i]][free[j]] - sum;
+        for (i, free_row) in free.iter().enumerate() {
+            for (j, free_col) in free.iter().enumerate() {
+                let correction: f64 = fixed
+                    .iter()
+                    .zip(ba_inv[i].iter())
+                    .map(|(k, coeff)| coeff * self.matrix[*k][*free_col])
+                    .sum();
+                covariance[i][j] = self.matrix[*free_row][*free_col] - correction;
             }
         }
 
-        Ok((mean, covariance))
+        Ok((free, ba_inv, covariance))
+    }
+
+    /// Sample uniforms while pinning **each row separately** to its own
+    /// z-score. This is what `fixed_range` with `mode: copula_conditional`
+    /// needs: the pinned column gets a different quantile per row, and the
+    /// other columns follow the conditional distribution of that row.
+    pub fn sample_with_fixed_z_rows(
+        &self,
+        n: usize,
+        fixed: &[(usize, Vec<f64>)],
+        seed: Option<u64>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let mut dims: Vec<usize> = Vec::with_capacity(fixed.len());
+        for (index, zs) in fixed {
+            if *index >= self.dimension {
+                return Err(format!(
+                    "fixed dimension {} is out of range for a {}-dimensional copula",
+                    index, self.dimension
+                ));
+            }
+            if dims.contains(index) {
+                return Err(format!("duplicate fixed dimension {}", index));
+            }
+            if zs.len() != n {
+                return Err(format!(
+                    "fixed dimension {} has {} z values but the table has {} rows",
+                    index,
+                    zs.len(),
+                    n
+                ));
+            }
+            if zs.iter().any(|z| !z.is_finite()) {
+                return Err(format!("fixed dimension {} has a non-finite z", index));
+            }
+            dims.push(*index);
+        }
+        dims.sort_unstable();
+
+        let (free, ba_inv, covariance) = self.conditional_setup(&dims)?;
+
+        // Fixed dimensions come back as their exact Φ(z), row by row.
+        let mut out = vec![vec![0.0; n]; self.dimension];
+        for (index, zs) in fixed {
+            out[*index] = zs.iter().map(|z| normal_cdf(*z)).collect();
+        }
+
+        if free.is_empty() {
+            return Ok(out);
+        }
+
+        let chol = cholesky_decomposition(&covariance);
+
+        let mut rng = if let Some(s) = seed {
+            rand::rngs::StdRng::seed_from_u64(s)
+        } else {
+            rand::rngs::StdRng::from_entropy()
+        };
+        let mut independent = Vec::with_capacity(free.len());
+        for _ in 0..free.len() {
+            let col: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
+            independent.push(col);
+        }
+
+        // `dims` is sorted, so `ba_inv` columns line up with `fixed` looked up
+        // by dimension rather than by the caller's argument order.
+        let zs_by_dim: Vec<&Vec<f64>> = dims
+            .iter()
+            .map(|dim| {
+                fixed
+                    .iter()
+                    .find(|(index, _)| index == dim)
+                    .map(|(_, zs)| zs)
+                    .ok_or_else(|| format!("missing pinned values for dimension {}", dim))
+            })
+            .collect::<Result<_, String>>()?;
+
+        for t in 0..n {
+            for (i, free_dim) in free.iter().enumerate() {
+                let mean: f64 = ba_inv[i]
+                    .iter()
+                    .zip(zs_by_dim.iter())
+                    .map(|(coeff, zs)| coeff * zs[t])
+                    .sum();
+                let mut z = mean;
+                for (j, ind_col) in independent.iter().enumerate().take(i + 1) {
+                    z += chol[i][j] * ind_col[t];
+                }
+                out[*free_dim][t] = normal_cdf(z);
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -533,6 +587,53 @@ mod tests {
             .unwrap();
         let second = copula
             .sample_with_fixed_z(16, &[(0, -0.5)], Some(99))
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    // ─── 逐行固定 z（#68 copula_conditional 的 fixed_range 情形）──────────
+
+    #[test]
+    fn should_condition_each_row_on_its_own_pinned_z() {
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.8], vec![0.8, 1.0]]);
+        let n = 8000;
+        // First half pinned at z = 1, second half at z = -1.
+        let mut pins: Vec<f64> = vec![1.0; n / 2];
+        pins.extend(vec![-1.0; n / 2]);
+
+        let samples = copula
+            .sample_with_fixed_z_rows(n, &[(0, pins)], Some(11))
+            .unwrap();
+        let z: Vec<f64> = samples[1].iter().map(|u| normal_quantile(*u)).collect();
+
+        let head = z[..n / 2].iter().sum::<f64>() / (n / 2) as f64;
+        let tail = z[n / 2..].iter().sum::<f64>() / (n / 2) as f64;
+        assert!((head - 0.8).abs() < 0.06, "pinned z=1 mean was {head}");
+        assert!((tail + 0.8).abs() < 0.06, "pinned z=-1 mean was {tail}");
+        for (index, u) in samples[0].iter().enumerate() {
+            let expected = normal_cdf(if index < n / 2 { 1.0 } else { -1.0 });
+            assert!((u - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn should_reject_pinned_row_list_of_the_wrong_length() {
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let error = copula
+            .sample_with_fixed_z_rows(4, &[(0, vec![0.0, 0.0])], Some(1))
+            .unwrap_err();
+        assert!(error.contains('4'), "error was {error}");
+    }
+
+    #[test]
+    fn should_reproduce_row_pinned_samples_for_same_seed() {
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]]);
+        let pins = vec![0.1, -0.2, 0.3, -0.4];
+        let first = copula
+            .sample_with_fixed_z_rows(4, &[(1, pins.clone())], Some(5))
+            .unwrap();
+        let second = copula
+            .sample_with_fixed_z_rows(4, &[(1, pins)], Some(5))
             .unwrap();
         assert_eq!(first, second);
     }
