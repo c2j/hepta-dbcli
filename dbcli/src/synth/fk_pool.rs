@@ -1,21 +1,83 @@
+use crate::synth::marginal::CategoricalParams;
 use rand::Rng;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionStrategy {
     Uniform,
     Zipf,
+    Weighted,
 }
 
 pub struct FkPool {
     values: Vec<Value>,
     harmonic: f64,
+    weights: Vec<f64>,
+    weight_sum: f64,
+}
+
+fn value_key(v: &Value) -> String {
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
 }
 
 impl FkPool {
     pub fn new(values: Vec<Value>) -> Self {
         let harmonic: f64 = (1..=values.len()).map(|k| 1.0 / k as f64).sum();
-        Self { values, harmonic }
+        Self {
+            values,
+            harmonic,
+            weights: Vec::new(),
+            weight_sum: 0.0,
+        }
+    }
+
+    /// Collapse `values` to unique entries weighted by observed frequency.
+    /// When `model` is a categorical marginal, those training weights overlay
+    /// the counts so unique parent keys still follow the observed share.
+    pub fn from_observed_weights(values: Vec<Value>, model: Option<&CategoricalParams>) -> Self {
+        let mut order: Vec<Value> = Vec::new();
+        let mut counts: HashMap<String, f64> = HashMap::new();
+        for v in values {
+            let key = value_key(&v);
+            if let Some(c) = counts.get_mut(&key) {
+                *c += 1.0;
+            } else {
+                counts.insert(key, 1.0);
+                order.push(v);
+            }
+        }
+        let weights: Vec<f64> = order
+            .iter()
+            .map(|v| {
+                let key = value_key(v);
+                if let Some(p) = model {
+                    if let Some(i) = p
+                        .values
+                        .iter()
+                        .position(|s| s == &key || v.as_str() == Some(s.as_str()))
+                    {
+                        return p
+                            .weights
+                            .get(i)
+                            .copied()
+                            .filter(|w| *w > 0.0)
+                            .unwrap_or(1.0);
+                    }
+                }
+                counts.get(&key).copied().unwrap_or(1.0)
+            })
+            .collect();
+        let weight_sum: f64 = weights.iter().sum();
+        let harmonic: f64 = (1..=order.len()).map(|k| 1.0 / k as f64).sum();
+        Self {
+            values: order,
+            harmonic,
+            weights,
+            weight_sum,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -41,6 +103,7 @@ impl FkPool {
         let idx = match strategy {
             SelectionStrategy::Uniform => rng.gen_range(0..self.values.len()),
             SelectionStrategy::Zipf => self.zipf_index(rng),
+            SelectionStrategy::Weighted => self.weighted_index(rng),
         };
         self.values.get(idx).cloned()
     }
@@ -62,6 +125,21 @@ impl FkPool {
         let mut acc = 0.0;
         for (i, k) in (1..=self.values.len()).enumerate() {
             acc += 1.0 / k as f64;
+            if u < acc {
+                return i;
+            }
+        }
+        self.values.len() - 1
+    }
+
+    fn weighted_index(&self, rng: &mut impl Rng) -> usize {
+        if self.weights.is_empty() || self.weight_sum <= 0.0 {
+            return rng.gen_range(0..self.values.len());
+        }
+        let u: f64 = rng.gen_range(0.0..self.weight_sum);
+        let mut acc = 0.0;
+        for (i, &w) in self.weights.iter().enumerate() {
+            acc += w;
             if u < acc {
                 return i;
             }
@@ -164,5 +242,36 @@ mod tests {
         let mut p = pool(0);
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         assert!(p.sample_unique(&mut rng).is_none());
+    }
+
+    #[test]
+    fn should_weight_fk_references_by_parent_frequency() {
+        let mut values = Vec::new();
+        values.extend(std::iter::repeat_n(Value::from("a"), 600));
+        values.extend(std::iter::repeat_n(Value::from("b"), 300));
+        values.extend(std::iter::repeat_n(Value::from("c"), 100));
+        let p = FkPool::from_observed_weights(values, None);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..10_000 {
+            let v = p.sample_one(SelectionStrategy::Weighted, &mut rng).unwrap();
+            *counts.entry(v.as_str().unwrap().to_string()).or_insert(0) += 1;
+        }
+        let share = |k: &str| *counts.get(k).unwrap_or(&0) as f64 / 10_000.0;
+        assert!(
+            (share("a") - 0.6).abs() < 0.05,
+            "a share {} not within 5pp of 0.6",
+            share("a")
+        );
+        assert!(
+            (share("b") - 0.3).abs() < 0.05,
+            "b share {} not within 5pp of 0.3",
+            share("b")
+        );
+        assert!(
+            (share("c") - 0.1).abs() < 0.05,
+            "c share {} not within 5pp of 0.1",
+            share("c")
+        );
     }
 }

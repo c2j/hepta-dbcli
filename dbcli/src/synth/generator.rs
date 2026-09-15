@@ -98,15 +98,10 @@ pub fn generate(
         let strategy = match rule.strategy {
             TableStrategy::Uniform => SelectionStrategy::Uniform,
             TableStrategy::Zipf => SelectionStrategy::Zipf,
-            TableStrategy::Weighted => {
-                return Err(format!(
-                    "table '{}': Weighted strategy is not supported; use uniform or zipf",
-                    table_name
-                ));
-            }
+            TableStrategy::Weighted => SelectionStrategy::Weighted,
         };
 
-        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, strategy)?;
+        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
@@ -360,10 +355,22 @@ fn fk_edges(rules: &SynthRules) -> Vec<(String, String)> {
     edges
 }
 
+fn parent_categorical<'a>(
+    models: &'a HashMap<String, TableModel>,
+    ref_str: &str,
+) -> Option<&'a crate::synth::marginal::CategoricalParams> {
+    let (table, col) = ref_str.split_once('.')?;
+    match models.get(table)?.columns.get(col).map(|c| &c.marginal) {
+        Some(crate::synth::marginal::Marginal::Categorical(p)) => Some(p),
+        _ => None,
+    }
+}
+
 fn build_rel_pools(
     table_name: &str,
     rule: &crate::synth::rules::TableRule,
     column_pools: &HashMap<String, Vec<Value>>,
+    models: &HashMap<String, TableModel>,
     strategy: SelectionStrategy,
 ) -> Result<Vec<RelPool>, String> {
     let mut rel_pools = Vec::new();
@@ -374,10 +381,15 @@ fn build_rel_pools(
             .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
 
         let (pool, unique) = match &rel.pool_strategy {
-            PoolStrategy::Fixed { values } => (
-                FkPool::new(values.iter().map(|v| Value::String(v.clone())).collect()),
-                false,
-            ),
+            PoolStrategy::Fixed { values } => {
+                let raw: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
+                let pool = if strategy == SelectionStrategy::Weighted {
+                    FkPool::from_observed_weights(raw, None)
+                } else {
+                    FkPool::new(raw)
+                };
+                (pool, false)
+            }
             PoolStrategy::Projection { unique } | PoolStrategy::Generated { unique } => {
                 let values = column_pools.get(ref_str).ok_or_else(|| {
                     format!(
@@ -386,7 +398,15 @@ fn build_rel_pools(
                         table_name, ref_str
                     )
                 })?;
-                (FkPool::new(values.clone()), *unique)
+                let pool = if strategy == SelectionStrategy::Weighted {
+                    FkPool::from_observed_weights(
+                        values.clone(),
+                        parent_categorical(models, ref_str),
+                    )
+                } else {
+                    FkPool::new(values.clone())
+                };
+                (pool, *unique)
             }
         };
 
@@ -1162,27 +1182,102 @@ mod tests {
     }
 
     #[test]
-    fn weighted_strategy_rejected_with_clear_error() {
+    fn should_weight_fk_references_by_parent_frequency() {
+        fn cat_model(table: &str, column: &str, values: &[&str], weights: &[f64]) -> TableModel {
+            let mut columns = HashMap::new();
+            columns.insert(
+                column.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Categorical,
+                    rounding: None,
+                    datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: values.iter().map(|s| s.to_string()).collect(),
+                        weights: weights.to_vec(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            TableModel {
+                version: 1,
+                table: table.to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![column.to_string()],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec![column.to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            }
+        }
+
         let mut models = HashMap::new();
         models.insert(
             "users".to_string(),
-            numerical_model("users", "id", 0.0, 1.0),
+            cat_model("users", "id", &["a", "b", "c"], &[0.6, 0.3, 0.1]),
+        );
+        models.insert(
+            "orders".to_string(),
+            cat_model("orders", "user_id", &["a", "b", "c"], &[0.6, 0.3, 0.1]),
         );
 
+        let mut users = single_rule("users", vec![]);
+        users.rows = Some(3);
+        let orders = TableRule {
+            name: "orders".to_string(),
+            columns: HashMap::new(),
+            rows: Some(10_000),
+            relationships: vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+            }],
+            strategy: TableStrategy::Weighted,
+        };
         let rules = SynthRules {
             version: "1".to_string(),
-            tables: vec![TableRule {
-                name: "users".to_string(),
-                columns: HashMap::new(),
-                rows: None,
-                relationships: vec![],
-                strategy: TableStrategy::Weighted,
-            }],
+            tables: vec![users, orders],
         };
 
-        let config = config(&["users"], 5);
-        let err = generate(&models, &rules, &config).unwrap_err();
-        assert!(err.contains("Weighted"), "error: {}", err);
+        let cfg = GeneratorConfig {
+            seed: Some(42),
+            ..GeneratorConfig::default()
+        };
+        let result = generate(&models, &rules, &cfg).expect("Weighted must not error");
+        let child = result.tables.get("orders").unwrap();
+        assert_eq!(child.len(), 10_000);
+
+        let mut counts = HashMap::new();
+        for row in child {
+            let key = row[0].as_str().expect("fk string").to_string();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        let share = |k: &str| *counts.get(k).unwrap_or(&0) as f64 / 10_000.0;
+        assert!(
+            (share("a") - 0.6).abs() < 0.05,
+            "a share {} not within 5pp of 0.6",
+            share("a")
+        );
+        assert!(
+            (share("b") - 0.3).abs() < 0.05,
+            "b share {} not within 5pp of 0.3",
+            share("b")
+        );
+        assert!(
+            (share("c") - 0.1).abs() < 0.05,
+            "c share {} not within 5pp of 0.1",
+            share("c")
+        );
     }
 
     #[test]

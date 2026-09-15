@@ -920,10 +920,10 @@ version: "1"
 tables:
   - name: users
     rows: 599                    # 可选：本表生成行数（CLI --rows 优先于它）
-    strategy: uniform            # uniform | zipf（weighted 暂不支持，会报错）
+    strategy: uniform            # uniform | zipf | weighted（按父列观测频次加权引用）
     relationships: []
   - name: orders
-    strategy: zipf               # 子表按 Zipf 偏置引用父表键
+    strategy: zipf               # 子表按 Zipf 偏置引用父表键；weighted 按父列观测频次（或分类边际权重）采样
     relationships:
       - pk: user_id              # 本表 FK 列
         references: [users.id]   # 父表.列
