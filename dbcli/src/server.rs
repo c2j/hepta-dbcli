@@ -1079,10 +1079,11 @@ impl DbMcp {
                         }
                     }
                 }
-                // Engine keeps full diffs for export; MCP payload stays capped.
-                crate::delta_diff::report::cap_sample_diffs(
+                // Engine keeps full diffs for export; MCP payload stays selected (issue #79 D5).
+                crate::delta_diff::sample::retain_sample(
                     &mut report,
                     params.sample_limit.unwrap_or(1000),
+                    crate::delta_diff::cmd::SampleMode::Diverse,
                 );
                 let mut payload = serde_json::to_value(&report)
                     .unwrap_or_else(|e| json!({"error": format!("json serialize: {e}")}));

@@ -167,12 +167,6 @@ pub(crate) fn stamp_columns_from_plan(
         .collect();
 }
 
-pub(crate) fn cap_sample_diffs(report: &mut DiffReport, limit: usize) {
-    if limit > 0 && report.sample_diffs.len() > limit {
-        report.sample_diffs.truncate(limit);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,53 +455,5 @@ mod tests {
         let legacy: DiffReport =
             serde_json::from_value(json).expect("legacy report should deserialize");
         assert!(legacy.modified_columns.is_none());
-    }
-
-    #[test]
-    fn cap_sample_diffs_truncates() {
-        let mut report = serde_json::from_str::<DiffReport>(
-            &serde_json::to_string(&DiffReport {
-                started_at: Utc::now(),
-                finished_at: Utc::now(),
-                left: TableRef {
-                    connection: "a".into(),
-                    schema: None,
-                    table: "t".into(),
-                },
-                right: TableRef {
-                    connection: "b".into(),
-                    schema: None,
-                    table: "t".into(),
-                },
-                strategy: "keyeddiff".into(),
-                consistency: "none".into(),
-                hash_algorithm: "md5".into(),
-                summary: DiffSummary::default(),
-                perf: PerfMetrics::default(),
-                shards: vec![],
-                sample_diffs: (0..5)
-                    .map(|i| DiffRow {
-                        key: serde_json::json!(i),
-                        left: None,
-                        right: None,
-                        status: DiffStatus::MissingLeft,
-                        confirmed: true,
-                    })
-                    .collect(),
-                warnings: vec![],
-                row_payload: RowPayload::Columns,
-                key_columns: vec![],
-                value_columns: vec![],
-                column_data_types: vec![],
-                ident_quote: '"',
-                ident_scheme: String::new(),
-                backslash_escape: false,
-                modified_columns: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        cap_sample_diffs(&mut report, 2);
-        assert_eq!(report.sample_diffs.len(), 2);
     }
 }

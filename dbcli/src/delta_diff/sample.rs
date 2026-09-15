@@ -91,6 +91,13 @@ pub(crate) fn select_sample_indices(report: &DiffReport, n: usize, mode: SampleM
     }
 }
 
+/// 就地按选择器保留样本（MCP cap 替身；issue #79 D5）。n = 0 视为全量。
+pub(crate) fn retain_sample(report: &mut DiffReport, n: usize, mode: SampleMode) {
+    let indices = select_sample_indices(report, n, mode);
+    let old = std::mem::take(&mut report.sample_diffs);
+    report.sample_diffs = indices.into_iter().map(|i| old[i].clone()).collect();
+}
+
 fn diverse_indices(report: &DiffReport, n: usize) -> Vec<usize> {
     let total = report.sample_diffs.len();
     let column_aware =
@@ -527,6 +534,35 @@ mod tests {
             picked.contains(&30),
             "rare signature row must be sampled: {picked:?}"
         );
+    }
+
+    #[test]
+    fn retain_sample_replaces_rows_with_diverse_selection() {
+        let mut r = base_report();
+        r.sample_diffs = skewed_rows();
+        retain_sample(&mut r, 20, SampleMode::Diverse);
+        assert_eq!(r.sample_diffs.len(), 20);
+        assert!(
+            r.sample_diffs.iter().any(|row| row.key == 30),
+            "rare signature must survive cap"
+        );
+        // 升序 = key 序
+        let keys: Vec<i64> = r
+            .sample_diffs
+            .iter()
+            .map(|row| row.key.as_i64().expect("key should be an integer"))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn retain_sample_zero_keeps_all() {
+        let mut r = base_report();
+        r.sample_diffs = skewed_rows();
+        retain_sample(&mut r, 0, SampleMode::Prefix);
+        assert_eq!(r.sample_diffs.len(), 31);
     }
 
     #[test]
