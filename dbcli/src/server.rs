@@ -1057,6 +1057,8 @@ impl DbMcp {
 
         match diff_result {
             Ok(mut report) => {
+                report.modified_columns =
+                    crate::delta_diff::sample::compute_modified_columns(&report);
                 let mut export_path = None;
                 if let (Some(path), Some(fmt)) = (params.export.as_deref(), export_plan) {
                     match crate::delta_diff::export::render_export(
@@ -1077,10 +1079,11 @@ impl DbMcp {
                         }
                     }
                 }
-                // Engine keeps full diffs for export; MCP payload stays capped.
-                crate::delta_diff::report::cap_sample_diffs(
+                // Engine keeps full diffs for export; MCP payload stays selected.
+                crate::delta_diff::sample::retain_sample(
                     &mut report,
                     params.sample_limit.unwrap_or(1000),
+                    crate::delta_diff::cmd::SampleMode::Diverse,
                 );
                 let mut payload = serde_json::to_value(&report)
                     .unwrap_or_else(|e| json!({"error": format!("json serialize: {e}")}));

@@ -6,7 +6,11 @@
 use serde_json::Value;
 
 use crate::backend::QueryResult;
+use crate::delta_diff::cmd::SampleMode;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
+use crate::delta_diff::sample::{
+    cells_differ, changed_value_indices, select_sample_indices, value_data_type,
+};
 
 /// 差异样本投影：列 [key, status, left, right]
 pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
@@ -40,7 +44,7 @@ pub(crate) fn diffs_to_query_result(report: &DiffReport) -> QueryResult {
 /// 汇总段投影：key/value 行
 pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
     let s = &report.summary;
-    let rows: Vec<Vec<Value>> = vec![
+    let mut rows: Vec<Vec<Value>> = vec![
         kv("strategy", &report.strategy),
         kv("consistency", &report.consistency),
         kv("hash_algorithm", &report.hash_algorithm),
@@ -57,9 +61,15 @@ pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
         kv_num("missing_left", s.missing_left),
         kv_num("missing_right", s.missing_right),
         kv_num("modified", s.modified),
-        kv("diff_rate", &format!("{:.4}%", s.diff_rate * 100.0)),
-        kv_num("queries_total", report.perf.queries_total),
     ];
+    // 列级变化直方图（count 降序；keyless / 无 Modified 行时整个块省略）
+    if let Some(cols) = &report.modified_columns {
+        for c in cols {
+            rows.push(kv_num(&format!("modified_by_column[{}]", c.name), c.count));
+        }
+    }
+    rows.push(kv("diff_rate", &format!("{:.4}%", s.diff_rate * 100.0)));
+    rows.push(kv_num("queries_total", report.perf.queries_total));
     QueryResult {
         columns: vec!["metric".into(), "value".into()],
         row_count: rows.len(),
@@ -76,17 +86,21 @@ fn kv_num(k: &str, v: u64) -> Vec<Value> {
     vec![Value::from(k), Value::from(v)]
 }
 
-pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bool) -> String {
+pub(crate) fn render_compact_sample(
+    report: &DiffReport,
+    sample: usize,
+    wide: bool,
+    mode: SampleMode,
+) -> String {
     let total = report.sample_diffs.len();
     if total == 0 {
         return String::new();
     }
-    let n = if sample == 0 {
-        total
-    } else {
-        sample.min(total)
-    };
-    let rows = &report.sample_diffs[..n];
+    let indices = select_sample_indices(report, sample, mode);
+    let n = indices.len();
+    let rows: Vec<&DiffRow> = indices.iter().map(|&i| &report.sample_diffs[i]).collect();
+    let truncated = n < total;
+    let labeled = truncated && mode == SampleMode::Diverse;
     let hash_count = report.row_payload == RowPayload::HashCount;
     let key_len = report.key_columns.len();
     let value_len = report.value_columns.len();
@@ -95,7 +109,7 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
     } else if wide {
         (0..value_len).collect()
     } else {
-        visible_value_indices(rows, report, key_len, value_len)
+        visible_value_indices(&rows, report, key_len, value_len)
     };
 
     let mut headers = vec!["status".to_string()];
@@ -109,7 +123,7 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
     }
 
     let mut table: Vec<Vec<String>> = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in &rows {
         let mut cells = vec![status_terminal(row.status).to_string()];
         if hash_count {
             cells.push(trunc32(&keyless_label(row)));
@@ -123,15 +137,25 @@ pub(crate) fn render_compact_sample(report: &DiffReport, sample: usize, wide: bo
     }
 
     let widths = col_widths(&headers, &table);
-    let mut out = format!("sample diffs ({n} of {total}):\n");
+    let mut out = if labeled {
+        format!("sample diffs ({n} of {total}) [diverse]:\n")
+    } else {
+        format!("sample diffs ({n} of {total}):\n")
+    };
     out.push_str(&align_row(&headers, &widths));
     out.push('\n');
     for row in &table {
         out.push_str(&align_row(row, &widths));
         out.push('\n');
     }
-    if n < total {
-        out.push_str(&format!("showing {n} of {total} — --export out.csv\n"));
+    if truncated {
+        if labeled {
+            out.push_str(&format!(
+                "showing {n} of {total} [diverse] — --export out.csv\n"
+            ));
+        } else {
+            out.push_str(&format!("showing {n} of {total} — --export out.csv\n"));
+        }
     }
     out
 }
@@ -145,7 +169,7 @@ fn status_terminal(s: DiffStatus) -> &'static str {
 }
 
 fn visible_value_indices(
-    rows: &[DiffRow],
+    rows: &[&DiffRow],
     report: &DiffReport,
     key_len: usize,
     value_len: usize,
@@ -153,6 +177,7 @@ fn visible_value_indices(
     if value_len == 0 {
         return Vec::new();
     }
+    let has_modified = rows.iter().any(|r| r.status == DiffStatus::Modified);
     let mut seen = vec![false; value_len];
     for row in rows {
         match row.status {
@@ -162,7 +187,11 @@ fn visible_value_indices(
                 }
             }
             DiffStatus::MissingLeft | DiffStatus::MissingRight => {
-                seen.fill(true);
+                // 仅当样本内没有 Modified 行时才展开全部值列：Missing 行不得
+                // 冲掉「Modified 只显示变化列」的紧凑性
+                if !has_modified {
+                    seen.fill(true);
+                }
             }
         }
     }
@@ -170,42 +199,6 @@ fn visible_value_indices(
         .enumerate()
         .filter(|(_, on)| **on)
         .map(|(i, _)| i)
-        .collect()
-}
-
-fn value_data_type(report: &DiffReport, key_len: usize, value_idx: usize) -> &str {
-    report
-        .column_data_types
-        .get(key_len + value_idx)
-        .map(String::as_str)
-        .unwrap_or("")
-}
-
-fn cells_differ(left: Option<&Value>, right: Option<&Value>, data_type: &str) -> bool {
-    match (left, right) {
-        (None, None) => false,
-        (Some(left), Some(right)) => !crate::delta_diff::rowdiff::values_equal(
-            left,
-            right,
-            crate::delta_diff::metadata::TablePlan::is_numeric_type(data_type),
-        ),
-        _ => true,
-    }
-}
-
-fn changed_value_indices(
-    row: &DiffRow,
-    report: &DiffReport,
-    key_len: usize,
-    value_len: usize,
-) -> Vec<usize> {
-    (0..value_len)
-        .filter(|&i| {
-            let ty = value_data_type(report, key_len, i);
-            let l = row.left.as_ref().and_then(|r| r.get(key_len + i));
-            let r = row.right.as_ref().and_then(|r| r.get(key_len + i));
-            cells_differ(l, r, ty)
-        })
         .collect()
 }
 
@@ -312,6 +305,7 @@ fn align_row(cells: &[String], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta_diff::cmd::SampleMode;
     use crate::delta_diff::report::*;
     use chrono::Utc;
 
@@ -357,7 +351,33 @@ mod tests {
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
+            modified_columns: None,
         }
+    }
+
+    #[test]
+    fn summary_projection_includes_modified_column_histogram_rows() {
+        let mut r = keyed_report(); // 既有 fixture：1 Modified 改 cjsl(10→12)
+        r.modified_columns = Some(vec![ColumnChangeCount {
+            name: "cjsl".into(),
+            count: 1,
+        }]);
+        let qr = summary_to_query_result(&r);
+        let hit = qr
+            .rows
+            .iter()
+            .find(|row| row[0] == "modified_by_column[cjsl]");
+        assert_eq!(hit.map(|row| row[1].clone()), Some(Value::from(1)));
+    }
+
+    #[test]
+    fn summary_projection_omits_histogram_when_none() {
+        let r = report_with_diff(); // 无 Modified 行 → modified_columns 为 None
+        let qr = summary_to_query_result(&r);
+        assert!(!qr
+            .rows
+            .iter()
+            .any(|row| row[0].to_string().starts_with("modified_by_column")));
     }
 
     #[test]
@@ -437,9 +457,132 @@ mod tests {
         report
     }
 
+    fn skewed_keyed_report() -> DiffReport {
+        // 30 行只改 cjsl + 1 行改 yhs（output 版 fixture，含 header/渲染断言用）
+        let mut r = keyed_report();
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(DiffRow {
+                key: serde_json::json!(["59267", format!("{i:06}")]),
+                left: Some(vec![
+                    Value::from("59267"),
+                    Value::from(format!("{i:06}")),
+                    Value::from(10),
+                    Value::from(0.1),
+                ]),
+                right: Some(vec![
+                    Value::from("59267"),
+                    Value::from(format!("{i:06}")),
+                    Value::from(11),
+                    Value::from(0.1),
+                ]),
+                status: DiffStatus::Modified,
+                confirmed: true,
+            });
+        }
+        rows.push(DiffRow {
+            key: serde_json::json!(["59267", "700000"]),
+            left: Some(vec![
+                Value::from("59267"),
+                Value::from("700000"),
+                Value::from(1),
+                Value::from(0.1),
+            ]),
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("700000"),
+                Value::from(1),
+                Value::from(0.5),
+            ]),
+            status: DiffStatus::Modified,
+            confirmed: true,
+        });
+        r.sample_diffs = rows;
+        r
+    }
+
+    #[test]
+    fn compact_terminal_diverse_label_on_title_and_footer() {
+        let out = render_compact_sample(&skewed_keyed_report(), 2, false, SampleMode::Diverse);
+        assert!(out.contains("sample diffs (2 of 31) [diverse]"), "{out}");
+        assert!(
+            out.contains("showing 2 of 31 [diverse] — --export out.csv"),
+            "{out}"
+        );
+        // 变化列覆盖：预算 2 = 配额首个 Modified(cjsl) + yhs 罕见签名行
+        assert!(out.contains("yhs"), "{out}");
+    }
+
+    #[test]
+    fn compact_terminal_prefix_mode_keeps_legacy_strings() {
+        let out = render_compact_sample(&skewed_keyed_report(), 2, false, SampleMode::Prefix);
+        assert!(out.contains("sample diffs (2 of 31):"), "{out}");
+        assert!(out.contains("showing 2 of 31 — --export out.csv"), "{out}");
+        assert!(!out.contains("diverse"), "{out}");
+    }
+
+    #[test]
+    fn compact_terminal_full_display_has_no_diverse_suffix() {
+        let out = render_compact_sample(&skewed_keyed_report(), 0, false, SampleMode::Diverse);
+        assert!(out.contains("sample diffs (31 of 31):"), "{out}");
+        assert!(!out.contains("diverse"), "{out}");
+    }
+
+    #[test]
+    fn compact_terminal_mixed_sample_shows_only_modified_changed_columns() {
+        // diverse 样本 = 1 Missing + 1 Modified(改 cjsl) → 不因 Missing 展开全部值列
+        let mut r = skewed_keyed_report();
+        let missing = DiffRow {
+            key: serde_json::json!(["59267", "800000"]),
+            left: None,
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("800000"),
+                Value::from(7),
+                Value::from(0.9),
+            ]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        };
+        let modified = DiffRow {
+            key: serde_json::json!(["59267", "900000"]),
+            left: Some(vec![
+                Value::from("59267"),
+                Value::from("900000"),
+                Value::from(10),
+                Value::from(0.1),
+            ]),
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("900000"),
+                Value::from(12),
+                Value::from(0.1),
+            ]),
+            status: DiffStatus::Modified,
+            confirmed: true,
+        };
+        r.sample_diffs = vec![missing, modified];
+        let out = render_compact_sample(&r, 0, false, SampleMode::Diverse); // 0 = 全量(2 行)
+        assert!(out.contains("cjsl"), "{out}");
+        assert!(
+            !out.contains("yhs"),
+            "mixed sample must not expand columns via Missing: {out}"
+        );
+    }
+
+    #[test]
+    fn compact_terminal_pure_missing_sample_keeps_all_columns() {
+        // D8 边界：样本全是 Missing → 保留今日 fill(true)，在场侧值列可见
+        let mut r = keyed_report();
+        r.sample_diffs.retain(|d| d.status != DiffStatus::Modified);
+        let out = render_compact_sample(&r, 20, false, SampleMode::Diverse);
+        assert!(out.contains("cjsl"), "{out}");
+        assert!(out.contains("yhs"), "{out}");
+    }
+
     #[test]
     fn compact_terminal_shows_real_columns_not_debug() {
-        let out = render_compact_sample(&keyed_report(), 20, false);
+        let out = render_compact_sample(&keyed_report(), 20, false, SampleMode::Prefix);
         assert!(out.contains("cjsl"), "{out}");
         assert!(out.contains("10 → 12"), "{out}");
         assert!(!out.contains("String("), "{out}");
@@ -454,7 +597,7 @@ mod tests {
         report.value_columns = (0..20).map(|i| format!("value_{i}")).collect();
         report.sample_diffs[0].left = Some(vec![Value::from("abc"), Value::from(1)]);
 
-        let out = render_compact_sample(&report, 20, false);
+        let out = render_compact_sample(&report, 20, false, SampleMode::Prefix);
         let header = out.lines().nth(1).expect("header row");
 
         assert_eq!(
@@ -490,7 +633,7 @@ mod tests {
             "NUMBER(15,2)".into(),
             "NUMBER(20,8)".into(),
         ];
-        let out = render_compact_sample(&report, 20, false);
+        let out = render_compact_sample(&report, 20, false, SampleMode::Prefix);
         assert!(out.contains("accrual"), "{out}");
         assert!(out.contains("748.31000000 → 935.38000000"), "{out}");
         assert!(!out.contains("cjsl"), "{out}");
@@ -503,9 +646,9 @@ mod tests {
         report
             .sample_diffs
             .retain(|d| d.status == DiffStatus::Modified);
-        let slim = render_compact_sample(&report, 20, false);
+        let slim = render_compact_sample(&report, 20, false, SampleMode::Prefix);
         assert!(!slim.contains("yhs"), "{slim}");
-        let wide = render_compact_sample(&report, 20, true);
+        let wide = render_compact_sample(&report, 20, true, SampleMode::Prefix);
         assert!(wide.contains("yhs"), "{wide}");
     }
 
@@ -518,7 +661,7 @@ mod tests {
             Value::from("abcdefghijklmnopqrstuvwxyz0123456789"),
             Value::from(0.5),
         ]);
-        let out = render_compact_sample(&report, 20, true);
+        let out = render_compact_sample(&report, 20, true, SampleMode::Prefix);
         assert!(out.contains('…'), "{out}");
         assert!(
             !out.contains("abcdefghijklmnopqrstuvwxyz0123456789"),
@@ -528,7 +671,7 @@ mod tests {
 
     #[test]
     fn compact_terminal_status_symbols() {
-        let out = render_compact_sample(&keyed_report(), 20, false);
+        let out = render_compact_sample(&keyed_report(), 20, false, SampleMode::Prefix);
         assert!(out.contains("+ right"), "{out}");
         assert!(out.contains("+ left"), "{out}");
         assert!(out.contains('~'), "{out}");
@@ -536,7 +679,7 @@ mod tests {
 
     #[test]
     fn compact_terminal_footer_when_truncated() {
-        let out = render_compact_sample(&keyed_report(), 1, false);
+        let out = render_compact_sample(&keyed_report(), 1, false, SampleMode::Prefix);
         assert!(out.contains("sample diffs (1 of 3)"), "{out}");
         assert!(out.contains("showing 1 of 3"), "{out}");
         assert!(out.contains("--export"), "{out}");

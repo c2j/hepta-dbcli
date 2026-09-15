@@ -66,6 +66,15 @@ pub(crate) enum ApplyTo {
     Right,
 }
 
+/// 终端抽样模式：diverse 按差异形态挑选，prefix 为 key 序前 N 行
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum SampleMode {
+    /// 按差异形态挑选：status 配额 + 变化列覆盖 + 签名去重（默认）
+    Diverse,
+    /// key 序前 N 行（历史行为）
+    Prefix,
+}
+
 // ─── CLI Arguments ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Args)]
@@ -149,6 +158,11 @@ pub(crate) struct DeltaDiffArgs {
     /// 终端差异明细行数上限（只裁终端；0 = 终端也打全量）
     #[arg(long, default_value_t = 20)]
     pub sample: usize,
+
+    /// 终端抽样模式：diverse（按差异形态）| prefix（key 序前 N 行）。
+    /// 只影响终端样本与 MCP payload，不影响 --export 全量
+    #[arg(long, value_enum, default_value = "diverse")]
+    pub sample_mode: SampleMode,
 
     /// 仅输出统计，不输出差异明细
     #[arg(long)]
@@ -343,6 +357,30 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<DeltaDiffArgs, clap::Error> {
         TestCli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    #[test]
+    fn sample_mode_default_is_diverse() {
+        let args = parse(&["delta-diff", "--left", "a", "--right", "b", "--table", "t"])
+            .expect("args should parse");
+        assert!(matches!(args.sample_mode, SampleMode::Diverse));
+    }
+
+    #[test]
+    fn sample_mode_prefix_parsed() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--sample-mode",
+            "prefix",
+        ])
+        .expect("args should parse");
+        assert!(matches!(args.sample_mode, SampleMode::Prefix));
     }
 
     #[test]

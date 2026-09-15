@@ -424,6 +424,7 @@ fn assemble(
         ident_quote: '"',
         ident_scheme: String::new(),
         backslash_escape: false,
+        modified_columns: None,
     }
 }
 
