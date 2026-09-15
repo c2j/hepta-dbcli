@@ -864,29 +864,44 @@ fn apply_branch_repair(
     let mut rounds_used = 0usize;
     for _round in 0..crate::synth::rules::MAX_REPAIR_ROUNDS {
         let mut touched = 0usize;
-        // Rows already rewritten by a sibling branch in this round. A candidate
-        // list rebuilt from `rows` would still see a sibling's rows as
-        // non-matching, so a later branch could steal the progress the earlier
-        // one just made (the two then livelock and only the last branch wins).
-        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        // A row that already satisfies *any* branch is off limits to every
-        // other branch: `set` can only add matches, so rewriting it can only
-        // destroy coverage a sibling has already reached. Only rows matching no
-        // branch at all are fair game, which is what makes two branches on the
-        // same column converge in one round instead of trading rows.
-        let reserved: std::collections::HashSet<usize> = if prepared.len() > 1 {
-            rows.iter()
-                .enumerate()
-                .filter(|(_, row)| {
-                    prepared
-                        .iter()
-                        .any(|(_, predicate, _)| predicate_matches(predicate, row, &index_of))
+        // Branches measured at or under their target still need their matches:
+        // `set` can only add matches, so a branch that has not reached its
+        // target cannot claw back a row another branch converts away. A branch
+        // that is *over* target is the opposite case — converting its surplus
+        // is how a partition reaches its targets — so its matches stay
+        // available (see `destroys_protected_coverage` below, which is what
+        // actually protects the rows; being under target alone is not enough
+        // when the sibling writes a column this predicate does not read).
+        let protected: Vec<bool> = prepared
+            .iter()
+            .map(|(branch, predicate, _)| {
+                let (matching, _) = measure_predicate(rows, predicate, &index_of);
+                let actual = matching as f64 / rows.len().max(1) as f64;
+                let tolerance = branch
+                    .tolerance
+                    .unwrap_or(crate::synth::rules::DEFAULT_BRANCH_TOLERANCE);
+                actual <= branch.target_ratio + tolerance
+            })
+            .collect();
+        // A rewrite is destructive only when it turns a row that matches a
+        // protected sibling into one that no longer does. Writing a column the
+        // sibling's predicate does not read destroys nothing, so two branches
+        // on disjoint columns may stack on the same rows in the same round.
+        let destroys_protected_coverage =
+            |position: usize, row: &[Value], assignments: &[(usize, Value)]| {
+                prepared.iter().enumerate().any(|(other, (_, sibling, _))| {
+                    other != position
+                        && protected[other]
+                        && predicate_matches(sibling, row, &index_of)
+                        && {
+                            let mut rewritten = row.to_vec();
+                            for (index, value) in assignments {
+                                rewritten[*index] = value.clone();
+                            }
+                            !predicate_matches(sibling, &rewritten, &index_of)
+                        }
                 })
-                .map(|(index, _)| index)
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
+            };
         // `(branch position, flips before the round, [(row index, snapshot)])`.
         let mut backups: Vec<RepairBackup> = Vec::new();
 
@@ -915,11 +930,8 @@ fn apply_branch_repair(
             let candidates: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(index, row)| {
-                    !claimed.contains(index)
-                        && !reserved.contains(index)
-                        && !predicate_matches(predicate, row, &index_of)
-                })
+                .filter(|(_, row)| !predicate_matches(predicate, row, &index_of))
+                .filter(|(_, row)| !destroys_protected_coverage(position, row, assignments))
                 .map(|(index, _)| index)
                 .collect();
             let needed = (wanted - matching).min(candidates.len());
@@ -936,7 +948,6 @@ fn apply_branch_repair(
             for pick in 0..needed {
                 let offset = pick * candidates.len() / needed;
                 let candidate = candidates[offset.min(candidates.len() - 1)];
-                claimed.insert(candidate);
                 backup.push((candidate, rows[candidate].clone()));
                 for (index, value) in assignments {
                     rows[candidate][*index] = value.clone();
@@ -5223,6 +5234,10 @@ tables:
         // list rebuilt after the sibling wrote still sees the sibling's rows as
         // non-matching, so the later branch can steal them; the loop then
         // oscillates and only the last declared branch reaches its target.
+        // The 80% `C` rows are what makes one round enough here: the two
+        // branches draw from a pool neither of them covers yet.
+        // `should_convert_surplus_from_an_over_target_sibling_branch` is the
+        // complementary case, where no such pool exists.
         let models = binary_model(&["A", "B", "C"], &[0.1, 0.1, 0.8]);
         let mut table = single_rule("t", vec![]);
         for (id, predicate) in [("a", "status == 'A'"), ("b", "status == 'B'")] {
@@ -5262,6 +5277,126 @@ tables:
         assert_eq!(
             data.branches[0].rounds, 1,
             "one round is enough when the branches stop fighting: {:?}",
+            data.branches
+        );
+        for outcome in &data.branches {
+            assert_eq!(
+                outcome.status,
+                CoverageStatus::Pass,
+                "every branch must pass: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_convert_surplus_from_an_over_target_sibling_branch() {
+        // `status` is binary and both branches claim one value each, so every
+        // row matches *some* predicate. Reserving every already-matching row
+        // leaves both branches with an empty candidate list and the partition
+        // freezes at the trained 10%/90%, even though 30%/70% only asks for the
+        // second branch's surplus to be converted.
+        let models = binary_model(&["A", "B"], &[0.1, 0.9]);
+        let mut table = single_rule("t", vec![]);
+        for (id, predicate, target, literal) in [
+            ("a", "status == 'A'", 0.3, "A"),
+            ("b", "status == 'B'", 0.7, "B"),
+        ] {
+            table.branches.push(crate::synth::rules::BranchRule {
+                id: id.to_string(),
+                predicate: predicate.to_string(),
+                target_ratio: target,
+                tolerance: Some(0.02),
+                repair: crate::synth::rules::BranchRepair {
+                    set: std::collections::BTreeMap::from([(
+                        "status".to_string(),
+                        literal.to_string(),
+                    )]),
+                    linked_derive_recompute: false,
+                },
+            });
+        }
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 500)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let a = rows.iter().filter(|row| row[0] == "A").count() as f64 / rows.len() as f64;
+        let b = rows.iter().filter(|row| row[0] == "B").count() as f64 / rows.len() as f64;
+        assert!(
+            (a - 0.3).abs() <= 0.02,
+            "the under-target branch must reach 30%: got {a} ({:?})",
+            data.branches
+        );
+        assert!(
+            (b - 0.7).abs() <= 0.02,
+            "the over-target branch must give up its surplus: got {b} ({:?})",
+            data.branches
+        );
+        assert_eq!(
+            data.branches[0].rounds, 1,
+            "converting surplus is one round of work: {:?}",
+            data.branches
+        );
+        for outcome in &data.branches {
+            assert_eq!(
+                outcome.status,
+                CoverageStatus::Pass,
+                "every branch must pass: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_stack_two_branches_that_write_different_columns() {
+        // The two predicates read and write disjoint columns, so the same row
+        // can satisfy both. Treating every sibling match as untouchable (or
+        // every row a sibling wrote this round as claimed) caps the second
+        // branch at whatever rows the first branch did not use.
+        let models = binary_model(&["A", "B"], &[0.2, 0.8]);
+        let mut table = single_rule("t", vec![]);
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "a".to_string(),
+            predicate: "status == 'A'".to_string(),
+            target_ratio: 0.9,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("status".to_string(), "A".to_string())]),
+                linked_derive_recompute: false,
+            },
+        });
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "seven".to_string(),
+            predicate: "amount == 7".to_string(),
+            target_ratio: 0.5,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("amount".to_string(), "7".to_string())]),
+                linked_derive_recompute: false,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 500)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let a = rows.iter().filter(|row| row[0] == "A").count() as f64 / rows.len() as f64;
+        let seven = rows
+            .iter()
+            .filter(|row| row[1].as_f64() == Some(7.0))
+            .count() as f64
+            / rows.len() as f64;
+        assert!(
+            (a - 0.9).abs() <= 0.02,
+            "first branch must reach 90%: got {a} ({:?})",
+            data.branches
+        );
+        assert!(
+            (seven - 0.5).abs() <= 0.02,
+            "the second branch must also reach 50% on the rows the first just wrote: got {seven} ({:?})",
             data.branches
         );
         for outcome in &data.branches {
