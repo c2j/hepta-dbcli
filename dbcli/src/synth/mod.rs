@@ -101,8 +101,10 @@ pub async fn run(
             rows,
             seed,
             &format,
-            enforce_min_max_values,
-            no_schema_qualifier,
+            cmd::GenerateFlags {
+                enforce_min_max_values,
+                no_schema_qualifier,
+            },
         ),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
     };
@@ -260,6 +262,31 @@ fn split_tables(tables: &str) -> Vec<String> {
         .collect()
 }
 
+/// Shared `--schema` resolution for train and rules-draft: an explicit
+/// non-empty value wins, otherwise the connection default schema.
+fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String {
+    match explicit {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => connection_default,
+    }
+}
+
+async fn resolved_side_schema(
+    explicit: Option<&str>,
+    conn: &mut (dyn crate::backend::DbConn + Send),
+    url: &str,
+    name: &str,
+) -> Result<String, String> {
+    if explicit.map(|s| !s.is_empty()).unwrap_or(false) {
+        Ok(resolve_schema(explicit, String::new()))
+    } else {
+        Ok(resolve_schema(
+            explicit,
+            crate::delta_diff::side_schema_from_conn(conn, url, name).await?,
+        ))
+    }
+}
+
 #[cfg(feature = "synth")]
 const FULL_MODEL_SIZE_WARN_BYTES: u64 = 10 * 1024 * 1024;
 const ORACLE_DRIVER_PREFETCH_CAP: usize = 100;
@@ -297,13 +324,7 @@ async fn run_train(
         .map(|i| side.connection_url[..i].to_string())
         .unwrap_or_else(|| "mysql".to_string());
 
-    let schema = match schema {
-        Some(s) => s.to_string(),
-        None => {
-            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
-                .await?
-        }
-    };
+    let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
 
     for table in &tables {
         let (col_sql, idx_sql, sample_sql) = {
@@ -419,15 +440,14 @@ async fn run_rules_draft(
     let side = resolve_connection(&raw, &name)?;
     let mut conn = connect(&side).await?;
 
-    // 与 train 的 --schema 语义一致：显式指定优先，否则取连接默认 schema，
-    // 保证 FK 发现与训练看到同一张表
-    let schema = match schema {
-        Some(s) => s,
-        None => {
-            crate::delta_diff::side_schema_from_conn(&mut *conn, &side.connection_url, &side.name)
-                .await?
-        }
-    };
+    // train 与 rules-draft 共用 resolve_schema：显式 --schema 优先，否则连接默认。
+    let schema = resolved_side_schema(
+        schema.as_deref(),
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+    )
+    .await?;
 
     let fk_sql = conn.dialect().foreign_keys_sql(&schema);
     let result = conn
@@ -454,6 +474,13 @@ async fn run_rules_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_resolve_schema_from_connection_default_when_unspecified() {
+        assert_eq!(resolve_schema(None, "public".to_string()), "public");
+        assert_eq!(resolve_schema(Some(""), "public".to_string()), "public");
+        assert_eq!(resolve_schema(Some("other"), "public".to_string()), "other");
+    }
 
     #[test]
     fn should_flag_oracle_sample_at_driver_cap() {

@@ -955,7 +955,7 @@ tables:
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断。`synth train` 在 Oracle 上若实际采样恰好 100 行，会向 stderr 打印 WARNING（含「分布可能失真」），并把 `{table}.model.json` 的 `provenance.truncated` 设为 `true`。采样不足 100 行或非 Oracle 连接不警告。native OCI 后端不受影响但当前无法从配置强制选择（见 `tests/benchmark/REPORT.md`）
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写。`synth train --schema S` 写入 `TableModel.schema`，`generate --format sql` **默认**输出 `INSERT INTO "S"."t"`（标识符按方言引用）；`--no-schema-qualifier` 恢复旧的无前缀语句
-- `train` / `rules-draft` 的 `--schema` 显式指定表所在 schema；缺省时 train 依赖连接默认 schema，rules-draft 取 `current_schema`，两者可能不同——跨 schema 场景请两侧都显式传 `--schema`
+- `train` 与 `rules-draft` 的 `--schema` 语义一致：显式值优先，缺省时都取连接默认 schema（`side_schema_from_conn`），不再分别回落到 `current_schema`
 
 ### 10.6 基准测试与评测
 

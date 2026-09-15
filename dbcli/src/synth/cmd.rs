@@ -362,6 +362,11 @@ pub(crate) fn load_profiles(dir: &Path) -> Result<HashMap<String, TableProfile>,
 
 // ─── 本地命令（无 DB）──────────────────────────────────────────────────
 
+pub struct GenerateFlags {
+    pub enforce_min_max_values: bool,
+    pub no_schema_qualifier: bool,
+}
+
 pub fn run_generate(
     models_dir: &str,
     rules_path: &str,
@@ -369,8 +374,7 @@ pub fn run_generate(
     rows_per_table: Option<usize>,
     seed: Option<u64>,
     format: &str,
-    enforce_min_max_values: bool,
-    no_schema_qualifier: bool,
+    flags: GenerateFlags,
 ) -> Result<(), String> {
     let models_dir = Path::new(models_dir);
     let rules_path = Path::new(rules_path);
@@ -399,7 +403,7 @@ pub fn run_generate(
     let config = GeneratorConfig {
         rows_per_table: rows_map,
         seed,
-        enforce_min_max_values,
+        enforce_min_max_values: flags.enforce_min_max_values,
     };
 
     let data = generate(&models, &rules, &config)?;
@@ -412,7 +416,7 @@ pub fn run_generate(
         other => return Err(format!("unsupported format: {}", other)),
     };
 
-    let schemas = if no_schema_qualifier {
+    let schemas = if flags.no_schema_qualifier {
         HashMap::new()
     } else {
         data.schemas.clone()
