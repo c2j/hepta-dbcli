@@ -1,10 +1,13 @@
 use crate::synth::copula::GaussianCopula;
 use crate::synth::fk_pool::{FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
-use crate::synth::rules::{PoolStrategy, SynthRules, TableStrategy};
+use crate::synth::rules::{
+    ColumnMode, ColumnRule, PoolStrategy, SynthRules, TableStrategy, ValuePool,
+};
 use rand::Rng;
 use rand::SeedableRng;
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub struct GeneratorConfig {
@@ -267,6 +270,18 @@ pub fn generate(
             }
         }
 
+        // Phase 4 (plan §1): column-level fixed / values / fixed_range
+        // overrides run after copula/marginal, FK and NULL injection.
+        apply_column_value_overrides(
+            &mut rows,
+            table_name,
+            rule,
+            model,
+            column_order,
+            config,
+            &referenced_targets,
+        )?;
+
         for (col_idx, col_name) in column_order.iter().enumerate() {
             let values: Vec<Value> = rows
                 .iter()
@@ -449,6 +464,28 @@ fn effective_null_rate(
     col_name: &str,
     is_referenced: bool,
 ) -> f64 {
+    // Phase 4 (plan §1) overwrites every row, so a trained NULL rate on a
+    // fixed/values/fixed_range column must not inject NULLs first.
+    if rule
+        .columns
+        .get(col_name)
+        .map(ColumnRule::has_column_override)
+        .unwrap_or(false)
+    {
+        let model_rate = model
+            .columns
+            .get(col_name)
+            .and_then(|c| c.null_rate)
+            .unwrap_or(0.0);
+        if model_rate > 0.0 {
+            eprintln!(
+                "warning: column '{}.{}' has a fixed/values/fixed_range rule; ignoring trained null_rate {}",
+                table_name, col_name, model_rate
+            );
+        }
+        return 0.0;
+    }
+
     let rate = rule
         .columns
         .get(col_name)
@@ -482,6 +519,230 @@ fn table_seed(base: Option<u64>, table: &str) -> Option<u64> {
         }
         s ^ h
     })
+}
+
+/// Independent per-column stream for phase-4 rules, seeded djb2-style so the
+/// same `--seed` reproduces the same draw and other columns are untouched.
+fn column_value_rng(
+    base: Option<u64>,
+    table: &str,
+    column: &str,
+    purpose: &str,
+) -> rand::rngs::StdRng {
+    match table_seed(base, &format!("{}:{}:{}", table, column, purpose)) {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    }
+}
+
+fn apply_column_value_overrides(
+    rows: &mut [Vec<Value>],
+    table_name: &str,
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    column_order: &[String],
+    config: &GeneratorConfig,
+    referenced_targets: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    for (col_idx, col_name) in column_order.iter().enumerate() {
+        let Some(column_rule) = rule.columns.get(col_name) else {
+            continue;
+        };
+        if !column_rule.has_column_override() {
+            continue;
+        }
+
+        if column_rule.mode == ColumnMode::CopulaConditional {
+            return Err(format!(
+                "table '{}' column '{}': mode 'copula_conditional' is not implemented yet",
+                table_name, col_name
+            ));
+        }
+
+        // The frozen validation matrix (V3/V4) covers fixed/values; this
+        // generator-side guard keeps fixed_range (and any caller that skips
+        // validate) from silently corrupting referential integrity.
+        let key = format!("{}.{}", table_name, col_name);
+        let is_referenced = referenced_targets.contains(&key);
+        let is_fk = rule.relationships.iter().any(|r| &r.pk == col_name);
+        if is_referenced || is_fk {
+            return Err(format!(
+                "table '{}' column '{}': fixed/values/fixed_range cannot be applied to a column that participates in a relationship",
+                table_name, col_name
+            ));
+        }
+
+        if let Some(fixed) = &column_rule.fixed {
+            let value = typed_literal(fixed, model.columns.get(col_name));
+            for row in rows.iter_mut() {
+                row[col_idx] = value.clone();
+            }
+        } else if let Some(pool) = &column_rule.values {
+            if value_pool_is_empty(pool) {
+                return Err(format!(
+                    "table '{}' column '{}': 'values' pool is empty",
+                    table_name, col_name
+                ));
+            }
+            let mut rng = column_value_rng(config.seed, table_name, col_name, "values");
+            for row in rows.iter_mut() {
+                let pick = sample_value_pool(pool, &mut rng);
+                row[col_idx] = typed_literal(&pick, model.columns.get(col_name));
+            }
+        } else if let Some(range) = &column_rule.fixed_range {
+            apply_fixed_range(
+                rows,
+                table_name,
+                col_name,
+                col_idx,
+                model.columns.get(col_name),
+                range,
+                config,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn typed_literal(literal: &str, column_model: Option<&crate::synth::model::ColumnModel>) -> Value {
+    let numerical = column_model
+        .map(|c| matches!(c.logical_type, crate::synth::model::LogicalType::Numerical))
+        .unwrap_or(false);
+    if numerical {
+        numeric_value_or_string(literal.to_string())
+    } else {
+        Value::String(literal.to_string())
+    }
+}
+
+fn value_pool_is_empty(pool: &ValuePool) -> bool {
+    match pool {
+        ValuePool::Weighted(weights) => weights.is_empty(),
+        ValuePool::Uniform(values) => values.is_empty(),
+    }
+}
+
+fn sample_value_pool(pool: &ValuePool, rng: &mut rand::rngs::StdRng) -> String {
+    match pool {
+        ValuePool::Uniform(values) => {
+            let idx = ((rng.gen::<f64>() * values.len() as f64) as usize).min(values.len() - 1);
+            values[idx].clone()
+        }
+        ValuePool::Weighted(weights) => {
+            let total: f64 = weights.values().sum();
+            let target = rng.gen::<f64>() * total;
+            let mut acc = 0.0;
+            for (value, weight) in weights {
+                acc += *weight;
+                if target < acc {
+                    return value.clone();
+                }
+            }
+            weights.keys().next_back().cloned().unwrap_or_default()
+        }
+    }
+}
+
+fn apply_fixed_range(
+    rows: &mut [Vec<Value>],
+    table_name: &str,
+    col_name: &str,
+    col_idx: usize,
+    column_model: Option<&crate::synth::model::ColumnModel>,
+    range: &[Value; 2],
+    config: &GeneratorConfig,
+) -> Result<(), String> {
+    // A categorical marginal maps uniforms to category indices, not to a
+    // numeric value axis, so rejection against [low, high] is meaningless.
+    if matches!(
+        column_model.map(|c| &c.marginal),
+        Some(crate::synth::marginal::Marginal::Categorical(_))
+    ) {
+        return Err(format!(
+            "table '{}' column '{}': fixed_range needs an invertible numeric marginal but the column is categorical; use a value pool or a numeric marginal",
+            table_name, col_name
+        ));
+    }
+
+    let numeric = column_model
+        .map(|c| {
+            !(matches!(c.logical_type, crate::synth::model::LogicalType::Datetime)
+                && c.datetime_format.is_some())
+        })
+        .unwrap_or(true);
+
+    let mut rng = column_value_rng(config.seed, table_name, col_name, "range");
+    let mut total_attempts = 0usize;
+    const MAX_ATTEMPTS_PER_VALUE: usize = 10_000;
+
+    for row in rows.iter_mut() {
+        let mut accepted = false;
+        for _ in 0..MAX_ATTEMPTS_PER_VALUE {
+            total_attempts += 1;
+            let candidate = gen_column_value(
+                column_model,
+                rng.gen::<f64>(),
+                config.enforce_min_max_values,
+            );
+            match value_in_range(&candidate, range, numeric) {
+                Some(true) => {
+                    row[col_idx] = candidate;
+                    accepted = true;
+                    break;
+                }
+                Some(false) => continue,
+                None => {
+                    return Err(format!(
+                        "table '{}' column '{}': fixed_range endpoints are not comparable with the generated values",
+                        table_name, col_name
+                    ));
+                }
+            }
+        }
+        if !accepted {
+            return Err(format!(
+                "table '{}' column '{}': fixed_range rejection exceeded {} draws for one value; the range is likely empty or nearly degenerate",
+                table_name, col_name, MAX_ATTEMPTS_PER_VALUE
+            ));
+        }
+    }
+
+    if total_attempts > 0 {
+        let quality = rows.len() as f64 / total_attempts as f64;
+        if quality < 0.01 {
+            return Err(format!(
+                "table '{}' column '{}': fixed_range acceptance is {:.2}% (below 1%); use mode: copula_conditional instead of rejection",
+                table_name,
+                col_name,
+                quality * 100.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn value_in_range(value: &Value, range: &[Value; 2], numeric: bool) -> Option<bool> {
+    let low_ok = compare_endpoint(&range[0], value, numeric)?;
+    let high_ok = compare_endpoint(value, &range[1], numeric)?;
+    Some(low_ok != Ordering::Greater && high_ok != Ordering::Greater)
+}
+
+fn compare_endpoint(a: &Value, b: &Value, numeric: bool) -> Option<Ordering> {
+    if numeric {
+        let x = value_as_f64(a)?;
+        let y = value_as_f64(b)?;
+        x.partial_cmp(&y)
+    } else {
+        let x = a.as_str()?;
+        let y = b.as_str()?;
+        Some(x.cmp(y))
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
 fn fk_edges(rules: &SynthRules) -> Vec<(String, String)> {
@@ -573,9 +834,10 @@ fn build_rel_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
+    use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
-    use crate::synth::rules::{ColumnRule, Relationship, TableRule};
+    use crate::synth::rules::{ColumnRule, Relationship, TableRule, ValuePool};
+    use std::collections::BTreeMap;
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
         let mut columns = HashMap::new();
@@ -2371,6 +2633,7 @@ tables:
             ColumnRule {
                 null_rate: Some(0.0),
                 marginal: None,
+                ..Default::default()
             },
         );
         let zero_rules = SynthRules {
@@ -2391,6 +2654,7 @@ tables:
             ColumnRule {
                 null_rate: Some(0.20),
                 marginal: None,
+                ..Default::default()
             },
         );
         let mut zero_model = model_with_null_rate("users", "email", 0.0);
@@ -2468,6 +2732,7 @@ tables:
             ColumnRule {
                 null_rate: Some(0.5),
                 marginal: None,
+                ..Default::default()
             },
         );
         let rules = SynthRules {
@@ -2830,5 +3095,382 @@ tables:
         m.min = None;
         m.max = None;
         assert_eq!(gen_column_value(Some(&m), 0.5, true), Value::from(1.23));
+    }
+
+    fn categorical_model(table: &str, column: &str) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["seed".to_string()],
+                    weights: vec![1.0],
+                }),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![column.to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        }
+    }
+
+    fn two_column_numerical_model(table: &str, a: &str, b: &str) -> TableModel {
+        let mut columns = HashMap::new();
+        for (name, loc) in [(a, 0.0), (b, 10.0)] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Numerical,
+                    marginal: Marginal::Normal(NormalParams { loc, scale: 1.0 }),
+                    ..Default::default()
+                },
+            );
+        }
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![a.to_string(), b.to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+        }
+    }
+
+    #[test]
+    fn should_pin_column_to_fixed_value() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), numerical_model("t", "amount", 0.0, 1.0));
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "amount".to_string(),
+            ColumnRule {
+                fixed: Some("42".to_string()),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 5)).unwrap();
+        let rows = result.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter().all(|row| row[0] == 42i64),
+            "every row must be pinned to 42, got {:?}",
+            rows.iter().map(|r| &r[0]).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn should_emit_numeric_fixed_value_without_quotes() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), numerical_model("t", "part_date", 0.0, 1.0));
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "part_date".to_string(),
+            ColumnRule {
+                fixed: Some("20240101".to_string()),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 4)).unwrap();
+        for row in result.tables.get("t").unwrap() {
+            assert!(
+                row[0].is_i64(),
+                "numeric fixed literal must not be a string, got {:?}",
+                row[0]
+            );
+            assert_eq!(serde_json::to_string(&row[0]).unwrap(), "20240101");
+        }
+    }
+
+    #[test]
+    fn should_sample_weighted_value_pool_according_to_weights() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), categorical_model("t", "status"));
+
+        let mut rule = single_rule("t", vec![]);
+        let mut weights = BTreeMap::new();
+        weights.insert("normal".to_string(), 0.7);
+        weights.insert("peak".to_string(), 0.3);
+        rule.columns.insert(
+            "status".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Weighted(weights)),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 10_000)).unwrap();
+        let rows = result.tables.get("t").unwrap();
+        let mut counts = HashMap::new();
+        for row in rows {
+            *counts
+                .entry(row[0].as_str().expect("categorical value").to_string())
+                .or_insert(0) += 1;
+        }
+        let share = |k: &str| *counts.get(k).unwrap_or(&0) as f64 / 10_000.0;
+        assert!(
+            (share("normal") - 0.7).abs() < 0.05,
+            "normal share {} not within 5pp of 0.7",
+            share("normal")
+        );
+        assert!(
+            (share("peak") - 0.3).abs() < 0.05,
+            "peak share {} not within 5pp of 0.3",
+            share("peak")
+        );
+    }
+
+    #[test]
+    fn should_emit_numeric_value_pool_without_quotes() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), numerical_model("t", "amount", 0.0, 1.0));
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "amount".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Uniform(vec![
+                    "1".to_string(),
+                    "2".to_string(),
+                    "3".to_string(),
+                ])),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 30)).unwrap();
+        for row in result.tables.get("t").unwrap() {
+            let value = row[0]
+                .as_i64()
+                .expect("numeric value pool must emit integers");
+            assert!((1..=3).contains(&value), "unexpected pool value {value}");
+        }
+    }
+
+    #[test]
+    fn should_reproduce_value_pool_for_same_seed() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), categorical_model("t", "status"));
+
+        let mut weights = BTreeMap::new();
+        weights.insert("normal".to_string(), 0.6);
+        weights.insert("peak".to_string(), 0.4);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![{
+                let mut rule = single_rule("t", vec![]);
+                rule.columns.insert(
+                    "status".to_string(),
+                    ColumnRule {
+                        values: Some(ValuePool::Weighted(weights)),
+                        ..Default::default()
+                    },
+                );
+                rule
+            }],
+        };
+
+        let cfg = config(&["t"], 500);
+        let first = generate(&models, &rules, &cfg).unwrap();
+        let second = generate(&models, &rules, &cfg).unwrap();
+        assert_eq!(
+            serde_json::to_string(first.tables.get("t").unwrap()).unwrap(),
+            serde_json::to_string(second.tables.get("t").unwrap()).unwrap(),
+            "same seed must reproduce the same value pool draw"
+        );
+    }
+
+    #[test]
+    fn should_keep_other_columns_rng_stream_untouched_by_fixed_column() {
+        let models = HashMap::from([("t".to_string(), two_column_numerical_model("t", "a", "b"))]);
+
+        let base_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let baseline = generate(&models, &base_rules, &config(&["t"], 50)).unwrap();
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "a".to_string(),
+            ColumnRule {
+                fixed: Some("999".to_string()),
+                ..Default::default()
+            },
+        );
+        let fixed_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        let fixed = generate(&models, &fixed_rules, &config(&["t"], 50)).unwrap();
+
+        let b_baseline: Vec<String> = baseline.tables["t"]
+            .iter()
+            .map(|row| serde_json::to_string(&row[1]).unwrap())
+            .collect();
+        let b_fixed: Vec<String> = fixed.tables["t"]
+            .iter()
+            .map(|row| serde_json::to_string(&row[1]).unwrap())
+            .collect();
+        assert_eq!(
+            b_baseline, b_fixed,
+            "fixing column 'a' must not perturb column 'b'"
+        );
+        assert!(
+            fixed.tables["t"].iter().all(|row| row[0] == 999i64),
+            "column 'a' must be pinned to 999"
+        );
+    }
+
+    #[test]
+    fn should_redraw_until_value_inside_fixed_range() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "v".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                marginal: Marginal::Uniform(UniformParams {
+                    low: 0.0,
+                    high: 100.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["v".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "v".to_string(),
+            ColumnRule {
+                fixed_range: Some([Value::from(10.0), Value::from(20.0)]),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let result = generate(&models, &rules, &config(&["t"], 1000)).unwrap();
+        for row in result.tables.get("t").unwrap() {
+            let value = row[0].as_f64().expect("numeric value");
+            assert!(
+                (10.0..=20.0).contains(&value),
+                "fixed_range redraw produced out-of-range value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_error_when_fixed_range_on_categorical_column() {
+        let models = HashMap::from([("t".to_string(), categorical_model("t", "status"))]);
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "status".to_string(),
+            ColumnRule {
+                fixed_range: Some([Value::from("a"), Value::from("b")]),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("categorical fixed_range must fail");
+        assert!(err.contains("status"), "error must name the column: {err}");
+        assert!(err.contains("categorical"), "error must be explicit: {err}");
+    }
+
+    #[test]
+    fn should_error_when_fixed_range_acceptance_is_below_one_percent() {
+        let mut models = HashMap::new();
+        models.insert("t".to_string(), numerical_model("t", "v", 0.0, 1.0));
+
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "v".to_string(),
+            ColumnRule {
+                fixed_range: Some([Value::from(2.0), Value::from(2.1)]),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+
+        let err = generate(&models, &rules, &config(&["t"], 100))
+            .expect_err("sub-1% acceptance must fail fast");
+        assert!(err.contains("v"), "error must name the column: {err}");
+        assert!(
+            err.contains("copula_conditional"),
+            "error must suggest copula_conditional: {err}"
+        );
     }
 }
