@@ -293,7 +293,7 @@ impl Expr {
 
 ### 尚未完成的串行项
 
-1. **#70 接线与修复循环**：`expr.rs` 已可独立使用，但 `derive` / `rules[].set` / `branches` 尚未进入 `rules.rs` schema 与 `generator.rs` 管线（V7-V11 未实现）。
+1. **#70 `rules[].set` / `branches` 覆盖修复循环**：`derive` 与表达式引擎已接线（见下），但条件行规则、`target_ratio` 覆盖率三态、翻行修复循环与 V11（可翻列白名单）尚未实现。
 2. **#76-C 生成后 WARN**：值池权重与 rule ratio 的实际占比校验，并入 `quality.rs` / `report`。
 3. **#76-B / #76-D**：按本文结论并入 #70，不单独实现。
 
@@ -301,10 +301,21 @@ impl Expr {
 
 | 提交 | 范围 |
 |---|---|
-| （见 git log） | MySQL 容器验证 + `mine` 同一性列守卫 |
-| （见 git log） | #68 `copula_conditional` 接线：`sample_with_fixed_z_rows` / `sample_with_fixed_uniform_rows` + 生成器 pin |
+| `75dd48b` | MySQL 容器验证 + `mine` 同一性列守卫 |
+| `e5f00ad` | #68 `copula_conditional` 接线 |
+| `c8e45f0` | #70 `derive` 接线（切片 1+2） |
 
-**#68 copula_conditional 验收（真实 CLI，MySQL 8.4 训练出的 `events` 模型，seed 42，500 行）**
+**#70 derive 验收（真实 CLI，MySQL 8.4 训练的 `line_items` 模型，seed 42，2000 行）**
+
+| 需求 | 检查 | 观察结果 |
+|---|---|---|
+| AC1 派生精确性 | `total = price * qty * 2 + 0.01`，用 Python `Decimal` 逐行比对 CSV | 2000 行 **0 违例** |
+| AC1 标度 | 目标列 `DECIMAL(16,4)` | 输出量化到 4 位小数，无二进制尾差（如 `110.17`） |
+| AC2 白名单 | `min(a,b)` / `price.__class__` / 未知列 | 加载期 fail-fast，错误指出违规节点与列名 |
+| 依赖顺序 | `c = b + 1` 先于 `b = price * 2` 声明 | 按依赖求值，结果正确；成环在加载期报错 |
+| AC5 回归 | 不含 `derive` 的 rules | 新增逐字节快照测试锁定 |
+
+**#68 copula_conditional 验收（同一容器，`events` 模型，seed 42，500 行）**
 
 | 需求 | 检查 | 观察结果 |
 |---|---|---|
