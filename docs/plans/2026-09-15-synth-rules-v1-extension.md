@@ -201,16 +201,16 @@ impl Expr {
 | # | 条件 | 语义 | 来源 |
 |---|---|---|---|
 | V1 | `fixed` 与 `values` 同时出现 | 互斥 | #76-AC4 |
-| V2 | `fixed`/`values` 与 `null_rate > 0` 同时出现 | 互斥 | #76-AC4 |
+| V2 | `fixed`/`values`/`fixed_range` 与 `null_rate > 0` 同时出现 | 互斥（阶段 4 覆盖整列，rate 无意义） | #76-AC4 |
 | V3 | `fixed`/`values` 的列是被其他表 `references` 的父键 | 唯一性数学不可达 | #76-AC4 |
-| V4 | `fixed`/`values` 的列同时是 relationship 的 `pk`（FK 子列） | 引用完整性 | #68 冲突校验 |
+| V4 | `fixed`/`values`/`fixed_range` 的列同时是 relationship 的 `pk`（FK 子列） | 引用完整性 | #68 冲突校验 |
 | V5 | `values` 权重和偏离 1.0 或存在 ≤ 0 权重 | 概率非法 | #76-A |
 | V6 | `fixed_range` 的 low > high，或列类型不是可比较类型 | 区间非法 | #68 |
 | V7 | `derive[].column` 引用不存在的列 / 引用了被 fixed 或被 `set` 写的列 | 优先级矛盾 | #70 |
 | V8 | derive 链成环 | 无法求值 | #70 |
 | V9 | `branches[].predicate` 语法错误 / 引用未知列 | 加载期 fail-fast | #70-AC2 |
 | V10 | 表达式含白名单外节点（函数调用、属性访问、下标） | 安全 | #70-AC2 |
-| V11 | 修复循环目标列落在可翻列白名单外（FK 列 / 被引用父键 / derive 目标 / 被 fixed 等 pin 的列） | 引用完整性 | 本文 §1 |
+| V11 | 修复循环目标列落在可翻列白名单外（FK 列 / 被引用父键 / derive 目标 / 被 fixed 等 pin 的列） | 引用完整性；YAML 可判定的部分在 `validate()` 加载期拒绝，未知列只能在生成期判定 | 本文 §1 |
 | V12 | branch 谓词在**所有**生成行上都求值失败 | 类型写错（如字符串列 `name == 1`），不能静默报 0% 覆盖 | 实现期发现 |
 
 ---

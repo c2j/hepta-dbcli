@@ -1,9 +1,7 @@
 use crate::synth::copula::GaussianCopula;
 use crate::synth::fk_pool::{FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
-use crate::synth::rules::{
-    ColumnMode, ColumnRule, PoolStrategy, SynthRules, TableStrategy, ValuePool,
-};
+use crate::synth::rules::{ColumnMode, PoolStrategy, SynthRules, TableStrategy, ValuePool};
 use rand::Rng;
 use rand::SeedableRng;
 use serde_json::Value;
@@ -575,12 +573,15 @@ fn effective_null_rate(
 ) -> f64 {
     // Phase 4 (plan §1) overwrites every row, so a trained NULL rate on a
     // fixed/values/fixed_range column must not inject NULLs first.
-    if rule
+    if let Some(column_rule) = rule
         .columns
         .get(col_name)
-        .map(ColumnRule::has_column_override)
-        .unwrap_or(false)
+        .filter(|column_rule| column_rule.has_column_override())
     {
+        // `validate` (V2) already rejects this, so the warning only fires for
+        // callers that generate without validating. Stage 4 overwrites every
+        // row, so both rates are ignored either way.
+        let rule_rate = column_rule.null_rate.unwrap_or(0.0);
         let model_rate = model
             .columns
             .get(col_name)
@@ -590,6 +591,12 @@ fn effective_null_rate(
             eprintln!(
                 "warning: column '{}.{}' has a fixed/values/fixed_range rule; ignoring trained null_rate {}",
                 table_name, col_name, model_rate
+            );
+        }
+        if rule_rate > 0.0 {
+            eprintln!(
+                "warning: column '{}.{}' has a fixed/values/fixed_range rule; ignoring rule null_rate {}",
+                table_name, col_name, rule_rate
             );
         }
         return 0.0;

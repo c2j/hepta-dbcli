@@ -334,12 +334,16 @@ impl SynthRules {
 
                 let has_fixed_or_values = rule.fixed.is_some() || rule.values.is_some();
 
-                // V2: fixed/values cannot be combined with a non-zero null rate.
-                if has_fixed_or_values {
+                // V2: a pinned column cannot be combined with a non-zero null
+                // rate. Stage 4 overwrites every row of the column, so the
+                // rate is a no-op; `fixed_range` is included so the three
+                // pinned fields agree instead of making ranges the one silent
+                // case.
+                if rule.has_column_override() {
                     if let Some(rate) = rule.null_rate {
                         if rate > 0.0 {
                             return Err(format!(
-                                "table '{}' column '{}': 'fixed'/'values' cannot be combined with null_rate > 0 (got {})",
+                                "table '{}' column '{}': 'fixed'/'values'/'fixed_range' cannot be combined with null_rate > 0 (got {})",
                                 table.name, column, rate
                             ));
                         }
@@ -358,11 +362,12 @@ impl SynthRules {
                     ));
                 }
 
-                // V4: fixed/values on a relationship pk (the FK child column)
-                // would break referential integrity.
-                if has_fixed_or_values && table.relationships.iter().any(|r| &r.pk == column) {
+                // V4: a pinned value on a relationship pk (the FK child
+                // column) would break referential integrity. Same three fields
+                // as V3, matching what `generate` refuses.
+                if is_pinned && table.relationships.iter().any(|r| &r.pk == column) {
                     return Err(format!(
-                        "table '{}' column '{}': 'fixed'/'values' on a relationship pk would break referential integrity",
+                        "table '{}' column '{}': 'fixed'/'values'/'fixed_range' on a relationship pk would break referential integrity",
                         table.name, column
                     ));
                 }
@@ -1172,6 +1177,43 @@ tables:
     }
 
     #[test]
+    fn should_reject_fixed_range_with_nonzero_null_rate() {
+        // V2 must cover `fixed_range` too: stage 4 overwrites the whole column,
+        // so a `null_rate` next to any pinned field is a no-op. Rejecting only
+        // `fixed`/`values` made the identical mistake silent for ranges.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      amount:
+        fixed_range: [1, 10]
+        null_rate: 0.2
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("fixed_range + null_rate > 0 must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("amount"), "error must name the column: {err}");
+        assert!(
+            err.contains("null_rate"),
+            "error must explain the conflict: {err}"
+        );
+
+        // The boundary stays open: a zero rate is not a conflict.
+        let ok = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      amount:
+        fixed_range: [1, 10]
+        null_rate: 0.0
+    relationships: []
+"#;
+        validate_yaml(ok).expect("fixed_range + null_rate == 0 must stay valid");
+    }
+
+    #[test]
     fn should_reject_fixed_on_referenced_parent_key() {
         let yaml = r#"
 version: "1"
@@ -1209,6 +1251,33 @@ tables:
         let err = validate_yaml(yaml).expect_err("values on a relationship pk must fail");
         assert!(err.contains("orders"), "error must name the table: {err}");
         assert!(err.contains("user_id"), "error must name the column: {err}");
+    }
+
+    #[test]
+    fn should_reject_fixed_range_on_relationship_pk() {
+        // V4 has the same asymmetry V2 had: `generate` refuses all three pinned
+        // fields on an FK child column, so `fixed_range` must not be the one
+        // that only fails after the whole table has been generated.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      user_id:
+        fixed_range: [1, 10]
+    relationships:
+      - pk: user_id
+        references: [users.id]
+  - name: users
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("fixed_range on a relationship pk must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("user_id"), "error must name the column: {err}");
+        assert!(
+            err.contains("referential integrity"),
+            "error must explain why: {err}"
+        );
     }
 
     #[test]
