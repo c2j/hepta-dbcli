@@ -144,3 +144,11 @@ jobs:
       - run: cargo test --all --features integration
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+      # Real-database acceptance for the synth M1 work (#62-#65): trains on a
+      # fixture with datetimes / decimals / NULLs / FKs, generates in every
+      # export format and asserts the artifacts with tests/synth-verify.
+      - name: synth M1 end-to-end verification
+        run: bash tests/synth-verify/run_m1.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb

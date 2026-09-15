@@ -25,9 +25,16 @@ pub struct ColumnProfile {
     pub top_values: Option<Vec<(String, f64)>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_integer: bool,
+    /// Max number of fractional digits observed in string-encoded samples;
+    /// `None` when the column is not a fixed-scale numeric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimal_scale: Option<u8>,
+    /// chrono format that all datetime samples matched, if one was inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datetime_format: Option<String>,
 }
 
-const TOP_VALUES_CAP: usize = 50;
+pub(crate) const TOP_VALUES_CAP: usize = 50;
 const NUMERIC_TOP_VALUES_MAX: usize = 50;
 
 fn is_unsupported_placeholder(s: &str) -> bool {
@@ -53,6 +60,67 @@ fn sql_type_base(data_type: &str) -> String {
         base = stripped;
     }
     base.to_string()
+}
+
+/// Scale `s` from a SQL `(p,s)` declaration such as `numeric(16,2)`,
+/// `decimal(18, 4)`, or `NUMBER(18,4)`. One-argument forms (`float(24)`,
+/// `varchar(8)`) and unparsable inner lists yield `None`.
+fn sql_type_scale(data_type: &str) -> Option<u8> {
+    let start = data_type.find('(')?;
+    let end = data_type[start + 1..].find(')')?;
+    let inner = data_type[start + 1..start + 1 + end].trim();
+    let mut parts = inner.split(',');
+    let _precision = parts.next()?.trim();
+    let scale = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    scale.parse().ok()
+}
+
+/// Fractional-digit count of a plain decimal literal: optional sign, digits,
+/// at most one `.`. Exponent forms (`1.2e3`) and any other character are
+/// rejected so f64 noise / scientific notation cannot inflate the scale.
+fn decimal_literal_scale(s: &str) -> Option<u8> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix('+')
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().any(|b| b == b'e' || b == b'E') {
+        return None;
+    }
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    let mut frac: u8 = 0;
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                if seen_dot {
+                    frac = frac.saturating_add(1);
+                }
+            }
+            b'.' if !seen_dot => seen_dot = true,
+            _ => return None,
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    Some(if seen_dot { frac } else { 0 })
+}
+
+fn learned_decimal_scale(non_null: &[&Value], data_type: Option<&str>) -> Option<u8> {
+    let sample_scale = non_null
+        .iter()
+        .filter_map(|v| v.as_str().and_then(decimal_literal_scale))
+        .max();
+    let ddl_scale = data_type.and_then(sql_type_scale);
+    [sample_scale, ddl_scale].into_iter().flatten().max()
 }
 
 fn is_numeric_sql_type(data_type: &str) -> bool {
@@ -91,6 +159,31 @@ fn is_numeric_sql_type(data_type: &str) -> bool {
             | "ubigint"
             | "uhugeint"
             | "hugeint"
+    )
+}
+
+/// SQL types that are integers by declaration, so a whole-number sample is not
+/// a coincidence and the column must keep integer output.
+fn is_integer_sql_type(data_type: &str) -> bool {
+    matches!(
+        sql_type_base(data_type).as_str(),
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "serial"
+            | "bigserial"
+            | "smallserial"
+            | "utinyint"
+            | "usmallint"
+            | "uinteger"
+            | "ubigint"
     )
 }
 
@@ -144,7 +237,7 @@ fn numerical_stats(nums: &[f64]) -> (Option<Value>, Option<Value>, Option<f64>, 
     )
 }
 
-fn frequency_top_values(non_null: &[&Value]) -> Option<Vec<(String, f64)>> {
+fn frequency_top_values(non_null: &[&Value], top_k: Option<usize>) -> Option<Vec<(String, f64)>> {
     if non_null.is_empty() {
         return None;
     }
@@ -169,7 +262,9 @@ fn frequency_top_values(non_null: &[&Value]) -> Option<Vec<(String, f64)>> {
         .map(|(k, c)| (k, c as f64 / non_null.len() as f64))
         .collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    entries.truncate(TOP_VALUES_CAP);
+    if let Some(cap) = top_k {
+        entries.truncate(cap);
+    }
     Some(entries)
 }
 
@@ -188,10 +283,14 @@ fn lookup_type<'a>(types: Option<&'a HashMap<String, String>>, name: &str) -> Op
 
 impl ColumnProfile {
     pub fn from_samples(samples: &[Value]) -> Self {
-        Self::from_samples_typed(samples, None)
+        Self::from_samples_typed(samples, None, Some(TOP_VALUES_CAP))
     }
 
-    pub fn from_samples_typed(samples: &[Value], data_type: Option<&str>) -> Self {
+    pub fn from_samples_typed(
+        samples: &[Value],
+        data_type: Option<&str>,
+        top_k: Option<usize>,
+    ) -> Self {
         let total = samples.len();
         let null_count = samples.iter().filter(|v| v.is_null()).count();
         let non_null: Vec<&Value> = samples.iter().filter(|v| !v.is_null()).collect();
@@ -233,7 +332,7 @@ impl ColumnProfile {
             None
         };
 
-        let (logical_type, min, max, mean, std_dev) = if non_null
+        let (logical_type, mut min, mut max, mut mean, mut std_dev) = if non_null
             .iter()
             .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
         {
@@ -288,10 +387,41 @@ impl ColumnProfile {
                     .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
             })
             .collect();
-        let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
-            && parsed_nums.len() == non_null.len()
+        let is_numeric_datetime = logical_type == "datetime"
+            && (all_compact_dates
+                || non_null.first().is_some_and(|v| v.is_number())
+                || numeric_strings.is_some());
+
+        let mut datetime_format = None;
+        if logical_type == "datetime" && !non_null.is_empty() && !is_numeric_datetime {
+            let samples: Vec<Value> = non_null.iter().map(|v| (*v).clone()).collect();
+            datetime_format = super::datetime::infer_format(&samples);
+            if let Some(fmt) = datetime_format.as_deref() {
+                let epochs: Vec<f64> = non_null
+                    .iter()
+                    .filter_map(|v| super::datetime::parse_to_epoch(v, Some(fmt)))
+                    .collect();
+                if !epochs.is_empty() {
+                    (min, max, mean, std_dev) = numerical_stats(&epochs);
+                }
+            }
+        }
+
+        let samples_integral = parsed_nums.len() == non_null.len()
             && !parsed_nums.is_empty()
             && parsed_nums.iter().all(|f| f.fract() == 0.0);
+        let schema_scale = data_type.and_then(sql_type_scale);
+        let schema_integer = data_type.map(is_integer_sql_type).unwrap_or(false);
+        // A declared non-zero scale makes the column a scaled decimal even when
+        // this sample happens to hold only whole values (`"1.0000"` parses to
+        // 1.0); without DDL information the sample decides.
+        let is_integer = matches!(logical_type.as_str(), "numerical" | "datetime")
+            && match (schema_integer, schema_scale) {
+                (true, _) => true,
+                (false, Some(0)) => true,
+                (false, Some(_)) => false,
+                (false, None) => samples_integral,
+            };
 
         let is_repeated_low_cardinality_numeric = logical_type == "numerical"
             && cardinality > 1
@@ -299,9 +429,15 @@ impl ColumnProfile {
             && cardinality <= NUMERIC_TOP_VALUES_MAX;
         let top_values = if logical_type == "categorical"
             || is_repeated_low_cardinality_numeric
-            || (logical_type == "datetime" && mean.is_none() && !non_null.is_empty())
+            || (logical_type == "datetime" && !non_null.is_empty() && !is_numeric_datetime)
         {
-            frequency_top_values(&non_null)
+            frequency_top_values(&non_null, top_k)
+        } else {
+            None
+        };
+
+        let decimal_scale = if logical_type == "numerical" && !is_integer {
+            learned_decimal_scale(&non_null, data_type)
         } else {
             None
         };
@@ -316,13 +452,15 @@ impl ColumnProfile {
             std_dev,
             top_values,
             is_integer,
+            decimal_scale,
+            datetime_format,
         }
     }
 }
 
 impl TableProfile {
     pub fn from_rows(table: &str, columns: &[String], rows: &[Vec<Value>]) -> Self {
-        Self::from_rows_typed(table, columns, rows, None)
+        Self::from_rows_typed(table, columns, rows, None, Some(TOP_VALUES_CAP))
     }
 
     pub fn from_rows_typed(
@@ -330,6 +468,7 @@ impl TableProfile {
         columns: &[String],
         rows: &[Vec<Value>],
         data_types: Option<&HashMap<String, String>>,
+        top_k: Option<usize>,
     ) -> Self {
         let row_count = rows.len();
         let mut column_profiles = HashMap::new();
@@ -341,7 +480,11 @@ impl TableProfile {
                 .collect();
             column_profiles.insert(
                 col_name.clone(),
-                ColumnProfile::from_samples_typed(&samples, lookup_type(data_types, col_name)),
+                ColumnProfile::from_samples_typed(
+                    &samples,
+                    lookup_type(data_types, col_name),
+                    top_k,
+                ),
             );
         }
 
@@ -501,6 +644,54 @@ mod tests {
     }
 
     #[test]
+    fn should_infer_iso_datetime_format_and_epoch_stats() {
+        let samples: Vec<Value> = ["2024-01-01", "2024-03-15", "2024-12-31"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp without time zone"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert_eq!(profile.logical_type, "datetime");
+        assert_eq!(profile.datetime_format.as_deref(), Some("%Y-%m-%d"));
+        let min = crate::synth::datetime::parse_to_epoch(&samples[0], Some("%Y-%m-%d")).unwrap();
+        let max = crate::synth::datetime::parse_to_epoch(&samples[2], Some("%Y-%m-%d")).unwrap();
+        assert_eq!(profile.min.as_ref().and_then(Value::as_f64), Some(min));
+        assert_eq!(profile.max.as_ref().and_then(Value::as_f64), Some(max));
+        assert!(profile.mean.is_some());
+        assert!(profile.std_dev.is_some());
+        assert!(profile.mean.unwrap() > min && profile.mean.unwrap() < max);
+    }
+
+    #[test]
+    fn should_leave_compact_yyyymmdd_without_datetime_format() {
+        let samples: Vec<Value> = ["20240101", "20240315", "20241231"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.datetime_format.is_none());
+        assert!(profile.mean.unwrap() > 20_000_000.0);
+    }
+
+    #[test]
+    fn should_not_infer_format_for_oracle_style_dates() {
+        let samples: Vec<Value> = ["15-JAN-24", "16-JAN-24", "17-JAN-24"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile =
+            ColumnProfile::from_samples_typed(&samples, Some("date"), Some(TOP_VALUES_CAP));
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.datetime_format.is_none());
+        assert!(profile.mean.is_none());
+        assert!(profile.top_values.is_some());
+    }
+
+    #[test]
     fn column_profile_eight_digit_non_dates_stay_numerical() {
         let samples: Vec<Value> = ["12345678", "10000001", "99999999"]
             .iter()
@@ -516,14 +707,22 @@ mod tests {
             .iter()
             .map(|s| Value::from(*s))
             .collect();
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("character varying(8)"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("character varying(8)"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "datetime");
     }
 
     #[test]
     fn column_profile_all_null_numeric_schema_is_numerical() {
         let samples = vec![Value::Null, Value::Null, Value::Null];
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("numeric(16,2)"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("numeric(16,2)"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "numerical");
         assert_eq!(profile.null_rate, 1.0);
         assert!(profile.mean.is_none());
@@ -541,7 +740,8 @@ mod tests {
             "double unsigned",
             "int unsigned zerofill",
         ] {
-            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            let profile =
+                ColumnProfile::from_samples_typed(&samples, Some(ty), Some(TOP_VALUES_CAP));
             assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
         }
     }
@@ -550,7 +750,8 @@ mod tests {
     fn column_profile_duckdb_unsigned_types_are_numerical() {
         let samples = vec![Value::Null, Value::Null];
         for ty in ["UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT", "HUGEINT"] {
-            let profile = ColumnProfile::from_samples_typed(&samples, Some(ty));
+            let profile =
+                ColumnProfile::from_samples_typed(&samples, Some(ty), Some(TOP_VALUES_CAP));
             assert_eq!(profile.logical_type, "numerical", "type '{ty}'");
         }
     }
@@ -561,7 +762,11 @@ mod tests {
             .iter()
             .map(|s| Value::from(*s))
             .collect();
-        let profile = ColumnProfile::from_samples_typed(&samples, Some("bigint unsigned"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("bigint unsigned"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "numerical");
     }
 
@@ -575,8 +780,11 @@ mod tests {
     #[test]
     fn column_profile_date_schema_overrides_empty_values() {
         let samples = vec![Value::Null, Value::Null];
-        let profile =
-            ColumnProfile::from_samples_typed(&samples, Some("timestamp without time zone"));
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp without time zone"),
+            Some(TOP_VALUES_CAP),
+        );
         assert_eq!(profile.logical_type, "datetime");
     }
 
@@ -645,9 +853,30 @@ mod tests {
         types.insert("amt".to_string(), "numeric(16,2)".to_string());
         types.insert("biz_date".to_string(), "character varying(8)".to_string());
 
-        let profile = TableProfile::from_rows_typed("t", &columns, &rows, Some(&types));
+        let profile =
+            TableProfile::from_rows_typed("t", &columns, &rows, Some(&types), Some(TOP_VALUES_CAP));
         assert_eq!(profile.columns["amt"].logical_type, "numerical");
         assert_eq!(profile.columns["biz_date"].logical_type, "datetime");
+    }
+
+    #[test]
+    fn should_keep_default_top_k_behaviour() {
+        // Unparameterised profiling still caps categorical top_values at 50.
+        let samples: Vec<Value> = (0..80)
+            .map(|i| Value::from(format!("v{}", i)))
+            .chain(std::iter::repeat_n(Value::from("common"), 20))
+            .collect();
+
+        let profile = ColumnProfile::from_samples(&samples);
+        let top = profile.top_values.expect("top_values captured");
+        assert_eq!(top.len(), TOP_VALUES_CAP);
+        assert_eq!(top[0], ("common".to_string(), 0.2));
+
+        let typed = ColumnProfile::from_samples_typed(&samples, None, Some(TOP_VALUES_CAP));
+        assert_eq!(
+            typed.top_values.as_ref().map(Vec::len),
+            Some(TOP_VALUES_CAP)
+        );
     }
 
     #[test]
@@ -694,5 +923,116 @@ mod tests {
         let loaded: TableProfile = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.table, "t");
         assert!(loaded.column_order.is_empty());
+    }
+
+    #[test]
+    fn should_take_max_scale_on_mixed_sample_scales() {
+        let samples: Vec<Value> = ["1.2", "3.456", "7.89", "-0.10"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let profile = ColumnProfile::from_samples(&samples);
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(!profile.is_integer);
+        assert_eq!(profile.decimal_scale, Some(3));
+    }
+
+    #[test]
+    fn should_learn_scale_from_ddl_type_when_samples_are_numeric() {
+        let samples = vec![
+            serde_json::json!(10.5),
+            serde_json::json!(20.25),
+            serde_json::json!(30.0),
+        ];
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("numeric(16,2)"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert_eq!(profile.logical_type, "numerical");
+        assert!(!profile.is_integer);
+        assert_eq!(profile.decimal_scale, Some(2));
+    }
+
+    #[test]
+    fn should_not_learn_scale_for_integer_or_datetime_columns() {
+        let ints = vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ];
+        // A declared integer type keeps integer output; the declared scale of a
+        // DECIMAL is covered by should_learn_scale_for_whole_number_samples_of_a_scaled_column.
+        let int_profile =
+            ColumnProfile::from_samples_typed(&ints, Some("bigint"), Some(TOP_VALUES_CAP));
+        assert_eq!(int_profile.logical_type, "numerical");
+        assert!(int_profile.is_integer);
+        assert_eq!(int_profile.decimal_scale, None);
+
+        let dates: Vec<Value> = ["2024-01-01", "2024-03-15", "2024-12-31"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let date_profile = ColumnProfile::from_samples(&dates);
+        assert_eq!(date_profile.logical_type, "datetime");
+        assert_eq!(date_profile.decimal_scale, None);
+    }
+
+    #[test]
+    fn should_learn_scale_for_whole_number_samples_of_a_scaled_column() {
+        // A DECIMAL(18,4) column whose sample happens to contain only whole
+        // values is still a scaled column: the DDL scale must win over the
+        // fract()==0 heuristic, which otherwise degrades it to i64 output.
+        let strings: Vec<Value> = ["1.0000", "2.0000", "3.0000"]
+            .iter()
+            .map(|s| Value::from(*s))
+            .collect();
+        let from_strings = ColumnProfile::from_samples_typed(
+            &strings,
+            Some("decimal(18,4)"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert!(!from_strings.is_integer);
+        assert_eq!(from_strings.decimal_scale, Some(4));
+
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let from_numbers = ColumnProfile::from_samples_typed(
+            &numbers,
+            Some("numeric(16,2)"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert!(!from_numbers.is_integer);
+        assert_eq!(from_numbers.decimal_scale, Some(2));
+    }
+
+    #[test]
+    fn should_treat_integer_ddl_types_as_integers() {
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2), Value::from(3)];
+        for ty in [
+            "bigint",
+            "int",
+            "smallint",
+            "bigint unsigned",
+            "int4",
+            "serial",
+            "numeric(10,0)",
+            "decimal(18,0)",
+        ] {
+            let profile =
+                ColumnProfile::from_samples_typed(&numbers, Some(ty), Some(TOP_VALUES_CAP));
+            assert!(profile.is_integer, "type '{ty}' must stay integer");
+            assert_eq!(
+                profile.decimal_scale, None,
+                "type '{ty}' must not carry a scale"
+            );
+        }
+    }
+
+    #[test]
+    fn should_still_infer_integer_from_whole_samples_without_ddl() {
+        let numbers: Vec<Value> = vec![Value::from(1), Value::from(2)];
+        let profile = ColumnProfile::from_samples(&numbers);
+        assert!(profile.is_integer);
+        assert_eq!(profile.decimal_scale, None);
     }
 }

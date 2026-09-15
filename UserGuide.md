@@ -905,9 +905,9 @@ hepta_dbcli synth validate --model .synth/users.model.json
 
 | 子命令 | 参数 | 说明 |
 |--------|------|------|
-| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000） |
+| `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample`、`--categorical-top-k` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000）；`--categorical-top-k N\|full` 控制分类列写入模型的档数（默认 50，与历史硬上限一致；`full` 不截断，模型文件超过 10 MiB 时打印警告） |
 | `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
-| `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100） |
+| `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format`、`--no-schema-qualifier` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100）；SQL 默认带训练 schema 限定，`--no-schema-qualifier` 恢复旧的无前缀语句 |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |
 
 未指定 `--name` 时使用配置的 `default_connection`，与 `check` / MCP 行为一致。
@@ -920,16 +920,25 @@ version: "1"
 tables:
   - name: users
     rows: 599                    # 可选：本表生成行数（CLI --rows 优先于它）
-    strategy: uniform            # uniform | zipf（weighted 暂不支持，会报错）
+    strategy: uniform            # uniform | zipf | weighted（按父列观测频次加权引用）
+    columns:
+      email:
+        null_rate: 0.20          # 覆盖该列训练得到的 NULL 比例；0.0 = 从不 NULL
     relationships: []
   - name: orders
-    strategy: zipf               # 子表按 Zipf 偏置引用父表键
+    strategy: zipf               # 子表按 Zipf 偏置引用父表键；weighted 按父列观测频次（或分类边际权重）采样
+    columns:
+      user_id:
+        null_rate: 0.10          # 可空 FK：命中 NULL 时不消耗父池
     relationships:
       - pk: user_id              # 本表 FK 列
         references: [users.id]   # 父表.列
         pool_strategy: !projection
           unique: false          # true = 无放回采样（1:1）；子行数超过父池时报错
+        # null_label 仍可写（兼容旧 YAML），生成路径不再读取它
 ```
+
+列级 `null_rate` 优先于模型里训练到的 `null_rate`；省略则用模型值，再省略则视为 0。被其它表 `references` 指向的父键在生成时强制为 0（父键不能为 NULL），模型或规则若写了非 0 会在 stderr 告警。
 
 `pool_strategy` 取值：
 
@@ -943,19 +952,26 @@ tables:
 - 表按外键依赖拓扑排序生成；检测到循环依赖直接报错并列出环路径
 - 同一 `--seed` 下每张表派生独立随机流（djb2 混淆），同名表跨运行可复现
 - 数值列：高基数或值无重复的列拟合 Normal 分布（整数列生成取整值）；**低基数且值重复出现**的数值列（如 19 档离散价格）自动按观测档位拟合分类分布，生成值保持在观测档位上并保留数值类型
+- 数值列会学习 `decimal_scale`：字符串样本里纯小数面值（可选正负号、数字、至多一个 `.`，拒绝科学计数法）的最大小数位数，与 DDL 类型括号中的 scale（如 `numeric(16,2)` / `decimal(18,4)` / `NUMBER(18,4)`）取较大值。生成时按该标度做十进制 half-up 量化、再钳回 `[ceil(min), floor(max)]` 的格点区间，既避免 `1004.9999999999999` 这类二进制尾差写入 CSV/SQL，也不会因进位越出训练值域。**整数性由声明决定**：`int`/`bigint` 等整型或 scale 为 0 的 `DECIMAL` 输出 i64；声明了非零 scale 的列即使样本恰好全是整数（`"1.0000"` → 1.0）也按标度输出小数；只有拿不到 DDL 信息时才回退到样本判据。旧模型未带 `decimal_scale` 时不量化，输出与原先逐字节一致。日期时间和分类列不量化
 - 字符串列拟合分类分布，分类列输出原始字符串值
-- Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码），PSD 修正用对角占优近似
-- `unique: true`（无放回）只能与 `strategy: uniform` 组合，与 `zipf` 组合会报错
+- Copula 相关矩阵从训练数据估计（PIT 变换 + Pearson，分类列用累计频次中点编码；推断到格式的 datetime 列按 UTC epoch 做 PIT），PSD 修正用对角占优近似
+- `unique: true`（无放回）可与 `uniform` / `zipf` / `weighted` 组合；`zipf`/`weighted` 使用 Efraimidis–Spirakis 加权无放回抽样（按权重一次排序，随后 O(1) 弹出）
 - 不支持的列类型（如驱动的 `<unsupported type …>` 占位）在训练时跳过并打印警告，生成的数据不含这些列
 - `{table}.model.json` 的 `pk` 来自 catalog 主键（`Dialect::table_indexes`），支持联合主键；无主键时为 `[]`。列名按采样列的大小写归一，且只保留最终进入模型的列（训练时被跳过的 PK 列不会出现在 `pk` 中）；`synth train` 与 `synth validate` 会打印主键
 - 列逻辑类型会结合 DDL：全空的 `numeric`/`decimal`/`number`（含 MySQL `unsigned`/`zerofill`、DuckDB `ubigint` 等）记为 `numerical`；全空的 `date`/`timestamp` 记为 `datetime`（不再 `unknown`）
+- 生成按列复现 NULL：有效比例为规则 `columns.<col>.null_rate`，否则模型 `null_rate`，否则 0。每列用独立 RNG 流（`{table}:{column}:null`）做 Bernoulli；比例为 0 时不构造该流，因此全 0 模型与开启 NULL 注入前的输出逐字节一致。`null_rate: 1.0` 仍为整列 NULL。可空 FK 命中 NULL 时不从父池取值，也不计入 `unique` 池耗尽。关系上的 `null_label` 仅保留解析兼容，生成不再消费。
+- Copula 相关矩阵改为 pairwise-complete：列对中任一侧为 NULL 的行不参与 Pearson，分母是有效成对行数。不再用 `loc` / `0.5` 填缺失（那会把缺失当成典型值、扭曲相关）。
+- 导出时 NULL 与空字符串可区分：CSV 空字段 = NULL、`""` = 空字符串；JSON/JSONL 为 `null`；SQL 为 `NULL`
 - 全空列仍写入 `model.json`（`null_rate: 1.0`），生成时该列输出 NULL——保留列以便导出/建表结构与源表一致，但不会用 0 之类的常量伪造数据
 - `YYYYMMDD`（及 ISO 日期字符串）即使物理类型是 `varchar(8)` 也会识别为 `datetime`，不再当成 numerical。DECIMAL/NUMBER 仍按数值训练。邮编、零填充 SKU、纯数字类别码仍可能被误判为数值；此类列请勿用于 synth 或先在库内转型
-- `YYYYMMDD` 这类紧凑日期在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
+- 可推断格式的文本 datetime（`%Y-%m-%d`、`%Y-%m-%d %H:%M:%S`、固定宽度小数秒 `%.3f`/`%.6f`、ISO-8601、`%Y/%m/%d` 等）按 UTC epoch 拟合 Normal（`datetime_epoch: true` + `datetime_format`），生成时再按该格式还原字符串。无时区的值视为 UTC 午夜/墙钟。`enforce_min_max_values` 在 epoch 空间裁剪
+- **带时区的列（`2024-01-15T12:34:56+08:00` / `+08` / `Z`）按 UTC 规范化输出**：绝对时刻与训练一致，但偏移与墙钟文本变成 `+00:00` 形式（与 delta-diff 对 `TIMESTAMPTZ` 的约定一致）。无时区的列才是逐字符还原；微秒列（`%.6f`）同样逐字符还原
+- 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
+- `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
-- 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断，`synth train` 在 Oracle 上最多采样 100 行，保真度相应下降（见 `tests/benchmark/REPORT.md`）；native OCI 后端不受影响但当前无法从配置强制选择
-- SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写；导出语句**不带 schema 限定**，灌库前请确认目标 schema 在 search_path 中（或手工补前缀）
-- `train` / `rules-draft` 的 `--schema` 显式指定表所在 schema；缺省时 train 依赖连接默认 schema，rules-draft 取 `current_schema`，两者可能不同——跨 schema 场景请两侧都显式传 `--schema`
+- 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断。`synth train` 仅在**请求行数超过 100（`--sample` 默认 10000）且实际采样恰好 100 行**时认定被截断：向 stderr 打印 WARNING（含「分布可能失真」），并把 `{table}.model.json` 的 `provenance.truncated` 设为 `true`。`--sample 100`（或更小）是调用方自己的上限，不算截断；采样不足 100 行或非 Oracle 连接也不警告。该判定是启发式：恰好只有 100 行的表在请求更多行时仍会误报。native OCI 后端不受影响但当前无法从配置强制选择（见 `tests/benchmark/REPORT.md`）
+- SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写。`synth train --schema S` 写入 `TableModel.schema`，`generate --format sql` **默认**输出 `INSERT INTO "S"."t"`（标识符按方言引用）；`--no-schema-qualifier` 恢复旧的无前缀语句
+- `train` 与 `rules-draft` 的 `--schema` 语义一致：显式值优先，缺省时都取连接默认 schema（`side_schema_from_conn`），不再分别回落到 `current_schema`
 
 ### 10.6 基准测试与评测
 
@@ -964,6 +980,7 @@ tables:
 | Case A | 合成 4 列高斯 Copula，对标 SDV `GaussianCopulaSynthesizer(norm)` | [tests/benchmark/REPORT.md](../tests/benchmark/REPORT.md) | `tests/benchmark/run_case_a.sh` |
 | P1 | SynMeter 真实单表（**仅 Adult**）：Wasserstein / MLA / QueryError 相对门禁（hepta ≤ SDV-GC × 1.15） | [tests/benchmark/p1/REPORT.md](../tests/benchmark/p1/REPORT.md) | `tests/benchmark/p1/run_p1.sh` |
 | P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
+| M1 验收 | synth M1 端到端（真实 MySQL fixture）：datetime 格式还原与值域、NULL 比例复现、DECIMAL 标度、字典列全档、FK 引用完整性、SQL schema 限定、同 seed 逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m1.sh` |
 
 CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 

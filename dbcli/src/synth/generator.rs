@@ -28,6 +28,7 @@ pub struct GeneratedData {
     pub tables: HashMap<String, Vec<Vec<Value>>>,
     pub columns: HashMap<String, Vec<String>>,
     pub dialect: String,
+    pub schemas: HashMap<String, String>,
 }
 
 struct RelPool {
@@ -72,6 +73,7 @@ pub fn generate(
 
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
 
     // "table.column" -> 该列已生成的全部值；子表 FK 从这里采样，保证引用完整性
@@ -98,19 +100,36 @@ pub fn generate(
         let strategy = match rule.strategy {
             TableStrategy::Uniform => SelectionStrategy::Uniform,
             TableStrategy::Zipf => SelectionStrategy::Zipf,
-            TableStrategy::Weighted => {
-                return Err(format!(
-                    "table '{}': Weighted strategy is not supported; use uniform or zipf",
-                    table_name
-                ));
-            }
+            TableStrategy::Weighted => SelectionStrategy::Weighted,
         };
 
-        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, strategy)?;
+        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
         let uniform_samples = copula.sample(row_count, table_seed(config.seed, table_name));
+
+        let null_rates: Vec<f64> = column_order
+            .iter()
+            .map(|col_name| {
+                let is_referenced =
+                    referenced_targets.contains(&format!("{}.{}", table_name, col_name));
+                effective_null_rate(rule, model, table_name, col_name, is_referenced)
+            })
+            .collect();
+        // Independent streams, built only when the effective rate is > 0 so
+        // all-zero models keep the same copula/FK draws as before this change.
+        let mut null_rngs: Vec<Option<rand::rngs::StdRng>> = column_order
+            .iter()
+            .zip(null_rates.iter())
+            .map(|(col_name, rate)| {
+                if *rate > 0.0 {
+                    Some(column_null_rng(config.seed, table_name, col_name))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let mut rows = Vec::with_capacity(row_count);
 
@@ -118,15 +137,25 @@ pub fn generate(
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
+                if let Some(null_rng) = null_rngs[col_idx].as_mut() {
+                    let u: f64 = null_rng.gen();
+                    if u < null_rates[col_idx] {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                }
+
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
                     let value = if rel.unique {
-                        rel.pool.sample_unique(&mut rng).ok_or_else(|| {
-                            format!(
-                                "table '{}': unique FK '{}' exhausted its parent pool \
+                        rel.pool
+                            .sample_unique(rel.strategy, &mut rng)
+                            .ok_or_else(|| {
+                                format!(
+                                    "table '{}': unique FK '{}' exhausted its parent pool \
                                  ({} parent rows); reduce row count or set unique: false",
-                                table_name, rel.column, rel.pool_size
-                            )
-                        })?
+                                    table_name, rel.column, rel.pool_size
+                                )
+                            })?
                     } else {
                         rel.pool.sample_one(rel.strategy, &mut rng).ok_or_else(|| {
                             format!(
@@ -247,6 +276,9 @@ pub fn generate(
         }
 
         table_columns.insert(table_name.clone(), column_order.clone());
+        if let Some(schema) = model.schema.as_ref().filter(|s| !s.is_empty()) {
+            table_schemas.insert(table_name.clone(), schema.clone());
+        }
         if model.dialect != "test" {
             dialect = model.dialect.clone();
         }
@@ -257,7 +289,49 @@ pub fn generate(
         tables,
         columns: table_columns,
         dialect,
+        schemas: table_schemas,
     })
+}
+
+fn round_to_scale(value: f64, scale: u8, strategy: rust_decimal::RoundingStrategy) -> f64 {
+    use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+    use rust_decimal::Decimal;
+
+    let Some(dec) = Decimal::from_f64(value) else {
+        return value;
+    };
+    let dp = u32::from(scale).min(Decimal::MAX_SCALE);
+    let rounded = dec.round_dp_with_strategy(dp, strategy);
+    rounded.to_f64().unwrap_or(value)
+}
+
+/// Quantize to `scale` decimals, half away from zero.
+fn quantize(value: f64, scale: u8) -> f64 {
+    round_to_scale(
+        value,
+        scale,
+        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+    )
+}
+
+/// The tightest on-grid interval covering `[min, max]`: smallest grid point
+/// `>= min` and largest grid point `<= max`. Clamping a quantized value to
+/// these keeps it both on the output grid and inside the trained range —
+/// clamping to raw `min`/`max` after quantization would let half-up rounding
+/// push a value past the range (e.g. max 1.225 at scale 2 rounding up to 1.23).
+fn grid_bounds(min: f64, max: f64, scale: u8) -> (f64, f64) {
+    (
+        round_to_scale(
+            min,
+            scale,
+            rust_decimal::RoundingStrategy::ToPositiveInfinity,
+        ),
+        round_to_scale(
+            max,
+            scale,
+            rust_decimal::RoundingStrategy::ToNegativeInfinity,
+        ),
+    )
 }
 
 fn gen_column_value(
@@ -309,10 +383,47 @@ fn gen_column_value(
                     }
                 }
             }
-            if column_model.and_then(|c| c.rounding) == Some(0) {
-                Value::from(generated.round() as i64)
+            if let Some(col) = column_model {
+                if matches!(col.logical_type, crate::synth::model::LogicalType::Datetime) {
+                    if let Some(fmt) = col.datetime_format.as_deref() {
+                        return crate::synth::datetime::format_epoch(generated, fmt)
+                            .map(Value::String)
+                            .unwrap_or(Value::Null);
+                    }
+                }
+            }
+            let is_integer_column = column_model.and_then(|c| c.rounding) == Some(0);
+            let decimal_scale = column_model
+                .filter(|c| matches!(c.logical_type, crate::synth::model::LogicalType::Numerical))
+                .and_then(|c| c.decimal_scale);
+            if !is_integer_column && decimal_scale.is_none() {
+                return Value::from(generated);
+            }
+
+            let scale = if is_integer_column {
+                0
             } else {
-                Value::from(generated)
+                decimal_scale.unwrap_or(0)
+            };
+            let mut snapped = if is_integer_column {
+                generated.round()
+            } else {
+                quantize(generated, scale)
+            };
+            if enforce_min_max_values {
+                if let Some((min, max)) = column_model.and_then(|c| Some((c.min?, c.max?))) {
+                    let (lo, hi) = grid_bounds(min, max, scale);
+                    // Degenerate ranges (no grid point inside [min, max]) keep
+                    // the pre-quantization clip result.
+                    if lo <= hi {
+                        snapped = snapped.clamp(lo, hi);
+                    }
+                }
+            }
+            if is_integer_column {
+                Value::from(snapped as i64)
+            } else {
+                Value::from(snapped)
             }
         }
         None => Value::Null,
@@ -329,6 +440,37 @@ fn numeric_value_or_string(value: String) -> Value {
         .and_then(serde_json::Number::from_f64)
         .map(Value::Number)
         .unwrap_or(Value::String(value))
+}
+
+fn effective_null_rate(
+    rule: &crate::synth::rules::TableRule,
+    model: &TableModel,
+    table_name: &str,
+    col_name: &str,
+    is_referenced: bool,
+) -> f64 {
+    let rate = rule
+        .columns
+        .get(col_name)
+        .and_then(|c| c.null_rate)
+        .or_else(|| model.columns.get(col_name).and_then(|c| c.null_rate))
+        .unwrap_or(0.0);
+    if is_referenced && rate > 0.0 {
+        eprintln!(
+            "warning: referenced column '{}.{}' cannot be NULL; ignoring null_rate {}",
+            table_name, col_name, rate
+        );
+        0.0
+    } else {
+        rate
+    }
+}
+
+fn column_null_rng(base: Option<u64>, table: &str, column: &str) -> rand::rngs::StdRng {
+    match table_seed(base, &format!("{}:{}:null", table, column)) {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    }
 }
 
 // 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
@@ -360,10 +502,22 @@ fn fk_edges(rules: &SynthRules) -> Vec<(String, String)> {
     edges
 }
 
+fn parent_categorical<'a>(
+    models: &'a HashMap<String, TableModel>,
+    ref_str: &str,
+) -> Option<&'a crate::synth::marginal::CategoricalParams> {
+    let (table, col) = ref_str.split_once('.')?;
+    match models.get(table)?.columns.get(col).map(|c| &c.marginal) {
+        Some(crate::synth::marginal::Marginal::Categorical(p)) => Some(p),
+        _ => None,
+    }
+}
+
 fn build_rel_pools(
     table_name: &str,
     rule: &crate::synth::rules::TableRule,
     column_pools: &HashMap<String, Vec<Value>>,
+    models: &HashMap<String, TableModel>,
     strategy: SelectionStrategy,
 ) -> Result<Vec<RelPool>, String> {
     let mut rel_pools = Vec::new();
@@ -374,10 +528,15 @@ fn build_rel_pools(
             .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
 
         let (pool, unique) = match &rel.pool_strategy {
-            PoolStrategy::Fixed { values } => (
-                FkPool::new(values.iter().map(|v| Value::String(v.clone())).collect()),
-                false,
-            ),
+            PoolStrategy::Fixed { values } => {
+                let raw: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
+                let pool = if strategy == SelectionStrategy::Weighted {
+                    FkPool::from_observed_weights(raw, None)
+                } else {
+                    FkPool::new(raw)
+                };
+                (pool, false)
+            }
             PoolStrategy::Projection { unique } | PoolStrategy::Generated { unique } => {
                 let values = column_pools.get(ref_str).ok_or_else(|| {
                     format!(
@@ -386,17 +545,17 @@ fn build_rel_pools(
                         table_name, ref_str
                     )
                 })?;
-                (FkPool::new(values.clone()), *unique)
+                let pool = if strategy == SelectionStrategy::Weighted {
+                    FkPool::from_observed_weights(
+                        values.clone(),
+                        parent_categorical(models, ref_str),
+                    )
+                } else {
+                    FkPool::new(values.clone())
+                };
+                (pool, *unique)
             }
         };
-
-        if unique && strategy == SelectionStrategy::Zipf {
-            return Err(format!(
-                "table '{}': zipf strategy cannot be combined with unique FK '{}'; \
-                 unique requires uniform selection",
-                table_name, rel.pk
-            ));
-        }
 
         let pool_size = pool.len();
 
@@ -416,7 +575,7 @@ mod tests {
     use super::*;
     use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
-    use crate::synth::rules::{Relationship, TableRule};
+    use crate::synth::rules::{ColumnRule, Relationship, TableRule};
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
         let mut columns = HashMap::new();
@@ -426,6 +585,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams { loc, scale }),
                 ..Default::default()
             },
@@ -434,10 +595,12 @@ mod tests {
             version: 1,
             table: table.to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec![column.to_string()],
             columns,
@@ -451,6 +614,7 @@ mod tests {
     fn single_rule(table: &str, relationships: Vec<Relationship>) -> TableRule {
         TableRule {
             name: table.to_string(),
+            columns: HashMap::new(),
             rows: None,
             relationships,
             strategy: TableStrategy::default(),
@@ -473,6 +637,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams { loc, scale: 1.0 }),
                 ..Default::default()
             },
@@ -481,10 +647,12 @@ mod tests {
             version: 1,
             table: table.to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec![column.to_string()],
             columns,
@@ -595,6 +763,8 @@ mod tests {
                     logical_type: LogicalType::Numerical,
                     rounding: Some(0),
                     datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
                     marginal: Marginal::Uniform(crate::synth::marginal::UniformParams {
                         low: 0.0,
                         high: 100.0,
@@ -606,10 +776,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -720,6 +892,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Categorical(CategoricalParams {
                     values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
                     weights: vec![1.0 / 3.0; 3],
@@ -731,10 +905,12 @@ mod tests {
             version: 1,
             table: "parent".to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec!["k".to_string()],
             columns,
@@ -783,6 +959,8 @@ mod tests {
                     logical_type: LogicalType::Numerical,
                     rounding: Some(0),
                     datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
                     marginal: Marginal::Categorical(CategoricalParams {
                         values: vec!["1".to_string(), "2".to_string()],
                         weights: vec![0.5, 0.5],
@@ -794,10 +972,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -855,6 +1035,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 0.01,
@@ -866,10 +1048,12 @@ mod tests {
             version: 1,
             table: "parent".to_string(),
             dialect: "mysql".to_string(),
+            schema: None,
             provenance: Provenance {
                 source: "test".to_string(),
                 converter_version: None,
                 sdv_version: None,
+                truncated: false,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -922,6 +1106,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 10.0,
                     scale: 2.0,
@@ -935,6 +1121,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 0.0,
                     scale: 1.0,
@@ -948,10 +1136,12 @@ mod tests {
                 version: 1,
                 table: "orders".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -1018,6 +1208,8 @@ mod tests {
                             logical_type: LogicalType::Numerical,
                             rounding: Some(0),
                             datetime_epoch: None,
+                            decimal_scale: None,
+                            datetime_format: None,
                             marginal: Marginal::Normal(NormalParams {
                                 loc: 100.0,
                                 scale: 15.0,
@@ -1032,10 +1224,12 @@ mod tests {
                 version: 1,
                 table: table.to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec!["id".to_string()],
                 columns: modeled_columns,
@@ -1127,26 +1321,102 @@ mod tests {
     }
 
     #[test]
-    fn weighted_strategy_rejected_with_clear_error() {
+    fn should_weight_fk_references_by_parent_frequency() {
+        fn cat_model(table: &str, column: &str, values: &[&str], weights: &[f64]) -> TableModel {
+            let mut columns = HashMap::new();
+            columns.insert(
+                column.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Categorical,
+                    rounding: None,
+                    datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: values.iter().map(|s| s.to_string()).collect(),
+                        weights: weights.to_vec(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            TableModel {
+                version: 1,
+                table: table.to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![column.to_string()],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec![column.to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            }
+        }
+
         let mut models = HashMap::new();
         models.insert(
             "users".to_string(),
-            numerical_model("users", "id", 0.0, 1.0),
+            cat_model("users", "id", &["a", "b", "c"], &[0.6, 0.3, 0.1]),
+        );
+        models.insert(
+            "orders".to_string(),
+            cat_model("orders", "user_id", &["a", "b", "c"], &[0.6, 0.3, 0.1]),
         );
 
+        let mut users = single_rule("users", vec![]);
+        users.rows = Some(3);
+        let orders = TableRule {
+            name: "orders".to_string(),
+            columns: HashMap::new(),
+            rows: Some(10_000),
+            relationships: vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+            }],
+            strategy: TableStrategy::Weighted,
+        };
         let rules = SynthRules {
             version: "1".to_string(),
-            tables: vec![TableRule {
-                name: "users".to_string(),
-                rows: None,
-                relationships: vec![],
-                strategy: TableStrategy::Weighted,
-            }],
+            tables: vec![users, orders],
         };
 
-        let config = config(&["users"], 5);
-        let err = generate(&models, &rules, &config).unwrap_err();
-        assert!(err.contains("Weighted"), "error: {}", err);
+        let cfg = GeneratorConfig {
+            seed: Some(42),
+            ..GeneratorConfig::default()
+        };
+        let result = generate(&models, &rules, &cfg).expect("Weighted must not error");
+        let child = result.tables.get("orders").unwrap();
+        assert_eq!(child.len(), 10_000);
+
+        let mut counts = HashMap::new();
+        for row in child {
+            let key = row[0].as_str().expect("fk string").to_string();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        let share = |k: &str| *counts.get(k).unwrap_or(&0) as f64 / 10_000.0;
+        assert!(
+            (share("a") - 0.6).abs() < 0.05,
+            "a share {} not within 5pp of 0.6",
+            share("a")
+        );
+        assert!(
+            (share("b") - 0.3).abs() < 0.05,
+            "b share {} not within 5pp of 0.3",
+            share("b")
+        );
+        assert!(
+            (share("c") - 0.1).abs() < 0.05,
+            "c share {} not within 5pp of 0.1",
+            share("c")
+        );
     }
 
     #[test]
@@ -1193,6 +1463,8 @@ mod tests {
                 logical_type: LogicalType::Categorical,
                 rounding: None,
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Categorical(CategoricalParams {
                     values: vec!["open".to_string(), "closed".to_string()],
                     weights: vec![0.5, 0.5],
@@ -1207,10 +1479,12 @@ mod tests {
                 version: 1,
                 table: "tasks".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1245,10 +1519,12 @@ mod tests {
                 version: 1,
                 table: "payments".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1257,6 +1533,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: Some(0),
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(1.0),
                         max: Some(19.0),
                         null_rate: None,
@@ -1302,6 +1580,7 @@ mod tests {
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "users".to_string(),
+                columns: HashMap::new(),
                 rows: None,
                 relationships: vec![],
                 strategy: TableStrategy::Zipf,
@@ -1407,6 +1686,8 @@ mod tests {
 
     #[test]
     fn unique_fk_with_zipf_is_rejected() {
+        // Behaviour change (#65c): unique + zipf is now supported via
+        // Efraimidis–Spirakis sampling without replacement.
         let mut models = HashMap::new();
         models.insert(
             "users".to_string(),
@@ -1422,6 +1703,7 @@ mod tests {
             tables: vec![
                 TableRule {
                     name: "orders".to_string(),
+                    columns: HashMap::new(),
                     rows: None,
                     relationships: vec![Relationship {
                         pk: "total".to_string(),
@@ -1436,9 +1718,14 @@ mod tests {
         };
 
         let config = config(&["users", "orders"], 5);
-        let err = generate(&models, &rules, &config).unwrap_err();
-        assert!(err.contains("zipf"), "error: {}", err);
-        assert!(err.contains("unique"), "error: {}", err);
+        let result = generate(&models, &rules, &config).expect("unique+zipf must not error");
+        let orders = result.tables.get("orders").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for row in orders {
+            let bits = row[0].as_f64().expect("numeric fk").to_bits();
+            assert!(seen.insert(bits), "unique+zipf repeated a parent key");
+        }
+        assert_eq!(seen.len(), 5);
     }
 
     #[test]
@@ -1472,6 +1759,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 100.0,
                     scale: 15.0,
@@ -1486,10 +1775,12 @@ mod tests {
                 version: 1,
                 table: "users".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1525,6 +1816,8 @@ mod tests {
                 logical_type: LogicalType::Numerical,
                 rounding: Some(0),
                 datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
                 marginal: Marginal::Normal(NormalParams {
                     loc: 100.0,
                     scale: 15.0,
@@ -1539,10 +1832,12 @@ mod tests {
                 version: 1,
                 table: "users".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns,
@@ -1593,10 +1888,12 @@ mod tests {
                 version: 1,
                 table: "metrics".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1605,6 +1902,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: None,
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(0.0),
                         max: Some(120.0),
                         null_rate: None,
@@ -1648,10 +1947,12 @@ mod tests {
                 version: 1,
                 table: "metrics".to_string(),
                 dialect: "mysql".to_string(),
+                schema: None,
                 provenance: Provenance {
                     source: "test".to_string(),
                     converter_version: None,
                     sdv_version: None,
+                    truncated: false,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -1660,6 +1961,8 @@ mod tests {
                         logical_type: LogicalType::Numerical,
                         rounding: None,
                         datetime_epoch: None,
+                        decimal_scale: None,
+                        datetime_format: None,
                         min: Some(0.0),
                         max: Some(101.0),
                         null_rate: None,
@@ -1709,5 +2012,724 @@ mod tests {
         let config = config(&["users"], 3);
         let result = generate(&models, &rules, &config).unwrap();
         assert_eq!(result.columns.get("users"), Some(&vec!["id".to_string()]));
+    }
+
+    fn zero_null_rate_snapshot() -> GeneratedData {
+        // Two tables, mixed None/Some(0.0) null_rate, FK sampling + copula.
+        // Captured before null-injection landed so AC2 can lock byte identity.
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+
+        let mut order_columns = HashMap::new();
+        order_columns.insert(
+            "amount".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 10.0,
+                    scale: 2.0,
+                }),
+                ..Default::default()
+            },
+        );
+        order_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "orders".to_string(),
+            TableModel {
+                version: 1,
+                table: "orders".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns: order_columns,
+                copula: CopulaInfo {
+                    column_order: vec!["amount".to_string(), "user_id".to_string()],
+                    correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                },
+            },
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule("users", vec![]),
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        generate(&models, &rules, &config(&["users", "orders"], 4)).unwrap()
+    }
+
+    #[test]
+    fn should_keep_zero_null_rate_output_byte_identical() {
+        let result = zero_null_rate_snapshot();
+        let users = serde_json::to_string(result.tables.get("users").unwrap()).unwrap();
+        let orders = serde_json::to_string(result.tables.get("orders").unwrap()).unwrap();
+        // Captured from this test on the pre-null-injection generator
+        // (seed 42, 4 rows, mixed None/Some(0.0) null_rate, FK + copula).
+        assert_eq!(
+            users,
+            "[[2.3076754763602025],[-0.5264344435639146],[-0.48212996526018514],[-0.07395728769978405]]"
+        );
+        assert_eq!(
+            orders,
+            "[[8.56627954969241,-0.48212996526018514],[9.248506620196224,-0.48212996526018514],[8.233932622046893,2.3076754763602025],[7.009810102099152,-0.07395728769978405]]"
+        );
+    }
+
+    fn model_with_null_rate(table: &str, column: &str, null_rate: f64) -> TableModel {
+        let mut model = numerical_model(table, column, 0.0, 1.0);
+        model.columns.get_mut(column).unwrap().null_rate = Some(null_rate);
+        model
+    }
+
+    #[test]
+    fn should_reproduce_training_null_rate() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.20),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+
+        let result = generate(&models, &rules, &config(&["users"], 10_000)).unwrap();
+        let rows = result.tables.get("users").unwrap();
+        assert_eq!(rows.len(), 10_000);
+        let nulls = rows.iter().filter(|row| row[0].is_null()).count();
+        let observed = nulls as f64 / rows.len() as f64;
+        assert!(
+            (0.17..=0.23).contains(&observed),
+            "observed null rate {observed} outside [0.17, 0.23] ({nulls}/10000)"
+        );
+    }
+
+    #[test]
+    fn should_place_nulls_identically_for_same_seed() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.20),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("users", vec![])],
+        };
+        let cfg = config(&["users"], 200);
+
+        let first = generate(&models, &rules, &cfg).unwrap();
+        let second = generate(&models, &rules, &cfg).unwrap();
+        let mask = |data: &GeneratedData| -> Vec<bool> {
+            data.tables["users"]
+                .iter()
+                .map(|row| row[0].is_null())
+                .collect()
+        };
+        let first_mask = mask(&first);
+        let second_mask = mask(&second);
+        assert_eq!(first_mask, second_mask);
+        assert!(
+            first_mask.iter().any(|is_null| *is_null),
+            "same-seed match must include real NULLs, not an all-filled column"
+        );
+        assert!(
+            first_mask.iter().any(|is_null| !*is_null),
+            "same-seed match must include real values, not an all-NULL column"
+        );
+    }
+
+    #[test]
+    fn should_keep_fk_values_in_parent_pool_when_null_rate_is_set() {
+        let parent = model_with_null_rate("users", "id", 0.5);
+
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.1),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["user_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+
+        let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule("users", vec![]),
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "user_id".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: false },
+                        null_label: "null".to_string(),
+                    }],
+                ),
+            ],
+        };
+
+        let result = generate(&models, &rules, &config(&["users", "orders"], 200)).unwrap();
+        let parent_rows = result.tables.get("users").unwrap();
+        assert!(
+            parent_rows.iter().all(|row| !row[0].is_null()),
+            "referenced parent key must never be NULL"
+        );
+        let pool: std::collections::HashSet<String> =
+            parent_rows.iter().map(|row| row[0].to_string()).collect();
+
+        let child_rows = result.tables.get("orders").unwrap();
+        let mut saw_null = false;
+        let mut saw_member = false;
+        for row in child_rows {
+            if row[0].is_null() {
+                saw_null = true;
+                continue;
+            }
+            assert!(
+                pool.contains(&row[0].to_string()),
+                "FK value {} is neither NULL nor in the parent pool",
+                row[0]
+            );
+            saw_member = true;
+        }
+        assert!(
+            saw_null,
+            "FK column with null_rate 0.1 must emit some NULLs"
+        );
+        assert!(saw_member, "FK column must still draw some parent keys");
+    }
+
+    #[test]
+    fn should_override_null_rate_from_rules() {
+        let models = HashMap::from([(
+            "users".to_string(),
+            model_with_null_rate("users", "email", 0.50),
+        )]);
+        let mut forced_zero = single_rule("users", vec![]);
+        forced_zero.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                null_rate: Some(0.0),
+            },
+        );
+        let zero_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![forced_zero],
+        };
+        let zero_result = generate(&models, &zero_rules, &config(&["users"], 200)).unwrap();
+        assert!(
+            zero_result.tables["users"]
+                .iter()
+                .all(|row| !row[0].is_null()),
+            "rules null_rate 0.0 must suppress the model's 0.50 rate"
+        );
+
+        let mut forced_rate = single_rule("users", vec![]);
+        forced_rate.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                null_rate: Some(0.20),
+            },
+        );
+        let mut zero_model = model_with_null_rate("users", "email", 0.0);
+        zero_model.columns.get_mut("email").unwrap().null_rate = Some(0.0);
+        let models = HashMap::from([("users".to_string(), zero_model)]);
+        let rate_rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![forced_rate],
+        };
+        let rate_result = generate(&models, &rate_rules, &config(&["users"], 10_000)).unwrap();
+        let nulls = rate_result.tables["users"]
+            .iter()
+            .filter(|row| row[0].is_null())
+            .count();
+        let observed = nulls as f64 / 10_000.0;
+        assert!(
+            (0.17..=0.23).contains(&observed),
+            "rules null_rate 0.20 must win over model 0.0, got {observed}"
+        );
+    }
+
+    #[test]
+    fn should_not_consume_unique_fk_pool_on_null_rows() {
+        let parent = numerical_model("users", "id", 0.0, 1.0);
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "user_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                null_rate: Some(0.5),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "orders".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["user_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
+        let mut parent_rule = single_rule("users", vec![]);
+        parent_rule.rows = Some(10);
+        let mut child_rule = single_rule(
+            "orders",
+            vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: true },
+                null_label: "null".to_string(),
+            }],
+        );
+        child_rule.rows = Some(14);
+        child_rule.columns.insert(
+            "user_id".to_string(),
+            ColumnRule {
+                null_rate: Some(0.5),
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let result = generate(&models, &rules, &GeneratorConfig::default())
+            .expect("NULL unique-FK rows must not exhaust the parent pool");
+        let pool: std::collections::HashSet<String> = result.tables["users"]
+            .iter()
+            .map(|row| row[0].to_string())
+            .collect();
+        let mut used = std::collections::HashSet::new();
+        for row in &result.tables["orders"] {
+            if row[0].is_null() {
+                continue;
+            }
+            let key = row[0].to_string();
+            assert!(pool.contains(&key));
+            assert!(used.insert(key), "non-null unique FK must not repeat");
+        }
+        assert!(
+            result.tables["orders"].iter().any(|row| row[0].is_null()),
+            "expected some NULL FK rows so the extra children can fit"
+        );
+    }
+
+    fn legacy_unquantized_amt_json() -> String {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "amt".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                min: Some(1.0),
+                max: Some(2000.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 1004.5678,
+                    scale: 12.5,
+                }),
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "payments".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["amt".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("payments".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("payments", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["payments"], 8)).unwrap();
+        serde_json::to_string(result.tables.get("payments").unwrap()).expect("serialize rows")
+    }
+
+    #[test]
+    fn should_keep_legacy_model_without_decimal_scale_byte_identical() {
+        // Captured from current generator output (decimal_scale: None, seed 42,
+        // 8 rows) BEFORE quantization landed. A regression that starts
+        // quantizing legacy models will change this JSON.
+        const EXPECTED: &str = "[[1007.664388321776],[1021.4910250901899],[1000.258291072789],[1022.4674214957709],[989.8366471906627],[1004.3359119647007],[1007.8413059613897],[982.1004635402403]]";
+        assert_eq!(legacy_unquantized_amt_json(), EXPECTED);
+    }
+
+    fn scaled_amt_model(decimal_scale: u8, loc: f64, std_dev: f64) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "amt".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: Some(decimal_scale),
+                datetime_format: None,
+                min: Some(1.0),
+                max: Some(9999.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc,
+                    scale: std_dev,
+                }),
+            },
+        );
+        TableModel {
+            version: 1,
+            table: "payments".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["amt".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        }
+    }
+
+    fn matches_scaled_decimal(s: &str, max_frac: usize) -> bool {
+        let Some((int_part, frac)) = s.split_once('.') else {
+            return false;
+        };
+        !int_part.is_empty()
+            && int_part.bytes().all(|b| b.is_ascii_digit())
+            && (1..=max_frac).contains(&frac.len())
+            && frac.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    fn generated_amt_strings(decimal_scale: u8, rows: usize) -> Vec<String> {
+        let models = HashMap::from([(
+            "payments".to_string(),
+            scaled_amt_model(decimal_scale, 1004.5678, 50.0),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("payments", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["payments"], rows)).unwrap();
+        result
+            .tables
+            .get("payments")
+            .unwrap()
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Number(n) => n.to_string(),
+                other => panic!("expected number, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quantize_is_bit_exact_and_uses_decimal_half_up() {
+        assert_eq!(quantize(1.23456, 4).to_bits(), 1.2346f64.to_bits());
+        assert_eq!(quantize(1.23455, 4).to_bits(), 1.2346f64.to_bits());
+        assert_eq!(quantize(1.23454, 4).to_bits(), 1.2345f64.to_bits());
+        assert_eq!(quantize(1.225, 2).to_bits(), 1.23f64.to_bits());
+        assert_eq!(quantize(-1.225, 2).to_bits(), (-1.23f64).to_bits());
+        let artefact = quantize(1004.9999999999999, 4);
+        assert_eq!(artefact.to_bits(), 1005.0f64.to_bits());
+        assert!(!format!("{artefact}").contains("9999999"));
+    }
+
+    #[test]
+    fn should_quantize_generated_values_to_four_place_scale() {
+        for s in generated_amt_strings(4, 10_000) {
+            assert!(
+                matches_scaled_decimal(&s, 4),
+                "value {s} must match ^\\d+\\.\\d{{1,4}}$"
+            );
+            assert!(!s.contains("9999999"), "trailing 9s artefact: {s}");
+        }
+    }
+
+    #[test]
+    fn should_quantize_generated_values_to_two_place_scale() {
+        for s in generated_amt_strings(2, 10_000) {
+            assert!(
+                matches_scaled_decimal(&s, 2),
+                "value {s} must match ^\\d+\\.\\d{{1,2}}$"
+            );
+            assert!(!s.contains("9999999"), "trailing 9s artefact: {s}");
+        }
+    }
+
+    #[test]
+    fn should_keep_integer_columns_emitting_i64() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: Some(0),
+                datetime_format: None,
+                min: Some(0.0),
+                max: Some(100.0),
+                null_rate: Some(0.0),
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 50.0,
+                    scale: 10.0,
+                }),
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "ids".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "native".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["id".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+        };
+        let models = HashMap::from([("ids".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("ids", vec![])],
+        };
+        let result = generate(&models, &rules, &config(&["ids"], 200)).unwrap();
+        for row in result.tables.get("ids").unwrap() {
+            assert!(
+                row[0].as_i64().is_some(),
+                "rounding Some(0) must emit Value::Number(i64), got {:?}",
+                row[0]
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_legacy_datetime_model_behaviour() {
+        fn datetime_categorical(logical_type: LogicalType) -> TableModel {
+            let mut columns = HashMap::new();
+            columns.insert(
+                "created_at".to_string(),
+                ColumnModel {
+                    logical_type,
+                    rounding: None,
+                    datetime_epoch: None,
+                    decimal_scale: None,
+                    datetime_format: None,
+                    min: None,
+                    max: None,
+                    null_rate: None,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: vec!["2024-01-01".into(), "2024-06-01".into()],
+                        weights: vec![0.5, 0.5],
+                    }),
+                },
+            );
+            TableModel {
+                version: 1,
+                table: "t".to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                },
+                pk: vec![],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec!["created_at".to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+            }
+        }
+
+        let legacy = datetime_categorical(LogicalType::Datetime);
+        let as_cat = datetime_categorical(LogicalType::Categorical);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let cfg = config(&["t"], 80);
+        let mut models_dt = HashMap::new();
+        models_dt.insert("t".to_string(), legacy);
+        let mut models_cat = HashMap::new();
+        models_cat.insert("t".to_string(), as_cat);
+
+        let from_dt = generate(&models_dt, &rules, &cfg).unwrap();
+        let from_cat = generate(&models_cat, &rules, &cfg).unwrap();
+        assert_eq!(
+            from_dt.tables.get("t").unwrap(),
+            from_cat.tables.get("t").unwrap(),
+            "Datetime + Categorical + datetime_format None must match the pre-change path"
+        );
+        for row in from_dt.tables.get("t").unwrap() {
+            let s = row[0].as_str().expect("legacy datetime stays a string");
+            assert!(s == "2024-01-01" || s == "2024-06-01");
+        }
+    }
+
+    fn scaled_model(scale: u8, min: f64, max: f64, loc: f64) -> ColumnModel {
+        ColumnModel {
+            logical_type: LogicalType::Numerical,
+            rounding: None,
+            datetime_epoch: None,
+            decimal_scale: Some(scale),
+            datetime_format: None,
+            min: Some(min),
+            max: Some(max),
+            null_rate: Some(0.0),
+            marginal: Marginal::Uniform(crate::synth::marginal::UniformParams {
+                low: loc,
+                high: loc,
+            }),
+        }
+    }
+
+    fn integer_model(min: f64, max: f64, loc: f64) -> ColumnModel {
+        ColumnModel {
+            rounding: Some(0),
+            ..scaled_model(0, min, max, loc)
+        }
+    }
+
+    #[test]
+    fn should_keep_quantized_values_within_training_max() {
+        // Training max sits between two scale-2 grid points (1.22, 1.23);
+        // rounding the clipped value up would emit 1.23 and violate the range.
+        let m = scaled_model(2, 1.0, 1.225, 1.225);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1.22));
+        assert!(value.as_f64().unwrap() <= 1.225);
+    }
+
+    #[test]
+    fn should_keep_quantized_values_within_training_min() {
+        let m = scaled_model(2, 1.225, 2.0, 1.225);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1.23));
+        assert!(value.as_f64().unwrap() >= 1.225);
+    }
+
+    #[test]
+    fn should_keep_rounded_integers_within_training_max() {
+        let m = integer_model(0.0, 1.5, 1.5);
+        let value = gen_column_value(Some(&m), 0.5, true);
+        assert_eq!(value, Value::from(1));
+    }
+
+    #[test]
+    fn should_leave_quantized_values_alone_without_min_max() {
+        let mut m = scaled_model(2, 0.0, 0.0, 1.225);
+        m.min = None;
+        m.max = None;
+        assert_eq!(gen_column_value(Some(&m), 0.5, true), Value::from(1.23));
     }
 }

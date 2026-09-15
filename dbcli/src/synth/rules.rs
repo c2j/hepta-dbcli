@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SynthRules {
@@ -11,9 +12,22 @@ pub struct TableRule {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<usize>,
+    /// Per-column overrides keyed by column name. Generation prefers these
+    /// over the values learned during training.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub columns: HashMap<String, ColumnRule>,
     pub relationships: Vec<Relationship>,
     #[serde(default)]
     pub strategy: TableStrategy,
+}
+
+/// Column-level generation override. Absent fields fall back to the trained
+/// model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ColumnRule {
+    /// Overrides the learned NULL rate for this column (`0.0` = never NULL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub null_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +36,8 @@ pub struct Relationship {
     pub references: Vec<String>,
     #[serde(default)]
     pub pool_strategy: PoolStrategy,
+    /// Parsed for YAML compatibility with existing rules files. Generation
+    /// does not read this field; NULL injection uses per-column `null_rate`.
     #[serde(default = "default_null_label")]
     pub null_label: String,
 }
@@ -155,6 +171,7 @@ tables: []
             version: "1".to_string(),
             tables: vec![TableRule {
                 name: "t".to_string(),
+                columns: HashMap::new(),
                 rows: None,
                 relationships: vec![Relationship {
                     pk: "id".to_string(),
@@ -188,5 +205,36 @@ tables:
         } else {
             panic!("expected Generated pool strategy");
         }
+    }
+
+    #[test]
+    fn should_parse_legacy_table_rule_without_columns_section() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    rows: 10
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert!(rules.tables[0].columns.is_empty());
+    }
+
+    #[test]
+    fn should_parse_column_null_rate_override() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    columns:
+      email:
+        null_rate: 0.35
+    relationships: []
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rules.tables[0].columns["email"].null_rate, Some(0.35));
+
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert!(serialized.contains("null_rate: 0.35"));
     }
 }
