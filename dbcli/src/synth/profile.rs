@@ -96,13 +96,13 @@ fn is_numeric_sql_type(data_type: &str) -> bool {
 
 fn is_datetime_sql_type(data_type: &str) -> bool {
     let base = sql_type_base(data_type);
+    // `starts_with("timestamp")` covers `timestamp(6)` / `timestamp with time
+    // zone`; `starts_with("time ")` covers `time with/without time zone`.
     matches!(
         base.as_str(),
         "date" | "time" | "timetz" | "datetime" | "timestamp" | "timestamptz" | "year" | "interval"
     ) || base.starts_with("timestamp")
         || base.starts_with("time ")
-        || base.starts_with("time with")
-        || base.starts_with("time without")
 }
 
 fn compact_yyyymmdd_number(s: &str) -> Option<f64> {

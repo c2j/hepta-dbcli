@@ -314,22 +314,13 @@ async fn run_train(
                 .await
                 .map_err(|e| format!("describe indexes for '{}': {}", table, e))?;
         let data_types = cmd::parse_column_types(&col_result);
-        let pk: Vec<String> = cmd::parse_primary_key(&idx_result)
-            .into_iter()
-            .filter(|k| data_types.keys().any(|name| name.eq_ignore_ascii_case(k)))
-            .map(|k| {
-                data_types
-                    .keys()
-                    .find(|name| name.eq_ignore_ascii_case(&k))
-                    .cloned()
-                    .unwrap_or(k)
-            })
-            .collect();
 
         let result = conn
             .query(&sample_sql)
             .await
             .map_err(|e| format!("sample table '{}': {}", table, e))?;
+
+        let pk = cmd::reconcile_primary_key(cmd::parse_primary_key(&idx_result), &result.columns);
 
         let profile = crate::synth::profile::TableProfile::from_rows_typed(
             table,
@@ -349,11 +340,17 @@ async fn run_train(
         let profile_path = output_dir.join(format!("{}.profile.json", table));
         model.save(&model_path)?;
         profile.save(&profile_path)?;
+        let pk_note = if model.pk.is_empty() {
+            String::new()
+        } else {
+            format!(", pk [{}]", model.pk.join(", "))
+        };
         println!(
-            "trained {}: {} columns, {} rows sampled -> {}",
+            "trained {}: {} columns, {} rows sampled{} -> {}",
             table,
             model.copula.column_order.len(),
             result.row_count,
+            pk_note,
             model_path.display()
         );
     }

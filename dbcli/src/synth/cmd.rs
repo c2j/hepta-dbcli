@@ -164,6 +164,10 @@ pub(crate) fn build_model(
         ));
     }
 
+    // A key column that did not survive training (unsupported type) cannot be
+    // part of the generated table, so drop it from the recorded key too.
+    let pk: Vec<String> = pk.into_iter().filter(|k| columns.contains_key(k)).collect();
+
     let mut column_order: Vec<String> = profile
         .column_order
         .iter()
@@ -274,6 +278,20 @@ pub(crate) fn parse_primary_key(result: &crate::backend::QueryResult) -> Vec<Str
     crate::delta_diff::metadata::primary_key_columns(result)
 }
 
+/// Normalize catalog primary-key names to the casing of the sampled columns and
+/// drop key columns absent from the sample, so every recorded key column can be
+/// looked up in the trained model.
+pub(crate) fn reconcile_primary_key(pk: Vec<String>, columns: &[String]) -> Vec<String> {
+    pk.into_iter()
+        .filter_map(|key| {
+            columns
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(&key))
+                .cloned()
+        })
+        .collect()
+}
+
 pub(crate) fn parse_column_types(result: &crate::backend::QueryResult) -> HashMap<String, String> {
     crate::delta_diff::metadata::column_name_and_type(result)
 }
@@ -379,6 +397,11 @@ pub fn run_validate(model_path: &str) -> Result<(), String> {
     println!("  Columns: {}", model.columns.len());
     println!("  Copula dimension: {}", model.copula.correlation.len());
     println!("  Dialect: {}", model.dialect);
+    if model.pk.is_empty() {
+        println!("  Primary key: (none)");
+    } else {
+        println!("  Primary key: {}", model.pk.join(", "));
+    }
 
     Ok(())
 }
@@ -748,6 +771,39 @@ mod tests {
 
     #[test]
     fn build_model_records_composite_pk() {
+        let profile = profile_from(&[
+            (
+                "a",
+                vec![
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from(3),
+                    Value::from(4),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    Value::from(5),
+                    Value::from(6),
+                    Value::from(7),
+                    Value::from(8),
+                ],
+            ),
+        ]);
+        let (model, _) = build_model(
+            "t",
+            "mysql",
+            &profile,
+            &[],
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap();
+        assert_eq!(model.pk, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn build_model_drops_pk_column_missing_from_the_model() {
         let profile = profile_from(&[(
             "a",
             vec![
@@ -762,10 +818,38 @@ mod tests {
             "mysql",
             &profile,
             &[],
-            vec!["a".to_string(), "b".to_string()],
+            vec!["a".to_string(), "ghost".to_string()],
         )
         .unwrap();
-        assert_eq!(model.pk, vec!["a", "b"]);
+        assert_eq!(model.pk, vec!["a"]);
+    }
+
+    #[test]
+    fn reconcile_primary_key_normalizes_case_and_drops_unknown() {
+        let columns = vec![
+            "Xwdm".to_string(),
+            "Security_Id".to_string(),
+            "amt".to_string(),
+        ];
+        let pk = vec![
+            "XWDM".to_string(),
+            "security_id".to_string(),
+            "missing".to_string(),
+        ];
+        assert_eq!(
+            reconcile_primary_key(pk, &columns),
+            vec!["Xwdm".to_string(), "Security_Id".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_primary_key_keeps_key_order_and_empty_input() {
+        let columns = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(
+            reconcile_primary_key(vec!["a".to_string(), "b".to_string()], &columns),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(reconcile_primary_key(vec![], &columns).is_empty());
     }
 
     #[test]
