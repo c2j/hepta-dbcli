@@ -137,6 +137,10 @@ pub enum SynthCommand {
             default_value_t = true
         )]
         enforce_min_max_values: bool,
+
+        /// Omit schema qualifiers from SQL export (legacy `INSERT INTO t`)
+        #[arg(long, default_value_t = false)]
+        no_schema_qualifier: bool,
     },
 
     /// Validate a trained model file
@@ -155,6 +159,7 @@ pub(crate) fn build_model(
     profile: &TableProfile,
     rows: &[Vec<serde_json::Value>],
     pk: Vec<String>,
+    schema: Option<String>,
 ) -> Result<(TableModel, Vec<String>), String> {
     if profile.columns.is_empty() {
         return Err(format!("table '{}' has no columns to model", table));
@@ -246,7 +251,7 @@ pub(crate) fn build_model(
         version: 1,
         table: table.to_string(),
         dialect: dialect.to_string(),
-        schema: None,
+        schema,
         provenance: Provenance {
             source: "native".to_string(),
             converter_version: None,
@@ -365,6 +370,7 @@ pub fn run_generate(
     seed: Option<u64>,
     format: &str,
     enforce_min_max_values: bool,
+    no_schema_qualifier: bool,
 ) -> Result<(), String> {
     let models_dir = Path::new(models_dir);
     let rules_path = Path::new(rules_path);
@@ -406,10 +412,16 @@ pub fn run_generate(
         other => return Err(format!("unsupported format: {}", other)),
     };
 
+    let schemas = if no_schema_qualifier {
+        HashMap::new()
+    } else {
+        data.schemas.clone()
+    };
     let payload = crate::synth::export::ExportPayload {
         tables: &data.tables,
         columns: &data.columns,
         dialect: &data.dialect,
+        schemas,
     };
     export(&payload, &export_format, output_dir)?;
 
@@ -585,7 +597,7 @@ mod tests {
             column_order: vec!["code".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("dict", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("dict", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
 
         let mut models = HashMap::new();
@@ -658,6 +670,7 @@ mod tests {
                 rows,
                 seed,
                 format,
+                no_schema_qualifier,
                 ..
             } => {
                 assert_eq!(models, "m");
@@ -665,7 +678,23 @@ mod tests {
                 assert_eq!(rows, Some(42));
                 assert_eq!(seed, Some(7));
                 assert_eq!(format, "sql");
+                assert!(!no_schema_qualifier);
             }
+            other => panic!("expected Generate, got {:?}", other),
+        }
+
+        let flagged = parse(&[
+            "synth",
+            "generate",
+            "--format",
+            "sql",
+            "--no-schema-qualifier",
+        ]);
+        match flagged {
+            SynthCommand::Generate {
+                no_schema_qualifier,
+                ..
+            } => assert!(no_schema_qualifier),
             other => panic!("expected Generate, got {:?}", other),
         }
     }
@@ -728,8 +757,17 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model(
+            "t",
+            "mysql",
+            &profile,
+            &[],
+            vec![],
+            Some("sales".to_string()),
+        )
+        .unwrap();
         assert!(skipped.is_empty());
+        assert_eq!(model.schema.as_deref(), Some("sales"));
         let n = model.copula.column_order.len();
         assert_eq!(n, 3);
         assert_eq!(model.copula.column_order, vec!["a", "b", "c"]);
@@ -745,7 +783,7 @@ mod tests {
     #[test]
     fn build_model_rejects_empty_profile() {
         let profile = TableProfile::from_rows("t", &[], &[]);
-        assert!(build_model("t", "mysql", &profile, &[], vec![]).is_err());
+        assert!(build_model("t", "mysql", &profile, &[], vec![], None).is_err());
     }
 
     #[test]
@@ -760,7 +798,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("status").unwrap();
         match &col.marginal {
@@ -808,7 +846,7 @@ mod tests {
             ],
         )]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("flag").unwrap();
         let generated = col.marginal.inverse_cdf(0.01);
@@ -833,7 +871,7 @@ mod tests {
         )]);
         profile.save(&dir.join("users.profile.json")).unwrap();
 
-        let (model, _) = build_model("users", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("users", "mysql", &profile, &[], vec![], None).unwrap();
         model.save(&dir.join("users.model.json")).unwrap();
 
         let loaded = load_profiles(&dir).unwrap();
@@ -867,7 +905,7 @@ mod tests {
             ),
         ]);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
@@ -893,7 +931,7 @@ mod tests {
         ];
         let profile = TableProfile::from_rows("t", &columns, &rows);
 
-        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &rows, vec![], None).unwrap();
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id", "v3"]);
         let r = model.copula.correlation[0][1];
@@ -916,7 +954,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         let col = model.columns.get("id").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -933,7 +971,7 @@ mod tests {
             ],
         )]);
 
-        let (model, _) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, _) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         let col = model.columns.get("v").unwrap();
         assert_eq!(col.rounding, Some(0));
     }
@@ -966,6 +1004,7 @@ mod tests {
             &profile,
             &[],
             vec!["a".to_string(), "b".to_string()],
+            None,
         )
         .unwrap();
         assert_eq!(model.pk, vec!["a", "b"]);
@@ -988,6 +1027,7 @@ mod tests {
             &profile,
             &[],
             vec!["a".to_string(), "ghost".to_string()],
+            None,
         )
         .unwrap();
         assert_eq!(model.pk, vec!["a"]);
@@ -1032,7 +1072,7 @@ mod tests {
                 Value::from("20241231"),
             ],
         )]);
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("biz_date").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));
@@ -1059,7 +1099,7 @@ mod tests {
             column_order: vec!["amt".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("amt").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Numerical));
@@ -1082,7 +1122,7 @@ mod tests {
             column_order: vec!["ts".to_string()],
             columns,
         };
-        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![]).unwrap();
+        let (model, skipped) = build_model("t", "mysql", &profile, &[], vec![], None).unwrap();
         assert!(skipped.is_empty());
         let col = model.columns.get("ts").unwrap();
         assert!(matches!(col.logical_type, LogicalType::Datetime));

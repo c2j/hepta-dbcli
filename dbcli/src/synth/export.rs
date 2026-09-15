@@ -6,6 +6,9 @@ pub struct ExportPayload<'a> {
     pub tables: &'a HashMap<String, Vec<Vec<Value>>>,
     pub columns: &'a HashMap<String, Vec<String>>,
     pub dialect: &'a str,
+    /// Per-table schema recorded at train time. Empty or missing keys keep
+    /// the legacy unqualified `INSERT INTO t` form.
+    pub schemas: HashMap<String, String>,
 }
 
 pub enum ExportFormat {
@@ -116,6 +119,16 @@ fn export_json(payload: &ExportPayload<'_>, output_dir: &std::path::Path) -> Res
     Ok(())
 }
 
+fn qualified_table(payload: &ExportPayload<'_>, table_name: &str) -> String {
+    let table_ident = export_ident(payload.dialect, table_name);
+    match payload.schemas.get(table_name) {
+        Some(schema) if !schema.is_empty() => {
+            format!("{}.{}", export_ident(payload.dialect, schema), table_ident)
+        }
+        _ => table_ident,
+    }
+}
+
 fn export_ident(dialect: &str, name: &str) -> String {
     if dialect == "mysql" {
         format!("`{}`", name.replace('`', "``"))
@@ -133,7 +146,7 @@ fn export_sql(payload: &ExportPayload<'_>, output_dir: &std::path::Path) -> Resu
         let mut file =
             std::fs::File::create(&path).map_err(|e| format!("create SQL file: {}", e))?;
 
-        let table_ident = export_ident(payload.dialect, table_name);
+        let table_ident = qualified_table(payload, table_name);
         let column_list: Option<String> = rows.first().map(|first_row| {
             columns_for(payload, table_name, first_row.len())
                 .iter()
@@ -194,6 +207,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_csv");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -219,6 +233,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_csv_esc");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -240,6 +255,7 @@ mod tests {
             tables: &tables,
             columns: &HashMap::new(),
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_csv_fallback");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -269,6 +285,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_jsonl");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -294,6 +311,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_json");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -323,6 +341,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_sql");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -351,6 +370,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "gaussdb",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_sql_ansi");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -375,6 +395,7 @@ mod tests {
             tables: &tables,
             columns: &columns,
             dialect: "oracle",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_sql_oracle");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -388,6 +409,62 @@ mod tests {
     }
 
     #[test]
+    fn should_qualify_sql_export_with_training_schema() {
+        let mut tables = HashMap::new();
+        tables.insert("t".to_string(), vec![vec![Value::from(1)]]);
+        let mut columns = HashMap::new();
+        columns.insert("t".to_string(), vec!["id".to_string()]);
+        let mut schemas = HashMap::new();
+        schemas.insert("t".to_string(), "sales".to_string());
+
+        let payload = ExportPayload {
+            tables: &tables,
+            columns: &columns,
+            dialect: "gaussdb",
+            schemas,
+        };
+        let temp_dir = std::env::temp_dir().join("synth_test_sql_schema_65");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        export(&payload, &ExportFormat::Sql, &temp_dir).unwrap();
+        let content = std::fs::read_to_string(temp_dir.join("t.sql")).unwrap();
+        assert_eq!(
+            content.lines().next().unwrap(),
+            "INSERT INTO \"sales\".\"t\" (\"id\") VALUES (1);"
+        );
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn should_omit_schema_qualifier_with_flag() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "users".to_string(),
+            vec![vec![Value::from(1), Value::from("hello")]],
+        );
+        let mut columns = HashMap::new();
+        columns.insert(
+            "users".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let payload = ExportPayload {
+            tables: &tables,
+            columns: &columns,
+            dialect: "mysql",
+            schemas: HashMap::new(),
+        };
+        let temp_dir = std::env::temp_dir().join("synth_test_sql_no_schema_65");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        export(&payload, &ExportFormat::Sql, &temp_dir).unwrap();
+        let content = std::fs::read_to_string(temp_dir.join("users.sql")).unwrap();
+        assert_eq!(
+            content.lines().next().unwrap(),
+            "INSERT INTO `users` (`id`, `name`) VALUES (1, 'hello');"
+        );
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
     fn sql_export_escapes_single_quotes() {
         let mut tables = HashMap::new();
         tables.insert("t".to_string(), vec![vec![Value::from("o'brien")]]);
@@ -396,6 +473,7 @@ mod tests {
             tables: &tables,
             columns: &HashMap::new(),
             dialect: "mysql",
+            schemas: HashMap::new(),
         };
         let temp_dir = std::env::temp_dir().join("synth_test_sql_quote");
         std::fs::create_dir_all(&temp_dir).unwrap();

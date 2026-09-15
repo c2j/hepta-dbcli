@@ -28,6 +28,7 @@ pub struct GeneratedData {
     pub tables: HashMap<String, Vec<Vec<Value>>>,
     pub columns: HashMap<String, Vec<String>>,
     pub dialect: String,
+    pub schemas: HashMap<String, String>,
 }
 
 struct RelPool {
@@ -72,6 +73,7 @@ pub fn generate(
 
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
 
     // "table.column" -> 该列已生成的全部值；子表 FK 从这里采样，保证引用完整性
@@ -244,6 +246,9 @@ pub fn generate(
         }
 
         table_columns.insert(table_name.clone(), column_order.clone());
+        if let Some(schema) = model.schema.as_ref().filter(|s| !s.is_empty()) {
+            table_schemas.insert(table_name.clone(), schema.clone());
+        }
         if model.dialect != "test" {
             dialect = model.dialect.clone();
         }
@@ -254,6 +259,7 @@ pub fn generate(
         tables,
         columns: table_columns,
         dialect,
+        schemas: table_schemas,
     })
 }
 

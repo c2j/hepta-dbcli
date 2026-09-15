@@ -93,6 +93,7 @@ pub async fn run(
             seed,
             format,
             enforce_min_max_values,
+            no_schema_qualifier,
         } => cmd::run_generate(
             &models,
             &rules,
@@ -101,6 +102,7 @@ pub async fn run(
             seed,
             &format,
             enforce_min_max_values,
+            no_schema_qualifier,
         ),
         cmd::SynthCommand::Validate { model } => cmd::run_validate(&model),
     };
@@ -334,7 +336,14 @@ async fn run_train(
             Some(&data_types),
             categorical_top_k.cap(),
         );
-        let (model, skipped) = cmd::build_model(table, &scheme, &profile, &result.rows, pk)?;
+        let (model, skipped) = cmd::build_model(
+            table,
+            &scheme,
+            &profile,
+            &result.rows,
+            pk,
+            Some(schema.clone()),
+        )?;
         for col in &skipped {
             eprintln!(
                 "warning: table '{}': column '{}' skipped (unsupported or untrainable type)",
@@ -475,6 +484,7 @@ mod tests {
                 seed: None,
                 format: "csv".to_string(),
                 enforce_min_max_values: true,
+                no_schema_qualifier: false,
             }),
             ("generate".to_string(), "models=m; rules=r.yaml".to_string())
         );
