@@ -976,9 +976,9 @@ tables:
 |------|------|
 | `fixed: <字面量>` | 该列全表取同一值。按列的逻辑类型输出：数值列的数值字面量在 JSON/SQL 中都是数值（分区键不会被引号包裹），日期时间列会按模型的 `datetime_format` 解析成 epoch 再定位 |
 | `values: {值: 权重}` 或 `values: [值, ...]` | 逐行独立按权重/等权取值；省略权重即等权。加权池用有序映射，保证同 seed 可复现。键按**标量**读取，`values: {1: 0.7, 2: 0.3}` 这种数值键不需要加引号 |
-| `fixed_range: [low, high]` | 闭区间。数值与可解析的日期时间列都支持；`low > high`、端点类型不一致、或区间落在训练分布外都会在配置期/生成期报错 |
+| `fixed_range: [low, high]` | 闭区间。数值与可解析的日期时间列都支持；`low > high`、端点类型不一致、或区间落在训练分布外都会在配置期/生成期报错。日期时间列的两个端点按**时刻**比较（epoch 秒，与 `copula_conditional` 同一域），端点先按列的 `datetime_format` 解析、失败再按通用 ISO 形状解析，纯数字端点直接当 epoch 秒；只写到日期的端点等于**当天 00:00:00** |
 
-`fixed` / `values` 与以下组合会被拒绝（错误含表名与列名）：两者并存、与该列 `null_rate > 0` 并存、该列是被其他表 `references` 的父键、该列是 relationship 的 `pk`。
+`fixed` / `values` / `fixed_range` 与以下组合都会被拒绝（错误含表名与列名）：`fixed` 与 `values` 并存、与该列 `null_rate > 0` 并存（阶段 4 覆盖整列，rate 无意义）、该列是被其他表 `references` 的父键、该列是 relationship 的 `pk`。
 
 区间约束有两条路径，取舍如下：
 
@@ -999,11 +999,12 @@ tables:
         expr: "price * qty * 2 + 0.01"
 ```
 
-- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& || !`）、单引号字符串（仅用于比较）。**函数调用、属性访问、下标一律拒绝**（加载期报错并指出违规节点）。
-- 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，不会 panic。
+- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**函数调用、属性访问、下标一律拒绝**（加载期报错并指出违规节点）。
+- 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，溢出报错而不是 panic。
+- **NULL 传播（三值逻辑）**：`derive` 无条件重算目标列，源列为 NULL 时结果也是 NULL（`total = price * qty` 在 `price` 为 NULL 的那一行把 `total` 写成 NULL），**不会**中断整张表的生成。目标列若在库里是 `NOT NULL`，会在写入时报数据库错误。除零/类型错误仍是硬错误：那是配置写错，不是 NULL 输入。
 - 时机：**所有列生成（含 copula、FK、NULL、`fixed`/`values`/`fixed_range`）之后统一求值**，因此表达式读到的是最终值；`derive` 之间按依赖顺序求值（`c = b + 1`、`b = price * 2` 可以声明为任意顺序），成环在加载期报错。
 - 输出按目标列的类型量化：整数列取整为 i64；带 `decimal_scale` 的列量化到该标度（避免 `110.16999999999999` 这类二进制尾差写入 CSV/SQL）。
-- 冲突校验（加载期，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、表达式引用未知列、derive 成环。
+- 冲突校验（**加载期**，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、derive 成环。**未知列在生成期报错**：`table.columns` 只记录覆盖项，列的存在性要拿模型才判得出来（`table 'orders' derive 'amount': unknown column 'x'`）。
 - 不含 `derive` 的 rules 输出与之前逐字节一致。
 
 #### 分支覆盖率（`branches`，issue #70）
@@ -1024,7 +1025,8 @@ tables:
 
 - 时机：`derive` 之后的最后一个阶段。先度量谓词命中率，未达目标就改写未命中的行，再重算 `derive`，最多 10 轮；命中率进入报告（stdout 为 Pass，stderr 为 `warning:` 的 Warn/Fail），**不阻断主流程退出码**（exit 仍为 0）。
 - 改写行的选择是确定性的：在未命中行里按等距抽取，避免把改动堆在表头；`set` 只能让行**命中**谓词，因此只从下方补齐，超出目标不会被「反向撤销」。
-- 可写列白名单（加载期报错，错误含表名与列名）：不能写 FK 列、被其它表 `references` 的父键、`derive` 目标列、以及被 `fixed`/`values`/`fixed_range` 钉住的列。
+- 可写列白名单（错误含表名、分支 id 与列名）：不能写 FK 列、被其它表 `references` 的父键、`derive` 目标列、以及被 `fixed`/`values`/`fixed_range` 钉住的列。这些关系在 YAML 里就能判定，因此都在**加载期**报错；只有「列是否存在」要等模型，在**生成期**报错。
+- 同列多分支：同一轮里已改写的行不会再被兄弟分支抢走，且**命中任一分支的行不归其他分支改写**（`set` 只能让行命中，改写这类行只会破坏兄弟分支已达成的覆盖）。两个分支争抢同一列时会一轮收敛，而不是互相覆盖到最后一轮（只有最后声明的分支达标）。
 - 一轮下来命中率没有任何变化（典型是 `set` 写的列与谓词无关）会立即停止并报 Warn，不会空转到 10 轮；若**所有**行都无法求值（例如字符串列写了 `predicate: "name == 1"`），直接报错而不是伪装成 0% 覆盖。
 - 与影子数据的差异（诚实说明）：本实现只做 `set` 补齐与 `derive` 联动重算，**不做** `derive` 表达式形式的 `set`、不做多轮最小扰动选行、不做「反向撤销」。不含 `branches` 的 rules 输出与之前逐字节一致。
 
@@ -1036,7 +1038,8 @@ tables:
 
 #### rules-draft：隐式引用推断与规则挖掘
 
-- **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship（`unique: true`），与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。
+- **隐式引用推断**（有 `--models` 时默认开启）：库中没写外键时，若子表列与父表列**精确同名**，且父表该列在训练 profile 中唯一（`cardinality == row_count`）、子表该列不是自身主键，则推断出一条 relationship，与数据库外键结果去重，并在 stderr 汇总 `inferred N implicit relationship(s)`。不做后缀猜测或模糊匹配。
+  - 推断出的 `unique` **跟随子表列**，与显式外键同一判据：子表该列在 profile 中唯一（`cardinality == row_count`，即 1:1）才是无放回采样的 `unique: true`；1:N 一律 `unique: false`，否则子表行数超过父表池时会报 `exhausted its parent pool`。
 - **条件规则挖掘**（`--mine`，默认关闭）：对类别列对 `(A, B)`，统计每个高频值 `a` 下 `B` 的条件分布与边缘分布的 TV 距离，`TV > --mine-support` 且最大条件取值占比 `≥ --mine-confidence` 时输出候选 `A=a => B=b`（附 confidence / support）。
   - 候选**只写入 YAML 注释或 `--emit-candidates` 指定文件，永不自动启用**；不传 `--mine` 时 draft 输出与之前完全一致。
   - 唯一值占该列非 NULL 行数过半的列（id、单据号等）视为标识符不参与，避免小样本上「每个取值都蕴含一条规则」的伪候选；`--mine-max-pairs` 限制列对数量（超出会记录并截断）；同输入同参数候选清单逐位一致。

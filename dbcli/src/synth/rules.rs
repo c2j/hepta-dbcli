@@ -469,10 +469,48 @@ fn validate_branches(
             }
         }
 
+        // V11: the flippable-column whitelist (plan §1). Known columns and
+        // known relationships make FK / derive-target / pinned writes
+        // decidable without the model, so they fail here rather than after the
+        // table has been generated. Unknown names can only be checked against
+        // the model, which `generate` does.
+        let derived: std::collections::HashSet<&str> = table
+            .derive
+            .iter()
+            .map(|entry| entry.column.as_str())
+            .collect();
+        let fk_columns: std::collections::HashSet<&str> = table
+            .relationships
+            .iter()
+            .map(|relationship| relationship.pk.as_str())
+            .collect();
+
         for column in branch.repair.set.keys() {
             if parent_keys.contains(&format!("{}.{}", table.name, column)) {
                 return Err(format!(
                     "table '{}' branch '{}': repair.set cannot write parent key '{}' referenced by another table (uniqueness is unreachable)",
+                    table.name, branch.id, column
+                ));
+            }
+            if fk_columns.contains(column.as_str()) {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write FK column '{}' (referential integrity)",
+                    table.name, branch.id, column
+                ));
+            }
+            if derived.contains(column.as_str()) {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write derived column '{}'",
+                    table.name, branch.id, column
+                ));
+            }
+            if table
+                .columns
+                .get(column)
+                .is_some_and(ColumnRule::has_column_override)
+            {
+                return Err(format!(
+                    "table '{}' branch '{}': repair.set cannot write pinned column '{}'",
                     table.name, branch.id, column
                 ));
             }
@@ -786,6 +824,82 @@ tables:
             err.contains("status"),
             "error must quote the predicate: {err}"
         );
+    }
+
+    #[test]
+    fn should_reject_branch_repair_that_writes_a_fk_column() {
+        // `generate` refuses this; the FK pk is already known from the YAML, so
+        // it must fail at load time instead of after the whole table is built.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.3
+        repair: {set: {user_id: "1"}}
+  - name: users
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("writing an FK column must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("user_id"), "error must name the column: {err}");
+        assert!(
+            err.contains("referential integrity"),
+            "error must explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_branch_repair_that_writes_a_derived_column() {
+        // A derived column is recomputed after `set`, so the write can never
+        // move the predicate. That is decidable from the YAML alone.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    derive:
+      - column: total
+        expr: "price * qty"
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.3
+        repair: {set: {total: "1"}}
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("writing a derived column must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("total"), "error must name the column: {err}");
+        assert!(err.contains("derived"), "error must explain why: {err}");
+    }
+
+    #[test]
+    fn should_reject_branch_repair_that_writes_a_pinned_column() {
+        // Stage 4 pins the column for every row, so a repair write to it is a
+        // priority conflict that the YAML already reveals.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    columns:
+      status:
+        fixed: "A"
+    branches:
+      - id: paid
+        predicate: "status == 'A'"
+        target_ratio: 0.3
+        repair: {set: {status: "B"}}
+    relationships: []
+"#;
+        let err = validate_yaml(yaml).expect_err("writing a pinned column must fail");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(err.contains("status"), "error must name the column: {err}");
+        assert!(err.contains("pinned"), "error must explain why: {err}");
     }
 
     #[test]

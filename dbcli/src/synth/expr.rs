@@ -92,6 +92,8 @@ pub enum ExprError {
     NonBooleanPredicate { found: &'static str },
     /// The expression evaluated to NULL and cannot be used as a decimal.
     NullResult,
+    /// An arithmetic operation left `rust_decimal`'s 96-bit mantissa.
+    Overflow { op: &'static str },
 }
 
 impl fmt::Display for ExprError {
@@ -123,6 +125,9 @@ impl fmt::Display for ExprError {
                 write!(f, "predicate must evaluate to a boolean, got {found}")
             }
             ExprError::NullResult => write!(f, "expression evaluated to NULL"),
+            ExprError::Overflow { op } => {
+                write!(f, "arithmetic overflow in expression (operator `{op}`)")
+            }
         }
     }
 }
@@ -736,9 +741,21 @@ fn eval(node: &Node, lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value
 fn arith(op: ArithOp, left: Value, right: Value) -> Result<Value, ExprError> {
     match (left, right) {
         (Value::Number(a), Value::Number(b)) => match op {
-            ArithOp::Add => Ok(Value::Number(a + b)),
-            ArithOp::Sub => Ok(Value::Number(a - b)),
-            ArithOp::Mul => Ok(Value::Number(a * b)),
+            // The `+`/`-`/`*` operators panic on overflow ("Addition
+            // overflowed"); the checked variants turn it into an error like
+            // division by zero, which is what the guide promises.
+            ArithOp::Add => a
+                .checked_add(b)
+                .map(Value::Number)
+                .ok_or(ExprError::Overflow { op: op.symbol() }),
+            ArithOp::Sub => a
+                .checked_sub(b)
+                .map(Value::Number)
+                .ok_or(ExprError::Overflow { op: op.symbol() }),
+            ArithOp::Mul => a
+                .checked_mul(b)
+                .map(Value::Number)
+                .ok_or(ExprError::Overflow { op: op.symbol() }),
             ArithOp::Div => a
                 .checked_div(b)
                 .map(Value::Number)
@@ -1014,6 +1031,39 @@ mod tests {
             err.to_string().contains("remainder by zero"),
             "message: {err}"
         );
+    }
+
+    #[test]
+    fn should_report_arithmetic_overflow_as_an_error() {
+        // `rust_decimal`'s `Add`/`Sub`/`Mul` operators panic ("Addition
+        // overflowed") instead of returning None, so the engine has to use the
+        // checked variants: a large `total = price * qty` must not abort the
+        // whole run with a panic inside the dependency.
+        const MAX: &str = "79228162514264337593543950335";
+        for (src, op) in [
+            (format!("{MAX} + 1"), "+"),
+            (format!("-{MAX} - 1"), "-"),
+            (format!("{MAX} * 2"), "*"),
+        ] {
+            let err = eval_decimal(&src, &[]).expect_err("overflow must be an error, not a panic");
+            match err {
+                ExprError::Overflow { op: got } => assert_eq!(got, op, "{src}"),
+                other => panic!("{src}: expected Overflow, got {other}"),
+            }
+        }
+        assert!(
+            !eval_decimal("1 + 2", &[]).is_err(),
+            "ordinary arithmetic must keep working"
+        );
+    }
+
+    #[test]
+    fn should_negate_the_largest_magnitude_without_overflow() {
+        // `Neg` only flips the sign bit, so `-MAX` is representable; this pins
+        // that unary minus needs no checked variant.
+        const MAX: &str = "79228162514264337593543950335";
+        let value = eval_decimal(&format!("-{MAX}"), &[]).expect("negation must not overflow");
+        assert_eq!(value.to_string(), format!("-{MAX}"));
     }
 
     #[test]
