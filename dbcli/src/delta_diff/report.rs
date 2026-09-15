@@ -32,7 +32,7 @@ pub(crate) enum RowPayload {
     HashCount,
 }
 
-/// Modified 行按「变化列」聚合计数（issue #79 §4.1；仅统计 DiffStatus::Modified）
+/// Modified 行按「变化列」聚合计数（仅统计 DiffStatus::Modified）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ColumnChangeCount {
     pub(crate) name: String,

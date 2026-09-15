@@ -66,7 +66,7 @@ pub(crate) enum ApplyTo {
     Right,
 }
 
-/// 终端抽样模式（issue #79 D2）
+/// 终端抽样模式：diverse 按差异形态挑选，prefix 为 key 序前 N 行
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum SampleMode {
     /// 按差异形态挑选：status 配额 + 变化列覆盖 + 签名去重（默认）

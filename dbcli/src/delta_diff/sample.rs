@@ -1,4 +1,4 @@
-// ─── delta-diff sample: 列级变化直方图 + 终端抽样选择器（issue #79）────
+// ─── delta-diff sample: 列级变化直方图 + 终端抽样选择器 ────────────────
 
 use std::collections::HashSet;
 
@@ -7,8 +7,10 @@ use serde_json::Value;
 use crate::delta_diff::cmd::SampleMode;
 use crate::delta_diff::report::{ColumnChangeCount, DiffReport, DiffRow, DiffStatus, RowPayload};
 
-/// Modified 行按「变化列」聚合计数（issue #79 §4.1）。
-/// 判定复用 cells_differ（数值标度对齐，D9）；HashCount / 无比对列 / 无 Modified 行 → None（D6）。
+/// Modified 行按「变化列」聚合计数，count 降序。变化判定复用 `cells_differ`
+/// （数值标度对齐：`12150.0` 与 `12150` 不算变化）。
+/// HashCount / 无比对列 / 无 Modified 行时返回 None——keyless 的 cells 是
+/// `[hash, count]`，没有列可比。
 pub(crate) fn compute_modified_columns(report: &DiffReport) -> Option<Vec<ColumnChangeCount>> {
     if report.row_payload == RowPayload::HashCount || report.value_columns.is_empty() {
         return None;
@@ -78,7 +80,9 @@ pub(crate) fn changed_value_indices(
         .collect()
 }
 
-/// 终端抽样选择器（issue #79 D2/D3/D6/D7）。返回**升序**行下标（key 序展示）。
+/// 终端抽样选择器。返回**升序**行下标（key 序展示）。
+/// diverse：status 配额（Modified 优先）→ 覆盖未出现列 → 签名去重 → 原序回填；
+/// prefix：key 序前 n 行。
 /// n == 0 或 n >= total → 全量下标（与今日 `--sample 0` / 足额语义一致）。
 pub(crate) fn select_sample_indices(report: &DiffReport, n: usize, mode: SampleMode) -> Vec<usize> {
     let total = report.sample_diffs.len();
@@ -91,7 +95,7 @@ pub(crate) fn select_sample_indices(report: &DiffReport, n: usize, mode: SampleM
     }
 }
 
-/// 就地按选择器保留样本（MCP cap 替身；issue #79 D5）。n = 0 视为全量。
+/// 就地按选择器保留样本（MCP payload 上限）。n = 0 视为全量。
 pub(crate) fn retain_sample(report: &mut DiffReport, n: usize, mode: SampleMode) {
     let indices = select_sample_indices(report, n, mode);
     let old = std::mem::take(&mut report.sample_diffs);
@@ -362,7 +366,7 @@ mod tests {
                 ],
             ));
         }
-        // 1 行数值标度假差异：cjsl 12150.0 vs 12150（NUMBER 类型 → 不算变化，D9）
+        // 1 行数值标度假差异：cjsl 12150.0 vs 12150（NUMBER 类型 → 标度对齐不算变化）
         rows.push(mod_row(
             99,
             vec![
@@ -430,7 +434,7 @@ mod tests {
                 Value::from("d"),
             ],
         )];
-        assert!(compute_modified_columns(&r).is_none()); // D6：keyless 无列可比
+        assert!(compute_modified_columns(&r).is_none()); // keyless cells 是 [hash, count]，无列可比
     }
 
     #[test]
@@ -458,7 +462,7 @@ mod tests {
 
     #[test]
     fn select_diverse_covers_all_column_shapes_within_budget() {
-        // 循环 2：大量 {cjsl} + 各 1 条 {yhs} / {cjrq}，预算 3 → 三种列都出现
+        // 大量 {cjsl} + 各 1 条 {yhs} / {cjrq}，预算 3 → 三种列都出现
         let mut r = base_report();
         let mut rows = Vec::new();
         for i in 0..30 {
@@ -518,7 +522,7 @@ mod tests {
 
     #[test]
     fn select_diverse_status_quota_includes_missing_and_modified() {
-        // 循环 3：前 100 行 MissingRight，后面才有 Modified → 两种 status 都在
+        // 前 100 行 MissingRight，后面才有 Modified → 两种 status 都在
         let mut r = base_report();
         let mut rows: Vec<DiffRow> = (0..100)
             .map(|i| DiffRow {
@@ -565,7 +569,7 @@ mod tests {
 
     #[test]
     fn select_diverse_signature_dedup_keeps_budget_for_rare_shape() {
-        // 循环 4：30 行 {cjsl,yhs} + 1 行 {cjrq}，预算 20 → 罕见签名不能被挤掉
+        // 30 行 {cjsl,yhs} + 1 行 {cjrq}，预算 20 → 罕见签名不能被挤掉
         let mut r = base_report();
         r.sample_diffs = skewed_rows();
         let picked = select_sample_indices(&r, 20, SampleMode::Diverse);

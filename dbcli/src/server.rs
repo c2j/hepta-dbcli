@@ -1079,7 +1079,7 @@ impl DbMcp {
                         }
                     }
                 }
-                // Engine keeps full diffs for export; MCP payload stays selected (issue #79 D5).
+                // Engine keeps full diffs for export; MCP payload stays selected.
                 crate::delta_diff::sample::retain_sample(
                     &mut report,
                     params.sample_limit.unwrap_or(1000),

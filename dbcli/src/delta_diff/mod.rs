@@ -536,7 +536,8 @@ async fn execute_diff_inner(
             .warnings
             .push("sample/export row fetch ran after snapshot commit".into());
     }
-    // issue #79：直方图必须在 hydrate 之后计算（hydrate 可能翻转 HashCount→Columns）
+    // 直方图必须在 hydrate 之后计算：keyless 回查可能把 payload 从 HashCount
+    // 翻成 Columns 并补全列名，先算会得到空直方图
     report.modified_columns = sample::compute_modified_columns(&report);
     if report.sample_diffs.len() > 100_000 {
         report.warnings.push(format!(

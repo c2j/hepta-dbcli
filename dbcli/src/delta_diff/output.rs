@@ -62,7 +62,7 @@ pub(crate) fn summary_to_query_result(report: &DiffReport) -> QueryResult {
         kv_num("missing_right", s.missing_right),
         kv_num("modified", s.modified),
     ];
-    // issue #79 §4.1：列级变化直方图（count 降序；keyless / 无 Modified 行时整个块省略）
+    // 列级变化直方图（count 降序；keyless / 无 Modified 行时整个块省略）
     if let Some(cols) = &report.modified_columns {
         for c in cols {
             rows.push(kv_num(&format!("modified_by_column[{}]", c.name), c.count));
@@ -187,8 +187,8 @@ fn visible_value_indices(
                 }
             }
             DiffStatus::MissingLeft | DiffStatus::MissingRight => {
-                // issue #79 D8：仅当样本内没有 Modified 行时才展开全部值列，
-                // 避免 Missing 冲掉「Modified 只显示变化列」的紧凑性
+                // 仅当样本内没有 Modified 行时才展开全部值列：Missing 行不得
+                // 冲掉「Modified 只显示变化列」的紧凑性
                 if !has_modified {
                     seen.fill(true);
                 }
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn compact_terminal_mixed_sample_shows_only_modified_changed_columns() {
-        // 循环 6（D8）：diverse 样本 = 1 Missing + 1 Modified(改 cjsl) → 不因 Missing 展开全部值列
+        // diverse 样本 = 1 Missing + 1 Modified(改 cjsl) → 不因 Missing 展开全部值列
         let mut r = skewed_keyed_report();
         let missing = DiffRow {
             key: serde_json::json!(["59267", "800000"]),
