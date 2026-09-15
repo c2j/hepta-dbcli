@@ -257,3 +257,49 @@ impl Expr {
 | D2 | coverage WARN/独立校验的 exit code 语义 | warn 不阻断主流程；`synth report` / 独立校验模式阻断。与 #76-C 一次定死 |
 | D3 | `copula_conditional` 与 rejection 的默认 | 默认 `rejection`；条件满足率 < 1% 时显式失败并提示改用 `copula_conditional`（#68 非功能） |
 | D4 | 挖掘候选是否自动启用 | 硬约束：**永不自动启用**，仅注释/清单（#69 非功能） |
+
+---
+
+## 8. 执行记录与验收证据（2026-09-15）
+
+### 已落地
+
+| 提交 | 范围 | 文件 |
+|---|---|---|
+| `08b86be` | 本文 + 两个守护测试 | `docs/plans/…`、`rules.rs`、`generator.rs` |
+| `a084504` | 预注册 `expr` / `mine` 模块槽 | `mod.rs` |
+| `0763ba1` | §2.1 / §2.2 冻结类型与表达式契约 | 本文 |
+| `1a006f6` | copula 条件采样数学 | `copula.rs` |
+| `7df6d7b` | #70 表达式引擎（未接线） | `expr.rs`（新） |
+| `21c59fa` | #69 挖掘 + #76-E 隐式 FK | `mine.rs`（新）、`rules_draft.rs`、`cmd.rs`、`mod.rs` |
+| `f24a6da` | #68 fixed/values/fixed_range + V1-V6 | `rules.rs`、`generator.rs` |
+
+### 验收证据（真实 CLI，seed 42，2000 行）
+
+| 需求 | 检查 | 观察结果 |
+|---|---|---|
+| #76-AC1 固定值 | `columns.part_id.fixed: "20240101"` 生成 2000 行 | 2000/2000 行 == 20240101；JSON 中为 **int** 而非字符串 |
+| #68-AC1 类型化输出 | 同上，`--format sql` | `VALUES (…, 20240101, 'normal')`：数值分区键**不带引号** |
+| #76-AC2 加权值池 | `values {normal:0.7, peak:0.3}` | 实际 0.699 / 0.301（∈[0.67,0.73]） |
+| #68 不扰动其他列 | 同批生成里 `trade_id` 的取值 | 2000 行 2000 个不同值，随机流未被固定列影响 |
+| #76-AC2 确定性 | 同 seed 跑两次 `--format json` | `cmp` 逐字节一致 |
+| #68 fixed_range | `fixed_range: [4,6]` 500 行 | min 4.008 / max 5.999，100% 落在闭区间内 |
+| #68 非功能（拒绝率） | `fixed_range: [100,200]`（分布上不可达） | exit 1，`fixed_range rejection exceeded 10000 draws … range is likely empty or nearly degenerate`，**不静默截断行数** |
+| #76-AC4 / §3 V1 | `fixed` 与 `values` 并存 | exit 1，`table 'trades' column 'part_id': 'fixed' and 'values' are mutually exclusive` |
+| 诚实的未实现边界 | `mode: copula_conditional` | exit 1，`mode 'copula_conditional' is not implemented yet`（不静默降级） |
+| #76-AC8 / #70-AC5 回归 | 旧 rules YAML 驱动生成 | `should_keep_legacy_rules_yaml_output_byte_identical` 逐字节绿；`git diff` 中无删除的测试断言行 |
+
+门禁：`cargo fmt --all -- --check` 干净；`cargo clippy --all --all-targets` 0 warning；`cargo test --all` 826 passed / 0 failed。
+
+### 尚未完成的串行项
+
+1. **#68 copula_conditional 接线**：数学已就绪（`GaussianCopula::sample_with_fixed_z` / `sample_with_fixed_uniforms`），需要把 `mode: copula_conditional` 从「显式报错」换成生成期条件采样（固定列定位 `z_i`，其余维度取自条件分布）。
+2. **#70 接线与修复循环**：`expr.rs` 已可独立使用，但 `derive` / `rules[].set` / `branches` 尚未进入 `rules.rs` schema 与 `generator.rs` 管线（V7-V11 未实现）。
+3. **#76-C 生成后 WARN**：值池权重与 rule ratio 的实际占比校验，并入 `quality.rs` / `report`。
+4. **#76-B / #76-D**：按本文结论并入 #70，不单独实现。
+
+### 环境限制（未验证项）
+
+- `#69` 的挖掘与 `#76-E` 的隐式推断只在**单元测试**层面验证（纯函数 + 合成行）；它们的 CLI 路径需要真实数据库采样，本机无 MySQL，`cargo test --all --features integration` 因 `127.0.0.1:3306 connection refused` 未能执行。
+- Oracle / GaussDB / DuckDB 相关路径与本次改动无关，未跑。
+
