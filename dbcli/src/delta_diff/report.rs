@@ -32,6 +32,13 @@ pub(crate) enum RowPayload {
     HashCount,
 }
 
+/// Modified 行按「变化列」聚合计数（issue #79 §4.1；仅统计 DiffStatus::Modified）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ColumnChangeCount {
+    pub(crate) name: String,
+    pub(crate) count: u64,
+}
+
 /// 分片比对结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShardResult {
@@ -101,6 +108,9 @@ pub(crate) struct DiffReport {
     /// Declared types aligned with `row_columns()` (left-plan names).
     #[serde(default)]
     pub(crate) column_data_types: Vec<String>,
+    /// Modified 行按变化列计数，count 降序；None = 无 Modified 行 / keyless / 尚未计算
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) modified_columns: Option<Vec<ColumnChangeCount>>,
     #[serde(skip)]
     pub(crate) ident_quote: char,
     #[serde(skip)]
@@ -210,6 +220,7 @@ mod tests {
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
+            modified_columns: None,
         };
         let s = serde_json::to_string(&report).unwrap();
         let back: DiffReport = serde_json::from_str(&s).unwrap();
@@ -247,6 +258,7 @@ mod tests {
             ident_quote: '"',
             ident_scheme: String::new(),
             backslash_escape: false,
+            modified_columns: None,
         };
         let mut json = serde_json::to_value(report).expect("report should serialize");
         json.as_object_mut()
@@ -290,6 +302,7 @@ mod tests {
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
+                modified_columns: None,
             })
             .unwrap(),
         )
@@ -337,6 +350,7 @@ mod tests {
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
+                modified_columns: None,
             })
             .unwrap(),
         )
@@ -381,6 +395,7 @@ mod tests {
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
+                modified_columns: None,
             })
             .unwrap(),
         )
@@ -392,6 +407,60 @@ mod tests {
         );
         assert_eq!(report.key_columns, vec!["k2", "k1"]);
         assert_eq!(report.value_columns, vec!["amt", "yhs"]);
+    }
+
+    #[test]
+    fn legacy_report_without_modified_columns_defaults_to_none() {
+        let report = DiffReport {
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            left: TableRef {
+                connection: "dev".into(),
+                schema: Some("test".into()),
+                table: "orders".into(),
+            },
+            right: TableRef {
+                connection: "prod".into(),
+                schema: None,
+                table: "orders".into(),
+            },
+            strategy: "hashdiff".into(),
+            consistency: "none".into(),
+            hash_algorithm: "md5".into(),
+            summary: DiffSummary {
+                left_total: 100,
+                right_total: 99,
+                missing_left: 0,
+                missing_right: 1,
+                modified: 0,
+                diff_rate: 0.01,
+            },
+            perf: PerfMetrics::default(),
+            shards: vec![],
+            sample_diffs: vec![DiffRow {
+                key: serde_json::json!(42),
+                left: Some(vec![serde_json::json!(42)]),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            }],
+            warnings: vec![],
+            row_payload: RowPayload::Columns,
+            key_columns: vec![],
+            value_columns: vec![],
+            column_data_types: vec![],
+            ident_quote: '"',
+            ident_scheme: String::new(),
+            backslash_escape: false,
+            modified_columns: None,
+        };
+        let mut json = serde_json::to_value(report).expect("report should serialize");
+        json.as_object_mut()
+            .expect("report JSON should be an object")
+            .remove("modified_columns");
+        let legacy: DiffReport =
+            serde_json::from_value(json).expect("legacy report should deserialize");
+        assert!(legacy.modified_columns.is_none());
     }
 
     #[test]
@@ -433,6 +502,7 @@ mod tests {
                 ident_quote: '"',
                 ident_scheme: String::new(),
                 backslash_escape: false,
+                modified_columns: None,
             })
             .unwrap(),
         )
