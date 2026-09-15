@@ -857,6 +857,29 @@ fn apply_branch_repair(
     let mut rounds_used = 0usize;
     for _round in 0..crate::synth::rules::MAX_REPAIR_ROUNDS {
         let mut touched = 0usize;
+        // Rows already rewritten by a sibling branch in this round. A candidate
+        // list rebuilt from `rows` would still see a sibling's rows as
+        // non-matching, so a later branch could steal the progress the earlier
+        // one just made (the two then livelock and only the last branch wins).
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // A row that already satisfies *any* branch is off limits to every
+        // other branch: `set` can only add matches, so rewriting it can only
+        // destroy coverage a sibling has already reached. Only rows matching no
+        // branch at all are fair game, which is what makes two branches on the
+        // same column converge in one round instead of trading rows.
+        let reserved: std::collections::HashSet<usize> = if prepared.len() > 1 {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    prepared
+                        .iter()
+                        .any(|(_, predicate, _)| predicate_matches(predicate, row, &index_of))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         // `(branch position, flips before the round, [(row index, snapshot)])`.
         let mut backups: Vec<RepairBackup> = Vec::new();
 
@@ -885,7 +908,11 @@ fn apply_branch_repair(
             let candidates: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| !predicate_matches(predicate, row, &index_of))
+                .filter(|(index, row)| {
+                    !claimed.contains(index)
+                        && !reserved.contains(index)
+                        && !predicate_matches(predicate, row, &index_of)
+                })
                 .map(|(index, _)| index)
                 .collect();
             let needed = (wanted - matching).min(candidates.len());
@@ -902,6 +929,7 @@ fn apply_branch_repair(
             for pick in 0..needed {
                 let offset = pick * candidates.len() / needed;
                 let candidate = candidates[offset.min(candidates.len() - 1)];
+                claimed.insert(candidate);
                 backup.push((candidate, rows[candidate].clone()));
                 for (index, value) in assignments {
                     rows[candidate][*index] = value.clone();
@@ -1141,12 +1169,25 @@ fn apply_derive_rules(
                 expr.eval_decimal(&lookup)
             };
 
-            let value = evaluated.map_err(|e| {
-                format!(
-                    "table '{}' derive '{}': {} (value left unchanged for this row)",
-                    table_name, target, e
-                )
-            })?;
+            let value = match evaluated {
+                Ok(value) => value,
+                // SQL three-valued logic: a NULL input makes the expression
+                // NULL, and stage 6 recomputes the target unconditionally, so
+                // the target becomes NULL as well. Aborting here would make
+                // `total = price * qty` unusable on any table whose inputs
+                // carry a `null_rate`. Division by zero and type errors stay
+                // fatal: those are configuration mistakes, not NULL input.
+                Err(crate::synth::expr::ExprError::NullResult) => {
+                    row[col_idx] = Value::Null;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "table '{}' derive '{}': {}",
+                        table_name, target, error
+                    ));
+                }
+            };
 
             let number = if is_integer {
                 let rounded = value.round();
@@ -4812,6 +4853,200 @@ tables:
                 double.round_dp(12),
                 (amount * rust_decimal::Decimal::TWO).round_dp(12),
                 "derived column must stay consistent with its inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn should_propagate_null_from_a_derived_expression_source() {
+        // `price * qty` is NULL whenever either input is NULL (SQL three-valued
+        // logic), so a NULL source must yield a NULL target instead of
+        // aborting the whole table. NULL injection runs in an earlier phase,
+        // so any table with a trained or rule `null_rate > 0` hits this.
+        let mut models = three_column_model(plain_total_model());
+        models
+            .get_mut("t")
+            .unwrap()
+            .columns
+            .get_mut("price")
+            .unwrap()
+            .null_rate = Some(0.5);
+
+        let mut table = single_rule("t", vec![]);
+        table.derive.push(crate::synth::rules::DeriveRule {
+            column: "total".to_string(),
+            expr: "price * qty".to_string(),
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 200))
+            .expect("a NULL source column must not abort the generate");
+        let rows = data.tables.get("t").unwrap();
+        let null_rows = rows.iter().filter(|row| row[2].is_null()).count();
+        assert!(
+            null_rows > 0 && null_rows < rows.len(),
+            "expected a mix of NULL and derived rows, got {null_rows} NULL of {}",
+            rows.len()
+        );
+        for row in rows {
+            if row[2].is_null() {
+                assert!(
+                    row[0].is_null(),
+                    "a NULL total can only come from a NULL source: {row:?}"
+                );
+            } else {
+                let price =
+                    rust_decimal::Decimal::from_f64_retain(row[0].as_f64().unwrap()).unwrap();
+                let qty = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+                let total =
+                    rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+                assert_eq!(
+                    total.round_dp(12),
+                    (price * qty).round_dp(12),
+                    "row {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_leave_no_stale_derived_value_after_a_stalled_repair_rollback() {
+        // Characterisation: the per-round rollback snapshots the *whole* row,
+        // so a stalled round must also undo whatever `derive` wrote on top of
+        // the rewrites. Storing only the `set` cells would leave those rows
+        // with `double == 14` while `amount` is back to its original value.
+        let mut models = binary_model(&["A", "B"], &[0.5, 0.5]);
+        {
+            let model = models.get_mut("t").unwrap();
+            model.columns.insert(
+                "double".to_string(),
+                numerical_model("t", "double", 0.0, 1.0).columns["double"].clone(),
+            );
+            model.copula.column_order = vec![
+                "status".to_string(),
+                "amount".to_string(),
+                "double".to_string(),
+            ];
+            model.copula.correlation = vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ];
+        }
+        let clean = generate(
+            &models,
+            &SynthRules {
+                version: "1".to_string(),
+                tables: vec![single_rule("t", vec![])],
+            },
+            &config(&["t"], 400),
+        )
+        .unwrap();
+
+        let mut table = single_rule("t", vec![]);
+        table.derive.push(crate::synth::rules::DeriveRule {
+            column: "double".to_string(),
+            expr: "amount * 2".to_string(),
+        });
+        table.branches.push(crate::synth::rules::BranchRule {
+            id: "paid".to_string(),
+            predicate: "status == 'A'".to_string(),
+            target_ratio: 0.9,
+            tolerance: Some(0.02),
+            repair: crate::synth::rules::BranchRepair {
+                set: std::collections::BTreeMap::from([("amount".to_string(), "7".to_string())]),
+                linked_derive_recompute: true,
+            },
+        });
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let repaired = generate(&models, &rules, &config(&["t"], 400)).unwrap();
+        assert_ne!(
+            repaired.branches[0].status,
+            CoverageStatus::Pass,
+            "the predicate cannot move, so the branch must not pass"
+        );
+        let clean_amounts: Vec<String> = clean.tables["t"]
+            .iter()
+            .map(|row| row[1].to_string())
+            .collect();
+        let repaired_amounts: Vec<String> = repaired.tables["t"]
+            .iter()
+            .map(|row| row[1].to_string())
+            .collect();
+        assert_eq!(
+            clean_amounts, repaired_amounts,
+            "stalled repair must leave the written column untouched"
+        );
+        for row in &repaired.tables["t"] {
+            let amount = rust_decimal::Decimal::from_f64_retain(row[1].as_f64().unwrap()).unwrap();
+            let double = rust_decimal::Decimal::from_f64_retain(row[2].as_f64().unwrap()).unwrap();
+            assert_eq!(
+                double.round_dp(12),
+                (amount * rust_decimal::Decimal::TWO).round_dp(12),
+                "a rolled-back row must not keep a stale derived value: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_let_a_later_branch_undo_an_earlier_branch_in_the_same_round() {
+        // Two branches flip the same column to different literals. A candidate
+        // list rebuilt after the sibling wrote still sees the sibling's rows as
+        // non-matching, so the later branch can steal them; the loop then
+        // oscillates and only the last declared branch reaches its target.
+        let models = binary_model(&["A", "B", "C"], &[0.1, 0.1, 0.8]);
+        let mut table = single_rule("t", vec![]);
+        for (id, predicate) in [("a", "status == 'A'"), ("b", "status == 'B'")] {
+            table.branches.push(crate::synth::rules::BranchRule {
+                id: id.to_string(),
+                predicate: predicate.to_string(),
+                target_ratio: if id == "a" { 0.3 } else { 0.7 },
+                tolerance: Some(0.02),
+                repair: crate::synth::rules::BranchRepair {
+                    set: std::collections::BTreeMap::from([(
+                        "status".to_string(),
+                        if id == "a" { "A" } else { "B" }.to_string(),
+                    )]),
+                    linked_derive_recompute: false,
+                },
+            });
+        }
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![table],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 500)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let a = rows.iter().filter(|row| row[0] == "A").count() as f64 / rows.len() as f64;
+        let b = rows.iter().filter(|row| row[0] == "B").count() as f64 / rows.len() as f64;
+        assert!(
+            (a - 0.3).abs() <= 0.02,
+            "first branch must keep its 30%: got {a} ({:?})",
+            data.branches
+        );
+        assert!(
+            (b - 0.7).abs() <= 0.02,
+            "second branch must reach its 70%: got {b} ({:?})",
+            data.branches
+        );
+        assert_eq!(
+            data.branches[0].rounds, 1,
+            "one round is enough when the branches stop fighting: {:?}",
+            data.branches
+        );
+        for outcome in &data.branches {
+            assert_eq!(
+                outcome.status,
+                CoverageStatus::Pass,
+                "every branch must pass: {outcome:?}"
             );
         }
     }
