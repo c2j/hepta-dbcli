@@ -111,16 +111,21 @@ struct PiiPlan {
 }
 
 impl PiiPlan {
-    fn value(&mut self, level: Option<usize>, column_seed: u64) -> String {
+    /// One fake value for `level`. A stable mapping derives it from the level so
+    /// equal levels map to equal fakes; `unique` makes retries advance the seed
+    /// (a fixed reseed would otherwise burn the budget on the same string) and
+    /// turns exhaustion into an error instead of a silent duplicate.
+    fn value(&mut self, level: Option<usize>, column_seed: u64) -> Result<String, String> {
         if self.stable {
             if let Some(cached) = level.and_then(|index| self.levels.get(&index)) {
-                return cached.clone();
+                return Ok(cached.clone());
             }
         }
-        for _ in 0..64 {
+        for attempt in 0..64u64 {
             let candidate = if self.stable {
-                let seed =
-                    column_seed ^ (level.unwrap_or(0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let seed = column_seed
+                    ^ (level.unwrap_or(0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ attempt.wrapping_mul(0x2545_F491_4F6C_DD1D);
                 let mut level_rng = rand::rngs::StdRng::seed_from_u64(seed);
                 crate::synth::pii::generate_value(self.provider, &mut level_rng)
             } else {
@@ -134,9 +139,12 @@ impl PiiPlan {
                     self.levels.insert(index, candidate.clone());
                 }
             }
-            return candidate;
+            return Ok(candidate);
         }
-        crate::synth::pii::generate_value(self.provider, &mut self.rng)
+        Err(format!(
+            "provider '{}' could not produce a unique value after 64 attempts",
+            self.provider.as_str()
+        ))
     }
 }
 
@@ -369,23 +377,6 @@ fn generate_with(
                     }
                 }
 
-                if let Some(plan) = pii_plans[col_idx].as_mut() {
-                    let uniform = uniform_samples
-                        .get(col_idx)
-                        .and_then(|column| column.get(t))
-                        .copied()
-                        .unwrap_or(0.5);
-                    let level = match model.columns.get(col_name).map(|column| &column.marginal) {
-                        Some(crate::synth::marginal::Marginal::Categorical(params)) => {
-                            Some(params.sample_index(uniform))
-                        }
-                        _ => None,
-                    };
-                    let seed = column_pii_seed(config.seed, table_name, col_name);
-                    row.push(Value::String(plan.value(level, seed)));
-                    continue;
-                }
-
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
                     let value = if rel.unique {
                         rel.pool
@@ -406,6 +397,28 @@ fn generate_with(
                         })?
                     };
                     row.push(value);
+                    continue;
+                }
+
+                // PII fill runs after FK assignment so a relationship column is
+                // never replaced by a fake (referential integrity wins).
+                if let Some(plan) = pii_plans[col_idx].as_mut() {
+                    let uniform = uniform_samples
+                        .get(col_idx)
+                        .and_then(|column| column.get(t))
+                        .copied()
+                        .unwrap_or(0.5);
+                    let level = match model.columns.get(col_name).map(|column| &column.marginal) {
+                        Some(crate::synth::marginal::Marginal::Categorical(params)) => {
+                            Some(params.sample_index(uniform))
+                        }
+                        _ => None,
+                    };
+                    let seed = column_pii_seed(config.seed, table_name, col_name);
+                    let value = plan.value(level, seed).map_err(|error| {
+                        format!("table '{}' column '{}': {}", table_name, col_name, error)
+                    })?;
+                    row.push(Value::String(value));
                     continue;
                 }
 
@@ -634,16 +647,6 @@ fn pk_column_is_frozen(guard: &PkGuard, column: &str) -> bool {
     if guard.rule.relationships.iter().any(|r| r.pk == column) {
         return true;
     }
-    if guard
-        .model
-        .columns
-        .get(column)
-        .is_some_and(|column| column.pii.is_some())
-    {
-        // A PII column is generated from the provider, not from its marginal;
-        // redrawing it from the placeholder would emit non-fake values.
-        return true;
-    }
     guard
         .model
         .columns
@@ -665,6 +668,16 @@ fn sample_uniqueness_value(
             .pool
             .sample_one(rel.strategy, rng)
             .unwrap_or(Value::Null);
+    }
+    // A PII key must be redrawn through its provider: the stored marginal is a
+    // placeholder and would emit `__pii_level_N` strings.
+    if let Some(provider) = guard
+        .model
+        .columns
+        .get(column)
+        .and_then(|column| column.pii)
+    {
+        return Value::String(crate::synth::pii::generate_value(provider, rng));
     }
     gen_column_value(
         guard.model.columns.get(column),
@@ -732,42 +745,68 @@ fn extrapolate_unique(
     extra: &mut usize,
     seen: &mut std::collections::HashSet<String>,
 ) -> Option<Value> {
-    let col = guard.model.columns.get(column)?;
     loop {
         *extra += 1;
         if *extra > 10_000_000 {
             return None;
         }
-        let candidate = match col.logical_type {
-            crate::synth::model::LogicalType::Numerical => {
-                let base = col.max?;
-                let step = match col.rounding {
-                    Some(0) => 1.0,
-                    _ => col
-                        .decimal_scale
-                        .map(|scale| 10f64.powi(-(scale as i32)))
-                        .unwrap_or(1.0),
-                };
-                let value = base + step * (*extra as f64);
-                if col.rounding == Some(0) {
-                    Value::from(value as i64)
-                } else {
-                    Value::from(quantize(value, col.decimal_scale.unwrap_or(0)))
-                }
-            }
-            crate::synth::model::LogicalType::Datetime => {
-                let base = col.max?;
-                let value = base + *extra as f64;
-                match col.datetime_format.as_deref() {
-                    Some(fmt) => Value::String(crate::synth::datetime::format_epoch(value, fmt)?),
-                    None => Value::from(value),
-                }
-            }
-            crate::synth::model::LogicalType::Categorical => return None,
-        };
+        let candidate = extrapolated_value(guard.model, column, *extra)?;
         if seen.insert(candidate.to_string()) {
             return Some(candidate);
         }
+    }
+}
+
+/// The `extra`-th value past the trained domain for a numeric or datetime
+/// column (`None` for a categorical one, which has no safe extension).
+fn extrapolated_value(model: &TableModel, column: &str, extra: usize) -> Option<Value> {
+    let col = model.columns.get(column)?;
+    match col.logical_type {
+        crate::synth::model::LogicalType::Numerical => {
+            let base = col.max?;
+            let step = match col.rounding {
+                Some(0) => 1.0,
+                _ => col
+                    .decimal_scale
+                    .map(|scale| 10f64.powi(-(scale as i32)))
+                    .unwrap_or(1.0),
+            };
+            let value = base + step * (extra as f64);
+            if col.rounding == Some(0) {
+                Some(Value::from(value as i64))
+            } else {
+                Some(Value::from(quantize(value, col.decimal_scale.unwrap_or(0))))
+            }
+        }
+        crate::synth::model::LogicalType::Datetime => {
+            let base = col.max?;
+            let format = col.datetime_format.as_deref();
+            // A date-only format ignores sub-day advances, so stepping by one
+            // second would spend the whole budget on the same string.
+            let step = format.map(datetime_step_seconds).unwrap_or(1.0);
+            let value = base + step * (extra as f64);
+            match format {
+                Some(fmt) => Some(Value::String(crate::synth::datetime::format_epoch(
+                    value, fmt,
+                )?)),
+                None => Some(Value::from(value)),
+            }
+        }
+        crate::synth::model::LogicalType::Categorical => None,
+    }
+}
+
+/// Step that actually changes a rendered datetime: one day for a date-only
+/// format, one second otherwise.
+fn datetime_step_seconds(format: &str) -> f64 {
+    const TIME_DIRECTIVES: [&str; 9] = ["%H", "%M", "%S", "%T", "%R", "%I", "%p", "%f", "%.f"];
+    if TIME_DIRECTIVES
+        .iter()
+        .any(|directive| format.contains(directive))
+    {
+        1.0
+    } else {
+        86_400.0
     }
 }
 
@@ -822,9 +861,15 @@ fn enforce_primary_key_uniqueness(
         // When the observed value space already fits the requested rows, redraw
         // can fill every slot from the learned marginal. Otherwise (scale-up
         // past the trained keys) the surplus is extrapolated past the domain.
-        let feasible = pk_value_space(model, column)
-            .map(|space| space >= row_count)
-            .unwrap_or(true);
+        // A PII key draws from its provider, whose domain is unbounded.
+        let is_pii = model
+            .columns
+            .get(column)
+            .is_some_and(|column| column.pii.is_some());
+        let feasible = is_pii
+            || pk_value_space(model, column)
+                .map(|space| space >= row_count)
+                .unwrap_or(true);
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut extra = 0usize;
@@ -902,7 +947,15 @@ fn enforce_primary_key_uniqueness(
                     continue;
                 }
                 let column = column_order[index].as_str();
-                let candidate = sample_uniqueness_value(column, guard, rel_pools, rng);
+                // Redraw first: it keeps the trained marginals while they can
+                // still cover the rows. Once the tuple space is exhausted,
+                // extend numeric/date members instead of failing.
+                let candidate = if attempts <= 100 {
+                    sample_uniqueness_value(column, guard, rel_pools, rng)
+                } else {
+                    extrapolated_value(model, column, attempts)
+                        .unwrap_or_else(|| sample_uniqueness_value(column, guard, rel_pools, rng))
+                };
                 if !candidate.is_null() {
                     row[index] = candidate;
                 }
@@ -7271,5 +7324,219 @@ tables:
             ids_masked, ids_raw,
             "a PII column must not move other columns"
         );
+    }
+
+    fn date_only_model(table: &str, column: &str, start_epoch: i64, days: i64) -> TableModel {
+        let min = start_epoch as f64;
+        let max = (start_epoch + days * 86_400) as f64;
+        let mut columns = HashMap::new();
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Datetime,
+                datetime_epoch: Some(true),
+                datetime_format: Some("%Y-%m-%d".to_string()),
+                min: Some(min),
+                max: Some(max),
+                marginal: Marginal::Uniform(UniformParams {
+                    low: min,
+                    high: max,
+                }),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![column.to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![column.to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        }
+    }
+
+    /// A PII primary key must still be unique on the SQL path, redrawn through
+    /// its provider (the stored marginal is only a placeholder).
+    #[test]
+    fn should_keep_a_pii_primary_key_unique_on_the_sql_path() {
+        let base = pii_model("t", "email", PiiProvider::Email, 4);
+        let mut model = base;
+        model.pk = vec!["email".to_string()];
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 80)]),
+            seed: Some(13),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let emails: Vec<&str> = data.tables["t"]
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        let distinct: std::collections::HashSet<&str> = emails.iter().copied().collect();
+        assert_eq!(distinct.len(), 80, "PII primary keys must be unique");
+        assert!(emails
+            .iter()
+            .all(|value| PiiProvider::Email.matches_format(value)));
+        assert!(!emails.iter().any(|value| value.starts_with("__pii_level_")));
+    }
+
+    /// A date-only pk must scale up by whole days, not by seconds that render
+    /// to the same date.
+    #[test]
+    fn should_extrapolate_a_date_only_primary_key_by_days() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            date_only_model("t", "day", 1_700_000_000, 2),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 10)]),
+            seed: Some(21),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let days: Vec<String> = data.tables["t"]
+            .iter()
+            .filter_map(|row| row[0].as_str().map(str::to_string))
+            .collect();
+        let distinct: std::collections::HashSet<&String> = days.iter().collect();
+        assert_eq!(distinct.len(), 10, "10 rows need 10 distinct dates");
+        for day in &days {
+            assert_eq!(day.len(), 10, "date-only format expected, got {day}");
+            assert!(day.chars().nth(4) == Some('-') && day.chars().nth(7) == Some('-'));
+        }
+    }
+
+    /// A composite numeric pk must extend its numeric side when the tuple space
+    /// is exhausted, instead of failing after 10k redraws.
+    #[test]
+    fn should_extrapolate_a_composite_numeric_primary_key() {
+        let mut columns = HashMap::new();
+        for name in ["a", "b"] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Numerical,
+                    rounding: Some(0),
+                    min: Some(0.0),
+                    max: Some(4.0),
+                    marginal: Marginal::Uniform(UniformParams {
+                        low: 0.0,
+                        high: 4.0,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 40)]),
+            seed: Some(4),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let tuples: std::collections::HashSet<String> = data.tables["t"]
+            .iter()
+            .map(|row| format!("{}|{}", row[0], row[1]))
+            .collect();
+        assert_eq!(tuples.len(), 40, "the numeric side must extend past 5x5");
+    }
+
+    /// Stable mapping plus `unique` must not silently emit a duplicate when a
+    /// level's retry space is exhausted.
+    #[test]
+    fn should_error_instead_of_duplicating_a_stable_unique_pii_value() {
+        let mut plan = PiiPlan {
+            provider: PiiProvider::Email,
+            stable: true,
+            unique: true,
+            rng: rand::rngs::StdRng::seed_from_u64(1),
+            levels: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        };
+        let seed = 123u64;
+        // Poison every candidate the stable retry can produce for level 7.
+        for attempt in 0..64u64 {
+            let attempt_seed = seed
+                ^ 7u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ attempt.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let mut level_rng = rand::rngs::StdRng::seed_from_u64(attempt_seed);
+            plan.seen.insert(crate::synth::pii::generate_value(
+                PiiProvider::Email,
+                &mut level_rng,
+            ));
+        }
+        assert!(
+            plan.value(Some(7), seed).is_err(),
+            "exhausted stable+unique space must error, not duplicate"
+        );
+    }
+
+    /// Stable mapping plus `unique` over many levels stays distinct and OK.
+    #[test]
+    fn should_keep_stable_unique_values_distinct() {
+        let mut plan = PiiPlan {
+            provider: PiiProvider::Name,
+            stable: true,
+            unique: true,
+            rng: rand::rngs::StdRng::seed_from_u64(2),
+            levels: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        };
+        let mut values = std::collections::HashSet::new();
+        for level in 0..200 {
+            let value = plan
+                .value(Some(level), 999)
+                .unwrap_or_else(|e| panic!("level {level}: {e}"));
+            assert!(
+                values.insert(value.clone()),
+                "duplicate stable value {value}"
+            );
+        }
     }
 }

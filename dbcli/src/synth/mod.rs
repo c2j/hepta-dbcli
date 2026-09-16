@@ -545,9 +545,23 @@ async fn run_train(
         // PII columns are anonymized before anything is written (issue #71):
         // the model loses their observed dictionary/range and leaves the
         // correlation matrix, and the profile drops their top values.
-        for (column, provider) in
-            detect_pii_columns(&result.columns, &result.rows, forced_sdtype.get(table))
-        {
+        // Primary keys and foreign keys are never anonymized: replacing a key
+        // with a fake string would break uniqueness and referential integrity.
+        let mut reserved: std::collections::HashSet<String> = model.pk.iter().cloned().collect();
+        reserved.extend(
+            foreign_keys
+                .iter()
+                .filter(|fk| fk.from_table == *table)
+                .map(|fk| fk.from_column.clone()),
+        );
+        let mut detected = detect_pii_columns(
+            &result.columns,
+            &result.rows,
+            &data_types,
+            forced_sdtype.get(table),
+        );
+        detected.retain(|column, _| !reserved.contains(column));
+        for (column, provider) in detected {
             if let Some(model_column) = model.columns.get_mut(&column) {
                 crate::synth::pii::anonymize_model_column(model_column, provider);
             }
@@ -636,6 +650,7 @@ fn distinct_non_null(rows: &[Vec<serde_json::Value>], index: usize) -> usize {
 fn detect_pii_columns(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
+    types: &HashMap<String, String>,
     overrides: Option<&HashMap<String, (crate::synth::rules::SdType, Option<String>)>>,
 ) -> HashMap<String, crate::synth::pii::PiiProvider> {
     let mut detected = HashMap::new();
@@ -651,7 +666,7 @@ fn detect_pii_columns(
             .iter()
             .filter_map(|row| row.get(index).cloned())
             .collect();
-        let guess = crate::synth::pii::detect(name, &samples);
+        let guess = crate::synth::pii::detect(name, &samples, types.get(name).map(String::as_str));
         let provider = if matches!(sdtype, crate::synth::rules::SdType::Pii) {
             override_
                 .and_then(|(_, provider)| provider.as_deref())
@@ -2100,20 +2115,21 @@ mod tests {
         ];
 
         // auto: the recognizer flags email only.
-        let auto = detect_pii_columns(&columns, &rows, None);
+        let types = HashMap::new();
+        let auto = detect_pii_columns(&columns, &rows, &types, None);
         assert_eq!(auto.get("email"), Some(&PiiProvider::Email));
         assert!(!auto.contains_key("status"));
 
         // keep: email is exempted.
         let keep = HashMap::from([("email".to_string(), (SdType::Keep, None))]);
-        assert!(detect_pii_columns(&columns, &rows, Some(&keep)).is_empty());
+        assert!(detect_pii_columns(&columns, &rows, &types, Some(&keep)).is_empty());
 
         // pii: forces the provider on a column the recognizer would ignore.
         let forced = HashMap::from([(
             "status".to_string(),
             (SdType::Pii, Some("name".to_string())),
         )]);
-        let out = detect_pii_columns(&columns, &rows, Some(&forced));
+        let out = detect_pii_columns(&columns, &rows, &types, Some(&forced));
         assert_eq!(out.get("status"), Some(&PiiProvider::Name));
         assert_eq!(out.get("email"), Some(&PiiProvider::Email));
     }

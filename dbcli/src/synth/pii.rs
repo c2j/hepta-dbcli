@@ -118,45 +118,144 @@ pub fn anonymize_model_column(column: &mut ColumnModel, provider: PiiProvider) {
     column.datetime_epoch = None;
 }
 
-/// Column-name patterns (English and pinyin/Chinese conventions).
+fn name_tokens(name: &str) -> Vec<&str> {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Whole names that collapse camelCase into one token, plus the multi-word
+/// forms whose *last* token is the type word.
+const PERSONAL_NAME_PREFIXES: [&str; 11] = [
+    "full", "real", "first", "last", "given", "family", "person", "user", "display", "contact",
+    "nick",
+];
+
+/// Single-token names (including camelCase collapses) that are personal names.
+const WHOLE_NAME_TOKENS: [&str; 13] = [
+    "name",
+    "nickname",
+    "fullname",
+    "realname",
+    "firstname",
+    "lastname",
+    "givenname",
+    "familyname",
+    "personname",
+    "username",
+    "displayname",
+    "contactname",
+    "nick",
+];
+
+/// Column-name pattern. Matching is anchored on whole tokens: `last == "email"`
+/// or `[email|mail] + [address|addr]`. Substring matching is deliberately not
+/// used, so `is_email_verified`, `microphone`, `mail_id`, `file_name`,
+/// `table_name` and `country_name` stay untouched.
 fn provider_from_name(column: &str) -> Option<PiiProvider> {
     let name = column.to_ascii_lowercase();
-    let tokens: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).collect();
-    let has = |wanted: &[&str]| tokens.iter().any(|t| wanted.contains(t));
+    let tokens = name_tokens(&name);
+    let (Some(first), Some(last)) = (tokens.first().copied(), tokens.last().copied()) else {
+        return None;
+    };
+    let has = |wanted: &str| tokens.contains(&wanted);
 
-    if has(&["email", "mail", "e_mail"]) || name.contains("email") || name.contains("邮箱") {
+    // Chinese column names have no token boundaries.
+    if name.contains("邮箱") || name.contains("电子邮件") {
         return Some(PiiProvider::Email);
     }
-    if has(&["phone", "mobile", "tel", "telephone", "msisdn"])
-        || name.contains("phone")
-        || name.contains("手机")
-        || name.contains("电话")
+    if name.contains("手机") || name.contains("电话") {
+        return Some(PiiProvider::Phone);
+    }
+    if name.contains("身份证") {
+        return Some(PiiProvider::IdCard);
+    }
+    if name.contains("姓名") || name.contains("昵称") {
+        return Some(PiiProvider::Name);
+    }
+
+    // Email: `email` / `mail` as the last token, `email_address`, or the
+    // camelCase collapse.
+    let email_tail = matches!(
+        last,
+        "email" | "mail" | "emailaddress" | "emailaddr" | "mailaddress" | "mailaddr"
+    ) || ((has("email") || has("mail")) && matches!(last, "address" | "addr"));
+    if email_tail {
+        return Some(PiiProvider::Email);
+    }
+
+    // Phone: the type word must be the last token (`phone_number` qualifies).
+    if matches!(
+        last,
+        "phone" | "mobile" | "tel" | "telephone" | "msisdn" | "cell" | "cellphone"
+    ) || ((has("phone") || has("mobile")) && matches!(last, "number" | "no" | "num"))
     {
         return Some(PiiProvider::Phone);
     }
-    if has(&["idcard", "id_card", "ssn", "idno", "id_no"])
-        || name.contains("id_card")
-        || name.contains("身份证")
+
+    // Id card: explicit forms only; a bare `id` is a primary key, not PII.
+    if matches!(
+        last,
+        "idcard" | "idno" | "ssn" | "nationalid" | "identitycard"
+    ) || ((first == "id" || first == "identity") && matches!(last, "card" | "no" | "number"))
     {
         return Some(PiiProvider::IdCard);
     }
-    if has(&[
-        "name",
-        "realname",
-        "real_name",
-        "fullname",
-        "full_name",
-        "nickname",
-        "nick",
-    ]) || name.contains("姓名")
-        || name.contains("昵称")
-    {
+
+    // Personal names: the type word is `name`/`nickname` and the qualifier is a
+    // known personal prefix, so `file_name` / `table_name` are not matched.
+    if last == "name" && PERSONAL_NAME_PREFIXES.contains(&first) {
+        return Some(PiiProvider::Name);
+    }
+    if tokens.len() == 1 && WHOLE_NAME_TOKENS.contains(&last) {
         return Some(PiiProvider::Name);
     }
     None
 }
 
-/// Content-based vote over the sampled values.
+/// Text-like SQL types. Any other declared type (numeric, boolean, datetime)
+/// is never anonymized: replacing it with a string fake would break the load.
+fn is_text_sql_type(data_type: &str) -> bool {
+    let base = data_type
+        .split('(')
+        .next()
+        .unwrap_or(data_type)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "char"
+            | "varchar"
+            | "nvarchar"
+            | "varchar2"
+            | "nvarchar2"
+            | "nchar"
+            | "character"
+            | "character varying"
+            | "text"
+            | "tinytext"
+            | "mediumtext"
+            | "longtext"
+            | "clob"
+            | "citext"
+            | "enum"
+            | "set"
+            | "json"
+    )
+}
+
+/// A phone-looking *content* vote is deliberately stricter than the generator
+/// format check: a bare digit run (order numbers, ids) is not a phone.
+fn looks_like_phone(value: &str) -> bool {
+    if !PiiProvider::Phone.matches_format(value) {
+        return false;
+    }
+    value.starts_with('+') || value.contains([' ', '-', '(', ')'])
+}
+
+/// Content-based vote over the sampled values. Only email and `+`-prefixed
+/// phones are detected from content: a digit column of 18-char codes or 10-digit
+/// order numbers must not become an anonymized id card.
 fn provider_from_content(samples: &[Value]) -> Option<PiiProvider> {
     let strings: Vec<&str> = samples.iter().filter_map(|value| value.as_str()).collect();
     if strings.is_empty() {
@@ -168,23 +267,28 @@ fn provider_from_content(samples: &[Value]) -> Option<PiiProvider> {
     if share(is_email) >= 0.8 {
         return Some(PiiProvider::Email);
     }
-    if share(|s| PiiProvider::Phone.matches_format(s)) >= 0.8 {
+    if share(looks_like_phone) >= 0.8 {
         return Some(PiiProvider::Phone);
-    }
-    if share(|s| PiiProvider::IdCard.matches_format(s)) >= 0.8 {
-        return Some(PiiProvider::IdCard);
     }
     None
 }
 
-/// Name pattern and content vote together. Name wins when both fire (a column
-/// called `email` holding odd data is still an email column). `data_type` is
-/// accepted for future type-aware rules; string columns are the ones scored.
-pub fn detect(column: &str, samples: &[Value]) -> Option<PiiProvider> {
-    let by_name = provider_from_name(column);
-    let by_content = provider_from_content(samples);
+/// Name pattern and content vote together. The name wins when both fire (a
+/// column called `email` holding odd data is still an email column).
+///
+/// `data_type` gates by the declared SQL type: a non-text column is never
+/// anonymized. When it is `None` (older callers, unit tests) the sample values
+/// must be strings instead.
+pub fn detect(column: &str, samples: &[Value], data_type: Option<&str>) -> Option<PiiProvider> {
+    if let Some(data_type) = data_type {
+        if !is_text_sql_type(data_type) {
+            return None;
+        }
+    } else if !samples.iter().any(|value| value.is_string()) {
+        return None;
+    }
 
-    match (by_name, by_content) {
+    match (provider_from_name(column), provider_from_content(samples)) {
         (Some(provider), _) => Some(provider),
         (None, Some(provider)) => Some(provider),
         (None, None) => None,
@@ -238,13 +342,18 @@ mod tests {
     #[test]
     fn should_detect_email_by_name_and_content() {
         assert_eq!(provider_from_name("email"), Some(PiiProvider::Email));
-        assert_eq!(provider_from_name("user_mail"), Some(PiiProvider::Email));
+        assert_eq!(provider_from_name("user_email"), Some(PiiProvider::Email));
+        assert_eq!(
+            provider_from_name("email_address"),
+            Some(PiiProvider::Email)
+        );
+        assert_eq!(provider_from_name("emailAddress"), Some(PiiProvider::Email));
         assert_eq!(
             provider_from_content(&strings(&["a@b.com", "c@d.org"])),
             Some(PiiProvider::Email)
         );
         assert_eq!(
-            detect("contact", &strings(&["a@b.com", "c@d.org"])),
+            detect("contact", &strings(&["a@b.com", "c@d.org"]), None),
             Some(PiiProvider::Email)
         );
     }
@@ -253,17 +362,68 @@ mod tests {
     fn should_prefer_the_name_vote_over_content() {
         // A column named `phone` holding junk is still treated as a phone.
         assert_eq!(
-            detect("phone", &strings(&["not-a-phone"])),
+            detect("phone", &strings(&["not-a-phone"]), None),
             Some(PiiProvider::Phone)
         );
     }
 
     #[test]
+    fn should_not_flag_lookalike_column_names() {
+        // Substring matches used to flag these; every one is a false positive.
+        for column in [
+            "is_email_verified",
+            "email_sent_at",
+            "mail_id",
+            "microphone",
+            "file_name",
+            "table_name",
+            "schema_name",
+            "country_name",
+            "customer_id",
+            "status",
+            "amount",
+        ] {
+            assert_eq!(
+                provider_from_name(column),
+                None,
+                "'{column}' must not be a PII column"
+            );
+        }
+    }
+
+    #[test]
     fn should_not_flag_ordinary_columns() {
-        assert_eq!(provider_from_name("status"), None);
-        assert_eq!(provider_from_name("amount"), None);
         assert_eq!(provider_from_content(&strings(&["open", "closed"])), None);
-        assert_eq!(detect("note", &strings(&["hello", "world"])), None);
+        assert_eq!(detect("note", &strings(&["hello", "world"]), None), None);
+    }
+
+    #[test]
+    fn should_skip_columns_whose_declared_type_is_not_text() {
+        // A numeric `phone` or boolean `is_email_verified` would be filled with
+        // a string fake and fail the SQL load.
+        assert_eq!(detect("phone", &strings(&["123"]), Some("bigint")), None);
+        assert_eq!(detect("email", &strings(&["x"]), Some("int")), None);
+        assert_eq!(
+            detect("email", &strings(&["a@b.com"]), Some("datetime")),
+            None
+        );
+        assert_eq!(
+            detect("email", &strings(&["a@b.com"]), Some("varchar(64)")),
+            Some(PiiProvider::Email)
+        );
+    }
+
+    #[test]
+    fn should_not_treat_digit_runs_as_phones() {
+        // 10-digit order numbers are not phones.
+        assert_eq!(
+            provider_from_content(&strings(&["1234567890", "0987654321"])),
+            None
+        );
+        assert_eq!(
+            provider_from_content(&strings(&["+1-800-555-0199", "+1-800-555-0100"])),
+            Some(PiiProvider::Phone)
+        );
     }
 
     #[test]

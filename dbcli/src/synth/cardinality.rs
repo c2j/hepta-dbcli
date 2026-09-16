@@ -34,6 +34,39 @@ pub struct CardinalityDist {
 }
 
 impl CardinalityDist {
+    /// Build from per-parent child counts over `parent_universe` parent keys
+    /// (counts above [`MAX_COUNT_BUCKET`] are merged into it; parents with no
+    /// children form the `0` bucket). `null_share` is the share of child rows
+    /// whose FK is NULL.
+    pub fn from_counts(
+        per_parent_counts: impl IntoIterator<Item = u64>,
+        parent_universe: usize,
+        null_share: f64,
+    ) -> Option<CardinalityDist> {
+        let mut histogram: BTreeMap<u64, f64> = BTreeMap::new();
+        let mut referenced = 0usize;
+        for count in per_parent_counts {
+            referenced += 1;
+            *histogram.entry(count.min(MAX_COUNT_BUCKET)).or_insert(0.0) += 1.0;
+        }
+        if referenced == 0 {
+            return None;
+        }
+        let zero_parents = parent_universe.saturating_sub(referenced);
+        let total = (referenced + zero_parents) as f64;
+        if total <= 0.0 {
+            return None;
+        }
+        let mut counts: BTreeMap<u64, f64> = BTreeMap::new();
+        if zero_parents > 0 {
+            counts.insert(0, zero_parents as f64 / total);
+        }
+        for (bucket, parents) in histogram {
+            *counts.entry(bucket).or_insert(0.0) += parents / total;
+        }
+        Some(CardinalityDist { counts, null_share })
+    }
+
     /// Draw a child count from the distribution using `uniform` in `[0, 1)`.
     pub fn sample_count(&self, uniform: f64) -> u64 {
         let total: f64 = self.counts.values().sum();
@@ -50,18 +83,22 @@ impl CardinalityDist {
         self.counts.keys().next_back().copied().unwrap_or(0)
     }
 
-    /// Total-variation distance between two count distributions, over the
-    /// union of their buckets, including the NULL share.
+    /// Total-variation distance between the two **count** distributions, over
+    /// the union of their buckets. Both bucket vectors are probabilities over
+    /// the same parent-key universe, so the result is in `[0, 1]`.
+    ///
+    /// `null_share` is a row-level fraction, not a parent-level probability,
+    /// so mixing it in would break the simplex; compare it separately.
     pub fn total_variation(&self, other: &CardinalityDist) -> f64 {
         let mut buckets: std::collections::BTreeSet<u64> = self.counts.keys().copied().collect();
         buckets.extend(other.counts.keys().copied());
-        let mut distance = 0.0;
+        let mut l1 = 0.0;
         for bucket in buckets {
             let left = self.counts.get(&bucket).copied().unwrap_or(0.0);
             let right = other.counts.get(&bucket).copied().unwrap_or(0.0);
-            distance += (left - right).abs();
+            l1 += (left - right).abs();
         }
-        (distance + (self.null_share - other.null_share).abs()) / 2.0
+        (l1 / 2.0).clamp(0.0, 1.0)
     }
 }
 
@@ -92,35 +129,16 @@ pub fn learn_cardinality(
         return None;
     }
 
-    // Histogram of "how many parents have exactly c children", truncated at K.
-    let mut histogram: BTreeMap<u64, f64> = BTreeMap::new();
-    for count in per_parent.values() {
-        let bucket = (*count).min(MAX_COUNT_BUCKET);
-        *histogram.entry(bucket).or_insert(0.0) += 1.0;
-    }
-
     let referenced = per_parent.len();
-    let zero_parents = parent_distinct
-        .map(|distinct| distinct.saturating_sub(referenced))
-        .unwrap_or(0);
-    let total_parents = (referenced + zero_parents) as f64;
-    if total_parents <= 0.0 {
-        return None;
-    }
-
-    let mut counts: BTreeMap<u64, f64> = BTreeMap::new();
-    if zero_parents > 0 {
-        counts.insert(0, zero_parents as f64 / total_parents);
-    }
-    for (bucket, parents_with_count) in histogram {
-        *counts.entry(bucket).or_insert(0.0) += parents_with_count / total_parents;
-    }
-
+    // A parent key universe smaller than the referenced set would be a caller
+    // bug; clamp so the `0` bucket can never go negative.
+    let universe = parent_distinct.unwrap_or(referenced).max(referenced);
     let total_rows = child_fk_values.len() as f64;
-    Some(CardinalityDist {
-        counts,
-        null_share: null_rows as f64 / total_rows,
-    })
+    CardinalityDist::from_counts(
+        per_parent.values().copied(),
+        universe,
+        null_rows as f64 / total_rows,
+    )
 }
 
 #[cfg(test)]
@@ -200,5 +218,37 @@ mod tests {
         };
         assert!((left.total_variation(&right) - 0.5).abs() < 1e-9);
         assert_eq!(left.total_variation(&left), 0.0);
+    }
+    #[test]
+    fn should_build_a_distribution_from_parent_counts() {
+        // 3 referenced parents (counts 1, 1, 2) over a 6-key universe.
+        let dist = CardinalityDist::from_counts([1u64, 1, 2], 6, 0.25).unwrap();
+        assert!((dist.counts[&0] - 3.0 / 6.0).abs() < 1e-9);
+        assert!((dist.counts[&1] - 2.0 / 6.0).abs() < 1e-9);
+        assert!((dist.counts[&2] - 1.0 / 6.0).abs() < 1e-9);
+        assert_eq!(dist.null_share, 0.25);
+        assert!(CardinalityDist::from_counts([], 5, 0.0).is_none());
+    }
+
+    #[test]
+    fn should_keep_total_variation_within_the_count_simplex() {
+        let all_zero = CardinalityDist {
+            counts: BTreeMap::from([(0, 1.0)]),
+            null_share: 1.0,
+        };
+        let all_five = CardinalityDist {
+            counts: BTreeMap::from([(5, 1.0)]),
+            null_share: 0.0,
+        };
+        let tv = all_zero.total_variation(&all_five);
+        assert!(tv <= 1.0, "tv {tv} must stay in [0, 1]");
+        assert!((tv - 1.0).abs() < 1e-9);
+
+        // A NULL-share difference alone is not a count-distribution shift.
+        let no_nulls = CardinalityDist {
+            counts: BTreeMap::from([(0, 1.0)]),
+            null_share: 0.0,
+        };
+        assert_eq!(all_zero.total_variation(&no_nulls), 0.0);
     }
 }

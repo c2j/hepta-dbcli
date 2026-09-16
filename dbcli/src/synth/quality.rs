@@ -147,6 +147,12 @@ pub fn build_baseline(
         let Some(model_column) = model.columns.get(name) else {
             continue;
         };
+        // PII columns carry no observed values in the model, and writing their
+        // holdout frequencies here would re-introduce the leak the model just
+        // removed (issue #71).
+        if model_column.pii.is_some() {
+            continue;
+        }
         let samples: Vec<&Value> = holdout
             .iter()
             .filter_map(|&row_idx| rows.get(row_idx).and_then(|row| row.get(col_idx)))
@@ -203,9 +209,15 @@ fn build_pair_baselines(
     let mut numeric_columns: Vec<(String, usize)> = Vec::new();
     let mut categorical_columns: Vec<(String, usize)> = Vec::new();
     for (name, &col_idx) in model.copula.column_order.iter().zip(col_indices) {
-        match model.columns.get(name).map(|c| &c.logical_type) {
-            Some(LogicalType::Numerical) => numeric_columns.push((name.clone(), col_idx)),
-            Some(LogicalType::Categorical) => categorical_columns.push((name.clone(), col_idx)),
+        let Some(model_column) = model.columns.get(name) else {
+            continue;
+        };
+        if model_column.pii.is_some() {
+            continue;
+        }
+        match &model_column.logical_type {
+            LogicalType::Numerical => numeric_columns.push((name.clone(), col_idx)),
+            LogicalType::Categorical => categorical_columns.push((name.clone(), col_idx)),
             _ => {}
         }
     }
@@ -993,12 +1005,6 @@ pub type GeneratedTable = (Vec<String>, Vec<Vec<Value>>);
 /// Parent key pool per `(table, column)`.
 pub type ParentKeyPools = HashMap<(String, String), Vec<String>>;
 
-/// Join rate of every generated child column against its parent key pool.
-///
-/// `parent_pools` is built by the caller: the live database keys with
-/// `--against-db`, otherwise [`generated_key_pools`] over the generated parent
-/// table. An edge whose parent column is not in that pool is skipped, so the
-/// caller's chosen source is visible in every reported rate.
 /// Distribution of generated child rows per parent key, over the parent
 /// universe `parent_universe` (the parent pool size). Mirrors
 /// [`crate::synth::cardinality::learn_cardinality`] so the two are comparable.
@@ -1020,27 +1026,26 @@ fn generated_cardinality_dist(
             _ => null_rows += 1,
         }
     }
-    let total = parent_universe as f64;
-    let mut counts: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
-    let zero = parent_universe.saturating_sub(per_parent.len());
-    if zero > 0 {
-        counts.insert(0, zero as f64 / total);
-    }
-    for count in per_parent.values() {
-        let bucket = (*count).min(crate::synth::cardinality::MAX_COUNT_BUCKET);
-        *counts.entry(bucket).or_insert(0.0) += 1.0 / total;
-    }
     let total_rows = rows.len() as f64;
-    Some(crate::synth::cardinality::CardinalityDist {
-        counts,
-        null_share: if total_rows > 0.0 {
+    crate::synth::cardinality::CardinalityDist::from_counts(
+        per_parent.values().copied(),
+        parent_universe,
+        if total_rows > 0.0 {
             null_rows as f64 / total_rows
         } else {
             0.0
         },
-    })
+    )
 }
 
+/// Join rate of every generated child column against its parent key pool.
+///
+/// `parent_pools` is built by the caller: the live database keys with
+/// `--against-db`, otherwise [`generated_key_pools`] over the generated parent
+/// table. An edge whose parent column is not in that pool is skipped, so the
+/// caller's chosen source is visible in every reported rate. When the child
+/// model carries a learned cardinality, the edge also reports how far the
+/// generated per-parent counts are from it (`cardinality_tv`, issue #72).
 pub fn evaluate_fk(
     relations: &[FkRelation],
     table_columns: &GeneratedColumns,
@@ -1376,6 +1381,40 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(amount_keys, vec!["kind", "knots"]);
+    }
+
+    #[test]
+    fn baseline_skips_pii_columns_and_their_pairs() {
+        // A PII column has no observed values in the model; writing its holdout
+        // frequencies here would re-introduce the leak (issue #71).
+        let mut model = model_of(&[numeric_column("amount"), categorical_column("email")]);
+        model.columns.get_mut("email").unwrap().pii = Some(crate::synth::pii::PiiProvider::Email);
+        let rows = rows_from(&[
+            (0..200).map(|i| Value::from(i as f64)).collect(),
+            (0..200)
+                .map(|i| Value::from(format!("user{i}@corp-example.cn")))
+                .collect(),
+        ]);
+
+        let baseline = build_baseline("t", &model, &rows, &[0, 1], 0.2).unwrap();
+        assert!(
+            !baseline.columns.contains_key("email"),
+            "PII column must not be recorded: {:?}",
+            baseline.columns.keys().collect::<Vec<_>>()
+        );
+        let json = serde_json::to_string(&baseline).unwrap();
+        assert!(
+            !json.contains("corp-example.cn"),
+            "no training value may survive in the baseline JSON"
+        );
+        for pair in &baseline.pairs {
+            let (left, right) = match pair {
+                PairBaseline::Numerical { left, right, .. } => (left, right),
+                PairBaseline::Categorical { left, right, .. } => (left, right),
+            };
+            assert_ne!(left, "email");
+            assert_ne!(right, "email");
+        }
     }
 
     #[test]

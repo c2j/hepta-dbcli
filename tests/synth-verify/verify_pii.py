@@ -65,6 +65,21 @@ def main():
         "the profile drops `full_name` top_values",
     )
 
+    baseline_text = (models / "pii_users.report-baseline.json").read_text()
+    check(
+        all(email not in baseline_text for email in TRAINING_EMAILS),
+        "no training email appears in the holdout baseline JSON",
+    )
+    check(
+        all(name not in baseline_text for name in TRAINING_NAMES),
+        "no training name appears in the holdout baseline JSON",
+    )
+    baseline = json.loads(baseline_text)
+    check(
+        "email" not in baseline["columns"] and "full_name" not in baseline["columns"],
+        "PII columns are absent from the holdout baseline",
+    )
+
     masked = read_rows(out / "masked" / "pii_users.csv")
     emails = [row["email"] for row in masked if row["email"]]
     phones = [row["phone"] for row in masked if row["phone"]]

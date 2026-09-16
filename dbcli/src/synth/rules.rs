@@ -400,6 +400,16 @@ impl SynthRules {
                         table.name, column
                     ));
                 }
+                if matches!(rule.sdtype, SdType::Pii)
+                    && table.relationships.iter().any(|rel| &rel.pk == column)
+                {
+                    return Err(format!(
+                        "table '{}' column '{}': 'sdtype: pii' on a relationship key would \
+                         replace the foreign key with fake values and break referential \
+                         integrity; drop the override or point the relationship elsewhere",
+                        table.name, column
+                    ));
+                }
 
                 // V1: `fixed` and `values` are mutually exclusive.
                 if rule.fixed.is_some() && rule.values.is_some() {
@@ -1888,5 +1898,37 @@ tables:
             tables: vec![rule],
         };
         assert!(rules.validate().unwrap_err().contains("require"));
+    }
+    #[test]
+    fn should_reject_pii_on_a_relationship_key() {
+        let rule = TableRule {
+            name: "orders".to_string(),
+            columns: HashMap::from([(
+                "user_id".to_string(),
+                ColumnRule {
+                    sdtype: SdType::Pii,
+                    ..Default::default()
+                },
+            )]),
+            derive: vec![],
+            branches: vec![],
+            rows: None,
+            relationships: vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                cardinality: CardinalityMode::ExactRows,
+                null_label: "null".to_string(),
+            }],
+            strategy: TableStrategy::Uniform,
+        };
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        assert!(rules
+            .validate()
+            .unwrap_err()
+            .contains("referential integrity"));
     }
 }
