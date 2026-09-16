@@ -1,0 +1,13 @@
+# Keep the M1 fixture's `email` column out of PII anonymization (issue #71).
+#
+# From 0.6 the recognizer treats an `email` column as PII by default and
+# replaces its values with fakes. The M1 acceptance suite (#62-#65) checks that
+# generated values stay in the *trained* value space, including `email`, so it
+# pins that column to the pre-#71 behaviour with `sdtype: keep`.
+version: "1"
+tables:
+  - name: m1_verify_parent
+    relationships: []
+    columns:
+      email:
+        sdtype: keep

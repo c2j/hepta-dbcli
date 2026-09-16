@@ -1203,6 +1203,7 @@ mod tests {
             max: None,
             null_rate: None,
             marginal: Marginal::Normal(NormalParams { loc, scale }),
+            pii: None,
         }
     }
 
@@ -1248,6 +1249,7 @@ mod tests {
                     values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
                     weights: vec![1.0 / 3.0; 3],
                 }),
+                pii: None,
             }
         }
 
@@ -1740,6 +1742,7 @@ mod tests {
             max: None,
             null_rate: None,
             marginal,
+            pii: None,
         }
     }
 

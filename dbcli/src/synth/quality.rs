@@ -1217,6 +1217,7 @@ mod tests {
                         max: None,
                         null_rate: None,
                         marginal: marginal.clone(),
+                        pii: None,
                     },
                 )
             })

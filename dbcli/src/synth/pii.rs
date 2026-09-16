@@ -13,6 +13,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::synth::marginal::{Marginal, UniformParams};
+use crate::synth::model::ColumnModel;
+
 /// PII kinds the recognizer and generator understand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +88,34 @@ fn is_email(value: &str) -> bool {
         && domain
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+/// Mark a model column as PII and erase the observed values it carried: a
+/// categorical dictionary becomes placeholder level names (keeping the
+/// count/frequency structure `stable_mapping` needs), anything else becomes a
+/// neutral uniform. Range/format metadata is dropped so no observed value or
+/// range survives in the model.
+pub fn anonymize_model_column(column: &mut ColumnModel, provider: PiiProvider) {
+    column.pii = Some(provider);
+    match &mut column.marginal {
+        Marginal::Categorical(params) => {
+            for (index, value) in params.values.iter_mut().enumerate() {
+                *value = format!("__pii_level_{index}");
+            }
+        }
+        marginal => {
+            *marginal = Marginal::Uniform(UniformParams {
+                low: 0.0,
+                high: 1.0,
+            });
+        }
+    }
+    column.min = None;
+    column.max = None;
+    column.rounding = None;
+    column.decimal_scale = None;
+    column.datetime_format = None;
+    column.datetime_epoch = None;
 }
 
 /// Column-name patterns (English and pinyin/Chinese conventions).
@@ -273,5 +304,30 @@ mod tests {
         assert!(!PiiProvider::Phone.matches_format("12"));
         assert!(PiiProvider::IdCard.matches_format("11010119900307123X"));
         assert!(!PiiProvider::IdCard.matches_format("1101011990030712"));
+    }
+    #[test]
+    fn should_erase_observed_values_when_anonymizing_a_model_column() {
+        use crate::synth::marginal::CategoricalParams;
+
+        let mut column = ColumnModel {
+            logical_type: crate::synth::model::LogicalType::Categorical,
+            marginal: crate::synth::marginal::Marginal::Categorical(CategoricalParams {
+                values: vec!["alice@corp.com".to_string(), "bob@corp.com".to_string()],
+                weights: vec![0.5, 0.5],
+            }),
+            ..Default::default()
+        };
+        anonymize_model_column(&mut column, PiiProvider::Email);
+
+        assert_eq!(column.pii, Some(PiiProvider::Email));
+        match &column.marginal {
+            crate::synth::marginal::Marginal::Categorical(params) => {
+                assert_eq!(
+                    params.values,
+                    vec!["__pii_level_0".to_string(), "__pii_level_1".to_string()]
+                );
+            }
+            other => panic!("categorical dictionary expected, got {other:?}"),
+        }
     }
 }

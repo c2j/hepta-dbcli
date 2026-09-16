@@ -63,6 +63,10 @@ pub struct ColumnModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub null_rate: Option<f64>,
     pub marginal: crate::synth::marginal::Marginal,
+    /// Set when the column is treated as PII (issue #71): its profile values
+    /// and dictionary are replaced, and generation fills it with fake values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii: Option<crate::synth::pii::PiiProvider>,
 }
 
 impl Default for ColumnModel {
@@ -82,6 +86,7 @@ impl Default for ColumnModel {
                     scale: 1.0,
                 },
             ),
+            pii: None,
         }
     }
 }
@@ -151,6 +156,7 @@ mod tests {
                     loc: 0.0,
                     scale: 1.0,
                 }),
+                pii: None,
             },
         );
 
@@ -267,6 +273,7 @@ mod tests {
                 values: vec!["a".to_string(), "b".to_string()],
                 weights: vec![0.5, 0.5],
             }),
+            pii: None,
         };
 
         let json = serde_json::to_string(&column).unwrap();

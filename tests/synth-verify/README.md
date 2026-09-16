@@ -89,6 +89,27 @@ asserts:
 | #72 AC4 | `synth report` emits a cardinality TV for the modeled edge and it is `< 0.1` |
 | #72 AC2 | without `modeled` the child row count stays exactly `--rows` |
 
+## PII run (#71)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_pii.sh
+```
+
+It loads `fixture_pii.sql` (200 rows over 50 emails, 200 phones and 30 names),
+trains twice (default and `sdtype: keep`) and generates four ways.
+`verify_pii.py` asserts:
+
+| Acceptance | Check |
+|---|---|
+| #71 recognition | the model marks `email` (email) and `full_name` (name) as PII |
+| #71 leak surfaces | no training email or name appears anywhere in the model JSON; the profile drops `email` / `full_name` `top_values` |
+| #71 AC1 | generated emails/phones/names never intersect the training values |
+| #71 AC2 | every generated email and phone matches its format pattern |
+| #71 AC5 | the same seed reproduces byte-identical output; non-PII columns are unaffected |
+| #71 AC3 | `pii_stable_mapping: true` emits at most one fake per training value (50 distinct here) |
+| #71 AC4 | `sdtype: keep` keeps the trained value space and leaves the model unmarked |
+
 ## What is asserted
 
 | Issue | Check |

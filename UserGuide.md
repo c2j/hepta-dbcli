@@ -996,6 +996,34 @@ tables:
 - 每张表最多一个 `cardinality: modeled` 关系（多个会报错）；
 - 训练分布与实际生成的基数对比见 `synth report` 的 fk 行（`cardinality tv`，越小越接近）。
 
+#### PII 识别与匿名化（`sdtype`，issue #71）
+
+`synth train` 默认识别 PII 列并**匿名化**：列名模式（`email/mail/phone/mobile/tel/name/real_name/id_card/ssn/nickname` 等，含中文）与内容正则（email、电话、18 位证件号）投票，命中的列在生成时用格式合法的假值替换，**不复现任何训练值**。识别结果写入模型列元数据（`pii: email|phone|name|id_card`）。
+
+```yaml
+tables:
+  - name: users
+    columns:
+      email:
+        sdtype: keep            # 关闭该列的匿名化（回到 top_values 采样）
+      mobile:
+        sdtype: pii             # 强制匿名化
+        pii_provider: phone     # 显式指定 provider：email/phone/name/id_card
+        pii_unique: true        # 假值不重复
+        pii_stable_mapping: true  # 训练中同值 → 生成同假值
+```
+
+| `sdtype` | 行为 |
+|----------|------|
+| `auto`（默认） | 采用识别结果 |
+| `keep` | 不匿名化，保留训练值域（`top_values` 频次采样，现状） |
+| `pii` | 强制匿名化；`pii_provider` 省略时用识别结果，再退回 `name` |
+
+- **防泄漏**：训练为 PII 的列不写入 `profile.json` 的 `top_values`；模型里该列的字典被替换为 `__pii_level_N` 占位（保留档位/频次结构，不保留原值），数值/日期列的 min/max/格式一并清空，相关矩阵中该维归零（不参与其它列的联合采样）。
+- **格式合法**：email 来自 `fake` 的 `SafeEmail`，name 来自 `Name`，phone / id_card 用固定模板；生成端会校验并重抽，保证 100% 通过各自格式。
+- **确定性**：假值由表名+列名+seed 派生，同 seed 同配置逐字节可复现；`stable_mapping` 时同档位映射同一假值（不同档位不碰撞）。
+- **二进制体积**：引入 `fake`（2.9，复用已有 `rand 0.8`）后 release 二进制增加约 1.9%（<15% 门禁），未做 feature gate。
+
 #### 主键唯一性（issue #82）
 
 `--format sql` 导出时，模型里记录的主键（`model.pk`，含复合主键）强制唯一，即使没有其它表引用它：否则生成的 SQL 回灌时必然 `Duplicate entry`。单列主键与父键一样做拒绝重抽；复合主键只要求**元组**唯一，单个成员可以重复。

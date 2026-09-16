@@ -333,6 +333,7 @@ pub(crate) fn build_model_with_overrides(
                         max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
                         null_rate: Some(col_profile.null_rate),
                         marginal,
+                        pii: None,
                     },
                 );
             }
@@ -476,6 +477,7 @@ fn fit_datetime_epoch_model(
             },
             None => Marginal::Normal(NormalParams { loc, scale }),
         },
+        pii: None,
     }
 }
 

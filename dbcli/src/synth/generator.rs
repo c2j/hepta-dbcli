@@ -97,6 +97,49 @@ struct RelPool {
     pool_size: usize,
 }
 
+/// Per-column PII generation state (issue #71).
+struct PiiPlan {
+    provider: crate::synth::pii::PiiProvider,
+    /// Same observed value -> same fake value (derived from the placeholder
+    /// level index, so nothing about the value is stored).
+    stable: bool,
+    /// Never emit the same fake value twice.
+    unique: bool,
+    rng: rand::rngs::StdRng,
+    levels: HashMap<usize, String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl PiiPlan {
+    fn value(&mut self, level: Option<usize>, column_seed: u64) -> String {
+        if self.stable {
+            if let Some(cached) = level.and_then(|index| self.levels.get(&index)) {
+                return cached.clone();
+            }
+        }
+        for _ in 0..64 {
+            let candidate = if self.stable {
+                let seed =
+                    column_seed ^ (level.unwrap_or(0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut level_rng = rand::rngs::StdRng::seed_from_u64(seed);
+                crate::synth::pii::generate_value(self.provider, &mut level_rng)
+            } else {
+                crate::synth::pii::generate_value(self.provider, &mut self.rng)
+            };
+            if self.unique && !self.seen.insert(candidate.clone()) {
+                continue;
+            }
+            if self.stable {
+                if let Some(index) = level {
+                    self.levels.insert(index, candidate.clone());
+                }
+            }
+            return candidate;
+        }
+        crate::synth::pii::generate_value(self.provider, &mut self.rng)
+    }
+}
+
 pub fn generate(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
@@ -291,6 +334,23 @@ fn generate_with(
             })
             .collect();
 
+        // PII columns are filled independently of the copula (issue #71).
+        let mut pii_plans: Vec<Option<PiiPlan>> = column_order
+            .iter()
+            .map(|col_name| {
+                let provider = model.columns.get(col_name).and_then(|column| column.pii)?;
+                let column_rule = rule.columns.get(col_name);
+                Some(PiiPlan {
+                    provider,
+                    stable: column_rule.is_some_and(|rule| rule.pii_stable_mapping),
+                    unique: column_rule.is_some_and(|rule| rule.pii_unique),
+                    rng: column_null_rng(config.seed, table_name, col_name),
+                    levels: HashMap::new(),
+                    seen: std::collections::HashSet::new(),
+                })
+            })
+            .collect();
+
         let mut rows = Vec::with_capacity(row_count);
 
         for t in 0..row_count {
@@ -307,6 +367,23 @@ fn generate_with(
                         row.push(Value::Null);
                         continue;
                     }
+                }
+
+                if let Some(plan) = pii_plans[col_idx].as_mut() {
+                    let uniform = uniform_samples
+                        .get(col_idx)
+                        .and_then(|column| column.get(t))
+                        .copied()
+                        .unwrap_or(0.5);
+                    let level = match model.columns.get(col_name).map(|column| &column.marginal) {
+                        Some(crate::synth::marginal::Marginal::Categorical(params)) => {
+                            Some(params.sample_index(uniform))
+                        }
+                        _ => None,
+                    };
+                    let seed = column_pii_seed(config.seed, table_name, col_name);
+                    row.push(Value::String(plan.value(level, seed)));
+                    continue;
                 }
 
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
@@ -555,6 +632,16 @@ fn pk_column_is_frozen(guard: &PkGuard, column: &str) -> bool {
         return true;
     }
     if guard.rule.relationships.iter().any(|r| r.pk == column) {
+        return true;
+    }
+    if guard
+        .model
+        .columns
+        .get(column)
+        .is_some_and(|column| column.pii.is_some())
+    {
+        // A PII column is generated from the provider, not from its marginal;
+        // redrawing it from the placeholder would emit non-fake values.
         return true;
     }
     guard
@@ -1039,6 +1126,12 @@ fn column_null_rng(base: Option<u64>, table: &str, column: &str) -> rand::rngs::
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::rngs::StdRng::from_entropy(),
     }
+}
+
+/// Stable seed for a PII column, used by `stable_mapping` to derive one fake
+/// value per placeholder level.
+fn column_pii_seed(base: Option<u64>, table: &str, column: &str) -> u64 {
+    table_seed(base, &format!("{}:{}:pii", table, column)).unwrap_or(0)
 }
 
 // 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
@@ -2212,6 +2305,7 @@ mod tests {
     use crate::synth::cardinality::CardinalityDist;
     use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
+    use crate::synth::pii::PiiProvider;
     use crate::synth::rules::{CardinalityMode, ColumnRule, Relationship, TableRule, ValuePool};
     use std::collections::BTreeMap;
 
@@ -3206,6 +3300,7 @@ mod tests {
                             values: levels.clone(),
                             weights: vec![1.0 / 19.0; 19],
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -3586,6 +3681,7 @@ mod tests {
                             loc: 100.0,
                             scale: 50.0,
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -3646,6 +3742,7 @@ mod tests {
                             loc: 100.0,
                             scale: 50.0,
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -4214,6 +4311,7 @@ tables:
                     loc: 1004.5678,
                     scale: 12.5,
                 }),
+                pii: None,
             },
         );
         let model = TableModel {
@@ -4270,6 +4368,7 @@ tables:
                     loc,
                     scale: std_dev,
                 }),
+                pii: None,
             },
         );
         TableModel {
@@ -4377,6 +4476,7 @@ tables:
                     loc: 50.0,
                     scale: 10.0,
                 }),
+                pii: None,
             },
         );
         let model = TableModel {
@@ -4432,6 +4532,7 @@ tables:
                         values: vec!["2024-01-01".into(), "2024-06-01".into()],
                         weights: vec![0.5, 0.5],
                     }),
+                    pii: None,
                 },
             );
             TableModel {
@@ -4494,6 +4595,7 @@ tables:
                 low: loc,
                 high: loc,
             }),
+            pii: None,
         }
     }
 
@@ -6978,6 +7080,196 @@ tables:
         assert!(
             err.contains("learned distribution"),
             "error must explain the missing distribution: {err}"
+        );
+    }
+
+    fn pii_model(table: &str, column: &str, provider: PiiProvider, levels: usize) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: (0..levels).map(|i| format!("__pii_level_{i}")).collect(),
+                    weights: vec![1.0 / levels as f64; levels],
+                }),
+                pii: Some(provider),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string(), column.to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        }
+    }
+
+    /// AC1/AC2: a PII column is filled with format-valid fakes, never with the
+    /// placeholder dictionary values, and the run is deterministic by seed.
+    #[test]
+    fn should_fill_pii_columns_with_format_valid_fakes() {
+        for (provider, column) in [
+            (PiiProvider::Email, "email"),
+            (PiiProvider::Phone, "phone"),
+            (PiiProvider::Name, "full_name"),
+            (PiiProvider::IdCard, "id_card"),
+        ] {
+            let models = HashMap::from([("t".to_string(), pii_model("t", column, provider, 4))]);
+            let rules = SynthRules {
+                version: "1".to_string(),
+                tables: vec![single_rule("t", vec![])],
+            };
+            let config = GeneratorConfig {
+                rows_per_table: HashMap::from([("t".to_string(), 60)]),
+                seed: Some(11),
+                enforce_min_max_values: true,
+            };
+
+            let first = generate(&models, &rules, &config).unwrap();
+            let second = generate(&models, &rules, &config).unwrap();
+            let rows = first.tables.get("t").unwrap();
+            let again = second.tables.get("t").unwrap();
+            assert_eq!(rows.len(), 60);
+            for row in rows {
+                let value = row[1].as_str().expect("PII value must be a string");
+                assert!(
+                    provider.matches_format(value),
+                    "{provider:?} produced invalid value {value:?}"
+                );
+                assert!(
+                    !value.starts_with("__pii_level_"),
+                    "placeholder dictionary value leaked: {value}"
+                );
+            }
+            assert_eq!(rows, again, "same seed must reproduce the same fakes");
+        }
+    }
+
+    /// AC3: with `stable_mapping`, equal training levels map to equal fakes.
+    #[test]
+    fn should_map_equal_levels_to_equal_fakes_when_stable_mapping_is_set() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 3),
+        )]);
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                pii_stable_mapping: true,
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 200)]),
+            seed: Some(5),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate(&models, &rules, &config).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let distinct: std::collections::HashSet<&str> =
+            rows.iter().filter_map(|row| row[1].as_str()).collect();
+        assert!(
+            (1..=3).contains(&distinct.len()),
+            "stable mapping must reuse at most one fake per level, got {}",
+            distinct.len()
+        );
+    }
+
+    /// `pii_unique` never repeats a fake value.
+    #[test]
+    fn should_keep_pii_values_unique_when_requested() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 4),
+        )]);
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                pii_unique: true,
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 120)]),
+            seed: Some(9),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate(&models, &rules, &config).unwrap();
+        let distinct: std::collections::HashSet<&str> = data
+            .tables
+            .get("t")
+            .unwrap()
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(distinct.len(), 120, "unique PII values must not repeat");
+    }
+
+    /// AC5 regression: anonymizing one column leaves the others identical.
+    #[test]
+    fn should_leave_other_columns_identical_when_a_pii_column_is_added() {
+        let plain = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 4),
+        )]);
+        let mut without_pii = pii_model("t", "email", PiiProvider::Email, 4);
+        without_pii.columns.get_mut("email").unwrap().pii = None;
+        let with_plain = HashMap::from([("t".to_string(), without_pii)]);
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 25)]),
+            seed: Some(3),
+            enforce_min_max_values: true,
+        };
+
+        let masked = generate(&plain, &rules, &config).unwrap();
+        let raw = generate(&with_plain, &rules, &config).unwrap();
+        let ids_masked: Vec<&Value> = masked.tables["t"].iter().map(|row| &row[0]).collect();
+        let ids_raw: Vec<&Value> = raw.tables["t"].iter().map(|row| &row[0]).collect();
+        assert_eq!(
+            ids_masked, ids_raw,
+            "a PII column must not move other columns"
         );
     }
 }

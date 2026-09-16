@@ -1,0 +1,8 @@
+# Opt out of anonymization for `email` (issue #71 AC4).
+version: "1"
+tables:
+  - name: pii_users
+    relationships: []
+    columns:
+      email:
+        sdtype: keep

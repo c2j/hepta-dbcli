@@ -179,3 +179,12 @@ jobs:
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
           SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth PII work (#71): recognized
+      # columns lose their values from both the model and the profile, the
+      # generated values are format-valid fakes, stable mapping and
+      # `sdtype: keep` behave, and the run is deterministic.
+      - name: synth PII end-to-end verification
+        run: bash tests/synth-verify/run_m4_pii.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
