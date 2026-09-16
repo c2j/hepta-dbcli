@@ -973,6 +973,66 @@ tables:
 | `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
 | `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
 
+#### 子表基数建模（`cardinality`，issue #72）
+
+`synth train` 会按外键统计"每个父键对应多少子行"，把计数分布写进**子表模型**的 `fk_cardinality`（键为 FK 列名；`0` 档来自父表键去重数减去被引用键数）。默认生成仍按 `--rows` 生成固定行数、逐行独立采父键；要让子表行数跟随学习到的基数分布，在 relationship 上加 `cardinality: modeled`：
+
+```yaml
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        cardinality: modeled   # 默认 exact_rows
+```
+
+| 取值 | 行为 |
+|------|------|
+| `exact_rows`（默认） | 子表行数 = `--rows`（或 rules 的 `rows`），与现状逐字节一致 |
+| `modeled` | 逐父键按 `fk_cardinality` 采样子行数，**子表行数由分布求和得出**（`--rows` 对这张表不再生效，父表仍是 `--rows`）；FK 值按父键成块写入，不再逐行独立采样 |
+
+- 模型里没有对应 `fk_cardinality`（旧模型或未训练）时 `generate` 直接报错，不会静默退回固定行数；
+- `unique: true` 的 1:1 关系把每个父键的子行数截断到 0/1，保证父值不被重复引用；
+- NULL 外键份额按训练期 `null_share` 复现，NULL 行不计入任何父键的基数；
+- 每张表最多一个 `cardinality: modeled` 关系（多个会报错）；
+- 训练分布与实际生成的基数对比见 `synth report` 的 fk 行（`cardinality tv`，越小越接近）。
+
+#### PII 识别与匿名化（`sdtype`，issue #71）
+
+`synth train` 默认识别 PII 列并**匿名化**：列名模式（`email/mail/phone/mobile/tel/name/real_name/id_card/ssn/nickname` 等，含中文）与内容正则（email、电话、18 位证件号）投票，命中的列在生成时用格式合法的假值替换，**不复现任何训练值**。识别结果写入模型列元数据（`pii: email|phone|name|id_card`）。
+
+```yaml
+tables:
+  - name: users
+    columns:
+      email:
+        sdtype: keep            # 关闭该列的匿名化（回到 top_values 采样）
+      mobile:
+        sdtype: pii             # 强制匿名化
+        pii_provider: phone     # 显式指定 provider：email/phone/name/id_card
+        pii_unique: true        # 假值不重复
+        pii_stable_mapping: true  # 训练中同值 → 生成同假值
+```
+
+| `sdtype` | 行为 |
+|----------|------|
+| `auto`（默认） | 采用识别结果 |
+| `keep` | 不匿名化，保留训练值域（`top_values` 频次采样，现状） |
+| `pii` | 强制匿名化；`pii_provider` 省略时用识别结果，再退回 `name` |
+
+- **防泄漏**：训练为 PII 的列不写入 `profile.json` 的 `top_values`；模型里该列的字典被替换为 `__pii_level_N` 占位（保留档位/频次结构，不保留原值），数值/日期列的 min/max/格式一并清空，相关矩阵中该维归零（不参与其它列的联合采样）。
+- **格式合法**：email 来自 `fake` 的 `SafeEmail`，name 来自 `Name`，phone / id_card 用固定模板；生成端会校验并重抽，保证 100% 通过各自格式。
+- **确定性**：假值由表名+列名+seed 派生，同 seed 同配置逐字节可复现；`stable_mapping` 时同档位映射同一假值（不同档位不碰撞）。
+- **二进制体积**：引入 `fake`（2.9，复用已有 `rand 0.8`）后 release 二进制增加约 1.9%（<15% 门禁），未做 feature gate。
+
+#### 主键唯一性（issue #82）
+
+`--format sql` 导出时，模型里记录的主键（`model.pk`，含复合主键）强制唯一，即使没有其它表引用它：否则生成的 SQL 回灌时必然 `Duplicate entry`。单列主键与父键一样做拒绝重抽；复合主键只要求**元组**唯一，单个成员可以重复。
+
+- 训练观测到的可取值足够 `--rows` 时用重抽填满；不够时（如 12 个整数主键要生成 200 行）超出部分**外推**到训练值域之外（整数主键续号、日期主键按秒推进），保证产物始终可插入。只有主键既不可外推（非数值/日期字符串）又不够行数时才报错，错误含列名与请求行数；
+- 该唯一化只发生在 SQL 导出路径。CSV / JSONL 没有键约束，仍按原边际采样，`synth report` 的分布评分因此不受影响（同 seed 下 SQL 与 CSV 的主键列可能不同）；
+- 列级 `fixed` / `values` / `fixed_range` 覆盖、relationship 的 `pk`（外键子列）与零方差列不在此检查范围内：前者是用户的显式选择，后两者由池策略/边际决定；
+- 主键列在训练集里全部为 NULL 时按 NULL 生成，不参与唯一性判定。
+
 #### 列级固定值与区间（`fixed` / `values` / `fixed_range`）
 
 | 字段 | 行为 |
@@ -1086,10 +1146,36 @@ tables:
 | P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
 | M1 验收 | synth M1 端到端（真实 MySQL fixture）：datetime 格式还原与值域、NULL 比例复现、DECIMAL 标度、字典列全档、FK 引用完整性、SQL schema 限定、同 seed 逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m1.sh` |
 | M2 验收 | synth M2 端到端（同一 fixture）：边际自动择优（非整表 Normal）、留出集摘要隐私、report 的 shapes/pairs/fk 三节、劣化检出与 `--min-score` 退出码、离线（生成父键）与真库（`--against-db`）FK join-rate、缺 baseline / 缺数据的 skip 与 `--strict`、两次报告逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m2.sh` |
+| M4 验收（#82） | SQL 导出主键唯一：12 键表 `--rows 200` 外推后可回灌 200 唯一 id、20×20 复合键 200 唯一元组、非数值键 fail-fast 且报列名+行数 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_pk.sh` |
+| M4 验收（#72） | 子表基数：模型学习分布精确 `{0:.5,1:.3,2:.2}`、modeled 生成形状复现（零占比 [0.4,0.6]、TV<0.1）、report 带 `cardinality tv`、默认 exact_rows 保持 `--rows` | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_cardinality.sh` |
+| M4 验收（#71） | PII：模型/剖面双泄漏面清除、生成值与训练值零交集且格式合法、同 seed 可复现、stable_mapping 同档同值、`sdtype: keep` 保留值域 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_pii.sh` |
 
 CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 
 范围声明：Case B（vs CTGAN / TVAE / TabDDPM / GReaT）与 Case C（vs SDV HMA / ClavaDDPM / REaLTabFormer）**不在本里程碑**；SynMeter / torch / SDV 仅存在于 benchmark venv（`tests/benchmark/requirements.txt`），不进入 `Cargo.toml`。
+
+### 10.7 能力矩阵（对照 SDV / shadow-seed）
+
+图例：✅ 开箱可用；⚠️ 部分/需额外组件；❌ 不具备。仅列 synth 相关能力，均为 M1-M4 结束后的状态（2026-09）。
+
+| 能力 | hepta-dbcli | SDV（社区版） | shadow-seed |
+|------|-------------|---------------|-------------|
+| 便携模型（纯 JSON，无 Python） | ✅ | ❌（pkl / Python 栈） | ❌ |
+| 单表边际 + copula | ✅ Normal/Beta/Gamma/Uniform/ECDF 自动择优 | ✅ 多种合成器 | ✅ copula |
+| 日期/时间列 | ✅ 格式还原 + epoch 边际 | ✅ | ⚠️ 部分 |
+| NULL 复现（含 pairwise-complete 相关修正） | ✅ | ✅ | ⚠️ 部分 |
+| FK 图拓扑排序 + 引用完整性 | ✅ | ✅ | ✅（固定模式） |
+| 子表基数建模（HMA-lite） | ✅ `cardinality: modeled` | ✅ HMA 全量 | ❌ |
+| 主键唯一性（SQL 导出可回灌） | ✅ 含数值外推 | ✅ 内建 id 处理 | ✅ |
+| PII 识别 + 不可逆匿名化 | ✅ email/phone/name/id_card，默认匿名、可 `keep` | ✅ AnonymizedFaker（40+ locale） | ❌（有意保留真实键值） |
+| 可逆伪匿名化 | ❌（明确不做，见 #73） | ✅ PseudoAnonymizedFaker | ❌ |
+| 差分隐私保证 | ❌（明确不做） | ⚠️ 企业版 | ❌ |
+| 条件规则 / 固定值 / 派生列 / 分支覆盖 | ✅ `fixed`/`values`/`fixed_range`/`derive`/`branches` + rules-draft 2.0 | ⚠️ constraints 子集 | ✅ 业务规则修复层 |
+| 离线质量报告（留出集 KS/TV/pairs/FK/基数 TV） | ✅ `synth report` | ✅ SDMetrics | ❌ |
+| 多方言直连训练（MySQL/Oracle/GaussDB/DuckDB） | ✅ | ❌（只吃 DataFrame） | ❌ |
+| 部署形态 | ✅ 单二进制，无 Python | ❌ Python 依赖栈 | ❌ |
+
+当前 `synth report` 基线（M1 fixture：日期/金额/字典/可空/FK 多表）为 **0.733**，明细见 [docs/plans/2026-09-16-synth-report-baseline.md](../docs/plans/2026-09-16-synth-report-baseline.md)；路线的 ≥0.85 目标尚未达成（差在 FK 列与高基数类列的 1-KS/1-TV）。
 
 ---
 

@@ -99,6 +99,19 @@ impl FkPool {
         self.values.is_empty()
     }
 
+    /// Distinct values in first-seen order. Modeled cardinality walks every
+    /// parent key once and gives it a sampled number of children.
+    pub fn distinct_values(&self) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::new();
+        let mut distinct = Vec::new();
+        for value in &self.values {
+            if seen.insert(value.to_string()) {
+                distinct.push(value.clone());
+            }
+        }
+        distinct
+    }
+
     pub fn sample_one(&self, strategy: SelectionStrategy, rng: &mut impl Rng) -> Option<Value> {
         if self.values.is_empty() {
             return None;
@@ -356,6 +369,21 @@ mod tests {
             (share("c") - 0.1).abs() < 0.05,
             "c share {} not within 5pp of 0.1",
             share("c")
+        );
+    }
+
+    #[test]
+    fn distinct_values_dedupes_in_first_seen_order() {
+        let pool = FkPool::new(vec![
+            Value::from("b"),
+            Value::from("a"),
+            Value::from("b"),
+            Value::from(1),
+        ]);
+        let distinct = pool.distinct_values();
+        assert_eq!(
+            distinct,
+            vec![Value::from("b"), Value::from("a"), Value::from(1)]
         );
     }
 }

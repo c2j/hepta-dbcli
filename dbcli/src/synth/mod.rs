@@ -1,4 +1,6 @@
 #[cfg(feature = "synth")]
+pub mod cardinality;
+#[cfg(feature = "synth")]
 pub mod cmd;
 #[cfg(feature = "synth")]
 pub mod copula;
@@ -20,6 +22,8 @@ pub mod marginal;
 pub mod mine;
 #[cfg(feature = "synth")]
 pub mod model;
+#[cfg(feature = "synth")]
+pub mod pii;
 #[cfg(feature = "synth")]
 pub mod profile;
 #[cfg(feature = "synth")]
@@ -397,31 +401,32 @@ async fn run_train(
     }
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create output dir: {}", e))?;
 
-    // Per-column marginal overrides, keyed by table then column. Optional: a
-    // rules file only needs the `columns` section to steer training.
-    let forced_marginals: HashMap<String, HashMap<String, String>> = match rules_path {
-        Some(path) => {
-            let rules = crate::synth::rules::SynthRules::load(Path::new(path))?;
-            rules.validate()?;
-            rules
-                .tables
-                .iter()
-                .filter_map(|table| {
-                    let forced: HashMap<String, String> = table
-                        .columns
-                        .iter()
-                        .filter_map(|(column, rule)| {
-                            rule.marginal
-                                .as_ref()
-                                .map(|marginal| (column.clone(), marginal.clone()))
-                        })
-                        .collect();
-                    (!forced.is_empty()).then(|| (table.name.clone(), forced))
-                })
-                .collect()
+    // Per-column overrides, keyed by table then column. Optional: a rules file
+    // only needs the `columns` section to steer training (marginal family and
+    // PII handling, issue #71).
+    type SdTypeOverride = (crate::synth::rules::SdType, Option<String>);
+    let mut forced_marginals: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut forced_sdtype: HashMap<String, HashMap<String, SdTypeOverride>> = HashMap::new();
+    if let Some(path) = rules_path {
+        let rules = crate::synth::rules::SynthRules::load(Path::new(path))?;
+        rules.validate()?;
+        for table in &rules.tables {
+            for (column, rule) in &table.columns {
+                if let Some(marginal) = &rule.marginal {
+                    forced_marginals
+                        .entry(table.name.clone())
+                        .or_default()
+                        .insert(column.clone(), marginal.clone());
+                }
+                if !matches!(rule.sdtype, crate::synth::rules::SdType::Auto) {
+                    forced_sdtype
+                        .entry(table.name.clone())
+                        .or_default()
+                        .insert(column.clone(), (rule.sdtype, rule.pii_provider.clone()));
+                }
+            }
         }
-        None => HashMap::new(),
-    };
+    }
 
     let raw =
         crate::config::read_config(config_path.map(PathBuf::from)).map_err(|e| e.to_string())?;
@@ -435,6 +440,22 @@ async fn run_train(
         .unwrap_or_else(|| "mysql".to_string());
 
     let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
+
+    // Foreign keys are read once so training can learn each child table's
+    // rows-per-parent-key distribution (issue #72). A dialect without FK
+    // metadata degrades to "no cardinality learned", never a failed train.
+    let foreign_keys = match conn.query(&conn.dialect().foreign_keys_sql(&schema)).await {
+        Ok(result) => cmd::parse_foreign_keys(&result).unwrap_or_else(|e| {
+            eprintln!("warning: not learning cardinality: {e}");
+            Vec::new()
+        }),
+        Err(e) => {
+            eprintln!("warning: not learning cardinality: {e}");
+            Vec::new()
+        }
+    };
+    let mut key_distinct: HashMap<(String, String), usize> = HashMap::new();
+    let mut fk_values: HashMap<(String, String), Vec<serde_json::Value>> = HashMap::new();
 
     for table in &tables {
         let (col_sql, idx_sql, sample_sql) = {
@@ -468,7 +489,36 @@ async fn run_train(
 
         let pk = cmd::reconcile_primary_key(cmd::parse_primary_key(&idx_result), &result.columns);
 
-        let profile = crate::synth::profile::TableProfile::from_rows_typed(
+        // Cardinality inputs: the distinct count of this table's key (for the
+        // `0` bucket of a child's distribution) and the FK value columns
+        // (issue #72). Both are read from the same sample the model is fitted
+        // on, so no extra query is needed.
+        if let Some(pk_column) = pk.first() {
+            if let Some(index) = result.columns.iter().position(|column| column == pk_column) {
+                key_distinct.insert(
+                    (table.clone(), pk_column.clone()),
+                    distinct_non_null(&result.rows, index),
+                );
+            }
+        }
+        for fk in foreign_keys.iter().filter(|fk| &fk.from_table == table) {
+            if let Some(index) = result
+                .columns
+                .iter()
+                .position(|column| column == &fk.from_column)
+            {
+                fk_values.insert(
+                    (table.clone(), fk.from_column.clone()),
+                    result
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.get(index).cloned())
+                        .collect(),
+                );
+            }
+        }
+
+        let mut profile = crate::synth::profile::TableProfile::from_rows_typed(
             table,
             &result.columns,
             &result.rows,
@@ -491,6 +541,36 @@ async fn run_train(
                 table, col
             );
         }
+
+        // PII columns are anonymized before anything is written (issue #71):
+        // the model loses their observed dictionary/range and leaves the
+        // correlation matrix, and the profile drops their top values.
+        // Primary keys and foreign keys are never anonymized: replacing a key
+        // with a fake string would break uniqueness and referential integrity.
+        let mut reserved: std::collections::HashSet<String> = model.pk.iter().cloned().collect();
+        reserved.extend(
+            foreign_keys
+                .iter()
+                .filter(|fk| fk.from_table == *table)
+                .map(|fk| fk.from_column.clone()),
+        );
+        let mut detected = detect_pii_columns(
+            &result.columns,
+            &result.rows,
+            &data_types,
+            forced_sdtype.get(table),
+        );
+        detected.retain(|column, _| !reserved.contains(column));
+        for (column, provider) in detected {
+            if let Some(model_column) = model.columns.get_mut(&column) {
+                crate::synth::pii::anonymize_model_column(model_column, provider);
+            }
+            zero_correlation(&mut model, &column);
+            if let Some(profile_column) = profile.columns.get_mut(&column) {
+                profile_column.top_values = None;
+            }
+        }
+
         if sample_may_be_truncated(&scheme, result.row_count, sample) {
             eprintln!(
                 "warning: Oracle driver truncated the sample of table '{}' at {} rows; \
@@ -547,6 +627,152 @@ async fn run_train(
         );
     }
 
+    attach_fk_cardinality(output_dir, &foreign_keys, &key_distinct, &fk_values)?;
+
+    Ok(())
+}
+
+/// Number of distinct non-NULL values of one row column.
+#[cfg(feature = "synth")]
+fn distinct_non_null(rows: &[Vec<serde_json::Value>], index: usize) -> usize {
+    rows.iter()
+        .filter_map(|row| row.get(index))
+        .filter(|value| !value.is_null())
+        .map(|value| value.to_string())
+        .collect::<std::collections::HashSet<String>>()
+        .len()
+}
+
+/// PII columns of one table: `sdtype: keep` disables, `sdtype: pii` forces a
+/// provider (falling back to the recognizer, then to `name`), and `auto` uses
+/// the recognizer (issue #71).
+#[cfg(feature = "synth")]
+fn detect_pii_columns(
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+    types: &HashMap<String, String>,
+    overrides: Option<&HashMap<String, (crate::synth::rules::SdType, Option<String>)>>,
+) -> HashMap<String, crate::synth::pii::PiiProvider> {
+    let mut detected = HashMap::new();
+    for (index, name) in columns.iter().enumerate() {
+        let override_ = overrides.and_then(|map| map.get(name));
+        let sdtype = override_
+            .map(|(sdtype, _)| *sdtype)
+            .unwrap_or(crate::synth::rules::SdType::Auto);
+        if matches!(sdtype, crate::synth::rules::SdType::Keep) {
+            continue;
+        }
+        let samples: Vec<serde_json::Value> = rows
+            .iter()
+            .filter_map(|row| row.get(index).cloned())
+            .collect();
+        let guess = crate::synth::pii::detect(name, &samples, types.get(name).map(String::as_str));
+        let provider = if matches!(sdtype, crate::synth::rules::SdType::Pii) {
+            override_
+                .and_then(|(_, provider)| provider.as_deref())
+                .and_then(crate::synth::pii::PiiProvider::parse)
+                .or(guess)
+                .unwrap_or(crate::synth::pii::PiiProvider::Name)
+        } else {
+            match guess {
+                Some(provider) => provider,
+                None => continue,
+            }
+        };
+        detected.insert(name.clone(), provider);
+    }
+    detected
+}
+
+/// Drop a column from the copula correlation matrix (diagonal 1, everything
+/// else 0): a PII column is generated independently, so it must not shape the
+/// other columns' joint draw (issue #71).
+#[cfg(feature = "synth")]
+fn zero_correlation(model: &mut crate::synth::model::TableModel, column: &str) {
+    let Some(index) = model
+        .copula
+        .column_order
+        .iter()
+        .position(|name| name == column)
+    else {
+        return;
+    };
+    let size = model.copula.correlation.len();
+    for other in 0..size {
+        if let Some(row) = model.copula.correlation.get_mut(index) {
+            if let Some(cell) = row.get_mut(other) {
+                *cell = if other == index { 1.0 } else { 0.0 };
+            }
+        }
+        if other != index {
+            if let Some(row) = model.copula.correlation.get_mut(other) {
+                if let Some(cell) = row.get_mut(index) {
+                    *cell = 0.0;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "synth")]
+fn learned_cardinality(
+    models: &HashMap<String, crate::synth::model::TableModel>,
+) -> HashMap<(String, String), crate::synth::cardinality::CardinalityDist> {
+    let mut learned = HashMap::new();
+    for (table, model) in models {
+        for (column, distribution) in &model.fk_cardinality {
+            learned.insert((table.clone(), column.clone()), distribution.clone());
+        }
+    }
+    learned
+}
+
+/// Learn each child table's rows-per-parent distribution and store it in the
+/// child's model (issue #72). Runs after the training loop because a parent
+/// key's distinct count may come from a table trained after its child.
+#[cfg(feature = "synth")]
+fn attach_fk_cardinality(
+    output_dir: &Path,
+    foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
+    key_distinct: &HashMap<(String, String), usize>,
+    fk_values: &HashMap<(String, String), Vec<serde_json::Value>>,
+) -> Result<(), String> {
+    // Load each child model once; a table may have several foreign keys.
+    let mut loaded: HashMap<String, crate::synth::model::TableModel> = HashMap::new();
+    let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for fk in foreign_keys {
+        let Some(values) = fk_values.get(&(fk.from_table.clone(), fk.from_column.clone())) else {
+            continue;
+        };
+        let parent_distinct = key_distinct
+            .get(&(fk.to_table.clone(), fk.to_column.clone()))
+            .copied();
+        let Some(distribution) =
+            crate::synth::cardinality::learn_cardinality(values, parent_distinct)
+        else {
+            continue;
+        };
+        let model = match loaded.entry(fk.from_table.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let path = output_dir.join(format!("{}.model.json", fk.from_table));
+                entry.insert(crate::synth::model::TableModel::load(&path)?)
+            }
+        };
+        if !model.columns.contains_key(&fk.from_column) {
+            continue;
+        }
+        model
+            .fk_cardinality
+            .insert(fk.from_column.clone(), distribution);
+        changed.insert(fk.from_table.clone());
+    }
+    for table in changed {
+        if let Some(model) = loaded.get(&table) {
+            let path = output_dir.join(format!("{}.model.json", table));
+            model.save(&path)?;
+        }
+    }
     Ok(())
 }
 
@@ -937,6 +1163,7 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         &table_rows,
         &parent_pools,
         fk_source,
+        &learned_cardinality(&models),
     );
 
     // Every model gets a row in the report: a table whose data is missing is
@@ -1202,6 +1429,7 @@ mod tests {
                 column_order: vec![],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         };
         std::fs::write(
             dir.path().join("orders.model.json"),
@@ -1374,6 +1602,7 @@ mod tests {
                 loc: 50.0,
                 scale: 10.0,
             }),
+            pii: None,
         };
         let categorical = ColumnModel {
             logical_type: LogicalType::Categorical,
@@ -1388,6 +1617,7 @@ mod tests {
                 values: vec!["a".to_string(), "b".to_string()],
                 weights: vec![0.5, 0.5],
             }),
+            pii: None,
         };
         TableModel {
             version: 1,
@@ -1409,6 +1639,7 @@ mod tests {
                 column_order: vec!["amount".to_string(), "kind".to_string()],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -1658,6 +1889,7 @@ mod tests {
                             values: values.iter().map(|v| v.to_string()).collect(),
                             weights: vec![1.0 / values.len() as f64; values.len()],
                         }),
+                        pii: None,
                     },
                 )
             })
@@ -1679,6 +1911,7 @@ mod tests {
                 column_order: columns.iter().map(|(n, _)| n.to_string()).collect(),
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -1863,5 +2096,41 @@ mod tests {
 
         std::fs::remove_dir_all(&models_dir).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+    #[test]
+    fn should_apply_pii_sdtype_overrides() {
+        use crate::synth::pii::PiiProvider;
+        use crate::synth::rules::SdType;
+
+        let columns = vec!["email".to_string(), "status".to_string()];
+        let rows = vec![
+            vec![
+                serde_json::Value::from("a@b.com"),
+                serde_json::Value::from("open"),
+            ],
+            vec![
+                serde_json::Value::from("c@d.org"),
+                serde_json::Value::from("closed"),
+            ],
+        ];
+
+        // auto: the recognizer flags email only.
+        let types = HashMap::new();
+        let auto = detect_pii_columns(&columns, &rows, &types, None);
+        assert_eq!(auto.get("email"), Some(&PiiProvider::Email));
+        assert!(!auto.contains_key("status"));
+
+        // keep: email is exempted.
+        let keep = HashMap::from([("email".to_string(), (SdType::Keep, None))]);
+        assert!(detect_pii_columns(&columns, &rows, &types, Some(&keep)).is_empty());
+
+        // pii: forces the provider on a column the recognizer would ignore.
+        let forced = HashMap::from([(
+            "status".to_string(),
+            (SdType::Pii, Some("name".to_string())),
+        )]);
+        let out = detect_pii_columns(&columns, &rows, &types, Some(&forced));
+        assert_eq!(out.get("status"), Some(&PiiProvider::Name));
+        assert_eq!(out.get("email"), Some(&PiiProvider::Email));
     }
 }

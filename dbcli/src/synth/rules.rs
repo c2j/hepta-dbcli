@@ -56,6 +56,36 @@ pub struct ColumnRule {
     /// column's `fixed` value or `fixed_range` (issue #68).
     #[serde(default, skip_serializing_if = "ColumnMode::is_rejection")]
     pub mode: ColumnMode,
+    /// PII handling (issue #71). `auto` (default) uses the recognizer; `keep`
+    /// disables anonymization for this column; `pii` forces it.
+    #[serde(default, skip_serializing_if = "SdType::is_auto")]
+    pub sdtype: SdType,
+    /// Provider to force when `sdtype: pii` (`email` / `phone` / `name` /
+    /// `id_card`); omitted means the recognizer's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_provider: Option<String>,
+    /// Emit each fake value at most once (aligned with the FK-pool semantics).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pii_unique: bool,
+    /// Map an equal training value to an equal fake value (deterministic by
+    /// level, so the equality structure survives without storing the value).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pii_stable_mapping: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdType {
+    #[default]
+    Auto,
+    Keep,
+    Pii,
+}
+
+impl SdType {
+    fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 impl ColumnRule {
@@ -241,10 +271,30 @@ pub struct Relationship {
     pub references: Vec<String>,
     #[serde(default)]
     pub pool_strategy: PoolStrategy,
+    /// How the child row count per parent key is produced (issue #72).
+    /// `exact_rows` (default) keeps `--rows` as the literal child row count;
+    /// `modeled` samples the child table's learned count distribution and
+    /// derives the child row count from it.
+    #[serde(default, skip_serializing_if = "CardinalityMode::is_exact_rows")]
+    pub cardinality: CardinalityMode,
     /// Parsed for YAML compatibility with existing rules files. Generation
     /// does not read this field; NULL injection uses per-column `null_rate`.
     #[serde(default = "default_null_label")]
     pub null_label: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardinalityMode {
+    #[default]
+    ExactRows,
+    Modeled,
+}
+
+impl CardinalityMode {
+    fn is_exact_rows(&self) -> bool {
+        matches!(self, Self::ExactRows)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +372,43 @@ impl SynthRules {
                             ALLOWED_MARGINALS.join(", ")
                         ));
                     }
+                }
+
+                // PII overrides (issue #71): an explicit provider must be one
+                // the generator knows, and `keep` cannot carry one.
+                if let Some(provider) = rule.pii_provider.as_deref() {
+                    if crate::synth::pii::PiiProvider::parse(provider).is_none() {
+                        return Err(format!(
+                            "table '{}' column '{}': unknown pii_provider '{}' \
+                             (expected email, phone, name or id_card)",
+                            table.name, column, provider
+                        ));
+                    }
+                    if !matches!(rule.sdtype, SdType::Pii) {
+                        return Err(format!(
+                            "table '{}' column '{}': 'pii_provider' requires 'sdtype: pii'",
+                            table.name, column
+                        ));
+                    }
+                }
+                if matches!(rule.sdtype, SdType::Keep)
+                    && (rule.pii_unique || rule.pii_stable_mapping)
+                {
+                    return Err(format!(
+                        "table '{}' column '{}': 'pii_unique'/'pii_stable_mapping' require \
+                         anonymization (drop 'sdtype: keep')",
+                        table.name, column
+                    ));
+                }
+                if matches!(rule.sdtype, SdType::Pii)
+                    && table.relationships.iter().any(|rel| &rel.pk == column)
+                {
+                    return Err(format!(
+                        "table '{}' column '{}': 'sdtype: pii' on a relationship key would \
+                         replace the foreign key with fake values and break referential \
+                         integrity; drop the override or point the relationship elsewhere",
+                        table.name, column
+                    ));
                 }
 
                 // V1: `fixed` and `values` are mutually exclusive.
@@ -1117,6 +1204,7 @@ tables:
                     references: vec![],
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
                 strategy: TableStrategy::Uniform,
             }],
@@ -1681,5 +1769,166 @@ tables:
                 .validate()
                 .unwrap_or_else(|e| panic!("'{name}' should be accepted: {e}"));
         }
+    }
+
+    #[test]
+    fn should_default_cardinality_to_exact_rows() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rules.tables[0].relationships[0].cardinality,
+            CardinalityMode::ExactRows
+        );
+        // The default must not be serialized back, so legacy rules files stay
+        // byte-identical after a load/save round-trip.
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert!(!serialized.contains("cardinality"));
+    }
+
+    #[test]
+    fn should_parse_modeled_cardinality() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        cardinality: modeled
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rules.tables[0].relationships[0].cardinality,
+            CardinalityMode::Modeled
+        );
+    }
+    #[test]
+    fn should_parse_sdtype_keep_and_pii() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: users
+    relationships: []
+    columns:
+      email:
+        sdtype: keep
+      mobile:
+        sdtype: pii
+        pii_provider: phone
+        pii_unique: true
+        pii_stable_mapping: true
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        let columns = &rules.tables[0].columns;
+        assert_eq!(columns["email"].sdtype, SdType::Keep);
+        assert_eq!(columns["mobile"].sdtype, SdType::Pii);
+        assert_eq!(columns["mobile"].pii_provider.as_deref(), Some("phone"));
+        assert!(columns["mobile"].pii_unique);
+        assert!(columns["mobile"].pii_stable_mapping);
+
+        // Defaults are not serialized, so old rules files round-trip byte
+        // identically.
+        let plain = SynthRules {
+            version: "1".to_string(),
+            tables: vec![TableRule {
+                name: "t".to_string(),
+                columns: HashMap::from([("amount".to_string(), ColumnRule::default())]),
+                derive: vec![],
+                branches: vec![],
+                rows: None,
+                relationships: vec![],
+                strategy: TableStrategy::Uniform,
+            }],
+        };
+        let text = serde_yaml::to_string(&plain).unwrap();
+        assert!(!text.contains("sdtype"), "{text}");
+        assert!(!text.contains("pii_"), "{text}");
+    }
+
+    #[test]
+    fn should_reject_invalid_pii_overrides() {
+        let mut rule = TableRule {
+            name: "t".to_string(),
+            columns: HashMap::from([(
+                "mobile".to_string(),
+                ColumnRule {
+                    sdtype: SdType::Pii,
+                    pii_provider: Some("nope".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            derive: vec![],
+            branches: vec![],
+            rows: None,
+            relationships: vec![],
+            strategy: TableStrategy::Uniform,
+        };
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule.clone()],
+        };
+        assert!(rules
+            .validate()
+            .unwrap_err()
+            .contains("unknown pii_provider"));
+
+        rule.columns.get_mut("mobile").unwrap().pii_provider = Some("phone".to_string());
+        rule.columns.get_mut("mobile").unwrap().sdtype = SdType::Auto;
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule.clone()],
+        };
+        assert!(rules
+            .validate()
+            .unwrap_err()
+            .contains("requires 'sdtype: pii'"));
+
+        rule.columns.get_mut("mobile").unwrap().sdtype = SdType::Keep;
+        rule.columns.get_mut("mobile").unwrap().pii_provider = None;
+        rule.columns.get_mut("mobile").unwrap().pii_unique = true;
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        assert!(rules.validate().unwrap_err().contains("require"));
+    }
+    #[test]
+    fn should_reject_pii_on_a_relationship_key() {
+        let rule = TableRule {
+            name: "orders".to_string(),
+            columns: HashMap::from([(
+                "user_id".to_string(),
+                ColumnRule {
+                    sdtype: SdType::Pii,
+                    ..Default::default()
+                },
+            )]),
+            derive: vec![],
+            branches: vec![],
+            rows: None,
+            relationships: vec![Relationship {
+                pk: "user_id".to_string(),
+                references: vec!["users.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                cardinality: CardinalityMode::ExactRows,
+                null_label: "null".to_string(),
+            }],
+            strategy: TableStrategy::Uniform,
+        };
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        assert!(rules
+            .validate()
+            .unwrap_err()
+            .contains("referential integrity"));
     }
 }

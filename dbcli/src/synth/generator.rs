@@ -1,7 +1,9 @@
 use crate::synth::copula::GaussianCopula;
 use crate::synth::fk_pool::{FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
-use crate::synth::rules::{ColumnMode, PoolStrategy, SynthRules, TableStrategy, ValuePool};
+use crate::synth::rules::{
+    ColumnMode, PoolStrategy, SynthRules, TableRule, TableStrategy, ValuePool,
+};
 use rand::Rng;
 use rand::SeedableRng;
 use serde_json::Value;
@@ -95,10 +97,82 @@ struct RelPool {
     pool_size: usize,
 }
 
+/// Per-column PII generation state (issue #71).
+struct PiiPlan {
+    provider: crate::synth::pii::PiiProvider,
+    /// Same observed value -> same fake value (derived from the placeholder
+    /// level index, so nothing about the value is stored).
+    stable: bool,
+    /// Never emit the same fake value twice.
+    unique: bool,
+    rng: rand::rngs::StdRng,
+    levels: HashMap<usize, String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl PiiPlan {
+    /// One fake value for `level`. A stable mapping derives it from the level so
+    /// equal levels map to equal fakes; `unique` makes retries advance the seed
+    /// (a fixed reseed would otherwise burn the budget on the same string) and
+    /// turns exhaustion into an error instead of a silent duplicate.
+    fn value(&mut self, level: Option<usize>, column_seed: u64) -> Result<String, String> {
+        if self.stable {
+            if let Some(cached) = level.and_then(|index| self.levels.get(&index)) {
+                return Ok(cached.clone());
+            }
+        }
+        for attempt in 0..64u64 {
+            let candidate = if self.stable {
+                let seed = column_seed
+                    ^ (level.unwrap_or(0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ attempt.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let mut level_rng = rand::rngs::StdRng::seed_from_u64(seed);
+                crate::synth::pii::generate_value(self.provider, &mut level_rng)
+            } else {
+                crate::synth::pii::generate_value(self.provider, &mut self.rng)
+            };
+            if self.unique && !self.seen.insert(candidate.clone()) {
+                continue;
+            }
+            if self.stable {
+                if let Some(index) = level {
+                    self.levels.insert(index, candidate.clone());
+                }
+            }
+            return Ok(candidate);
+        }
+        Err(format!(
+            "provider '{}' could not produce a unique value after 64 attempts",
+            self.provider.as_str()
+        ))
+    }
+}
+
 pub fn generate(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
     config: &GeneratorConfig,
+) -> Result<GeneratedData, String> {
+    generate_with(models, rules, config, false)
+}
+
+/// Like [`generate`], but forces every `model.pk` to be unique so the rows can
+/// be inserted into the source table. Only the SQL export uses this: CSV/JSONL
+/// have no key constraint, and changing their key draws would move the very
+/// distribution `synth report` scores (see UserGuide §主键唯一性).
+pub fn generate_unique_primary_keys(
+    models: &HashMap<String, TableModel>,
+    rules: &SynthRules,
+    config: &GeneratorConfig,
+) -> Result<GeneratedData, String> {
+    generate_with(models, rules, config, true)
+}
+
+fn generate_with(
+    models: &HashMap<String, TableModel>,
+    rules: &SynthRules,
+    config: &GeneratorConfig,
+    unique_primary_keys: bool,
 ) -> Result<GeneratedData, String> {
     let mut rng = if let Some(s) = config.seed {
         rand::rngs::StdRng::seed_from_u64(s)
@@ -148,7 +222,7 @@ pub fn generate(
             .find(|t| &t.name == table_name)
             .ok_or_else(|| format!("no rule for table '{}'", table_name))?;
 
-        let row_count = config
+        let mut row_count = config
             .rows_per_table
             .get(table_name)
             .copied()
@@ -162,6 +236,67 @@ pub fn generate(
         };
 
         let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
+
+        // `cardinality: modeled` (issue #72) replaces the fixed row count and
+        // the independent FK draw with one sampled count per parent key.
+        let mut modeled_assignments: HashMap<String, Vec<Value>> = HashMap::new();
+        {
+            let modeled: Vec<&crate::synth::rules::Relationship> = rule
+                .relationships
+                .iter()
+                .filter(|rel| rel.cardinality == crate::synth::rules::CardinalityMode::Modeled)
+                .collect();
+            if modeled.len() > 1 {
+                return Err(format!(
+                    "table '{}': only one relationship may use `cardinality: modeled` \
+                     (multiple modeled relationships are not supported)",
+                    table_name
+                ));
+            }
+            if let Some(rel) = modeled.first() {
+                let distribution = model.fk_cardinality.get(&rel.pk).ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': `cardinality: modeled` needs a learned \
+                         distribution in the child model; retrain with `synth train`",
+                        table_name, rel.pk
+                    )
+                })?;
+                let pool = rel_pools
+                    .iter_mut()
+                    .find(|pool| pool.column == rel.pk)
+                    .ok_or_else(|| {
+                        format!(
+                            "table '{}' relationship '{}': no FK pool was built",
+                            table_name, rel.pk
+                        )
+                    })?;
+                let parent_values = pool.pool.distinct_values();
+                if parent_values.is_empty() {
+                    return Err(format!(
+                        "table '{}' relationship '{}': modeled cardinality needs a non-empty \
+                         parent key pool",
+                        table_name, rel.pk
+                    ));
+                }
+                let unique = pool.unique;
+                let mut assignments: Vec<Value> = Vec::new();
+                for value in parent_values {
+                    let sampled = distribution.sample_count(rng.gen::<f64>());
+                    // A 1:1 relationship can only give a parent 0 or 1 child.
+                    let count = if unique { sampled.min(1) } else { sampled };
+                    assignments.extend(std::iter::repeat_n(value, count as usize));
+                }
+                if distribution.null_share > 0.0 && distribution.null_share < 1.0 {
+                    let non_null = assignments.len() as f64;
+                    let null_rows = (non_null * distribution.null_share
+                        / (1.0 - distribution.null_share))
+                        .round() as usize;
+                    assignments.extend(std::iter::repeat_n(Value::Null, null_rows));
+                }
+                row_count = assignments.len();
+                modeled_assignments.insert(rel.pk.clone(), assignments);
+            }
+        }
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
@@ -207,12 +342,33 @@ pub fn generate(
             })
             .collect();
 
+        // PII columns are filled independently of the copula (issue #71).
+        let mut pii_plans: Vec<Option<PiiPlan>> = column_order
+            .iter()
+            .map(|col_name| {
+                let provider = model.columns.get(col_name).and_then(|column| column.pii)?;
+                let column_rule = rule.columns.get(col_name);
+                Some(PiiPlan {
+                    provider,
+                    stable: column_rule.is_some_and(|rule| rule.pii_stable_mapping),
+                    unique: column_rule.is_some_and(|rule| rule.pii_unique),
+                    rng: column_null_rng(config.seed, table_name, col_name),
+                    levels: HashMap::new(),
+                    seen: std::collections::HashSet::new(),
+                })
+            })
+            .collect();
+
         let mut rows = Vec::with_capacity(row_count);
 
         for t in 0..row_count {
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
+                if let Some(assignments) = modeled_assignments.get(col_name) {
+                    row.push(assignments.get(t).cloned().unwrap_or(Value::Null));
+                    continue;
+                }
                 if let Some(null_rng) = null_rngs[col_idx].as_mut() {
                     let u: f64 = null_rng.gen();
                     if u < null_rates[col_idx] {
@@ -244,6 +400,28 @@ pub fn generate(
                     continue;
                 }
 
+                // PII fill runs after FK assignment so a relationship column is
+                // never replaced by a fake (referential integrity wins).
+                if let Some(plan) = pii_plans[col_idx].as_mut() {
+                    let uniform = uniform_samples
+                        .get(col_idx)
+                        .and_then(|column| column.get(t))
+                        .copied()
+                        .unwrap_or(0.5);
+                    let level = match model.columns.get(col_name).map(|column| &column.marginal) {
+                        Some(crate::synth::marginal::Marginal::Categorical(params)) => {
+                            Some(params.sample_index(uniform))
+                        }
+                        _ => None,
+                    };
+                    let seed = column_pii_seed(config.seed, table_name, col_name);
+                    let value = plan.value(level, seed).map_err(|error| {
+                        format!("table '{}' column '{}': {}", table_name, col_name, error)
+                    })?;
+                    row.push(Value::String(value));
+                    continue;
+                }
+
                 let uniform_val = uniform_samples
                     .get(col_idx)
                     .and_then(|col| col.get(t))
@@ -265,6 +443,11 @@ pub fn generate(
         // Referenced columns get rejection-redraw until every value is
         // distinct; a duplicated parent key cannot be FK-loaded downstream.
         for (col_idx, col_name) in column_order.iter().enumerate() {
+            if modeled_assignments.contains_key(col_name) {
+                // The row count and the per-parent counts come from the learned
+                // distribution; forcing uniqueness would destroy it.
+                continue;
+            }
             if !referenced_targets.contains(&format!("{}.{}", table_name, col_name)) {
                 continue;
             }
@@ -345,6 +528,26 @@ pub fn generate(
             }
         }
 
+        // Issue #82: for the SQL export, `model.pk` is a real primary key even
+        // when no other table references it, so duplicated values cannot be
+        // inserted back. Enforced on the copula-generated values only; the
+        // explicit column-level overrides and branch repair below run later and
+        // are the user's choice.
+        if unique_primary_keys {
+            enforce_primary_key_uniqueness(
+                &mut rows,
+                &PkGuard {
+                    table_name,
+                    model,
+                    rule,
+                    column_order,
+                    config,
+                },
+                &mut rel_pools,
+                &mut rng,
+            )?;
+        }
+
         // Phase 4 (plan §1): column-level fixed / values / fixed_range
         // overrides run after copula/marginal, FK and NULL injection.
         apply_column_value_overrides(
@@ -413,6 +616,358 @@ pub fn generate(
         branches: branch_outcomes,
         value_pools: value_pool_outcomes,
     })
+}
+
+/// Per-table inputs the primary-key uniqueness pass needs, grouped so the
+/// entry point stays under clippy's argument limit.
+struct PkGuard<'a> {
+    table_name: &'a str,
+    model: &'a TableModel,
+    rule: &'a TableRule,
+    column_order: &'a [String],
+    config: &'a GeneratorConfig,
+}
+
+/// True when a primary-key column cannot supply a fresh value, so uniqueness
+/// is not enforceable here:
+/// - a `fixed` / `values` / `fixed_range` override is the user's explicit
+///   choice and wins over the primary-key contract (existing behaviour);
+/// - the column is a relationship pk (a foreign key child), whose uniqueness
+///   is governed by the pool strategy and referential integrity;
+/// - a zero-variance model (`min == max`) has no value space to redraw from.
+fn pk_column_is_frozen(guard: &PkGuard, column: &str) -> bool {
+    if guard
+        .rule
+        .columns
+        .get(column)
+        .is_some_and(|c| c.has_column_override())
+    {
+        return true;
+    }
+    if guard.rule.relationships.iter().any(|r| r.pk == column) {
+        return true;
+    }
+    guard
+        .model
+        .columns
+        .get(column)
+        .is_some_and(|c| matches!((c.min, c.max), (Some(lo), Some(hi)) if lo == hi))
+}
+
+/// Draw one fresh value for a primary-key column, from the parent pool when
+/// the column is also a foreign key (values must stay inside the referenced
+/// domain) and from its own marginal otherwise.
+fn sample_uniqueness_value(
+    column: &str,
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+) -> Value {
+    if let Some(rel) = rel_pools.iter_mut().find(|r| r.column == column) {
+        return rel
+            .pool
+            .sample_one(rel.strategy, rng)
+            .unwrap_or(Value::Null);
+    }
+    // A PII key must be redrawn through its provider: the stored marginal is a
+    // placeholder and would emit `__pii_level_N` strings.
+    if let Some(provider) = guard
+        .model
+        .columns
+        .get(column)
+        .and_then(|column| column.pii)
+    {
+        return Value::String(crate::synth::pii::generate_value(provider, rng));
+    }
+    gen_column_value(
+        guard.model.columns.get(column),
+        rng.gen::<f64>(),
+        guard.config.enforce_min_max_values,
+    )
+}
+
+/// Number of distinct values the learned marginal can produce, when that is
+/// knowable (`None` = unbounded, e.g. a continuous marginal or a datetime
+/// epoch axis). Only the redraw-vs-extrapolate decision reads it.
+fn pk_value_space(model: &TableModel, column: &str) -> Option<usize> {
+    let col = model.columns.get(column)?;
+    if let crate::synth::marginal::Marginal::Categorical(p) = &col.marginal {
+        return Some(p.values.len());
+    }
+    let (min, max) = (col.min?, col.max?);
+    if !min.is_finite() || !max.is_finite() || max < min {
+        return None;
+    }
+    let step = match col.rounding {
+        Some(0) => 1.0,
+        _ => 10f64.powi(-(col.decimal_scale? as i32)),
+    };
+    if step <= 0.0 {
+        return None;
+    }
+    let span = (max - min) / step;
+    if !span.is_finite() || span < 0.0 || span > usize::MAX as f64 {
+        return None;
+    }
+    Some(span.round() as usize + 1)
+}
+
+/// Redraw the slot from the marginal until it holds an unseen value. Returns
+/// `false` when the budget runs out (the caller then extrapolates).
+fn redraw_unique(
+    slot: &mut Value,
+    column: &str,
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    for _ in 0..10_000 {
+        let candidate = sample_uniqueness_value(column, guard, rel_pools, rng);
+        if candidate.is_null() {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            *slot = candidate;
+            return true;
+        }
+    }
+    false
+}
+
+/// Extend a numeric or datetime primary key past its trained maximum with a
+/// deterministic sequence (`max + step`, `max + 2*step`, ...). Categorical
+/// (string) values have no safe extension, so they return `None` and the
+/// caller reports the impossibility.
+fn extrapolate_unique(
+    column: &str,
+    guard: &PkGuard,
+    extra: &mut usize,
+    seen: &mut std::collections::HashSet<String>,
+) -> Option<Value> {
+    loop {
+        *extra += 1;
+        if *extra > 10_000_000 {
+            return None;
+        }
+        let candidate = extrapolated_value(guard.model, column, *extra)?;
+        if seen.insert(candidate.to_string()) {
+            return Some(candidate);
+        }
+    }
+}
+
+/// The `extra`-th value past the trained domain for a numeric or datetime
+/// column (`None` for a categorical one, which has no safe extension).
+fn extrapolated_value(model: &TableModel, column: &str, extra: usize) -> Option<Value> {
+    let col = model.columns.get(column)?;
+    match col.logical_type {
+        crate::synth::model::LogicalType::Numerical => {
+            let base = col.max?;
+            let step = match col.rounding {
+                Some(0) => 1.0,
+                _ => col
+                    .decimal_scale
+                    .map(|scale| 10f64.powi(-(scale as i32)))
+                    .unwrap_or(1.0),
+            };
+            let value = base + step * (extra as f64);
+            if col.rounding == Some(0) {
+                Some(Value::from(value as i64))
+            } else {
+                Some(Value::from(quantize(value, col.decimal_scale.unwrap_or(0))))
+            }
+        }
+        crate::synth::model::LogicalType::Datetime => {
+            let base = col.max?;
+            let format = col.datetime_format.as_deref();
+            // A date-only format ignores sub-day advances, so stepping by one
+            // second would spend the whole budget on the same string.
+            let step = format.map(datetime_step_seconds).unwrap_or(1.0);
+            let value = base + step * (extra as f64);
+            match format {
+                Some(fmt) => Some(Value::String(crate::synth::datetime::format_epoch(
+                    value, fmt,
+                )?)),
+                None => Some(Value::from(value)),
+            }
+        }
+        crate::synth::model::LogicalType::Categorical => None,
+    }
+}
+
+/// Step that actually changes a rendered datetime: one day for a date-only
+/// format, one second otherwise.
+fn datetime_step_seconds(format: &str) -> f64 {
+    const TIME_DIRECTIVES: [&str; 9] = ["%H", "%M", "%S", "%T", "%R", "%I", "%p", "%f", "%.f"];
+    if TIME_DIRECTIVES
+        .iter()
+        .any(|directive| format.contains(directive))
+    {
+        1.0
+    } else {
+        86_400.0
+    }
+}
+
+/// Enforce `model.pk` uniqueness on the copula-generated values (issue #82).
+///
+/// A single-column primary key is rejection-redrawn like a referenced key, and
+/// when the observed value space is too small for the requested row count the
+/// surplus is extrapolated past the trained domain (integer ids continue the
+/// sequence, dates advance by seconds) so the export stays loadable rather
+/// than repeating keys. A composite primary key is redrawn by tuple. NULLs are
+/// not counted: a primary key is `NOT NULL` in any real schema, and excluding
+/// them keeps nullable-column fixtures unchanged.
+fn enforce_primary_key_uniqueness(
+    rows: &mut [Vec<Value>],
+    guard: &PkGuard,
+    rel_pools: &mut [RelPool],
+    rng: &mut rand::rngs::StdRng,
+) -> Result<(), String> {
+    let PkGuard {
+        table_name,
+        model,
+        column_order,
+        ..
+    } = *guard;
+    let row_count = rows.len();
+    if row_count <= 1 || model.pk.is_empty() {
+        return Ok(());
+    }
+
+    // A pk column absent from `column_order` cannot be checked; the model's
+    // copula column set is the source of truth for what was generated.
+    let pk_indices: Vec<usize> = model
+        .pk
+        .iter()
+        .filter_map(|name| column_order.iter().position(|c| c == name))
+        .collect();
+    if pk_indices.is_empty() {
+        return Ok(());
+    }
+    let pk_names: Vec<&str> = pk_indices
+        .iter()
+        .map(|&index| column_order[index].as_str())
+        .collect();
+
+    if pk_indices.len() == 1 {
+        let index = pk_indices[0];
+        let column = pk_names[0];
+        if pk_column_is_frozen(guard, column) {
+            return Ok(());
+        }
+
+        // When the observed value space already fits the requested rows, redraw
+        // can fill every slot from the learned marginal. Otherwise (scale-up
+        // past the trained keys) the surplus is extrapolated past the domain.
+        // A PII key draws from its provider, whose domain is unbounded.
+        let is_pii = model
+            .columns
+            .get(column)
+            .is_some_and(|column| column.pii.is_some());
+        let feasible = is_pii
+            || pk_value_space(model, column)
+                .map(|space| space >= row_count)
+                .unwrap_or(true);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut extra = 0usize;
+        for row in rows.iter_mut() {
+            if row[index].is_null() {
+                continue;
+            }
+            if seen.insert(row[index].to_string()) {
+                continue;
+            }
+            if feasible && redraw_unique(&mut row[index], column, guard, rel_pools, rng, &mut seen)
+            {
+                continue;
+            }
+            let candidate =
+                extrapolate_unique(column, guard, &mut extra, &mut seen).ok_or_else(|| {
+                    format!(
+                        "primary key column '{}.{}' cannot supply {row_count} unique values: \
+                         its observed space is exhausted and the marginal is not numeric or \
+                         datetime, so it cannot be extended; reduce --rows or drop the table \
+                         from the rules",
+                        table_name, column
+                    )
+                })?;
+            row[index] = candidate;
+        }
+        return Ok(());
+    }
+
+    // Composite primary key: members may repeat individually, only the tuple
+    // must be unique.
+    let frozen: Vec<bool> = pk_names
+        .iter()
+        .map(|name| pk_column_is_frozen(guard, name))
+        .collect();
+    if frozen.iter().all(|is_frozen| *is_frozen) {
+        return Ok(());
+    }
+
+    fn tuple_key(row: &[Value], pk_indices: &[usize]) -> Option<String> {
+        if pk_indices.iter().any(|&index| row[index].is_null()) {
+            return None;
+        }
+        Some(
+            pk_indices
+                .iter()
+                .map(|&index| row[index].to_string())
+                .collect::<Vec<String>>()
+                .join("\u{1f}"),
+        )
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows.iter_mut() {
+        let Some(key) = tuple_key(row, &pk_indices) else {
+            continue;
+        };
+        if seen.insert(key) {
+            continue;
+        }
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            if attempts >= 10_000 {
+                return Err(format!(
+                    "composite primary key ({}) on table '{}' exhausted its value space \
+                     after {attempts} redraws but {row_count} rows are requested; duplicated \
+                     primary keys cannot be inserted back into the source table",
+                    pk_names.join(", "),
+                    table_name
+                ));
+            }
+            for (slot, &index) in pk_indices.iter().enumerate() {
+                if frozen[slot] {
+                    continue;
+                }
+                let column = column_order[index].as_str();
+                // Redraw first: it keeps the trained marginals while they can
+                // still cover the rows. Once the tuple space is exhausted,
+                // extend numeric/date members instead of failing.
+                let candidate = if attempts <= 100 {
+                    sample_uniqueness_value(column, guard, rel_pools, rng)
+                } else {
+                    extrapolated_value(model, column, attempts)
+                        .unwrap_or_else(|| sample_uniqueness_value(column, guard, rel_pools, rng))
+                };
+                if !candidate.is_null() {
+                    row[index] = candidate;
+                }
+            }
+            if let Some(key) = tuple_key(row, &pk_indices) {
+                if seen.insert(key) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn round_to_scale(value: f64, scale: u8, strategy: rust_decimal::RoundingStrategy) -> f64 {
@@ -624,6 +1179,12 @@ fn column_null_rng(base: Option<u64>, table: &str, column: &str) -> rand::rngs::
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::rngs::StdRng::from_entropy(),
     }
+}
+
+/// Stable seed for a PII column, used by `stable_mapping` to derive one fake
+/// value per placeholder level.
+fn column_pii_seed(base: Option<u64>, table: &str, column: &str) -> u64 {
+    table_seed(base, &format!("{}:{}:pii", table, column)).unwrap_or(0)
 }
 
 // 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
@@ -1794,9 +2355,11 @@ fn build_rel_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synth::cardinality::CardinalityDist;
     use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
-    use crate::synth::rules::{ColumnRule, Relationship, TableRule, ValuePool};
+    use crate::synth::pii::PiiProvider;
+    use crate::synth::rules::{CardinalityMode, ColumnRule, Relationship, TableRule, ValuePool};
     use std::collections::BTreeMap;
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
@@ -1830,6 +2393,7 @@ mod tests {
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -1884,6 +2448,7 @@ mod tests {
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -2013,6 +2578,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2029,6 +2595,7 @@ mod tests {
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2070,6 +2637,7 @@ mod tests {
                 references: vec!["a.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         b_rule.rows = Some(30);
@@ -2080,6 +2648,7 @@ mod tests {
                 references: vec!["b.a_id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         c_rule.rows = Some(10);
@@ -2142,6 +2711,7 @@ mod tests {
                 column_order: vec!["k".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let mut models = HashMap::new();
         models.insert("parent".to_string(), parent);
@@ -2156,6 +2726,7 @@ mod tests {
                 references: vec!["parent.k".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2209,6 +2780,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2226,6 +2798,7 @@ mod tests {
                 references: vec!["a.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         b_rule.rows = Some(5);
@@ -2236,6 +2809,7 @@ mod tests {
                 references: vec!["b.a_id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2285,6 +2859,7 @@ mod tests {
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let mut models = HashMap::new();
         models.insert("parent".to_string(), parent);
@@ -2299,6 +2874,7 @@ mod tests {
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2373,6 +2949,7 @@ mod tests {
                     column_order: vec!["total".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -2386,6 +2963,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -2467,6 +3045,7 @@ mod tests {
                         })
                         .collect(),
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2480,6 +3059,7 @@ mod tests {
             references: vec![format!("{}.id", parent)],
             pool_strategy: PoolStrategy::Projection { unique: false },
             null_label: "null".to_string(),
+            cardinality: Default::default(),
         };
         let mut a = single_rule("a", vec![]);
         a.rows = Some(3);
@@ -2531,6 +3111,7 @@ mod tests {
                     references: vec!["ghost.id".to_string()],
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
             )],
         };
@@ -2580,6 +3161,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2606,6 +3188,7 @@ mod tests {
                 references: vec!["users.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
             strategy: TableStrategy::Weighted,
         };
@@ -2664,6 +3247,7 @@ mod tests {
                         values: vec!["CN".to_string(), "US".to_string()],
                     },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
             )],
         };
@@ -2718,6 +3302,7 @@ mod tests {
                     column_order: vec!["status".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -2768,12 +3353,14 @@ mod tests {
                             values: levels.clone(),
                             weights: vec![1.0 / 19.0; 19],
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
                     column_order: vec!["amount".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
         let rules = SynthRules {
@@ -2842,6 +3429,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -2893,6 +3481,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -2940,6 +3529,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                     strategy: TableStrategy::Zipf,
                 },
@@ -3018,6 +3608,7 @@ mod tests {
                     column_order: vec!["id".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3075,6 +3666,7 @@ mod tests {
                     column_order: vec!["id".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
         models.insert(
@@ -3092,6 +3684,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3141,12 +3734,14 @@ mod tests {
                             loc: 100.0,
                             scale: 50.0,
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
                     column_order: vec!["value".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3200,12 +3795,14 @@ mod tests {
                             loc: 100.0,
                             scale: 50.0,
                         }),
+                        pii: None,
                     },
                 )]),
                 copula: CopulaInfo {
                     column_order: vec!["value".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3305,6 +3902,7 @@ mod tests {
                     column_order: vec!["amount".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3319,6 +3917,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -3426,6 +4025,7 @@ tables:
                     column_order: vec!["amount".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3539,6 +4139,7 @@ tables:
                 column_order: vec!["user_id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
 
         let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
@@ -3553,6 +4154,7 @@ tables:
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -3681,6 +4283,7 @@ tables:
                 column_order: vec!["user_id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
         let mut parent_rule = single_rule("users", vec![]);
@@ -3692,6 +4295,7 @@ tables:
                 references: vec!["users.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: true },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         child_rule.rows = Some(14);
@@ -3760,6 +4364,7 @@ tables:
                     loc: 1004.5678,
                     scale: 12.5,
                 }),
+                pii: None,
             },
         );
         let model = TableModel {
@@ -3779,6 +4384,7 @@ tables:
                 column_order: vec!["amt".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("payments".to_string(), model)]);
         let rules = SynthRules {
@@ -3815,6 +4421,7 @@ tables:
                     loc,
                     scale: std_dev,
                 }),
+                pii: None,
             },
         );
         TableModel {
@@ -3834,6 +4441,7 @@ tables:
                 column_order: vec!["amt".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -3921,6 +4529,7 @@ tables:
                     loc: 50.0,
                     scale: 10.0,
                 }),
+                pii: None,
             },
         );
         let model = TableModel {
@@ -3940,6 +4549,7 @@ tables:
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("ids".to_string(), model)]);
         let rules = SynthRules {
@@ -3975,6 +4585,7 @@ tables:
                         values: vec!["2024-01-01".into(), "2024-06-01".into()],
                         weights: vec![0.5, 0.5],
                     }),
+                    pii: None,
                 },
             );
             TableModel {
@@ -3994,6 +4605,7 @@ tables:
                     column_order: vec!["created_at".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -4036,6 +4648,7 @@ tables:
                 low: loc,
                 high: loc,
             }),
+            pii: None,
         }
     }
 
@@ -4109,6 +4722,7 @@ tables:
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -4141,6 +4755,7 @@ tables:
                 column_order: vec![a.to_string(), b.to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -4380,6 +4995,7 @@ tables:
                 column_order: vec!["v".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("t".to_string(), model)]);
 
@@ -4491,6 +5107,7 @@ tables:
                 column_order: vec!["a".to_string(), "b".to_string()],
                 correlation: vec![vec![1.0, rho], vec![rho, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         (model.clone(), HashMap::from([("t".to_string(), model)]))
     }
@@ -4677,6 +5294,7 @@ tables:
                     vec![0.0, 0.0, 1.0],
                 ],
             },
+            fk_cardinality: Default::default(),
         };
         HashMap::from([("t".to_string(), model)])
     }
@@ -4806,6 +5424,7 @@ tables:
                 column_order: vec!["status".to_string(), "amount".to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         HashMap::from([("t".to_string(), model)])
     }
@@ -5021,6 +5640,7 @@ tables:
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -5832,6 +6452,7 @@ tables:
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         table.branches.push(crate::synth::rules::BranchRule {
@@ -6033,6 +6654,7 @@ tables:
                         references: vec!["p.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -6110,5 +6732,811 @@ tables:
         let data = generate(&models, &rules, &config(&["t"], 3)).unwrap();
         let rows = serde_json::to_string(data.tables.get("t").unwrap()).unwrap();
         assert_eq!(rows, "[[-0.7745645303296556,0.1440950566134802,-0.8762332024966213],[1.0044406514899151,-0.803943491589223,-1.4398776414381587],[-2.1981105969970827,-0.19184861516094998,0.5787749357941152]]");
+    }
+
+    /// A single-column pk with fewer dictionary levels than requested rows is
+    /// impossible to make unique (issue #82): `generate` must fail fast and
+    /// name the column, not silently emit duplicate keys.
+    #[test]
+    fn should_reject_low_cardinality_primary_key_that_cannot_cover_rows() {
+        let mut model = categorical_model("t", "id");
+        model.pk = vec!["id".to_string()];
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let err = generate_unique_primary_keys(&models, &rules, &config(&["t"], 5))
+            .expect_err("low-cardinality primary key must error");
+        assert!(
+            err.contains("primary key column 't.id'"),
+            "error must name the primary key column: {err}"
+        );
+        assert!(err.contains('5'), "error must name the row count: {err}");
+    }
+
+    /// A numeric primary key with a bounded observed space still has to fill
+    /// more rows on scale-up (issue #82): the surplus continues past the
+    /// trained maximum instead of repeating keys or failing the run.
+    #[test]
+    fn should_extrapolate_numeric_primary_key_beyond_the_trained_maximum() {
+        let mut model = int_key_model("t", "id", 0.0);
+        let column = model.columns.get_mut("id").unwrap();
+        column.rounding = Some(0);
+        column.marginal = Marginal::Uniform(UniformParams {
+            low: 0.0,
+            high: 10.0,
+        });
+        column.min = Some(0.0);
+        column.max = Some(10.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config(&["t"], 25)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 25);
+        let distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            25,
+            "extrapolated primary keys must stay unique, got {} distinct of {}",
+            distinct.len(),
+            rows.len()
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row[0].as_i64().is_some_and(|value| value > 10)),
+            "the surplus keys must extend past the trained maximum"
+        );
+    }
+
+    /// Primary-key uniqueness is a SQL-export concern (issue #82): the plain
+    /// generator used for CSV/JSONL must keep its historical draws, so the
+    /// distribution `synth report` scores does not move.
+    #[test]
+    fn should_keep_duplicate_primary_keys_on_the_non_sql_path() {
+        let mut model = int_key_model("t", "id", 0.0);
+        let column = model.columns.get_mut("id").unwrap();
+        column.rounding = Some(0);
+        column.marginal = Marginal::Uniform(UniformParams {
+            low: 0.0,
+            high: 10.0,
+        });
+        column.min = Some(0.0);
+        column.max = Some(10.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 25)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert!(
+            distinct.len() < rows.len(),
+            "the non-SQL path must keep drawing with replacement"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row[0].as_i64().is_some_and(|value| value <= 10)),
+            "the non-SQL path must not extrapolate"
+        );
+    }
+
+    /// Composite primary key members may repeat individually; only the tuple
+    /// must be unique. `a` has two levels over six rows, so a per-column rule
+    /// would fail even though the tuple space is large enough.
+    #[test]
+    fn should_enforce_composite_primary_key_tuple_uniqueness() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "a".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["x".to_string(), "y".to_string()],
+                    weights: vec![0.5, 0.5],
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "b".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["1", "2", "3", "4", "5"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    weights: vec![0.2; 5],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config(&["t"], 6)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 6);
+        let tuples: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|row| format!("{}\u{1f}{}", row[0], row[1]))
+            .collect();
+        assert_eq!(
+            tuples.len(),
+            6,
+            "composite primary key tuples must be unique, got {} distinct of {}",
+            tuples.len(),
+            rows.len()
+        );
+        let first_distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert!(
+            first_distinct.len() < rows.len(),
+            "a composite member is allowed to repeat (proves tuple-level, not per-column, uniqueness)"
+        );
+    }
+
+    /// A composite pk whose members cannot cover the row count must fail fast.
+    #[test]
+    fn should_reject_composite_primary_key_that_cannot_cover_rows() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "a".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["only".to_string()],
+                    weights: vec![1.0],
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "b".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["only".to_string()],
+                    weights: vec![1.0],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let err = generate_unique_primary_keys(&models, &rules, &config(&["t"], 3))
+            .expect_err("impossible composite primary key must error");
+        assert!(
+            err.contains("composite primary key"),
+            "error must mention the composite primary key: {err}"
+        );
+    }
+
+    fn cardinality_child_model(table: &str, column: &str, dist: CardinalityDist) -> TableModel {
+        let mut model = int_key_model(table, column, 0.0);
+        model.fk_cardinality.insert(column.to_string(), dist);
+        model
+    }
+
+    fn modeled_rule(pk: &str, parent: &str, unique: bool) -> TableRule {
+        single_rule(
+            "child",
+            vec![Relationship {
+                pk: pk.to_string(),
+                references: vec![format!("{}.id", parent)],
+                pool_strategy: PoolStrategy::Projection { unique },
+                cardinality: CardinalityMode::Modeled,
+                null_label: "null".to_string(),
+            }],
+        )
+    }
+
+    /// AC1: the generated per-parent child counts follow the learned
+    /// distribution (shape, zero share and mean).
+    #[test]
+    fn should_reproduce_modeled_cardinality_shape() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(100);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", false)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 100)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let parent_rows = data.tables.get("parent").unwrap();
+        assert_eq!(parent_rows.len(), 100);
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in child_rows {
+            *counts.entry(row[0].to_string()).or_insert(0) += 1;
+        }
+        let zero = parent_rows.len() - counts.len();
+        let with = |want: usize| {
+            counts.values().filter(|c| **c == want).count() + if want == 0 { zero } else { 0 }
+        };
+        let share = |want: usize| with(want) as f64 / parent_rows.len() as f64;
+        let average = child_rows.len() as f64 / parent_rows.len() as f64;
+
+        assert!(
+            (0.4..=1.0).contains(&average),
+            "average children per parent {average} outside [0.4, 1.0]"
+        );
+        assert!(
+            (0.4..=0.6).contains(&share(0)),
+            "zero-children share {} outside [0.4, 0.6]",
+            share(0)
+        );
+        assert!((share(0) - 0.5).abs() < 0.1, "0 bucket {} vs 0.5", share(0));
+        assert!((share(1) - 0.3).abs() < 0.1, "1 bucket {} vs 0.3", share(1));
+        assert!((share(2) - 0.2).abs() < 0.1, "2 bucket {} vs 0.2", share(2));
+    }
+
+    /// AC3: a modeled 1:1 relationship cannot give a parent more than one
+    /// child, even when the learned distribution has larger counts.
+    #[test]
+    fn should_clamp_modeled_cardinality_to_one_for_unique_relationships() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", true)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 60)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            child_rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            child_rows.len(),
+            "a 1:1 modeled relationship must reference each parent at most once"
+        );
+        assert!(child_rows.len() <= 60);
+    }
+
+    /// AC2: without `cardinality: modeled` the row count stays exactly
+    /// `--rows`, whatever the model learned.
+    #[test]
+    fn should_keep_exact_rows_when_cardinality_is_not_modeled() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 1.0)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(20);
+        let mut child = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "parent_id".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                cardinality: CardinalityMode::ExactRows,
+                null_label: "null".to_string(),
+            }],
+        );
+        child.rows = Some(37);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, child],
+        };
+
+        let data = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
+        assert_eq!(data.tables.get("parent").unwrap().len(), 20);
+        assert_eq!(data.tables.get("child").unwrap().len(), 37);
+    }
+
+    /// A modeled relationship without a learned distribution must fail loudly,
+    /// not silently fall back to the fixed row count.
+    #[test]
+    fn should_error_when_modeled_cardinality_has_no_learned_distribution() {
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                int_key_model("child", "parent_id", 0.0),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(10);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", false)],
+        };
+
+        let err = generate(&models, &rules, &config(&["parent", "child"], 10))
+            .expect_err("missing learned distribution must error");
+        assert!(
+            err.contains("learned distribution"),
+            "error must explain the missing distribution: {err}"
+        );
+    }
+
+    fn pii_model(table: &str, column: &str, provider: PiiProvider, levels: usize) -> TableModel {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                marginal: Marginal::Normal(NormalParams {
+                    loc: 0.0,
+                    scale: 1.0,
+                }),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: (0..levels).map(|i| format!("__pii_level_{i}")).collect(),
+                    weights: vec![1.0 / levels as f64; levels],
+                }),
+                pii: Some(provider),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string(), column.to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        }
+    }
+
+    /// AC1/AC2: a PII column is filled with format-valid fakes, never with the
+    /// placeholder dictionary values, and the run is deterministic by seed.
+    #[test]
+    fn should_fill_pii_columns_with_format_valid_fakes() {
+        for (provider, column) in [
+            (PiiProvider::Email, "email"),
+            (PiiProvider::Phone, "phone"),
+            (PiiProvider::Name, "full_name"),
+            (PiiProvider::IdCard, "id_card"),
+        ] {
+            let models = HashMap::from([("t".to_string(), pii_model("t", column, provider, 4))]);
+            let rules = SynthRules {
+                version: "1".to_string(),
+                tables: vec![single_rule("t", vec![])],
+            };
+            let config = GeneratorConfig {
+                rows_per_table: HashMap::from([("t".to_string(), 60)]),
+                seed: Some(11),
+                enforce_min_max_values: true,
+            };
+
+            let first = generate(&models, &rules, &config).unwrap();
+            let second = generate(&models, &rules, &config).unwrap();
+            let rows = first.tables.get("t").unwrap();
+            let again = second.tables.get("t").unwrap();
+            assert_eq!(rows.len(), 60);
+            for row in rows {
+                let value = row[1].as_str().expect("PII value must be a string");
+                assert!(
+                    provider.matches_format(value),
+                    "{provider:?} produced invalid value {value:?}"
+                );
+                assert!(
+                    !value.starts_with("__pii_level_"),
+                    "placeholder dictionary value leaked: {value}"
+                );
+            }
+            assert_eq!(rows, again, "same seed must reproduce the same fakes");
+        }
+    }
+
+    /// AC3: with `stable_mapping`, equal training levels map to equal fakes.
+    #[test]
+    fn should_map_equal_levels_to_equal_fakes_when_stable_mapping_is_set() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 3),
+        )]);
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                pii_stable_mapping: true,
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 200)]),
+            seed: Some(5),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate(&models, &rules, &config).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        let distinct: std::collections::HashSet<&str> =
+            rows.iter().filter_map(|row| row[1].as_str()).collect();
+        assert!(
+            (1..=3).contains(&distinct.len()),
+            "stable mapping must reuse at most one fake per level, got {}",
+            distinct.len()
+        );
+    }
+
+    /// `pii_unique` never repeats a fake value.
+    #[test]
+    fn should_keep_pii_values_unique_when_requested() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 4),
+        )]);
+        let mut rule = single_rule("t", vec![]);
+        rule.columns.insert(
+            "email".to_string(),
+            ColumnRule {
+                pii_unique: true,
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![rule],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 120)]),
+            seed: Some(9),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate(&models, &rules, &config).unwrap();
+        let distinct: std::collections::HashSet<&str> = data
+            .tables
+            .get("t")
+            .unwrap()
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(distinct.len(), 120, "unique PII values must not repeat");
+    }
+
+    /// AC5 regression: anonymizing one column leaves the others identical.
+    #[test]
+    fn should_leave_other_columns_identical_when_a_pii_column_is_added() {
+        let plain = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "email", PiiProvider::Email, 4),
+        )]);
+        let mut without_pii = pii_model("t", "email", PiiProvider::Email, 4);
+        without_pii.columns.get_mut("email").unwrap().pii = None;
+        let with_plain = HashMap::from([("t".to_string(), without_pii)]);
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 25)]),
+            seed: Some(3),
+            enforce_min_max_values: true,
+        };
+
+        let masked = generate(&plain, &rules, &config).unwrap();
+        let raw = generate(&with_plain, &rules, &config).unwrap();
+        let ids_masked: Vec<&Value> = masked.tables["t"].iter().map(|row| &row[0]).collect();
+        let ids_raw: Vec<&Value> = raw.tables["t"].iter().map(|row| &row[0]).collect();
+        assert_eq!(
+            ids_masked, ids_raw,
+            "a PII column must not move other columns"
+        );
+    }
+
+    fn date_only_model(table: &str, column: &str, start_epoch: i64, days: i64) -> TableModel {
+        let min = start_epoch as f64;
+        let max = (start_epoch + days * 86_400) as f64;
+        let mut columns = HashMap::new();
+        columns.insert(
+            column.to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Datetime,
+                datetime_epoch: Some(true),
+                datetime_format: Some("%Y-%m-%d".to_string()),
+                min: Some(min),
+                max: Some(max),
+                marginal: Marginal::Uniform(UniformParams {
+                    low: min,
+                    high: max,
+                }),
+                ..Default::default()
+            },
+        );
+        TableModel {
+            version: 1,
+            table: table.to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec![column.to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec![column.to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        }
+    }
+
+    /// A PII primary key must still be unique on the SQL path, redrawn through
+    /// its provider (the stored marginal is only a placeholder).
+    #[test]
+    fn should_keep_a_pii_primary_key_unique_on_the_sql_path() {
+        let base = pii_model("t", "email", PiiProvider::Email, 4);
+        let mut model = base;
+        model.pk = vec!["email".to_string()];
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 80)]),
+            seed: Some(13),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let emails: Vec<&str> = data.tables["t"]
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        let distinct: std::collections::HashSet<&str> = emails.iter().copied().collect();
+        assert_eq!(distinct.len(), 80, "PII primary keys must be unique");
+        assert!(emails
+            .iter()
+            .all(|value| PiiProvider::Email.matches_format(value)));
+        assert!(!emails.iter().any(|value| value.starts_with("__pii_level_")));
+    }
+
+    /// A date-only pk must scale up by whole days, not by seconds that render
+    /// to the same date.
+    #[test]
+    fn should_extrapolate_a_date_only_primary_key_by_days() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            date_only_model("t", "day", 1_700_000_000, 2),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 10)]),
+            seed: Some(21),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let days: Vec<String> = data.tables["t"]
+            .iter()
+            .filter_map(|row| row[0].as_str().map(str::to_string))
+            .collect();
+        let distinct: std::collections::HashSet<&String> = days.iter().collect();
+        assert_eq!(distinct.len(), 10, "10 rows need 10 distinct dates");
+        for day in &days {
+            assert_eq!(day.len(), 10, "date-only format expected, got {day}");
+            assert!(day.chars().nth(4) == Some('-') && day.chars().nth(7) == Some('-'));
+        }
+    }
+
+    /// A composite numeric pk must extend its numeric side when the tuple space
+    /// is exhausted, instead of failing after 10k redraws.
+    #[test]
+    fn should_extrapolate_a_composite_numeric_primary_key() {
+        let mut columns = HashMap::new();
+        for name in ["a", "b"] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Numerical,
+                    rounding: Some(0),
+                    min: Some(0.0),
+                    max: Some(4.0),
+                    marginal: Marginal::Uniform(UniformParams {
+                        low: 0.0,
+                        high: 4.0,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+            },
+            pk: vec!["a".to_string(), "b".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["a".to_string(), "b".to_string()],
+                correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 40)]),
+            seed: Some(4),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate_unique_primary_keys(&models, &rules, &config).unwrap();
+        let tuples: std::collections::HashSet<String> = data.tables["t"]
+            .iter()
+            .map(|row| format!("{}|{}", row[0], row[1]))
+            .collect();
+        assert_eq!(tuples.len(), 40, "the numeric side must extend past 5x5");
+    }
+
+    /// Stable mapping plus `unique` must not silently emit a duplicate when a
+    /// level's retry space is exhausted.
+    #[test]
+    fn should_error_instead_of_duplicating_a_stable_unique_pii_value() {
+        let mut plan = PiiPlan {
+            provider: PiiProvider::Email,
+            stable: true,
+            unique: true,
+            rng: rand::rngs::StdRng::seed_from_u64(1),
+            levels: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        };
+        let seed = 123u64;
+        // Poison every candidate the stable retry can produce for level 7.
+        for attempt in 0..64u64 {
+            let attempt_seed = seed
+                ^ 7u64.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ attempt.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let mut level_rng = rand::rngs::StdRng::seed_from_u64(attempt_seed);
+            plan.seen.insert(crate::synth::pii::generate_value(
+                PiiProvider::Email,
+                &mut level_rng,
+            ));
+        }
+        assert!(
+            plan.value(Some(7), seed).is_err(),
+            "exhausted stable+unique space must error, not duplicate"
+        );
+    }
+
+    /// Stable mapping plus `unique` over many levels stays distinct and OK.
+    #[test]
+    fn should_keep_stable_unique_values_distinct() {
+        let mut plan = PiiPlan {
+            provider: PiiProvider::Name,
+            stable: true,
+            unique: true,
+            rng: rand::rngs::StdRng::seed_from_u64(2),
+            levels: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        };
+        let mut values = std::collections::HashSet::new();
+        for level in 0..200 {
+            let value = plan
+                .value(Some(level), 999)
+                .unwrap_or_else(|e| panic!("level {level}: {e}"));
+            assert!(
+                values.insert(value.clone()),
+                "duplicate stable value {value}"
+            );
+        }
     }
 }

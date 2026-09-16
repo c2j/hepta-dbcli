@@ -1,0 +1,5 @@
+# No column overrides: PII detection runs by default.
+version: "1"
+tables:
+  - name: pii_users
+    relationships: []

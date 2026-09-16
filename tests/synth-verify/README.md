@@ -54,6 +54,62 @@ with no baseline (`--strict`, and `--min-score`). `verify_m2.py` asserts:
 | #67 AC5 | two runs over the same inputs produce byte-identical report JSON (and the same seed regenerates byte-identical data) |
 | #67 AC6 | baseline files contain only aggregate payloads (numeric knots or `[value, frequency]` pairs), never a row record |
 
+## pk-uniqueness run (#82)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_pk.sh
+```
+
+It loads `fixture_pk.sql` (a 12-key integer primary key, a 20×20 composite
+primary key, and a 3-key non-numeric primary key), trains the tables, and then:
+
+| Acceptance | Check |
+|---|---|
+| #82 AC1 | `generate --format sql --rows 200` on the 12-key table succeeds and the SQL loads back into MySQL with 200 rows / 200 distinct `id`s (the surplus is extrapolated past the trained maximum) |
+| #82 AC2 | the composite primary key round-trips: 200 rows / 200 distinct `(region, slot)` tuples even though each member repeats alone |
+| #82 AC1 | the non-numeric key table cannot be extended: `generate --format sql --rows 10` fails and names the column and the row count |
+
+## cardinality run (#72)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_cardinality.sh
+```
+
+It loads `fixture_cardinality.sql` (100 parent keys, 70 child rows distributed
+`{0: 0.5, 1: 0.3, 2: 0.2}`), trains, then generates with
+`cardinality: modeled` and with the default `exact_rows`. `verify_cardinality.py`
+asserts:
+
+| Acceptance | Check |
+|---|---|
+| #72 train | the child model stores a `fk_cardinality.parent_id` distribution exactly `{0: 0.5, 1: 0.3, 2: 0.2}` with no NULL share |
+| #72 AC1 | modeled generation reproduces the shape: the zero-children share is in `[0.4, 0.6]`, the average is in `[0.4, 1.0]`, and every non-NULL key references a generated parent key |
+| #72 AC4 | `synth report` emits a cardinality TV for the modeled edge and it is `< 0.1` |
+| #72 AC2 | without `modeled` the child row count stays exactly `--rows` |
+
+## PII run (#71)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_pii.sh
+```
+
+It loads `fixture_pii.sql` (200 rows over 50 emails, 200 phones and 30 names),
+trains twice (default and `sdtype: keep`) and generates four ways.
+`verify_pii.py` asserts:
+
+| Acceptance | Check |
+|---|---|
+| #71 recognition | the model marks `email` (email) and `full_name` (name) as PII |
+| #71 leak surfaces | no training email or name appears anywhere in the model JSON; the profile drops `email` / `full_name` `top_values` |
+| #71 AC1 | generated emails/phones/names never intersect the training values |
+| #71 AC2 | every generated email and phone matches its format pattern |
+| #71 AC5 | the same seed reproduces byte-identical output; non-PII columns are unaffected |
+| #71 AC3 | `pii_stable_mapping: true` emits at most one fake per training value (50 distinct here) |
+| #71 AC4 | `sdtype: keep` keeps the trained value space and leaves the model unmarked |
+
 ## What is asserted
 
 | Issue | Check |
