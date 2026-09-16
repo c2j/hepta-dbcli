@@ -186,6 +186,7 @@ fn route_impl(
                 warnings,
             ));
         }
+        Strategy::Naivediff => Box::new(bucket_diff::BucketDiffer),
     };
 
     Ok(finish_route(strategy, key_columns, warnings))
