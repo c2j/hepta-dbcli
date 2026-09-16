@@ -1,4 +1,6 @@
 #[cfg(feature = "synth")]
+pub mod cardinality;
+#[cfg(feature = "synth")]
 pub mod cmd;
 #[cfg(feature = "synth")]
 pub mod copula;
@@ -1202,6 +1204,7 @@ mod tests {
                 column_order: vec![],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         };
         std::fs::write(
             dir.path().join("orders.model.json"),
@@ -1409,6 +1412,7 @@ mod tests {
                 column_order: vec!["amount".to_string(), "kind".to_string()],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -1679,6 +1683,7 @@ mod tests {
                 column_order: columns.iter().map(|(n, _)| n.to_string()).collect(),
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         }
     }
 

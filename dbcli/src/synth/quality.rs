@@ -1178,6 +1178,7 @@ mod tests {
                 column_order: columns.iter().map(|(n, _, _)| n.to_string()).collect(),
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         }
     }
 

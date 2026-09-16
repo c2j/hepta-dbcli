@@ -17,6 +17,11 @@ pub struct TableModel {
     pub pk: Vec<String>,
     pub columns: HashMap<String, ColumnModel>,
     pub copula: CopulaInfo,
+    /// Learned child-row-count distributions keyed by this table's FK column
+    /// (issue #72). Empty for tables that are never children; `serde(default)`
+    /// keeps old models loadable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fk_cardinality: HashMap<String, crate::synth::cardinality::CardinalityDist>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +171,7 @@ mod tests {
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
 
         let json = serde_json::to_string_pretty(&model).unwrap();
@@ -234,6 +240,7 @@ mod tests {
                 column_order: vec![],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         };
 
         let json = serde_json::to_string(&model).unwrap();

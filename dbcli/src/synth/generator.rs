@@ -2175,6 +2175,7 @@ mod tests {
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -2229,6 +2230,7 @@ mod tests {
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -2358,6 +2360,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2487,6 +2490,7 @@ mod tests {
                 column_order: vec!["k".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let mut models = HashMap::new();
         models.insert("parent".to_string(), parent);
@@ -2554,6 +2558,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2630,6 +2635,7 @@ mod tests {
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let mut models = HashMap::new();
         models.insert("parent".to_string(), parent);
@@ -2718,6 +2724,7 @@ mod tests {
                     column_order: vec!["total".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -2812,6 +2819,7 @@ mod tests {
                         })
                         .collect(),
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -2925,6 +2933,7 @@ mod tests {
                     column_order: vec![column.to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -3063,6 +3072,7 @@ mod tests {
                     column_order: vec!["status".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3119,6 +3129,7 @@ mod tests {
                     column_order: vec!["amount".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
         let rules = SynthRules {
@@ -3363,6 +3374,7 @@ mod tests {
                     column_order: vec!["id".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3420,6 +3432,7 @@ mod tests {
                     column_order: vec!["id".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
         models.insert(
@@ -3492,6 +3505,7 @@ mod tests {
                     column_order: vec!["value".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3551,6 +3565,7 @@ mod tests {
                     column_order: vec!["value".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3650,6 +3665,7 @@ mod tests {
                     column_order: vec!["amount".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3771,6 +3787,7 @@ tables:
                     column_order: vec!["amount".to_string(), "user_id".to_string()],
                     correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
                 },
+                fk_cardinality: Default::default(),
             },
         );
 
@@ -3884,6 +3901,7 @@ tables:
                 column_order: vec!["user_id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
 
         let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
@@ -4026,6 +4044,7 @@ tables:
                 column_order: vec!["user_id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("users".to_string(), parent), ("orders".to_string(), child)]);
         let mut parent_rule = single_rule("users", vec![]);
@@ -4124,6 +4143,7 @@ tables:
                 column_order: vec!["amt".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("payments".to_string(), model)]);
         let rules = SynthRules {
@@ -4179,6 +4199,7 @@ tables:
                 column_order: vec!["amt".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -4285,6 +4306,7 @@ tables:
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("ids".to_string(), model)]);
         let rules = SynthRules {
@@ -4339,6 +4361,7 @@ tables:
                     column_order: vec!["created_at".to_string()],
                     correlation: vec![vec![1.0]],
                 },
+                fk_cardinality: Default::default(),
             }
         }
 
@@ -4454,6 +4477,7 @@ tables:
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -4486,6 +4510,7 @@ tables:
                 column_order: vec![a.to_string(), b.to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -4725,6 +4750,7 @@ tables:
                 column_order: vec!["v".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("t".to_string(), model)]);
 
@@ -4836,6 +4862,7 @@ tables:
                 column_order: vec!["a".to_string(), "b".to_string()],
                 correlation: vec![vec![1.0, rho], vec![rho, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         (model.clone(), HashMap::from([("t".to_string(), model)]))
     }
@@ -5022,6 +5049,7 @@ tables:
                     vec![0.0, 0.0, 1.0],
                 ],
             },
+            fk_cardinality: Default::default(),
         };
         HashMap::from([("t".to_string(), model)])
     }
@@ -5151,6 +5179,7 @@ tables:
                 column_order: vec!["status".to_string(), "amount".to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         HashMap::from([("t".to_string(), model)])
     }
@@ -5366,6 +5395,7 @@ tables:
                 column_order: vec![column.to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         }
     }
 
@@ -6601,6 +6631,7 @@ tables:
                 column_order: vec!["a".to_string(), "b".to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("t".to_string(), model)]);
         let rules = SynthRules {
@@ -6673,6 +6704,7 @@ tables:
                 column_order: vec!["a".to_string(), "b".to_string()],
                 correlation: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             },
+            fk_cardinality: Default::default(),
         };
         let models = HashMap::from([("t".to_string(), model)]);
         let rules = SynthRules {

@@ -405,6 +405,7 @@ pub(crate) fn build_model_with_overrides(
             column_order,
             correlation,
         },
+        fk_cardinality: Default::default(),
     };
     Ok((model, skipped))
 }
