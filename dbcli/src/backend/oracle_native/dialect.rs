@@ -1,5 +1,7 @@
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, NULL_SENTINEL};
+use crate::backend::{
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, ScanSqlSpec, NULL_SENTINEL,
+};
 
 /// MD5 SQL: `STANDARD_HASH` is 12c+; 11g uses `DBMS_CRYPTO.HASH` (same RAW MD5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +394,27 @@ impl Dialect for OracleDialect {
         }
     }
 
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String {
+        let mut table = quoted_table(&spec.schema, &spec.table);
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\nWHERE ({f})"))
+            .unwrap_or_default();
+        let order_by = if spec.order_by.is_empty() {
+            String::new()
+        } else {
+            format!("\nORDER BY {}", spec.order_by.join(", "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}{order_by}",
+            spec.columns.join(", ")
+        )
+    }
+
     fn row_hash_expr(&self, exprs: &[String]) -> String {
         self.md5_hash(&exprs.join(" || '#' || "))
     }
@@ -682,5 +705,40 @@ mod tests {
             "COALESCE(RAWTOHEX(\"DATA\"), '\u{1f}NULL\u{1f}')"
         );
         assert!(d.normalize_expr(&col("DOC", "CLOB", true)).is_err());
+    }
+
+    #[test]
+    fn scan_sql_matches_oracle_dialect_byte_for_byte() {
+        let rs = crate::backend::oracle::dialect::OracleDialect::new();
+        let native = OracleDialect::new();
+        let spec = ScanSqlSpec {
+            schema: Some("SCOTT".into()),
+            table: "DAT_FUND_CJQS".into(),
+            columns: vec![
+                r#""K1""#.into(),
+                r#""K2""#.into(),
+                native
+                    .normalize_expr(&col("AMT", "NUMBER(16,2)", true))
+                    .unwrap(),
+            ],
+            order_by: vec![r#""K1""#.into(), r#""K2""#.into()],
+            filter: Some("BCRQ='20251215'".into()),
+            scn: Some(424242),
+        };
+        let keyless = ScanSqlSpec {
+            order_by: vec![],
+            filter: None,
+            scn: None,
+            ..spec.clone()
+        };
+        assert_eq!(
+            rs.render_scan_sql(&spec),
+            native.render_scan_sql(&spec),
+            "oracle/oracle_native scan SQL must stay in lockstep"
+        );
+        assert_eq!(
+            rs.render_scan_sql(&keyless),
+            native.render_scan_sql(&keyless)
+        );
     }
 }

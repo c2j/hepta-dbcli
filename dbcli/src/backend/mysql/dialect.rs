@@ -1,6 +1,7 @@
 use crate::backend::error::DbError;
 use crate::backend::{
-    ChecksumSqlSpec, ColumnNormSpec, Dialect, HashCapability, KeysetPageSpec, NULL_SENTINEL,
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, HashCapability, KeysetPageSpec, ScanSqlSpec,
+    NULL_SENTINEL,
 };
 
 pub(crate) struct MySqlDialect;
@@ -291,6 +292,27 @@ impl Dialect for MySqlDialect {
             cols.join(", "),
             crate::backend::keyset_order_by('`', spec, "mysql"),
             spec.page_size
+        )
+    }
+
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String {
+        let table = match &spec.schema {
+            Some(s) => format!("`{}`.`{}`", s, spec.table),
+            None => format!("`{}`", spec.table),
+        };
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\nWHERE ({f})"))
+            .unwrap_or_default();
+        let order_by = if spec.order_by.is_empty() {
+            String::new()
+        } else {
+            format!("\nORDER BY {}", spec.order_by.join(", "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}{order_by}",
+            spec.columns.join(", ")
         )
     }
 
@@ -619,6 +641,39 @@ mod tests {
         };
         let sql = MySqlDialect.render_keyset_page_sql(&spec);
         assert!(!sql.contains("COLLATE"), "sql={sql}");
+    }
+
+    #[test]
+    fn scan_sql_orders_by_raw_key_without_collate() {
+        let spec = ScanSqlSpec {
+            schema: Some("shop".into()),
+            table: "orders".into(),
+            columns: vec!["`id`".into(), "`name`".into()],
+            order_by: vec!["`id`".into(), "`name`".into()],
+            filter: Some("status=1".into()),
+            scn: None,
+        };
+        let sql = MySqlDialect.render_scan_sql(&spec);
+        assert!(sql.contains("FROM `shop`.`orders`"), "{sql}");
+        assert!(sql.contains("WHERE (status=1)"), "{sql}");
+        assert!(sql.contains("ORDER BY `id`, `name`"), "{sql}");
+        assert!(!sql.contains("COLLATE"), "{sql}");
+        assert!(!sql.contains("LIMIT"), "{sql}");
+    }
+
+    #[test]
+    fn scan_sql_omits_order_by_when_keyless() {
+        let spec = ScanSqlSpec {
+            schema: None,
+            table: "t".into(),
+            columns: vec!["`v`".into()],
+            order_by: vec![],
+            filter: None,
+            scn: None,
+        };
+        let sql = MySqlDialect.render_scan_sql(&spec);
+        assert!(!sql.contains("ORDER BY"), "{sql}");
+        assert!(!sql.contains("WHERE"), "{sql}");
     }
 
     #[test]

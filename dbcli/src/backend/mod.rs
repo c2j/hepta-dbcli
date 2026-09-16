@@ -235,6 +235,12 @@ pub trait Dialect: Send + Sync {
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 
+    /// Render one full-scan row fetch for naivediff (issue #87):
+    /// `SELECT <cols> FROM <table>[ AS OF SCN n][ WHERE (<filter>)][ ORDER BY <order_by>]`
+    /// — single statement, no LIMIT/FETCH FIRST/ROWNUM, and ORDER BY must use the
+    /// RAW key columns (never NLSSORT/COLLATE — that is the 34s-vs-6s regression).
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String;
+
     /// Render a bucket multiset query (v2.1 §6.3 BucketDiffer)：
     /// `SELECT h, COUNT(*) FROM (SELECT <row_hash> AS h FROM t WHERE <bucket pred>) GROUP BY h`。
     /// spec.bucket 必须存在；返回 (row_hash, count) 行集，客户端做多重集合比对。
@@ -347,6 +353,21 @@ pub struct KeysetPageSpec {
     pub page_size: usize,
     pub filter: Option<String>,
     /// Oracle AS OF SCN anchor (snapshot mode).
+    pub scn: Option<u64>,
+}
+
+/// One full-table scan for the naivediff strategy (issue #87):
+/// single statement, no pagination, NO collation wrappers on ORDER BY,
+/// no row limit. `columns` 是已渲染的 SELECT 列表(裸键列/normalize 表达式);
+/// `order_by` 是已渲染的裸键列列表(空 = 无 ORDER BY,无键表)。
+#[derive(Debug, Clone)]
+pub struct ScanSqlSpec {
+    pub schema: Option<String>,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub order_by: Vec<String>,
+    pub filter: Option<String>,
+    /// Oracle AS OF SCN anchor (snapshot mode); other dialects ignore.
     pub scn: Option<u64>,
 }
 
@@ -794,6 +815,9 @@ mod tests {
                 String::new()
             }
             fn render_keyset_page_sql(&self, _spec: &KeysetPageSpec) -> String {
+                String::new()
+            }
+            fn render_scan_sql(&self, _spec: &ScanSqlSpec) -> String {
                 String::new()
             }
             fn render_bucket_multiset_sql(&self, _spec: &ChecksumSqlSpec) -> String {

@@ -1,5 +1,7 @@
 use crate::backend::error::DbError;
-use crate::backend::{ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, NULL_SENTINEL};
+use crate::backend::{
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, ScanSqlSpec, NULL_SENTINEL,
+};
 
 /// MD5 SQL: `STANDARD_HASH` is 12c+; 11g uses `DBMS_CRYPTO.HASH` (same RAW MD5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +394,27 @@ impl Dialect for OracleDialect {
         }
     }
 
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String {
+        let mut table = quoted_table(&spec.schema, &spec.table);
+        if let Some(scn) = spec.scn {
+            table.push_str(&format!(" AS OF SCN {scn}"));
+        }
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\nWHERE ({f})"))
+            .unwrap_or_default();
+        let order_by = if spec.order_by.is_empty() {
+            String::new()
+        } else {
+            format!("\nORDER BY {}", spec.order_by.join(", "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}{order_by}",
+            spec.columns.join(", ")
+        )
+    }
+
     fn row_hash_expr(&self, exprs: &[String]) -> String {
         self.md5_hash(&exprs.join(" || '#' || "))
     }
@@ -734,6 +757,46 @@ mod tests {
         assert!(sql.contains("MOD(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH("));
         assert!(sql.contains(", 8) = 5"));
         assert!(sql.contains("\"ID\" >= 0 AND \"ID\" < 1000"));
+    }
+
+    #[test]
+    fn scan_sql_orders_by_raw_key_without_nlssort() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::ScanSqlSpec {
+            schema: Some("SCOTT".into()),
+            table: "T".into(),
+            columns: vec![
+                r#""K1""#.into(),
+                r#""K2""#.into(),
+                d.normalize_expr(&col("AMT", "NUMBER", false)).unwrap(),
+            ],
+            order_by: vec![r#""K1""#.into(), r#""K2""#.into()],
+            filter: Some("BCRQ='20251215'".into()),
+            scn: Some(424242),
+        };
+        let sql = d.render_scan_sql(&spec);
+        assert!(sql.contains("ORDER BY \"K1\", \"K2\""), "{sql}");
+        assert!(!sql.contains("NLSSORT"), "{sql}");
+        assert!(!sql.contains("FETCH FIRST") && !sql.contains("ROWNUM"), "{sql}");
+        assert!(sql.contains("AS OF SCN 424242"), "{sql}");
+        assert!(sql.contains("WHERE (BCRQ='20251215')"), "{sql}");
+    }
+
+    #[test]
+    fn scan_sql_omits_order_by_when_keyless() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::ScanSqlSpec {
+            schema: None,
+            table: "T".into(),
+            columns: vec![d.normalize_expr(&col("AMT", "NUMBER", false)).unwrap()],
+            order_by: vec![],
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_scan_sql(&spec);
+        assert!(!sql.contains("ORDER BY"), "{sql}");
+        assert!(sql.starts_with("SELECT "), "{sql}");
+        assert!(!sql.contains("WHERE"), "{sql}");
     }
 
     #[test]

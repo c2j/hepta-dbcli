@@ -9,7 +9,8 @@ use async_trait::async_trait;
 
 use crate::backend::error::DbError;
 use crate::backend::{
-    BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec, NULL_SENTINEL,
+    BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec, ScanSqlSpec,
+    NULL_SENTINEL,
 };
 use crate::config::TimeoutConfig;
 
@@ -327,6 +328,27 @@ impl Dialect for GaussdbDialect {
         )
     }
 
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String {
+        let table = match &spec.schema {
+            Some(s) => format!("\"{}\".\"{}\"", s, spec.table),
+            None => format!("\"{}\"", spec.table),
+        };
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\nWHERE ({f})"))
+            .unwrap_or_default();
+        let order_by = if spec.order_by.is_empty() {
+            String::new()
+        } else {
+            format!("\nORDER BY {}", spec.order_by.join(", "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}{order_by}",
+            spec.columns.join(", ")
+        )
+    }
+
     fn row_hash_expr(&self, exprs: &[String]) -> String {
         format!("MD5(concat_ws('#', {}))", exprs.join(", "))
     }
@@ -566,6 +588,25 @@ mod tests {
             "sql={sql}"
         );
         assert!(!sql.contains("> 47872"), "sql={sql}");
+    }
+
+    #[test]
+    fn scan_sql_orders_by_raw_key_without_collate() {
+        let d = GaussdbDialect;
+        let spec = crate::backend::ScanSqlSpec {
+            schema: Some("s".into()),
+            table: "t".into(),
+            columns: vec![r#""k1""#.into(), r#""k2""#.into()],
+            order_by: vec![r#""k1""#.into(), r#""k2""#.into()],
+            filter: Some("bcrq='20251215'".into()),
+            scn: None,
+        };
+        let sql = d.render_scan_sql(&spec);
+        assert!(sql.contains("FROM \"s\".\"t\""), "{sql}");
+        assert!(sql.contains("WHERE (bcrq='20251215')"), "{sql}");
+        assert!(sql.contains("ORDER BY \"k1\", \"k2\""), "{sql}");
+        assert!(!sql.contains("COLLATE \"C\""), "{sql}");
+        assert!(!sql.contains("LIMIT"), "{sql}");
     }
 
     #[test]
