@@ -117,9 +117,8 @@ fn keyed_merge(
 
     let mut left_map: HashMap<Vec<Fingerprint>, Vec<usize>> = HashMap::new();
     for (i, row) in lrows.iter().enumerate() {
-        let n = arity.min(row.len());
         left_map
-            .entry(fingerprint_row(&row[..n], &combined))
+            .entry(fingerprint_row(&row[..arity], &combined))
             .or_default()
             .push(i);
     }
@@ -127,20 +126,17 @@ fn keyed_merge(
     let mut out = Vec::new();
     let mut consumed = vec![false; lrows.len()];
     for rrow in rrows {
-        let n = arity.min(rrow.len());
         let paired = left_map
-            .get_mut(&fingerprint_row(&rrow[..n], &combined))
+            .get_mut(&fingerprint_row(&rrow[..arity], &combined))
             .and_then(|indices| indices.pop());
         match paired {
             Some(li) => {
                 consumed[li] = true;
                 let lrow = &lrows[li];
-                let ln = arity.min(lrow.len());
-                let rn = arity.min(rrow.len());
                 if !rowdiff::row_values_equal(
-                    &lrow[ln..],
-                    &rrow[rn..],
-                    &combined[arity.min(combined.len())..],
+                    &lrow[arity..],
+                    &rrow[arity..],
+                    &combined[arity..],
                 ) {
                     out.push(DiffRow {
                         key: rowdiff::diff_key(lrow, arity),
@@ -306,24 +302,45 @@ impl NaiveDiffer {
             ));
         }
 
-        let rows = if ctx.key_columns.is_empty() {
-            keyless_merge(
-                &lrows,
-                &rrows,
-                &keyless_numeric_flags(ctx, true),
-                &keyless_numeric_flags(ctx, false),
+        let (lnum, rnum) = if ctx.key_columns.is_empty() {
+            (
+                keyless_numeric_flags(ctx, true),
+                keyless_numeric_flags(ctx, false),
             )
         } else {
-            keyed_merge(
-                &lrows,
-                &rrows,
-                ctx.key_columns.len(),
-                &keyed_diff::full_row_numeric_flags(ctx, true),
-                &keyed_diff::full_row_numeric_flags(ctx, false),
+            (
+                keyed_diff::full_row_numeric_flags(ctx, true),
+                keyed_diff::full_row_numeric_flags(ctx, false),
             )
+        };
+        validate_flag_alignment(&lrows, &rrows, &lnum, &rnum)?;
+        let rows = if ctx.key_columns.is_empty() {
+            keyless_merge(&lrows, &rrows, &lnum, &rnum)
+        } else {
+            keyed_merge(&lrows, &rrows, ctx.key_columns.len(), &lnum, &rnum)
         };
         Ok((rows, left_total, right_total, extra))
     }
+}
+
+/// Misaligned type flags would silently turn every compared row into a
+/// false Modified (row_values_equal length-guard), so fail loudly first —
+/// same contract as `row_level_diff`.
+fn validate_flag_alignment(
+    lrows: &[Vec<Value>],
+    rrows: &[Vec<Value>],
+    lnum: &[bool],
+    rnum: &[bool],
+) -> Result<(), DbError> {
+    if lnum.len() != rnum.len()
+        || lrows.iter().any(|row| row.len() != lnum.len())
+        || rrows.iter().any(|row| row.len() != rnum.len())
+    {
+        return Err(DbError::config(
+            "naivediff: row comparison type flags do not align with selected columns",
+        ));
+    }
+    Ok(())
 }
 
 /// One statement per side: bare quoted key columns + normalized value
@@ -960,6 +977,59 @@ mod tests {
                 max_inflight.load(Ordering::SeqCst),
                 2,
                 "both side scans must be in flight together"
+            );
+        }
+
+        #[tokio::test]
+        async fn naive_diff_rejects_misaligned_numeric_flags() {
+            let ctx = DiffContext {
+                left: side(&["k1", "k2"], &[("amt", "decimal(20,6)"), ("extra", "int")]),
+                right: side(&["k1", "k2"], &[("amt", "decimal(20,6)")]),
+                left_pool: dummy_pool(),
+                right_pool: dummy_pool(),
+                key_column: "k1".into(),
+                key_columns: vec!["k1".into(), "k2".into()],
+                left_key_columns: vec!["k1".into(), "k2".into()],
+                right_key_columns: vec!["k1".into(), "k2".into()],
+                filter: None,
+                incremental: None,
+                bisection_factor: 32,
+                bisection_threshold: 16_384,
+                sample_limit: 20,
+                threads: 4,
+                consistency: ConsistencyMode::None,
+                recheck: false,
+                route_warnings: vec![],
+                checkpoint: None,
+                iblt_capacity: 65_536,
+                fetch_all_threshold: 4096,
+                naive_max_rows: 200_000,
+                strict: false,
+                scns: std::sync::OnceLock::new(),
+                verbose: false,
+            };
+            let mut left = Box::new(ScriptedConn {
+                responses: VecDeque::from([
+                    ScriptedConn::count(1),
+                    ScriptedConn::scan(vec![vec![json!("a"), json!("1"), json!("10"), json!("20")]]),
+                ]),
+                dialect: MySqlDialect,
+            }) as Box<dyn DbConn + Send>;
+            let mut right = Box::new(ScriptedConn {
+                responses: VecDeque::from([
+                    ScriptedConn::count(1),
+                    ScriptedConn::scan(vec![vec![json!("a"), json!("1"), json!("10")]]),
+                ]),
+                dialect: MySqlDialect,
+            }) as Box<dyn DbConn + Send>;
+            let err = NaiveDiffer
+                .diff(&mut *left, &mut *right, &ctx)
+                .await
+                .expect_err("misaligned flags must error, not fake Modified rows");
+            assert!(
+                err.to_string()
+                    .contains("row comparison type flags do not align"),
+                "{err}"
             );
         }
 
