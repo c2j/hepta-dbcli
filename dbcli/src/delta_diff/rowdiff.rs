@@ -270,7 +270,12 @@ pub(crate) fn diff_key(row: &[Value], arity: usize) -> Value {
     }
 }
 
-pub(crate) fn diff_row_n(row: &[Value], arity: usize, is_left: bool, status: DiffStatus) -> DiffRow {
+pub(crate) fn diff_row_n(
+    row: &[Value],
+    arity: usize,
+    is_left: bool,
+    status: DiffStatus,
+) -> DiffRow {
     DiffRow {
         key: diff_key(row, arity),
         left: if is_left { Some(row.to_vec()) } else { None },

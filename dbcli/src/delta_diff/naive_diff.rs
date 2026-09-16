@@ -161,7 +161,12 @@ fn keyed_merge(
     }
     for (li, row) in lrows.iter().enumerate() {
         if !consumed[li] {
-            out.push(rowdiff::diff_row_n(row, arity, true, DiffStatus::MissingRight));
+            out.push(rowdiff::diff_row_n(
+                row,
+                arity,
+                true,
+                DiffStatus::MissingRight,
+            ));
         }
     }
     out
@@ -202,12 +207,7 @@ fn keyless_merge(
             .and_then(|indices| indices.pop());
         match paired {
             Some(li) => consumed[li] = true,
-            None => out.push(rowdiff::diff_row_n(
-                rrow,
-                0,
-                false,
-                DiffStatus::MissingLeft,
-            )),
+            None => out.push(rowdiff::diff_row_n(rrow, 0, false, DiffStatus::MissingLeft)),
         }
     }
     for (li, row) in lrows.iter().enumerate() {
@@ -364,7 +364,12 @@ async fn scan_rows(
 
 fn keyless_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let names: Vec<String> = side.plan.norm_specs.iter().map(|s| s.name.clone()).collect();
+    let names: Vec<String> = side
+        .plan
+        .norm_specs
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
     side.plan.numeric_value_flags_for(&names)
 }
 
@@ -510,14 +515,8 @@ mod tests {
 
     #[test]
     fn keyed_merge_pairs_duplicate_keys_without_false_modified() {
-        let lrows = vec![
-            vec![json!("k"), json!("v1")],
-            vec![json!("k"), json!("v2")],
-        ];
-        let rrows = vec![
-            vec![json!("k"), json!("v2")],
-            vec![json!("k"), json!("v1")],
-        ];
+        let lrows = vec![vec![json!("k"), json!("v1")], vec![json!("k"), json!("v2")]];
+        let rrows = vec![vec![json!("k"), json!("v2")], vec![json!("k"), json!("v1")]];
         let rows = keyed_merge(&lrows, &rrows, 1, &[false, false], &[false, false]);
         assert!(
             rows.is_empty(),
@@ -634,9 +633,16 @@ mod tests {
         #[async_trait]
         impl DbConn for ScriptedConn {
             async fn query(&mut self, _sql: &str) -> Result<QueryResult, DbError> {
-                Ok(self.responses.pop_front().unwrap_or_else(QueryResult::empty))
+                Ok(self
+                    .responses
+                    .pop_front()
+                    .unwrap_or_else(QueryResult::empty))
             }
-            async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            async fn exec(
+                &mut self,
+                _sql: &str,
+                _params: &[Value],
+            ) -> Result<QueryResult, DbError> {
                 Err(DbError::unsupported("scripted"))
             }
             async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
@@ -894,20 +900,15 @@ mod tests {
                 verbose: false,
             };
             let mut left = Box::new(ScriptedConn {
-                responses: VecDeque::from([
-                    ScriptedConn::count(1),
-                    ScriptedConn::scan(ctx_rows_l),
-                ]),
+                responses: VecDeque::from([ScriptedConn::count(1), ScriptedConn::scan(ctx_rows_l)]),
                 dialect: MySqlDialect,
             }) as Box<dyn DbConn + Send>;
             let mut right = Box::new(ScriptedConn {
-                responses: VecDeque::from([
-                    ScriptedConn::count(1),
-                    ScriptedConn::scan(ctx_rows_r),
-                ]),
+                responses: VecDeque::from([ScriptedConn::count(1), ScriptedConn::scan(ctx_rows_r)]),
                 dialect: MySqlDialect,
             }) as Box<dyn DbConn + Send>;
-            let report = NaiveDiffer.diff(&mut *left, &mut *right, &ctx)
+            let report = NaiveDiffer
+                .diff(&mut *left, &mut *right, &ctx)
                 .await
                 .expect("keyless run");
             assert_eq!(report.summary.missing_right, 1, "{:?}", report.sample_diffs);
@@ -915,5 +916,189 @@ mod tests {
             assert_eq!(report.summary.modified, 0);
             assert_eq!(report.perf.queries_total, 4);
         }
+    }
+}
+
+// ─── DuckDB end-to-end (embedded — the layer allowed to expose real bugs) ──
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_e2e_tests {
+    use super::*;
+    use crate::backend::duckdb::DuckDbFactory;
+    use crate::backend::{BackendFactory, DbPool};
+    use crate::delta_diff::metadata::TablePlan;
+    use crate::delta_diff::strategy::SideCtx;
+    use std::sync::Arc;
+
+    async fn pool_with(ddl: &str, rows: &str) -> Arc<dyn DbPool> {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("duckdb pool");
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.query_drop(ddl).await.expect("create");
+        if !rows.is_empty() {
+            conn.query_drop(rows).await.expect("insert");
+        }
+        pool
+    }
+
+    fn dummy_pool() -> Arc<dyn DbPool> {
+        struct Pool;
+        #[async_trait::async_trait]
+        impl DbPool for Pool {
+            async fn acquire(&self) -> Result<Box<dyn DbConn + Send>, DbError> {
+                Err(DbError::unsupported("dummy"))
+            }
+        }
+        Arc::new(Pool)
+    }
+
+    fn plan(amt_type: &str) -> TablePlan {
+        TablePlan {
+            url_scheme: "duckdb".into(),
+            key_columns: vec!["k1".into(), "k2".into()],
+            compare_columns: vec!["k1".into(), "k2".into(), "amt".into()],
+            norm_specs: vec![
+                crate::backend::ColumnNormSpec {
+                    name: "k1".into(),
+                    data_type: "VARCHAR".into(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                },
+                crate::backend::ColumnNormSpec {
+                    name: "k2".into(),
+                    data_type: "VARCHAR".into(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                },
+                crate::backend::ColumnNormSpec {
+                    name: "amt".into(),
+                    data_type: amt_type.into(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                },
+            ],
+            warnings: vec![],
+        }
+    }
+
+    async fn run_diff(
+        left: Arc<dyn DbPool>,
+        right: Arc<dyn DbPool>,
+        left_amt: &str,
+        right_amt: &str,
+    ) -> DiffReport {
+        let mut lconn = left.acquire().await.expect("left conn");
+        let mut rconn = right.acquire().await.expect("right conn");
+        let ctx = DiffContext {
+            left: SideCtx {
+                connection_name: "l".into(),
+                schema: Some("main".into()),
+                table: "t_nv".into(),
+                plan: plan(left_amt),
+            },
+            right: SideCtx {
+                connection_name: "r".into(),
+                schema: Some("main".into()),
+                table: "t_nv".into(),
+                plan: plan(right_amt),
+            },
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column: "k1".into(),
+            key_columns: vec!["k1".into(), "k2".into()],
+            left_key_columns: vec!["k1".into(), "k2".into()],
+            right_key_columns: vec!["k1".into(), "k2".into()],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 4,
+            consistency: ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            naive_max_rows: 200_000,
+            strict: false,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        };
+        NaiveDiffer
+            .diff(&mut *lconn, &mut *rconn, &ctx)
+            .await
+            .expect("naivediff run")
+    }
+
+    #[tokio::test]
+    async fn duckdb_naivediff_zero_diff_runs_four_queries() {
+        let ddl = "CREATE TABLE t_nv (k1 VARCHAR, k2 VARCHAR, amt DECIMAL(20,6))";
+        let rows = "INSERT INTO t_nv VALUES \
+                    ('a','1',1.50),('b','2',2.25),('K',NULL,3.75)";
+        let report = run_diff(
+            pool_with(ddl, rows).await,
+            pool_with(ddl, rows).await,
+            "DECIMAL(20,6)",
+            "DECIMAL(20,6)",
+        )
+        .await;
+        assert!(
+            report.sample_diffs.is_empty(),
+            "identical sides must produce zero diffs: {:?}",
+            report.sample_diffs
+        );
+        assert_eq!(report.perf.queries_total, 4, "2 COUNT + 2 scan");
+        assert_eq!(report.summary.left_total, 3);
+        assert_eq!(report.summary.right_total, 3);
+    }
+
+    #[tokio::test]
+    async fn duckdb_naivediff_reports_modified_and_missing_with_null_keys() {
+        let ddl = "CREATE TABLE t_nv (k1 VARCHAR, k2 VARCHAR, amt DECIMAL(20,6))";
+        let left_rows = "INSERT INTO t_nv VALUES \
+                         ('a','1',1.50),('b','2',2.25),('K',NULL,3.75)";
+        let right_rows = "INSERT INTO t_nv VALUES \
+                          ('a','1',9.99),('c','3',4.00),('K',NULL,3.75)";
+        let report = run_diff(
+            pool_with(ddl, left_rows).await,
+            pool_with(ddl, right_rows).await,
+            "DECIMAL(20,6)",
+            "DECIMAL(20,6)",
+        )
+        .await;
+        assert_eq!(report.summary.modified, 1, "{:?}", report.sample_diffs);
+        assert_eq!(report.summary.missing_right, 1, "{:?}", report.sample_diffs);
+        assert_eq!(report.summary.missing_left, 1, "{:?}", report.sample_diffs);
+        let modified = report
+            .sample_diffs
+            .iter()
+            .find(|d| d.status == DiffStatus::Modified)
+            .expect("modified row");
+        assert_eq!(modified.key, serde_json::json!(["a", "1"]));
+    }
+
+    #[tokio::test]
+    async fn duckdb_naivediff_cross_scale_decimal_reports_no_diff() {
+        // Left stores 1.50 in DECIMAL(20,2), right stores 1.5 in
+        // DECIMAL(20,6): client-side Decimal comparison must see them equal.
+        let left = pool_with(
+            "CREATE TABLE t_nv (k1 VARCHAR, k2 VARCHAR, amt DECIMAL(20,2))",
+            "INSERT INTO t_nv VALUES ('a','1',1.50),('K',NULL,3.75)",
+        )
+        .await;
+        let right = pool_with(
+            "CREATE TABLE t_nv (k1 VARCHAR, k2 VARCHAR, amt DECIMAL(20,6))",
+            "INSERT INTO t_nv VALUES ('a','1',1.5),('K',NULL,3.750000)",
+        )
+        .await;
+        let report = run_diff(left, right, "DECIMAL(20,2)", "DECIMAL(20,6)").await;
+        assert!(
+            report.sample_diffs.is_empty(),
+            "1.50 vs 1.5 is one value across scales: {:?}",
+            report.sample_diffs
+        );
     }
 }

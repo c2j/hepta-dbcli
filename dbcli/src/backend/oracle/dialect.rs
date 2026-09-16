@@ -777,7 +777,10 @@ mod tests {
         let sql = d.render_scan_sql(&spec);
         assert!(sql.contains("ORDER BY \"K1\", \"K2\""), "{sql}");
         assert!(!sql.contains("NLSSORT"), "{sql}");
-        assert!(!sql.contains("FETCH FIRST") && !sql.contains("ROWNUM"), "{sql}");
+        assert!(
+            !sql.contains("FETCH FIRST") && !sql.contains("ROWNUM"),
+            "{sql}"
+        );
         assert!(sql.contains("AS OF SCN 424242"), "{sql}");
         assert!(sql.contains("WHERE (BCRQ='20251215')"), "{sql}");
     }
