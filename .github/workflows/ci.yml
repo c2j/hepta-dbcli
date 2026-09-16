@@ -170,3 +170,12 @@ jobs:
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
           SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth child-cardinality work (#72):
+      # the learned rows-per-parent distribution survives into the model, a
+      # `cardinality: modeled` generate reproduces its shape (TV < 0.1) with
+      # FK integrity, and the default keeps `--rows`.
+      - name: synth cardinality end-to-end verification
+        run: bash tests/synth-verify/run_m4_cardinality.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb

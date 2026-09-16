@@ -610,6 +610,19 @@ fn distinct_non_null(rows: &[Vec<serde_json::Value>], index: usize) -> usize {
         .len()
 }
 
+#[cfg(feature = "synth")]
+fn learned_cardinality(
+    models: &HashMap<String, crate::synth::model::TableModel>,
+) -> HashMap<(String, String), crate::synth::cardinality::CardinalityDist> {
+    let mut learned = HashMap::new();
+    for (table, model) in models {
+        for (column, distribution) in &model.fk_cardinality {
+            learned.insert((table.clone(), column.clone()), distribution.clone());
+        }
+    }
+    learned
+}
+
 /// Learn each child table's rows-per-parent distribution and store it in the
 /// child's model (issue #72). Runs after the training loop because a parent
 /// key's distinct count may come from a table trained after its child.
@@ -1046,6 +1059,7 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         &table_rows,
         &parent_pools,
         fk_source,
+        &learned_cardinality(&models),
     );
 
     // Every model gets a row in the report: a table whose data is missing is

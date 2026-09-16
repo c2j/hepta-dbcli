@@ -70,6 +70,25 @@ primary key, and a 3-key non-numeric primary key), trains the tables, and then:
 | #82 AC2 | the composite primary key round-trips: 200 rows / 200 distinct `(region, slot)` tuples even though each member repeats alone |
 | #82 AC1 | the non-numeric key table cannot be extended: `generate --format sql --rows 10` fails and names the column and the row count |
 
+## cardinality run (#72)
+
+```bash
+HEPTA_DBCLI_TEST_URL=mysql://user:pass@127.0.0.1:3306/testdb \
+  bash tests/synth-verify/run_m4_cardinality.sh
+```
+
+It loads `fixture_cardinality.sql` (100 parent keys, 70 child rows distributed
+`{0: 0.5, 1: 0.3, 2: 0.2}`), trains, then generates with
+`cardinality: modeled` and with the default `exact_rows`. `verify_cardinality.py`
+asserts:
+
+| Acceptance | Check |
+|---|---|
+| #72 train | the child model stores a `fk_cardinality.parent_id` distribution exactly `{0: 0.5, 1: 0.3, 2: 0.2}` with no NULL share |
+| #72 AC1 | modeled generation reproduces the shape: the zero-children share is in `[0.4, 0.6]`, the average is in `[0.4, 1.0]`, and every non-NULL key references a generated parent key |
+| #72 AC4 | `synth report` emits a cardinality TV for the modeled edge and it is `< 0.1` |
+| #72 AC2 | without `modeled` the child row count stays exactly `--rows` |
+
 ## What is asserted
 
 | Issue | Check |

@@ -454,6 +454,11 @@ pub struct FkRate {
     /// `--against-db`) or `generated` (the parent column of the generated
     /// data).
     pub source: String,
+    /// Total-variation distance between the generated per-parent child counts
+    /// and the distribution learned at train time (issue #72). `None` when the
+    /// child model has no learned cardinality for this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality_tv: Option<f64>,
     pub warn: bool,
 }
 
@@ -513,8 +518,12 @@ impl QualityReport {
             match &table.fk {
                 Section::Scored { items, .. } => {
                     for rate in items {
+                        let cardinality = match rate.cardinality_tv {
+                            Some(tv) => format!(", cardinality tv {tv:.3}"),
+                            None => String::new(),
+                        };
                         lines.push(format!(
-                            "    fk {}.{} -> {}.{}: {}/{} = {:.4}{} ({})",
+                            "    fk {}.{} -> {}.{}: {}/{} = {:.4}{} ({}){}",
                             rate.child_table,
                             rate.child_column,
                             rate.parent_table,
@@ -523,7 +532,8 @@ impl QualityReport {
                             rate.keys,
                             rate.rate,
                             if rate.warn { " WARN" } else { "" },
-                            rate.source
+                            rate.source,
+                            cardinality
                         ));
                     }
                 }
@@ -989,12 +999,55 @@ pub type ParentKeyPools = HashMap<(String, String), Vec<String>>;
 /// `--against-db`, otherwise [`generated_key_pools`] over the generated parent
 /// table. An edge whose parent column is not in that pool is skipped, so the
 /// caller's chosen source is visible in every reported rate.
+/// Distribution of generated child rows per parent key, over the parent
+/// universe `parent_universe` (the parent pool size). Mirrors
+/// [`crate::synth::cardinality::learn_cardinality`] so the two are comparable.
+fn generated_cardinality_dist(
+    rows: &[Vec<Value>],
+    col_idx: usize,
+    parent_universe: usize,
+) -> Option<crate::synth::cardinality::CardinalityDist> {
+    if parent_universe == 0 {
+        return None;
+    }
+    let mut per_parent: HashMap<String, u64> = HashMap::new();
+    let mut null_rows = 0u64;
+    for row in rows {
+        match row.get(col_idx) {
+            Some(value) if !value.is_null() => {
+                *per_parent.entry(value.to_string()).or_insert(0) += 1;
+            }
+            _ => null_rows += 1,
+        }
+    }
+    let total = parent_universe as f64;
+    let mut counts: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    let zero = parent_universe.saturating_sub(per_parent.len());
+    if zero > 0 {
+        counts.insert(0, zero as f64 / total);
+    }
+    for count in per_parent.values() {
+        let bucket = (*count).min(crate::synth::cardinality::MAX_COUNT_BUCKET);
+        *counts.entry(bucket).or_insert(0.0) += 1.0 / total;
+    }
+    let total_rows = rows.len() as f64;
+    Some(crate::synth::cardinality::CardinalityDist {
+        counts,
+        null_share: if total_rows > 0.0 {
+            null_rows as f64 / total_rows
+        } else {
+            0.0
+        },
+    })
+}
+
 pub fn evaluate_fk(
     relations: &[FkRelation],
     table_columns: &GeneratedColumns,
     generated: &GeneratedTables,
     parent_pools: &ParentKeyPools,
     source: &str,
+    learned_cardinality: &HashMap<(String, String), crate::synth::cardinality::CardinalityDist>,
 ) -> Section<Vec<FkRate>> {
     if relations.is_empty() {
         return Section::Skipped {
@@ -1039,6 +1092,12 @@ pub fn evaluate_fk(
         } else {
             hits as f64 / keys.len() as f64
         };
+        let cardinality_tv = learned_cardinality
+            .get(&(relation.child_table.clone(), relation.child_column.clone()))
+            .and_then(|learned| {
+                generated_cardinality_dist(rows, col_idx, pool_set.len())
+                    .map(|generated| generated.total_variation(learned))
+            });
         items.push(FkRate {
             child_table: relation.child_table.clone(),
             child_column: relation.child_column.clone(),
@@ -1048,6 +1107,7 @@ pub fn evaluate_fk(
             hits,
             rate,
             source: source.to_string(),
+            cardinality_tv,
             warn: keys.is_empty() || rate < 0.99,
         });
     }
@@ -1510,7 +1570,14 @@ mod tests {
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
         )]);
 
-        let section = evaluate_fk(&relations, &table_columns, &generated, &pools, "model");
+        let section = evaluate_fk(
+            &relations,
+            &table_columns,
+            &generated,
+            &pools,
+            "model",
+            &HashMap::new(),
+        );
         let Section::Scored { items, .. } = section else {
             panic!("expected scored fk section");
         };
@@ -1529,6 +1596,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             "model",
+            &HashMap::new(),
         );
         match empty {
             Section::Skipped { reason } => assert!(reason.contains("foreign keys"), "{reason}"),
@@ -1547,6 +1615,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             "model",
+            &HashMap::new(),
         );
         assert!(matches!(section, Section::Skipped { .. }));
     }
@@ -1607,6 +1676,7 @@ mod tests {
                     hits: 2,
                     rate: 0.666,
                     source: "model".to_string(),
+                    cardinality_tv: None,
                     warn: true,
                 },
                 FkRate {
@@ -1618,6 +1688,7 @@ mod tests {
                     hits: 2,
                     rate: 1.0,
                     source: "model".to_string(),
+                    cardinality_tv: None,
                     warn: false,
                 },
             ],
@@ -1720,6 +1791,7 @@ mod tests {
                 &HashMap::from([("orders".to_string(), generated["orders"].clone())]),
             ),
             "generated",
+            &HashMap::new(),
         );
         match section {
             Section::Skipped { reason } => assert!(reason.contains("--against-db"), "{reason}"),

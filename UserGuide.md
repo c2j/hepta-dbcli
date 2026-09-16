@@ -973,6 +973,29 @@ tables:
 | `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
 | `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
 
+#### 子表基数建模（`cardinality`，issue #72）
+
+`synth train` 会按外键统计"每个父键对应多少子行"，把计数分布写进**子表模型**的 `fk_cardinality`（键为 FK 列名；`0` 档来自父表键去重数减去被引用键数）。默认生成仍按 `--rows` 生成固定行数、逐行独立采父键；要让子表行数跟随学习到的基数分布，在 relationship 上加 `cardinality: modeled`：
+
+```yaml
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        cardinality: modeled   # 默认 exact_rows
+```
+
+| 取值 | 行为 |
+|------|------|
+| `exact_rows`（默认） | 子表行数 = `--rows`（或 rules 的 `rows`），与现状逐字节一致 |
+| `modeled` | 逐父键按 `fk_cardinality` 采样子行数，**子表行数由分布求和得出**（`--rows` 对这张表不再生效，父表仍是 `--rows`）；FK 值按父键成块写入，不再逐行独立采样 |
+
+- 模型里没有对应 `fk_cardinality`（旧模型或未训练）时 `generate` 直接报错，不会静默退回固定行数；
+- `unique: true` 的 1:1 关系把每个父键的子行数截断到 0/1，保证父值不被重复引用；
+- NULL 外键份额按训练期 `null_share` 复现，NULL 行不计入任何父键的基数；
+- 每张表最多一个 `cardinality: modeled` 关系（多个会报错）；
+- 训练分布与实际生成的基数对比见 `synth report` 的 fk 行（`cardinality tv`，越小越接近）。
+
 #### 主键唯一性（issue #82）
 
 `--format sql` 导出时，模型里记录的主键（`model.pk`，含复合主键）强制唯一，即使没有其它表引用它：否则生成的 SQL 回灌时必然 `Duplicate entry`。单列主键与父键一样做拒绝重抽；复合主键只要求**元组**唯一，单个成员可以重复。
