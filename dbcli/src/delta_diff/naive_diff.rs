@@ -261,22 +261,41 @@ impl NaiveDiffer {
             return Ok((Vec::new(), 0, 0, Vec::new()));
         }
 
-        let (lrows, lfetched) = if left_total == 0 {
-            (Vec::new(), 0)
+        let lspec = if left_total == 0 {
+            None
         } else {
-            let spec = scan_spec(ctx, true, left.dialect())?;
-            let rows = scan_rows(left, &spec, ctx.verbose, queries).await?;
-            let fetched = rows.len() as u64;
-            (rows, fetched)
+            Some(scan_spec(ctx, true, left.dialect())?)
         };
-        let (rrows, rfetched) = if right_total == 0 {
-            (Vec::new(), 0)
+        let rspec = if right_total == 0 {
+            None
         } else {
-            let spec = scan_spec(ctx, false, right.dialect())?;
-            let rows = scan_rows(right, &spec, ctx.verbose, queries).await?;
-            let fetched = rows.len() as u64;
-            (rows, fetched)
+            Some(scan_spec(ctx, false, right.dialect())?)
         };
+        let mut lqueries = 0u64;
+        let mut rqueries = 0u64;
+        let (lscan, rscan) = tokio::join!(
+            async {
+                match &lspec {
+                    Some(spec) => Ok::<_, DbError>(Some(
+                        scan_rows(&mut *left, spec, ctx.verbose, &mut lqueries).await?,
+                    )),
+                    None => Ok(None),
+                }
+            },
+            async {
+                match &rspec {
+                    Some(spec) => Ok::<_, DbError>(Some(
+                        scan_rows(&mut *right, spec, ctx.verbose, &mut rqueries).await?,
+                    )),
+                    None => Ok(None),
+                }
+            },
+        );
+        *queries += lqueries + rqueries;
+        let lrows = lscan?.unwrap_or_default();
+        let lfetched = lrows.len() as u64;
+        let rrows = rscan?.unwrap_or_default();
+        let rfetched = rrows.len() as u64;
 
         let mut extra = Vec::new();
         if lfetched != left_total || rfetched != right_total {
@@ -602,6 +621,7 @@ mod tests {
         use crate::delta_diff::strategy::{ConsistencyMode, SideCtx};
         use async_trait::async_trait;
         use std::collections::VecDeque;
+        use std::sync::Arc;
 
         /// FIFO scripted connection: each `query` pops the next canned
         /// result (call order per side: COUNT, then scan).
@@ -867,6 +887,80 @@ mod tests {
             assert_eq!(report.row_payload, RowPayload::Columns);
             assert_eq!(report.shards.len(), 1);
             assert_eq!(report.shards[0].shard_id, "naive-all");
+        }
+
+        #[tokio::test]
+        async fn naive_diff_scans_run_concurrently() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            /// Counts in-flight scan queries (COUNT responses return without
+            /// yielding, isolating the probe to the scan phase).
+            struct ProbeConn {
+                inflight: Arc<AtomicUsize>,
+                max_inflight: Arc<AtomicUsize>,
+                responses: VecDeque<QueryResult>,
+                dialect: MySqlDialect,
+            }
+
+            #[async_trait]
+            impl DbConn for ProbeConn {
+                async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+                    if !sql.contains("COUNT(*)") {
+                        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.max_inflight.fetch_max(now, Ordering::SeqCst);
+                        for _ in 0..5 {
+                            tokio::task::yield_now().await;
+                        }
+                        self.inflight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    Ok(self.responses.pop_front().unwrap_or_else(QueryResult::empty))
+                }
+                async fn exec(
+                    &mut self,
+                    _sql: &str,
+                    _params: &[Value],
+                ) -> Result<QueryResult, DbError> {
+                    Err(DbError::unsupported("probe"))
+                }
+                async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+                    Err(DbError::unsupported("probe"))
+                }
+                fn dialect(&self) -> &dyn Dialect {
+                    &self.dialect
+                }
+            }
+
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let max_inflight = Arc::new(AtomicUsize::new(0));
+            let probe = |responses: VecDeque<QueryResult>| ProbeConn {
+                inflight: Arc::clone(&inflight),
+                max_inflight: Arc::clone(&max_inflight),
+                responses,
+                dialect: MySqlDialect,
+            };
+            let rows = keyed_rows(&[("A", 1, "1.00")]);
+            let report = run(
+                Flow {
+                    left: Box::new(probe(VecDeque::from([
+                        ScriptedConn::count(1),
+                        ScriptedConn::scan(rows.clone()),
+                    ]))),
+                    right: Box::new(probe(VecDeque::from([
+                        ScriptedConn::count(1),
+                        ScriptedConn::scan(rows),
+                    ]))),
+                },
+                200_000,
+            )
+            .await
+            .expect("run");
+            assert!(report.sample_diffs.is_empty());
+            assert_eq!(report.perf.queries_total, 4);
+            assert_eq!(
+                max_inflight.load(Ordering::SeqCst),
+                2,
+                "both side scans must be in flight together"
+            );
         }
 
         #[tokio::test]
