@@ -203,15 +203,44 @@ fn keyless_merge(
             .and_then(|indices| indices.pop());
         match paired {
             Some(li) => consumed[li] = true,
-            None => out.push(rowdiff::diff_row_n(rrow, 0, false, DiffStatus::MissingLeft)),
+            None => out.push(DiffRow {
+                key: keyless_key(rrow, &combined),
+                left: None,
+                right: Some(rrow.clone()),
+                status: DiffStatus::MissingLeft,
+                confirmed: true,
+            }),
         }
     }
     for (li, row) in lrows.iter().enumerate() {
         if !consumed[li] {
-            out.push(rowdiff::diff_row_n(row, 0, true, DiffStatus::MissingRight));
+            out.push(DiffRow {
+                key: keyless_key(row, &combined),
+                left: Some(row.clone()),
+                right: None,
+                status: DiffStatus::MissingRight,
+                confirmed: true,
+            });
         }
     }
     out
+}
+
+/// Keyless rows have no identity, so the key must not look like one: a
+/// canonical fingerprint-text prefix plus a loud suffix (bucketdiff's
+/// `…(×l/r)` convention). Identical row contents share one key.
+fn keyless_key(row: &[Value], flags: &[bool]) -> Value {
+    let text = fingerprint_row(row, flags)
+        .iter()
+        .map(|f| match f {
+            Fingerprint::Null => "NULL".to_string(),
+            Fingerprint::Num(d) => d.to_string(),
+            Fingerprint::Text(s) => s.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("#");
+    let prefix: String = text.chars().take(12).collect();
+    Value::String(format!("{prefix}…(keyless)"))
 }
 
 impl NaiveDiffer {
@@ -625,6 +654,29 @@ mod tests {
             "1 / 1.0 / \"1.0\" are one fingerprint value: {rows:?}"
         );
         assert_eq!(rows[0].status, DiffStatus::MissingRight);
+    }
+
+    #[test]
+    fn keyless_rows_get_descriptive_non_identity_keys() {
+        let lrows = vec![vec![json!("left-only")], vec![json!("left-only")]];
+        let rrows = vec![vec![json!("right-only")]];
+        let rows = keyless_merge(&lrows, &rrows, &[false], &[false]);
+        for row in &rows {
+            let key = row.key.as_str().expect("keyless key must be a string");
+            assert!(key.ends_with("…(keyless)"), "{key}");
+            assert_ne!(key, "left-only", "key must not read as an identity");
+            assert_ne!(key, "right-only", "key must not read as an identity");
+        }
+        let surplus_left: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.status == DiffStatus::MissingRight)
+            .filter_map(|row| row.key.as_str())
+            .collect();
+        assert_eq!(surplus_left.len(), 2, "{rows:?}");
+        assert_eq!(
+            surplus_left[0], surplus_left[1],
+            "identical surplus rows share one key"
+        );
     }
 
     // ─── end-to-end flow over scripted connections ─────────────────────
