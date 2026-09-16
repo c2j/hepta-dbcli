@@ -27,3 +27,17 @@ impl DiffStrategy for NaiveDiffer {
         todo!("naivediff end-to-end flow lands with the merge implementation tasks")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn compare_primitives_are_shared_across_modules() {
+        assert!(crate::delta_diff::rowdiff::row_values_equal(
+            &[json!(1)],
+            &[json!(1)],
+            &[true]
+        ));
+    }
+}
