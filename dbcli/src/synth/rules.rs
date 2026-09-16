@@ -241,10 +241,30 @@ pub struct Relationship {
     pub references: Vec<String>,
     #[serde(default)]
     pub pool_strategy: PoolStrategy,
+    /// How the child row count per parent key is produced (issue #72).
+    /// `exact_rows` (default) keeps `--rows` as the literal child row count;
+    /// `modeled` samples the child table's learned count distribution and
+    /// derives the child row count from it.
+    #[serde(default, skip_serializing_if = "CardinalityMode::is_exact_rows")]
+    pub cardinality: CardinalityMode,
     /// Parsed for YAML compatibility with existing rules files. Generation
     /// does not read this field; NULL injection uses per-column `null_rate`.
     #[serde(default = "default_null_label")]
     pub null_label: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardinalityMode {
+    #[default]
+    ExactRows,
+    Modeled,
+}
+
+impl CardinalityMode {
+    fn is_exact_rows(&self) -> bool {
+        matches!(self, Self::ExactRows)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1117,6 +1137,7 @@ tables:
                     references: vec![],
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
                 strategy: TableStrategy::Uniform,
             }],
@@ -1681,5 +1702,44 @@ tables:
                 .validate()
                 .unwrap_or_else(|e| panic!("'{name}' should be accepted: {e}"));
         }
+    }
+
+    #[test]
+    fn should_default_cardinality_to_exact_rows() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rules.tables[0].relationships[0].cardinality,
+            CardinalityMode::ExactRows
+        );
+        // The default must not be serialized back, so legacy rules files stay
+        // byte-identical after a load/save round-trip.
+        let serialized = serde_yaml::to_string(&rules).unwrap();
+        assert!(!serialized.contains("cardinality"));
+    }
+
+    #[test]
+    fn should_parse_modeled_cardinality() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: orders
+    relationships:
+      - pk: user_id
+        references: [users.id]
+        cardinality: modeled
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rules.tables[0].relationships[0].cardinality,
+            CardinalityMode::Modeled
+        );
     }
 }

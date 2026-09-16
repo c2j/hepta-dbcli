@@ -438,6 +438,22 @@ async fn run_train(
 
     let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
 
+    // Foreign keys are read once so training can learn each child table's
+    // rows-per-parent-key distribution (issue #72). A dialect without FK
+    // metadata degrades to "no cardinality learned", never a failed train.
+    let foreign_keys = match conn.query(&conn.dialect().foreign_keys_sql(&schema)).await {
+        Ok(result) => cmd::parse_foreign_keys(&result).unwrap_or_else(|e| {
+            eprintln!("warning: not learning cardinality: {e}");
+            Vec::new()
+        }),
+        Err(e) => {
+            eprintln!("warning: not learning cardinality: {e}");
+            Vec::new()
+        }
+    };
+    let mut key_distinct: HashMap<(String, String), usize> = HashMap::new();
+    let mut fk_values: HashMap<(String, String), Vec<serde_json::Value>> = HashMap::new();
+
     for table in &tables {
         let (col_sql, idx_sql, sample_sql) = {
             let dialect = conn.dialect();
@@ -469,6 +485,35 @@ async fn run_train(
             .map_err(|e| format!("sample table '{}': {}", table, e))?;
 
         let pk = cmd::reconcile_primary_key(cmd::parse_primary_key(&idx_result), &result.columns);
+
+        // Cardinality inputs: the distinct count of this table's key (for the
+        // `0` bucket of a child's distribution) and the FK value columns
+        // (issue #72). Both are read from the same sample the model is fitted
+        // on, so no extra query is needed.
+        if let Some(pk_column) = pk.first() {
+            if let Some(index) = result.columns.iter().position(|column| column == pk_column) {
+                key_distinct.insert(
+                    (table.clone(), pk_column.clone()),
+                    distinct_non_null(&result.rows, index),
+                );
+            }
+        }
+        for fk in foreign_keys.iter().filter(|fk| &fk.from_table == table) {
+            if let Some(index) = result
+                .columns
+                .iter()
+                .position(|column| column == &fk.from_column)
+            {
+                fk_values.insert(
+                    (table.clone(), fk.from_column.clone()),
+                    result
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.get(index).cloned())
+                        .collect(),
+                );
+            }
+        }
 
         let profile = crate::synth::profile::TableProfile::from_rows_typed(
             table,
@@ -549,6 +594,68 @@ async fn run_train(
         );
     }
 
+    attach_fk_cardinality(output_dir, &foreign_keys, &key_distinct, &fk_values)?;
+
+    Ok(())
+}
+
+/// Number of distinct non-NULL values of one row column.
+#[cfg(feature = "synth")]
+fn distinct_non_null(rows: &[Vec<serde_json::Value>], index: usize) -> usize {
+    rows.iter()
+        .filter_map(|row| row.get(index))
+        .filter(|value| !value.is_null())
+        .map(|value| value.to_string())
+        .collect::<std::collections::HashSet<String>>()
+        .len()
+}
+
+/// Learn each child table's rows-per-parent distribution and store it in the
+/// child's model (issue #72). Runs after the training loop because a parent
+/// key's distinct count may come from a table trained after its child.
+#[cfg(feature = "synth")]
+fn attach_fk_cardinality(
+    output_dir: &Path,
+    foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
+    key_distinct: &HashMap<(String, String), usize>,
+    fk_values: &HashMap<(String, String), Vec<serde_json::Value>>,
+) -> Result<(), String> {
+    // Load each child model once; a table may have several foreign keys.
+    let mut loaded: HashMap<String, crate::synth::model::TableModel> = HashMap::new();
+    let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for fk in foreign_keys {
+        let Some(values) = fk_values.get(&(fk.from_table.clone(), fk.from_column.clone())) else {
+            continue;
+        };
+        let parent_distinct = key_distinct
+            .get(&(fk.to_table.clone(), fk.to_column.clone()))
+            .copied();
+        let Some(distribution) =
+            crate::synth::cardinality::learn_cardinality(values, parent_distinct)
+        else {
+            continue;
+        };
+        let model = match loaded.entry(fk.from_table.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let path = output_dir.join(format!("{}.model.json", fk.from_table));
+                entry.insert(crate::synth::model::TableModel::load(&path)?)
+            }
+        };
+        if !model.columns.contains_key(&fk.from_column) {
+            continue;
+        }
+        model
+            .fk_cardinality
+            .insert(fk.from_column.clone(), distribution);
+        changed.insert(fk.from_table.clone());
+    }
+    for table in changed {
+        if let Some(model) = loaded.get(&table) {
+            let path = output_dir.join(format!("{}.model.json", table));
+            model.save(&path)?;
+        }
+    }
     Ok(())
 }
 

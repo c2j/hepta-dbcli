@@ -171,7 +171,7 @@ fn generate_with(
             .find(|t| &t.name == table_name)
             .ok_or_else(|| format!("no rule for table '{}'", table_name))?;
 
-        let row_count = config
+        let mut row_count = config
             .rows_per_table
             .get(table_name)
             .copied()
@@ -185,6 +185,67 @@ fn generate_with(
         };
 
         let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
+
+        // `cardinality: modeled` (issue #72) replaces the fixed row count and
+        // the independent FK draw with one sampled count per parent key.
+        let mut modeled_assignments: HashMap<String, Vec<Value>> = HashMap::new();
+        {
+            let modeled: Vec<&crate::synth::rules::Relationship> = rule
+                .relationships
+                .iter()
+                .filter(|rel| rel.cardinality == crate::synth::rules::CardinalityMode::Modeled)
+                .collect();
+            if modeled.len() > 1 {
+                return Err(format!(
+                    "table '{}': only one relationship may use `cardinality: modeled` \
+                     (multiple modeled relationships are not supported)",
+                    table_name
+                ));
+            }
+            if let Some(rel) = modeled.first() {
+                let distribution = model.fk_cardinality.get(&rel.pk).ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': `cardinality: modeled` needs a learned \
+                         distribution in the child model; retrain with `synth train`",
+                        table_name, rel.pk
+                    )
+                })?;
+                let pool = rel_pools
+                    .iter_mut()
+                    .find(|pool| pool.column == rel.pk)
+                    .ok_or_else(|| {
+                        format!(
+                            "table '{}' relationship '{}': no FK pool was built",
+                            table_name, rel.pk
+                        )
+                    })?;
+                let parent_values = pool.pool.distinct_values();
+                if parent_values.is_empty() {
+                    return Err(format!(
+                        "table '{}' relationship '{}': modeled cardinality needs a non-empty \
+                         parent key pool",
+                        table_name, rel.pk
+                    ));
+                }
+                let unique = pool.unique;
+                let mut assignments: Vec<Value> = Vec::new();
+                for value in parent_values {
+                    let sampled = distribution.sample_count(rng.gen::<f64>());
+                    // A 1:1 relationship can only give a parent 0 or 1 child.
+                    let count = if unique { sampled.min(1) } else { sampled };
+                    assignments.extend(std::iter::repeat_n(value, count as usize));
+                }
+                if distribution.null_share > 0.0 && distribution.null_share < 1.0 {
+                    let non_null = assignments.len() as f64;
+                    let null_rows = (non_null * distribution.null_share
+                        / (1.0 - distribution.null_share))
+                        .round() as usize;
+                    assignments.extend(std::iter::repeat_n(Value::Null, null_rows));
+                }
+                row_count = assignments.len();
+                modeled_assignments.insert(rel.pk.clone(), assignments);
+            }
+        }
 
         let column_order = &model.copula.column_order;
         let copula = GaussianCopula::new(model.copula.correlation.clone());
@@ -236,6 +297,10 @@ fn generate_with(
             let mut row = Vec::with_capacity(column_order.len());
 
             for (col_idx, col_name) in column_order.iter().enumerate() {
+                if let Some(assignments) = modeled_assignments.get(col_name) {
+                    row.push(assignments.get(t).cloned().unwrap_or(Value::Null));
+                    continue;
+                }
                 if let Some(null_rng) = null_rngs[col_idx].as_mut() {
                     let u: f64 = null_rng.gen();
                     if u < null_rates[col_idx] {
@@ -288,6 +353,11 @@ fn generate_with(
         // Referenced columns get rejection-redraw until every value is
         // distinct; a duplicated parent key cannot be FK-loaded downstream.
         for (col_idx, col_name) in column_order.iter().enumerate() {
+            if modeled_assignments.contains_key(col_name) {
+                // The row count and the per-parent counts come from the learned
+                // distribution; forcing uniqueness would destroy it.
+                continue;
+            }
             if !referenced_targets.contains(&format!("{}.{}", table_name, col_name)) {
                 continue;
             }
@@ -2139,9 +2209,10 @@ fn build_rel_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synth::cardinality::CardinalityDist;
     use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
-    use crate::synth::rules::{ColumnRule, Relationship, TableRule, ValuePool};
+    use crate::synth::rules::{CardinalityMode, ColumnRule, Relationship, TableRule, ValuePool};
     use std::collections::BTreeMap;
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
@@ -2377,6 +2448,7 @@ mod tests {
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2418,6 +2490,7 @@ mod tests {
                 references: vec!["a.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         b_rule.rows = Some(30);
@@ -2428,6 +2501,7 @@ mod tests {
                 references: vec!["b.a_id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         c_rule.rows = Some(10);
@@ -2505,6 +2579,7 @@ mod tests {
                 references: vec!["parent.k".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2576,6 +2651,7 @@ mod tests {
                 references: vec!["a.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         b_rule.rows = Some(5);
@@ -2586,6 +2662,7 @@ mod tests {
                 references: vec!["b.a_id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2650,6 +2727,7 @@ mod tests {
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         let rules = SynthRules {
@@ -2738,6 +2816,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -2833,6 +2912,7 @@ mod tests {
             references: vec![format!("{}.id", parent)],
             pool_strategy: PoolStrategy::Projection { unique: false },
             null_label: "null".to_string(),
+            cardinality: Default::default(),
         };
         let mut a = single_rule("a", vec![]);
         a.rows = Some(3);
@@ -2884,6 +2964,7 @@ mod tests {
                     references: vec!["ghost.id".to_string()],
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
             )],
         };
@@ -2960,6 +3041,7 @@ mod tests {
                 references: vec!["users.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
             strategy: TableStrategy::Weighted,
         };
@@ -3018,6 +3100,7 @@ mod tests {
                         values: vec!["CN".to_string(), "US".to_string()],
                     },
                     null_label: "null".to_string(),
+                    cardinality: Default::default(),
                 }],
             )],
         };
@@ -3198,6 +3281,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3249,6 +3333,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3296,6 +3381,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                     strategy: TableStrategy::Zipf,
                 },
@@ -3450,6 +3536,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3680,6 +3767,7 @@ mod tests {
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -3916,6 +4004,7 @@ tables:
                         references: vec!["users.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -4056,6 +4145,7 @@ tables:
                 references: vec!["users.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: true },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         child_rule.rows = Some(14);
@@ -6207,6 +6297,7 @@ tables:
                 references: vec!["parent.id".to_string()],
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             }],
         );
         table.branches.push(crate::synth::rules::BranchRule {
@@ -6408,6 +6499,7 @@ tables:
                         references: vec!["p.id".to_string()],
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
+                        cardinality: Default::default(),
                     }],
                 ),
             ],
@@ -6717,6 +6809,175 @@ tables:
         assert!(
             err.contains("composite primary key"),
             "error must mention the composite primary key: {err}"
+        );
+    }
+
+    fn cardinality_child_model(table: &str, column: &str, dist: CardinalityDist) -> TableModel {
+        let mut model = int_key_model(table, column, 0.0);
+        model.fk_cardinality.insert(column.to_string(), dist);
+        model
+    }
+
+    fn modeled_rule(pk: &str, parent: &str, unique: bool) -> TableRule {
+        single_rule(
+            "child",
+            vec![Relationship {
+                pk: pk.to_string(),
+                references: vec![format!("{}.id", parent)],
+                pool_strategy: PoolStrategy::Projection { unique },
+                cardinality: CardinalityMode::Modeled,
+                null_label: "null".to_string(),
+            }],
+        )
+    }
+
+    /// AC1: the generated per-parent child counts follow the learned
+    /// distribution (shape, zero share and mean).
+    #[test]
+    fn should_reproduce_modeled_cardinality_shape() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(100);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", false)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 100)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let parent_rows = data.tables.get("parent").unwrap();
+        assert_eq!(parent_rows.len(), 100);
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in child_rows {
+            *counts.entry(row[0].to_string()).or_insert(0) += 1;
+        }
+        let zero = parent_rows.len() - counts.len();
+        let with = |want: usize| {
+            counts.values().filter(|c| **c == want).count() + if want == 0 { zero } else { 0 }
+        };
+        let share = |want: usize| with(want) as f64 / parent_rows.len() as f64;
+        let average = child_rows.len() as f64 / parent_rows.len() as f64;
+
+        assert!(
+            (0.4..=1.0).contains(&average),
+            "average children per parent {average} outside [0.4, 1.0]"
+        );
+        assert!(
+            (0.4..=0.6).contains(&share(0)),
+            "zero-children share {} outside [0.4, 0.6]",
+            share(0)
+        );
+        assert!((share(0) - 0.5).abs() < 0.1, "0 bucket {} vs 0.5", share(0));
+        assert!((share(1) - 0.3).abs() < 0.1, "1 bucket {} vs 0.3", share(1));
+        assert!((share(2) - 0.2).abs() < 0.1, "2 bucket {} vs 0.2", share(2));
+    }
+
+    /// AC3: a modeled 1:1 relationship cannot give a parent more than one
+    /// child, even when the learned distribution has larger counts.
+    #[test]
+    fn should_clamp_modeled_cardinality_to_one_for_unique_relationships() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", true)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 60)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            child_rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            child_rows.len(),
+            "a 1:1 modeled relationship must reference each parent at most once"
+        );
+        assert!(child_rows.len() <= 60);
+    }
+
+    /// AC2: without `cardinality: modeled` the row count stays exactly
+    /// `--rows`, whatever the model learned.
+    #[test]
+    fn should_keep_exact_rows_when_cardinality_is_not_modeled() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 1.0)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(20);
+        let mut child = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "parent_id".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                cardinality: CardinalityMode::ExactRows,
+                null_label: "null".to_string(),
+            }],
+        );
+        child.rows = Some(37);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, child],
+        };
+
+        let data = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
+        assert_eq!(data.tables.get("parent").unwrap().len(), 20);
+        assert_eq!(data.tables.get("child").unwrap().len(), 37);
+    }
+
+    /// A modeled relationship without a learned distribution must fail loudly,
+    /// not silently fall back to the fixed row count.
+    #[test]
+    fn should_error_when_modeled_cardinality_has_no_learned_distribution() {
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                int_key_model("child", "parent_id", 0.0),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(10);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", false)],
+        };
+
+        let err = generate(&models, &rules, &config(&["parent", "child"], 10))
+            .expect_err("missing learned distribution must error");
+        assert!(
+            err.contains("learned distribution"),
+            "error must explain the missing distribution: {err}"
         );
     }
 }
