@@ -161,3 +161,30 @@ jobs:
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
           SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth primary-key fix (#82): SQL
+      # export must round-trip through MySQL with unique single keys and
+      # composite tuples (extrapolating a bounded numeric key), while a
+      # non-extendable key set fails fast and names the column and row count.
+      - name: synth pk-uniqueness end-to-end verification
+        run: bash tests/synth-verify/run_m4_pk.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth child-cardinality work (#72):
+      # the learned rows-per-parent distribution survives into the model, a
+      # `cardinality: modeled` generate reproduces its shape (TV < 0.1) with
+      # FK integrity, and the default keeps `--rows`.
+      - name: synth cardinality end-to-end verification
+        run: bash tests/synth-verify/run_m4_cardinality.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb
+      # Real-database acceptance for the synth PII work (#71): recognized
+      # columns lose their values from both the model and the profile, the
+      # generated values are format-valid fakes, stable mapping and
+      # `sdtype: keep` behave, and the run is deterministic.
+      - name: synth PII end-to-end verification
+        run: bash tests/synth-verify/run_m4_pii.sh
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+          SYNTH_E2E_MYSQL_CMD: docker exec -i ${{ job.services.mysql.id }} mysql -uroot -ptestpass -D testdb

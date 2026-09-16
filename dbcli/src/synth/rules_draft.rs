@@ -39,6 +39,7 @@ pub fn generate_rules_draft(
             references: vec![format!("{}.{}", fk.to_table, fk.to_column)],
             pool_strategy: PoolStrategy::Projection { unique },
             null_label: "null".to_string(),
+            cardinality: Default::default(),
         };
 
         if let Some(rule) = table_rules.get_mut(&fk.from_table) {
@@ -180,6 +181,7 @@ pub fn generate_draft_with_implicit(
                     unique: is_unique(fk, &table_stats),
                 },
                 null_label: "null".to_string(),
+                cardinality: Default::default(),
             });
         }
     }

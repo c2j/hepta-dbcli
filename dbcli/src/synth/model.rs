@@ -17,6 +17,11 @@ pub struct TableModel {
     pub pk: Vec<String>,
     pub columns: HashMap<String, ColumnModel>,
     pub copula: CopulaInfo,
+    /// Learned child-row-count distributions keyed by this table's FK column
+    /// (issue #72). Empty for tables that are never children; `serde(default)`
+    /// keeps old models loadable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fk_cardinality: HashMap<String, crate::synth::cardinality::CardinalityDist>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,10 @@ pub struct ColumnModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub null_rate: Option<f64>,
     pub marginal: crate::synth::marginal::Marginal,
+    /// Set when the column is treated as PII (issue #71): its profile values
+    /// and dictionary are replaced, and generation fills it with fake values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii: Option<crate::synth::pii::PiiProvider>,
 }
 
 impl Default for ColumnModel {
@@ -77,6 +86,7 @@ impl Default for ColumnModel {
                     scale: 1.0,
                 },
             ),
+            pii: None,
         }
     }
 }
@@ -146,6 +156,7 @@ mod tests {
                     loc: 0.0,
                     scale: 1.0,
                 }),
+                pii: None,
             },
         );
 
@@ -166,6 +177,7 @@ mod tests {
                 column_order: vec!["id".to_string()],
                 correlation: vec![vec![1.0]],
             },
+            fk_cardinality: Default::default(),
         };
 
         let json = serde_json::to_string_pretty(&model).unwrap();
@@ -234,6 +246,7 @@ mod tests {
                 column_order: vec![],
                 correlation: vec![],
             },
+            fk_cardinality: Default::default(),
         };
 
         let json = serde_json::to_string(&model).unwrap();
@@ -260,6 +273,7 @@ mod tests {
                 values: vec!["a".to_string(), "b".to_string()],
                 weights: vec![0.5, 0.5],
             }),
+            pii: None,
         };
 
         let json = serde_json::to_string(&column).unwrap();

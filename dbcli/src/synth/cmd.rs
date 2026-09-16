@@ -1,5 +1,5 @@
 use crate::synth::export::{export, ExportFormat};
-use crate::synth::generator::{generate, GeneratorConfig};
+use crate::synth::generator::{generate, generate_unique_primary_keys, GeneratorConfig};
 use crate::synth::marginal::{
     compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
     NormalParams,
@@ -333,6 +333,7 @@ pub(crate) fn build_model_with_overrides(
                         max: col_profile.max.as_ref().and_then(|v| v.as_f64()),
                         null_rate: Some(col_profile.null_rate),
                         marginal,
+                        pii: None,
                     },
                 );
             }
@@ -405,6 +406,7 @@ pub(crate) fn build_model_with_overrides(
             column_order,
             correlation,
         },
+        fk_cardinality: Default::default(),
     };
     Ok((model, skipped))
 }
@@ -475,6 +477,7 @@ fn fit_datetime_epoch_model(
             },
             None => Marginal::Normal(NormalParams { loc, scale }),
         },
+        pii: None,
     }
 }
 
@@ -697,7 +700,13 @@ pub fn run_generate(
         enforce_min_max_values: flags.enforce_min_max_values,
     };
 
-    let data = generate(&models, &rules, &config)?;
+    let data = if format == "sql" {
+        // Unique primary keys only matter where a relational constraint will
+        // be applied; see `generate_unique_primary_keys` (issue #82).
+        generate_unique_primary_keys(&models, &rules, &config)?
+    } else {
+        generate(&models, &rules, &config)?
+    };
 
     let export_format = match format {
         "csv" => ExportFormat::Csv,

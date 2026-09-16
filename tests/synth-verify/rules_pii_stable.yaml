@@ -1,0 +1,10 @@
+# Stable mapping: an equal trained value maps to an equal fake.
+version: "1"
+tables:
+  - name: pii_users
+    relationships: []
+    columns:
+      email:
+        sdtype: pii
+        pii_provider: email
+        pii_stable_mapping: true

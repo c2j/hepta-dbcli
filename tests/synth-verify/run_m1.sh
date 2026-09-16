@@ -89,8 +89,12 @@ run() {
 }
 
 echo "== synth train =="
+# `rules_m1_keep.yaml` pins `m1_verify_parent.email` to `sdtype: keep`: since
+# issue #71 an `email` column is anonymized by default, which would replace the
+# trained value space this suite asserts on.
 run "${HEPTA_BIN}" synth train --tables "${TABLES}" --schema "${SCHEMA}" \
-    --output "${OUT}" --sample 10000 --categorical-top-k full
+    --output "${OUT}" --sample 10000 --categorical-top-k full \
+    --rules "${ROOT}/rules_m1_keep.yaml"
 
 echo "== synth rules-draft =="
 run "${HEPTA_BIN}" synth rules-draft --tables "${TABLES}" --schema "${SCHEMA}" \
