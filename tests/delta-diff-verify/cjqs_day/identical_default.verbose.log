@@ -1,0 +1,30 @@
+[delta-diff] strategy=keyeddiff consistency=snapshot keys=xwdm,security_id,scdm,fund_code,trade_type,bs,pay_type,stock_kind,bcrq,etf_flag,gddm,gddmzm,check_type,mom_fund fetch_all_threshold=4096
+[sql] BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+[sql] BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+[sql:left] SELECT COUNT(*) AS cnt FROM "gaussdb"."dat_fund_cjqs_bak" WHERE (bcrq='20251215')
+[sql:right] SELECT COUNT(*) AS cnt FROM "gaussdb"."dat_fund_cjqs_bak_r" WHERE (bcrq='20251215')
+[sql] SELECT MOD(('x' || SUBSTR(kh, 1, 8))::bit(32)::bigint, 5) AS bkt,
+  COUNT(*) AS cnt,
+  MOD(SUM(('x' || SUBSTR(h,  1, 8))::bit(32)::bigint), 18446744073709551616) AS s1,
+  MOD(SUM(('x' || SUBSTR(h,  9, 8))::bit(32)::bigint), 18446744073709551616) AS s2,
+  MOD(SUM(('x' || SUBSTR(h, 17, 8))::bit(32)::bigint), 18446744073709551616) AS s3,
+  MOD(SUM(('x' || SUBSTR(h, 25, 8))::bit(32)::bigint), 18446744073709551616) AS s4
+FROM (
+  SELECT MD5(concat_ws('#', "xwdm", "security_id", "scdm", "fund_code", "trade_type", "bs", "pay_type", "stock_kind", "bcrq", "etf_flag", "gddm", "gddmzm", "check_type", "mom_fund")) AS kh, MD5(concat_ws('#', "xwdm", "security_id", "scdm", "fund_code", "trade_type", "bs", "pay_type", "stock_kind", "bcrq", "etf_flag", "gddm", "gddmzm", "check_type", "mom_fund", COALESCE("cjsl"::text, 'NULL'), COALESCE("cjje"::text, 'NULL'), "yhs"::text, "jsf"::text, "jiesf"::text, "zgf"::text, "ghf"::text, "yj"::text, "fxj"::text, "accrual"::text, COALESCE("mrcb"::text, 'NULL'), "main_xwdm", "ghf_dealer"::text, COALESCE("accural_tax"::text, 'NULL'), COALESCE("inst_num"::text, 'NULL'), COALESCE("inst_data_date", 'NULL'), COALESCE("account_flag", 'NULL'), "gh_type", COALESCE("cjbz", 'NULL'), COALESCE("sxf"::text, 'NULL'))) AS h
+  FROM "gaussdb"."dat_fund_cjqs_bak"
+  WHERE (bcrq='20251215')
+) t
+GROUP BY MOD(('x' || SUBSTR(kh, 1, 8))::bit(32)::bigint, 5)
+[sql] SELECT MOD(('x' || SUBSTR(kh, 1, 8))::bit(32)::bigint, 5) AS bkt,
+  COUNT(*) AS cnt,
+  MOD(SUM(('x' || SUBSTR(h,  1, 8))::bit(32)::bigint), 18446744073709551616) AS s1,
+  MOD(SUM(('x' || SUBSTR(h,  9, 8))::bit(32)::bigint), 18446744073709551616) AS s2,
+  MOD(SUM(('x' || SUBSTR(h, 17, 8))::bit(32)::bigint), 18446744073709551616) AS s3,
+  MOD(SUM(('x' || SUBSTR(h, 25, 8))::bit(32)::bigint), 18446744073709551616) AS s4
+FROM (
+  SELECT MD5(concat_ws('#', "xwdm", "security_id", "scdm", "fund_code", "trade_type", "bs", "pay_type", "stock_kind", "bcrq", "etf_flag", "gddm", "gddmzm", "check_type", "mom_fund")) AS kh, MD5(concat_ws('#', "xwdm", "security_id", "scdm", "fund_code", "trade_type", "bs", "pay_type", "stock_kind", "bcrq", "etf_flag", "gddm", "gddmzm", "check_type", "mom_fund", COALESCE("cjsl"::text, 'NULL'), COALESCE("cjje"::text, 'NULL'), "yhs"::text, "jsf"::text, "jiesf"::text, "zgf"::text, "ghf"::text, "yj"::text, "fxj"::text, "accrual"::text, COALESCE("mrcb"::text, 'NULL'), "main_xwdm", "ghf_dealer"::text, COALESCE("accural_tax"::text, 'NULL'), COALESCE("inst_num"::text, 'NULL'), COALESCE("inst_data_date", 'NULL'), COALESCE("account_flag", 'NULL'), "gh_type", COALESCE("cjbz", 'NULL'), COALESCE("sxf"::text, 'NULL'))) AS h
+  FROM "gaussdb"."dat_fund_cjqs_bak_r"
+  WHERE (bcrq='20251215')
+) t
+GROUP BY MOD(('x' || SUBSTR(kh, 1, 8))::bit(32)::bigint, 5)
+[sql] COMMIT

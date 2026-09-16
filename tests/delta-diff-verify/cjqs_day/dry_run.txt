@@ -1,0 +1,11 @@
+dry-run plan
+  strategy         : keyeddiff
+  left             : gaussdb.dat_fund_cjqs_bak (dota_l)
+  right            : gaussdb.dat_fund_cjqs_bak_r (dota_r)
+  key              : xwdm,security_id,scdm,fund_code,trade_type,bs,pay_type,stock_kind,bcrq,etf_flag,gddm,gddmzm,check_type,mom_fund
+  compare columns  : 34 (left) / 34 (right)
+  key domain       : (not applicable — keyeddiff)
+  consistency      : snapshot
+  recheck          : true
+  statement timeout: 300s
+  threads          : 4
