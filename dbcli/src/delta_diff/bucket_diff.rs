@@ -486,6 +486,7 @@ mod tests {
             checkpoint: None,
             iblt_capacity: 65_536,
             fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
             strict: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,

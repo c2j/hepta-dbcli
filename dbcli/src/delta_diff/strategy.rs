@@ -45,6 +45,8 @@ pub(crate) struct DiffContext {
     /// IBLT 预期差异容量 d（k=3d 桶，Addendum §2.4）
     pub(crate) iblt_capacity: u64,
     pub(crate) fetch_all_threshold: u64,
+    /// Naivediff 行数硬顶（issue #87 D4）：max(COUNT) 超过即拒绝；0 = 不设顶
+    pub(crate) naive_max_rows: u64,
     /// IBLT 解码失败时报错（exit 2）而非透明回退
     pub(crate) strict: bool,
     /// Oracle AS OF SCN 锚点（左, 右），快照开启后由策略捕获（§8.2）
@@ -173,6 +175,7 @@ mod filter_tests {
             checkpoint: None,
             iblt_capacity: 65536,
             fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
             strict: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,

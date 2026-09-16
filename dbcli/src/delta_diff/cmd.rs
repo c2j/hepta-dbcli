@@ -210,6 +210,10 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long, default_value_t = 4096)]
     pub fetch_all_threshold: u64,
 
+    /// Naivediff: refuse when max(COUNT) exceeds this (0 = unlimited)
+    #[arg(long, default_value_t = 200_000)]
+    pub naive_max_rows: u64,
+
     /// 终端显示全部比对列，不只变化列
     #[arg(long)]
     pub wide: bool,
@@ -438,6 +442,13 @@ mod tests {
         .expect("parse");
         assert_eq!(args.strategy, Strategy::Keyeddiff);
         assert_eq!(args.strategy.to_string(), "keyeddiff");
+    }
+
+    #[test]
+    fn naive_max_rows_defaults_to_200k() {
+        let args =
+            parse(&["delta-diff", "--left", "a", "--right", "b", "--table", "t"]).expect("parse");
+        assert_eq!(args.naive_max_rows, 200_000);
     }
 
     #[test]

@@ -3,20 +3,68 @@
 // Per side a single `SELECT … WHERE …` full scan (raw key ORDER BY, no
 // NLSSORT/COLLATE, no LIMIT); rows are matched client-side by canonical
 // fingerprints (HashMap join), so correctness never depends on the server
-// row order. Filled in by the naivediff implementation tasks; the `diff`
-// body is a placeholder until then.
+// row order.
 
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use crate::backend::{DbConn, DbError};
-use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus};
+use crate::backend::{DbConn, DbError, ScanSqlSpec};
+use crate::delta_diff::hash_diff::{capture_scn, open_snapshot};
+use crate::delta_diff::keyed_diff;
+use crate::delta_diff::report::{
+    DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, RowPayload, ShardResult,
+    ShardStatus, TableRef,
+};
 use crate::delta_diff::rowdiff;
-use crate::delta_diff::strategy::{DiffContext, DiffStrategy};
+use crate::delta_diff::strategy::{side_filter, ConsistencyMode, DiffContext, DiffStrategy};
 
 pub(crate) struct NaiveDiffer;
+
+#[async_trait::async_trait]
+impl DiffStrategy for NaiveDiffer {
+    fn name(&self) -> &'static str {
+        "naivediff"
+    }
+
+    async fn diff(
+        &self,
+        left: &mut (dyn DbConn + Send),
+        right: &mut (dyn DbConn + Send),
+        ctx: &DiffContext,
+    ) -> Result<DiffReport, DbError> {
+        let started = Utc::now();
+        let mut queries = 0u64;
+        ctx.vlog(format!(
+            "[delta-diff] strategy=naivediff consistency={} keys={} naive_max_rows={}",
+            ctx.consistency.as_str(),
+            ctx.key_columns.join(","),
+            ctx.naive_max_rows
+        ));
+        if ctx.consistency == ConsistencyMode::Snapshot {
+            open_snapshot(left, ctx.verbose).await?;
+            open_snapshot(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((
+                capture_scn(left, ctx.verbose).await?,
+                capture_scn(right, ctx.verbose).await?,
+            ));
+        }
+        let result = self.diff_inner(left, right, ctx, &mut queries).await;
+        if ctx.consistency == ConsistencyMode::Snapshot {
+            ctx.vlog("[sql] COMMIT");
+            let _ = left.query_drop("COMMIT").await;
+            let _ = right.query_drop("COMMIT").await;
+        }
+        let (rows, left_total, right_total, extra_warnings) = result?;
+        let mut report = assemble(ctx, rows, left_total, right_total, extra_warnings);
+        report.started_at = started;
+        report.finished_at = Utc::now();
+        report.perf.queries_total = queries;
+        Ok(report)
+    }
+}
 
 /// Canonical client-side cell identity (issue #87 D2): Null and Text stay
 /// strictly distinct, numeric-flagged text normalizes through Decimal so
@@ -170,20 +218,236 @@ fn keyless_merge(
     out
 }
 
-#[async_trait::async_trait]
-impl DiffStrategy for NaiveDiffer {
-    fn name(&self) -> &'static str {
-        "naivediff"
-    }
-
-    async fn diff(
+impl NaiveDiffer {
+    async fn diff_inner(
         &self,
-        _left: &mut (dyn DbConn + Send),
-        _right: &mut (dyn DbConn + Send),
-        _ctx: &DiffContext,
-    ) -> Result<DiffReport, DbError> {
-        todo!("naivediff end-to-end flow lands with the merge implementation tasks")
+        left: &mut (dyn DbConn + Send),
+        right: &mut (dyn DbConn + Send),
+        ctx: &DiffContext,
+        queries: &mut u64,
+    ) -> Result<(Vec<DiffRow>, u64, u64, Vec<String>), DbError> {
+        let lscheme = left.dialect().url_scheme();
+        let rscheme = right.dialect().url_scheme();
+        let lsql = keyed_diff::render_count_sql(
+            lscheme,
+            left.dialect().identifier_quote(),
+            ctx.left.schema.as_deref(),
+            &ctx.left.table,
+            side_filter(ctx, lscheme).as_deref(),
+        );
+        let rsql = keyed_diff::render_count_sql(
+            rscheme,
+            right.dialect().identifier_quote(),
+            ctx.right.schema.as_deref(),
+            &ctx.right.table,
+            side_filter(ctx, rscheme).as_deref(),
+        );
+        ctx.vlog(format!("[sql:left] {lsql}"));
+        ctx.vlog(format!("[sql:right] {rsql}"));
+        let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
+        *queries += 2;
+        let left_total = keyed_diff::parse_count(&lr?)?;
+        let right_total = keyed_diff::parse_count(&rr?)?;
+
+        if ctx.naive_max_rows > 0 && left_total.max(right_total) > ctx.naive_max_rows {
+            return Err(DbError::query(format!(
+                "naivediff row cap exceeded: left={left_total} right={right_total} cap={}; \
+                 use --strategy keyeddiff for larger filtered sets",
+                ctx.naive_max_rows
+            )));
+        }
+
+        if left_total == 0 && right_total == 0 {
+            return Ok((Vec::new(), 0, 0, Vec::new()));
+        }
+
+        let (lrows, lfetched) = if left_total == 0 {
+            (Vec::new(), 0)
+        } else {
+            let spec = scan_spec(ctx, true, left.dialect())?;
+            let rows = scan_rows(left, &spec, ctx.verbose, queries).await?;
+            let fetched = rows.len() as u64;
+            (rows, fetched)
+        };
+        let (rrows, rfetched) = if right_total == 0 {
+            (Vec::new(), 0)
+        } else {
+            let spec = scan_spec(ctx, false, right.dialect())?;
+            let rows = scan_rows(right, &spec, ctx.verbose, queries).await?;
+            let fetched = rows.len() as u64;
+            (rows, fetched)
+        };
+
+        let mut extra = Vec::new();
+        if lfetched != left_total || rfetched != right_total {
+            extra.push(format!(
+                "naivediff scan count mismatch: left count={left_total} fetched={lfetched}, \
+                 right count={right_total} fetched={rfetched}; \
+                 concurrent writes may have changed rows"
+            ));
+        }
+
+        let rows = if ctx.key_columns.is_empty() {
+            keyless_merge(
+                &lrows,
+                &rrows,
+                &keyless_numeric_flags(ctx, true),
+                &keyless_numeric_flags(ctx, false),
+            )
+        } else {
+            keyed_merge(
+                &lrows,
+                &rrows,
+                ctx.key_columns.len(),
+                &keyed_diff::full_row_numeric_flags(ctx, true),
+                &keyed_diff::full_row_numeric_flags(ctx, false),
+            )
+        };
+        Ok((rows, left_total, right_total, extra))
     }
+}
+
+/// One statement per side: bare quoted key columns + normalized value
+/// expressions; ORDER BY uses raw key columns only (empty for keyless).
+fn scan_spec(
+    ctx: &DiffContext,
+    is_left: bool,
+    dialect: &dyn crate::backend::Dialect,
+) -> Result<ScanSqlSpec, DbError> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_keys = ctx.side_key_columns(is_left);
+    let (columns, order_by) = if side_keys.is_empty() {
+        let columns = side
+            .plan
+            .norm_specs
+            .iter()
+            .map(|spec| dialect.normalize_expr(spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        (columns, Vec::new())
+    } else {
+        let mut columns: Vec<String> = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
+        for spec in side
+            .plan
+            .norm_specs
+            .iter()
+            .filter(|s| !side_keys.iter().any(|k| k == &s.name))
+        {
+            columns.push(dialect.normalize_expr(spec)?);
+        }
+        let order_by = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
+        (columns, order_by)
+    };
+    Ok(ScanSqlSpec {
+        schema: side.schema.clone(),
+        table: side.table.clone(),
+        columns,
+        order_by,
+        filter: side_filter(ctx, dialect.url_scheme()),
+        scn: ctx.scn_of(is_left),
+    })
+}
+
+async fn scan_rows(
+    conn: &mut (dyn DbConn + Send),
+    spec: &ScanSqlSpec,
+    verbose: bool,
+    queries: &mut u64,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    let sql = conn.dialect().render_scan_sql(spec);
+    if verbose {
+        eprintln!("[sql] {sql}");
+    }
+    let result = conn.query(&sql).await?;
+    *queries += 1;
+    Ok(result.rows)
+}
+
+fn keyless_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let names: Vec<String> = side.plan.norm_specs.iter().map(|s| s.name.clone()).collect();
+    side.plan.numeric_value_flags_for(&names)
+}
+
+fn assemble(
+    ctx: &DiffContext,
+    diff_rows: Vec<DiffRow>,
+    left_total: u64,
+    right_total: u64,
+    extra_warnings: Vec<String>,
+) -> DiffReport {
+    let mut summary = DiffSummary {
+        left_total,
+        right_total,
+        ..Default::default()
+    };
+    for d in &diff_rows {
+        match d.status {
+            DiffStatus::MissingLeft => summary.missing_left += 1,
+            DiffStatus::MissingRight => summary.missing_right += 1,
+            DiffStatus::Modified => summary.modified += 1,
+        }
+    }
+    let total = summary.left_total.max(summary.right_total);
+    summary.diff_rate = if total > 0 {
+        (summary.missing_left + summary.missing_right + summary.modified) as f64 / total as f64
+    } else {
+        0.0
+    };
+    let warnings: Vec<String> = ctx
+        .left
+        .plan
+        .warnings
+        .iter()
+        .chain(ctx.right.plan.warnings.iter())
+        .chain(ctx.route_warnings.iter())
+        .cloned()
+        .chain(extra_warnings)
+        .collect();
+    let diff_count = summary.missing_left + summary.missing_right + summary.modified;
+    let mut report = DiffReport {
+        started_at: Utc::now(),
+        finished_at: Utc::now(),
+        left: TableRef {
+            connection: ctx.left.connection_name.clone(),
+            schema: ctx.left.schema.clone(),
+            table: ctx.left.table.clone(),
+        },
+        right: TableRef {
+            connection: ctx.right.connection_name.clone(),
+            schema: ctx.right.schema.clone(),
+            table: ctx.right.table.clone(),
+        },
+        strategy: "naivediff".into(),
+        consistency: ctx.consistency.as_str().into(),
+        hash_algorithm: "none".into(),
+        summary,
+        perf: PerfMetrics::default(),
+        shards: vec![ShardResult {
+            shard_id: "naive-all".into(),
+            key_range: (Value::Null, Value::Null),
+            left_count: left_total,
+            right_count: right_total,
+            diff_count,
+            status: if diff_count > 0 {
+                ShardStatus::Diff
+            } else {
+                ShardStatus::Match
+            },
+            duration_ms: 0,
+        }],
+        sample_diffs: diff_rows,
+        warnings,
+        row_payload: RowPayload::Columns,
+        key_columns: vec![],
+        value_columns: vec![],
+        column_data_types: vec![],
+        ident_quote: '"',
+        ident_scheme: String::new(),
+        backslash_escape: false,
+        modified_columns: None,
+    };
+    crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
+    report
 }
 
 #[cfg(test)]
@@ -326,5 +590,330 @@ mod tests {
             "1 / 1.0 / \"1.0\" are one fingerprint value: {rows:?}"
         );
         assert_eq!(rows[0].status, DiffStatus::MissingRight);
+    }
+
+    // ─── end-to-end flow over scripted connections ─────────────────────
+
+    mod flow {
+        use super::*;
+        use crate::backend::mysql::dialect::MySqlDialect;
+        use crate::backend::{DbPool, Dialect, QueryResult};
+        use crate::delta_diff::metadata::TablePlan;
+        use crate::delta_diff::report::RowPayload;
+        use crate::delta_diff::strategy::{ConsistencyMode, SideCtx};
+        use async_trait::async_trait;
+        use std::collections::VecDeque;
+
+        /// FIFO scripted connection: each `query` pops the next canned
+        /// result (call order per side: COUNT, then scan).
+        struct ScriptedConn {
+            responses: VecDeque<QueryResult>,
+            dialect: MySqlDialect,
+        }
+
+        impl ScriptedConn {
+            fn count(n: u64) -> QueryResult {
+                QueryResult {
+                    columns: vec!["cnt".into()],
+                    rows: vec![vec![json!(n)]],
+                    row_count: 1,
+                    rows_affected: None,
+                }
+            }
+
+            fn scan(rows: Vec<Vec<Value>>) -> QueryResult {
+                QueryResult {
+                    columns: vec![],
+                    row_count: rows.len(),
+                    rows,
+                    rows_affected: None,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl DbConn for ScriptedConn {
+            async fn query(&mut self, _sql: &str) -> Result<QueryResult, DbError> {
+                Ok(self.responses.pop_front().unwrap_or_else(QueryResult::empty))
+            }
+            async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+                Err(DbError::unsupported("scripted"))
+            }
+            async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+                Err(DbError::unsupported("scripted"))
+            }
+            fn dialect(&self) -> &dyn Dialect {
+                &self.dialect
+            }
+        }
+
+        fn plan(keys: &[&str], values: &[(&str, &str)]) -> TablePlan {
+            let mut specs: Vec<crate::backend::ColumnNormSpec> = keys
+                .iter()
+                .map(|k| crate::backend::ColumnNormSpec {
+                    name: (*k).into(),
+                    data_type: "varchar(32)".into(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                })
+                .collect();
+            for (name, ty) in values {
+                specs.push(crate::backend::ColumnNormSpec {
+                    name: (*name).into(),
+                    data_type: (*ty).into(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                });
+            }
+            TablePlan {
+                url_scheme: "mysql".into(),
+                key_columns: keys.iter().map(|k| (*k).into()).collect(),
+                compare_columns: specs.iter().map(|s| s.name.clone()).collect(),
+                norm_specs: specs,
+                warnings: vec![],
+            }
+        }
+
+        fn side(keys: &[&str], values: &[(&str, &str)]) -> SideCtx {
+            SideCtx {
+                connection_name: "x".into(),
+                schema: Some("s".into()),
+                table: "t".into(),
+                plan: plan(keys, values),
+            }
+        }
+
+        fn dummy_pool() -> std::sync::Arc<dyn DbPool> {
+            struct Pool;
+            #[async_trait]
+            impl DbPool for Pool {
+                async fn acquire(&self) -> Result<Box<dyn DbConn + Send>, DbError> {
+                    Err(DbError::unsupported("dummy"))
+                }
+            }
+            std::sync::Arc::new(Pool)
+        }
+
+        struct Flow {
+            left: Box<dyn DbConn + Send>,
+            right: Box<dyn DbConn + Send>,
+        }
+
+        async fn run(flow: Flow, naive_max_rows: u64) -> Result<DiffReport, DbError> {
+            let ctx = DiffContext {
+                left: side(&["k1", "k2"], &[("amt", "decimal(20,6)")]),
+                right: side(&["k1", "k2"], &[("amt", "decimal(20,6)")]),
+                left_pool: dummy_pool(),
+                right_pool: dummy_pool(),
+                key_column: "k1".into(),
+                key_columns: vec!["k1".into(), "k2".into()],
+                left_key_columns: vec!["k1".into(), "k2".into()],
+                right_key_columns: vec!["k1".into(), "k2".into()],
+                filter: None,
+                incremental: None,
+                bisection_factor: 32,
+                bisection_threshold: 16_384,
+                sample_limit: 20,
+                threads: 4,
+                consistency: ConsistencyMode::None,
+                recheck: false,
+                route_warnings: vec![],
+                checkpoint: None,
+                iblt_capacity: 65_536,
+                fetch_all_threshold: 4096,
+                naive_max_rows,
+                strict: false,
+                scns: std::sync::OnceLock::new(),
+                verbose: false,
+            };
+            let mut left = flow.left;
+            let mut right = flow.right;
+            NaiveDiffer.diff(&mut *left, &mut *right, &ctx).await
+        }
+
+        fn keyed_rows(rows: &[(&str, i64, &str)]) -> Vec<Vec<Value>> {
+            rows.iter()
+                .map(|(k1, k2, amt)| vec![json!(k1), json!(k2), json!(amt)])
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn naive_diff_refuses_over_cap() {
+            let err = run(
+                Flow {
+                    left: Box::new(ScriptedConn {
+                        responses: VecDeque::from([ScriptedConn::count(300)]),
+                        dialect: MySqlDialect,
+                    }),
+                    right: Box::new(ScriptedConn {
+                        responses: VecDeque::from([ScriptedConn::count(300)]),
+                        dialect: MySqlDialect,
+                    }),
+                },
+                200,
+            )
+            .await
+            .expect_err("over-cap must refuse");
+            assert!(err.to_string().contains("row cap exceeded"), "{err}");
+            assert!(err.to_string().contains("keyeddiff"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn naive_diff_zero_diff_single_scan() {
+            let lrows = keyed_rows(&[("A", 1, "100.00"), ("B", 2, "5.50")]);
+            let report = run(
+                Flow {
+                    left: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(2),
+                            ScriptedConn::scan(lrows.clone()),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                    right: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(2),
+                            ScriptedConn::scan(lrows),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                },
+                200_000,
+            )
+            .await
+            .expect("identical data");
+            assert!(
+                report.sample_diffs.is_empty(),
+                "zero diff expected: {:?}",
+                report.sample_diffs
+            );
+            assert_eq!(report.perf.queries_total, 4, "2 COUNT + 2 scan");
+        }
+
+        #[tokio::test]
+        async fn naive_diff_reports_modified_missing_and_key_shape() {
+            let lrows = keyed_rows(&[("A", 1, "100.00"), ("B", 2, "5.50"), ("C", 3, "7.25")]);
+            let rrows = keyed_rows(&[("A", 1, "999.00"), ("D", 4, "1.00")]);
+            let report = run(
+                Flow {
+                    left: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(3),
+                            ScriptedConn::scan(lrows),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                    right: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(2),
+                            ScriptedConn::scan(rrows),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                },
+                200_000,
+            )
+            .await
+            .expect("mixed diffs");
+            assert_eq!(report.summary.modified, 1, "{:?}", report.sample_diffs);
+            assert_eq!(report.summary.missing_right, 2, "{:?}", report.sample_diffs);
+            assert_eq!(report.summary.missing_left, 1, "{:?}", report.sample_diffs);
+            let modified = report
+                .sample_diffs
+                .iter()
+                .find(|d| d.status == DiffStatus::Modified)
+                .expect("modified row");
+            assert_eq!(modified.key, json!(["A", 1]), "composite key is JSON array");
+            let missing_right = report
+                .sample_diffs
+                .iter()
+                .find(|d| d.status == DiffStatus::MissingRight)
+                .expect("missing-right row");
+            assert_eq!(missing_right.key, json!(["B", 2]));
+        }
+
+        #[tokio::test]
+        async fn naive_diff_strategy_report_fields() {
+            let lrows = keyed_rows(&[("A", 1, "100.00")]);
+            let report = run(
+                Flow {
+                    left: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(1),
+                            ScriptedConn::scan(lrows.clone()),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                    right: Box::new(ScriptedConn {
+                        responses: VecDeque::from([
+                            ScriptedConn::count(1),
+                            ScriptedConn::scan(lrows),
+                        ]),
+                        dialect: MySqlDialect,
+                    }),
+                },
+                200_000,
+            )
+            .await
+            .expect("run");
+            assert_eq!(report.strategy, "naivediff");
+            assert_eq!(report.hash_algorithm, "none");
+            assert_eq!(report.row_payload, RowPayload::Columns);
+            assert_eq!(report.shards.len(), 1);
+            assert_eq!(report.shards[0].shard_id, "naive-all");
+        }
+
+        #[tokio::test]
+        async fn naive_diff_keyless_reports_only_missing() {
+            let ctx_rows_l = vec![vec![json!("left-only")]];
+            let ctx_rows_r = vec![vec![json!("right-only")]];
+            let ctx = DiffContext {
+                left: side(&[], &[("v", "varchar(32)")]),
+                right: side(&[], &[("v", "varchar(32)")]),
+                left_pool: dummy_pool(),
+                right_pool: dummy_pool(),
+                key_column: String::new(),
+                key_columns: vec![],
+                left_key_columns: vec![],
+                right_key_columns: vec![],
+                filter: None,
+                incremental: None,
+                bisection_factor: 32,
+                bisection_threshold: 16_384,
+                sample_limit: 20,
+                threads: 4,
+                consistency: ConsistencyMode::None,
+                recheck: false,
+                route_warnings: vec![],
+                checkpoint: None,
+                iblt_capacity: 65_536,
+                fetch_all_threshold: 4096,
+                naive_max_rows: 200_000,
+                strict: false,
+                scns: std::sync::OnceLock::new(),
+                verbose: false,
+            };
+            let mut left = Box::new(ScriptedConn {
+                responses: VecDeque::from([
+                    ScriptedConn::count(1),
+                    ScriptedConn::scan(ctx_rows_l),
+                ]),
+                dialect: MySqlDialect,
+            }) as Box<dyn DbConn + Send>;
+            let mut right = Box::new(ScriptedConn {
+                responses: VecDeque::from([
+                    ScriptedConn::count(1),
+                    ScriptedConn::scan(ctx_rows_r),
+                ]),
+                dialect: MySqlDialect,
+            }) as Box<dyn DbConn + Send>;
+            let report = NaiveDiffer.diff(&mut *left, &mut *right, &ctx)
+                .await
+                .expect("keyless run");
+            assert_eq!(report.summary.missing_right, 1, "{:?}", report.sample_diffs);
+            assert_eq!(report.summary.missing_left, 1, "{:?}", report.sample_diffs);
+            assert_eq!(report.summary.modified, 0);
+            assert_eq!(report.perf.queries_total, 4);
+        }
     }
 }
