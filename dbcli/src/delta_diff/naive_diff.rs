@@ -133,11 +133,7 @@ fn keyed_merge(
             Some(li) => {
                 consumed[li] = true;
                 let lrow = &lrows[li];
-                if !rowdiff::row_values_equal(
-                    &lrow[arity..],
-                    &rrow[arity..],
-                    &combined[arity..],
-                ) {
+                if !rowdiff::row_values_equal(&lrow[arity..], &rrow[arity..], &combined[arity..]) {
                     out.push(DiffRow {
                         key: rowdiff::diff_key(lrow, arity),
                         left: Some(lrow.clone()),
@@ -982,7 +978,10 @@ mod tests {
                         }
                         self.inflight.fetch_sub(1, Ordering::SeqCst);
                     }
-                    Ok(self.responses.pop_front().unwrap_or_else(QueryResult::empty))
+                    Ok(self
+                        .responses
+                        .pop_front()
+                        .unwrap_or_else(QueryResult::empty))
                 }
                 async fn exec(
                     &mut self,
@@ -1063,7 +1062,12 @@ mod tests {
             let mut left = Box::new(ScriptedConn {
                 responses: VecDeque::from([
                     ScriptedConn::count(1),
-                    ScriptedConn::scan(vec![vec![json!("a"), json!("1"), json!("10"), json!("20")]]),
+                    ScriptedConn::scan(vec![vec![
+                        json!("a"),
+                        json!("1"),
+                        json!("10"),
+                        json!("20"),
+                    ]]),
                 ]),
                 dialect: MySqlDialect,
             }) as Box<dyn DbConn + Send>;
