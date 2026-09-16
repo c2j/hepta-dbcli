@@ -23,6 +23,8 @@ pub mod mine;
 #[cfg(feature = "synth")]
 pub mod model;
 #[cfg(feature = "synth")]
+pub mod pii;
+#[cfg(feature = "synth")]
 pub mod profile;
 #[cfg(feature = "synth")]
 pub mod quality;
