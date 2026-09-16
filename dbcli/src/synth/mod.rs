@@ -544,22 +544,29 @@ async fn run_train(
 
         // PII columns are anonymized before anything is written (issue #71):
         // the model loses their observed dictionary/range and leaves the
-        // correlation matrix, and the profile drops their top values.
-        // Primary keys and foreign keys are never anonymized: replacing a key
-        // with a fake string would break uniqueness and referential integrity.
-        let mut reserved: std::collections::HashSet<String> = model.pk.iter().cloned().collect();
-        reserved.extend(
-            foreign_keys
-                .iter()
-                .filter(|fk| fk.from_table == *table)
-                .map(|fk| fk.from_column.clone()),
-        );
+        // correlation matrix, and the profile drops their top values. Foreign
+        // keys are exempt because generation assigns them from the parent pool
+        // before the PII fill; a primary key is *not* exempt, and SQL-export
+        // uniqueness redraws it through the provider.
+        let reserved = pii_reserved_columns(&foreign_keys, table);
         let mut detected = detect_pii_columns(
             &result.columns,
             &result.rows,
             &data_types,
             forced_sdtype.get(table),
         );
+        let skipped: Vec<String> = detected
+            .keys()
+            .filter(|column| reserved.contains(*column))
+            .cloned()
+            .collect();
+        for column in skipped {
+            eprintln!(
+                "warning: table '{}': column '{}' is a foreign key; PII anonymization skipped \
+                 (generation fills it from the parent pool)",
+                table, column
+            );
+        }
         detected.retain(|column, _| !reserved.contains(column));
         for (column, provider) in detected {
             if let Some(model_column) = model.columns.get_mut(&column) {
@@ -641,6 +648,21 @@ fn distinct_non_null(rows: &[Vec<serde_json::Value>], index: usize) -> usize {
         .map(|value| value.to_string())
         .collect::<std::collections::HashSet<String>>()
         .len()
+}
+
+/// Columns anonymization must leave alone: foreign keys, which generation
+/// fills from the parent pool. Primary keys are *not* reserved: SQL-export
+/// uniqueness redraws a PII key through its provider.
+#[cfg(feature = "synth")]
+fn pii_reserved_columns(
+    foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
+    table: &str,
+) -> std::collections::HashSet<String> {
+    foreign_keys
+        .iter()
+        .filter(|fk| fk.from_table == table)
+        .map(|fk| fk.from_column.clone())
+        .collect()
 }
 
 /// PII columns of one table: `sdtype: keep` disables, `sdtype: pii` forces a
@@ -2132,5 +2154,18 @@ mod tests {
         let out = detect_pii_columns(&columns, &rows, &types, Some(&forced));
         assert_eq!(out.get("status"), Some(&PiiProvider::Name));
         assert_eq!(out.get("email"), Some(&PiiProvider::Email));
+    }
+    #[test]
+    fn should_reserve_only_foreign_keys_from_pii_anonymization() {
+        let foreign_keys = vec![crate::synth::rules_draft::ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let reserved = pii_reserved_columns(&foreign_keys, "orders");
+        assert!(reserved.contains("user_id"));
+        assert_eq!(reserved.len(), 1, "primary keys must not be reserved");
+        assert!(pii_reserved_columns(&foreign_keys, "other").is_empty());
     }
 }

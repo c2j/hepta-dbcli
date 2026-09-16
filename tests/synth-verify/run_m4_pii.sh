@@ -94,6 +94,13 @@ echo "== synth generate (keep) =="
 "${HEPTA_BIN}" synth generate --models "${OUT}/models_keep" --rules "${ROOT}/rules_pii_keep.yaml" \
     --output "${OUT}/keep" --rows 200 --seed 7 --format csv
 
+echo "== synth train + generate (natural-key PII parent + FK child) =="
+"${HEPTA_BIN}" synth train --tables pii_accounts,pii_logins --schema "${SCHEMA}" \
+    --output "${OUT}/natural_models" --sample 10000 2> "${OUT}/natural_train.err"
+"${HEPTA_BIN}" synth generate --models "${OUT}/natural_models" \
+    --rules "${ROOT}/rules_pii_natural.yaml" \
+    --output "${OUT}/natural" --rows 40 --seed 7 --format csv
+
 echo
 echo "== verifying =="
 if python3 "${ROOT}/verify_pii.py" "${OUT}"; then

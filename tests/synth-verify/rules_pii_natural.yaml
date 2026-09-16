@@ -1,0 +1,9 @@
+# Natural-key PII parent + FK child (no overrides: detection runs by default).
+version: "1"
+tables:
+  - name: pii_accounts
+    relationships: []
+  - name: pii_logins
+    relationships:
+      - pk: account_email
+        references: [pii_accounts.email]

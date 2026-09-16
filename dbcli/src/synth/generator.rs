@@ -293,6 +293,10 @@ fn generate_with(
                         .round() as usize;
                     assignments.extend(std::iter::repeat_n(Value::Null, null_rows));
                 }
+                // Expanding counts parent by parent would put every child of a
+                // parent in consecutive rows, a block structure the copula
+                // never learned; shuffle so row order carries no signal.
+                shuffle_in_place(&mut assignments, &mut rng);
                 row_count = assignments.len();
                 modeled_assignments.insert(rel.pk.clone(), assignments);
             }
@@ -452,6 +456,9 @@ fn generate_with(
                 continue;
             }
             let column_model = model.columns.get(col_name);
+            // A PII key redraws through its provider, so its placeholder
+            // dictionary says nothing about the real value space.
+            let pii_provider = column_model.and_then(|column| column.pii);
             // 该列同时是本表的 FK 列时，只能从父池重抽——从自身边际重抽
             // 会产生脱离父表值域的值，破坏引用完整性。
             let fk_pool_column = rel_pools
@@ -459,8 +466,9 @@ fn generate_with(
                 .find(|r| &r.column == col_name)
                 .map(|r| r.column.clone());
             if fk_pool_column.is_none() {
-                if let Some(crate::synth::marginal::Marginal::Categorical(p)) =
-                    column_model.map(|c| &c.marginal)
+                if let Some(crate::synth::marginal::Marginal::Categorical(p)) = column_model
+                    .filter(|_| pii_provider.is_none())
+                    .map(|c| &c.marginal)
                 {
                     if p.values.len() < row_count {
                         return Err(format!(
@@ -505,6 +513,8 @@ fn generate_with(
                             .find(|r| &r.column == col_name)
                             .and_then(|r| r.pool.sample_one(r.strategy, &mut rng))
                             .unwrap_or_else(|| current.clone())
+                    } else if let Some(provider) = pii_provider {
+                        Value::String(crate::synth::pii::generate_value(provider, &mut rng))
                     } else {
                         gen_column_value(
                             column_model,
@@ -698,9 +708,18 @@ fn pk_value_space(model: &TableModel, column: &str) -> Option<usize> {
     if !min.is_finite() || !max.is_finite() || max < min {
         return None;
     }
-    let step = match col.rounding {
-        Some(0) => 1.0,
-        _ => 10f64.powi(-(col.decimal_scale? as i32)),
+    // A datetime key's space is its formatted step, not its epoch span: a
+    // date-only key has one value per day, so redraw would spin for nothing.
+    let step = match col.logical_type {
+        crate::synth::model::LogicalType::Datetime => col
+            .datetime_format
+            .as_deref()
+            .map(datetime_step_seconds)
+            .unwrap_or(1.0),
+        _ => match col.rounding {
+            Some(0) => 1.0,
+            _ => 10f64.powi(-(col.decimal_scale? as i32)),
+        },
     };
     if step <= 0.0 {
         return None;
@@ -1185,6 +1204,15 @@ fn column_null_rng(base: Option<u64>, table: &str, column: &str) -> rand::rngs::
 /// value per placeholder level.
 fn column_pii_seed(base: Option<u64>, table: &str, column: &str) -> u64 {
     table_seed(base, &format!("{}:{}:pii", table, column)).unwrap_or(0)
+}
+
+/// In-place Fisher-Yates, used to keep modeled FK assignments from forming
+/// contiguous parent blocks.
+fn shuffle_in_place(values: &mut [Value], rng: &mut impl Rng) {
+    for index in (1..values.len()).rev() {
+        let other = rng.gen_range(0..=index);
+        values.swap(index, other);
+    }
 }
 
 // 同一 --seed 下各表不能共用一条高斯流：djb2（跨平台/版本稳定）混淆出每表种子
@@ -7537,6 +7565,94 @@ tables:
                 values.insert(value.clone()),
                 "duplicate stable value {value}"
             );
+        }
+    }
+    /// Modeled assignments must not leave each parent's children in contiguous
+    /// rows: that block structure would leak into the copula-sampled columns.
+    #[test]
+    fn should_not_emit_modeled_children_in_parent_blocks() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(100);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", false)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 100)).unwrap();
+        let rows = data.tables.get("child").unwrap();
+        let keys: Vec<String> = rows.iter().map(|row| row[0].to_string()).collect();
+        let distinct: std::collections::HashSet<&String> = keys.iter().collect();
+        let transitions = keys.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert!(
+            transitions > distinct.len(),
+            "block layout would give at most {} transitions, got {transitions}",
+            distinct.len() - 1
+        );
+    }
+    /// A natural-key PII parent (email PK) referenced by a child: the parent
+    /// key must be redrawn through the provider and stay unique, so the child
+    /// still references real parent keys.
+    #[test]
+    fn should_keep_a_pii_natural_key_unique_and_referenceable() {
+        let mut parent = pii_model("parent", "email", PiiProvider::Email, 3);
+        parent.pk = vec!["email".to_string()];
+        let models = HashMap::from([
+            ("parent".to_string(), parent),
+            (
+                "child".to_string(),
+                int_key_model("child", "user_email", 0.0),
+            ),
+        ]);
+        let parent_rule = single_rule("parent", vec![]);
+        let child_rule = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "user_email".to_string(),
+                references: vec!["parent.email".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                cardinality: CardinalityMode::ExactRows,
+                null_label: "null".to_string(),
+            }],
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("parent".to_string(), 30), ("child".to_string(), 60)]),
+            seed: Some(17),
+            enforce_min_max_values: true,
+        };
+
+        let data = generate(&models, &rules, &config).unwrap();
+        let parent_emails: Vec<&str> = data.tables["parent"]
+            .iter()
+            .filter_map(|row| row[1].as_str())
+            .collect();
+        let distinct: std::collections::HashSet<&str> = parent_emails.iter().copied().collect();
+        assert_eq!(distinct.len(), 30, "a referenced PII key must stay unique");
+        assert!(parent_emails
+            .iter()
+            .all(|value| PiiProvider::Email.matches_format(value)));
+        assert!(!parent_emails
+            .iter()
+            .any(|value| value.starts_with("__pii_level_")));
+
+        let parent_set: std::collections::HashSet<&str> = distinct.clone();
+        for row in data.tables["child"].iter() {
+            let value = row[0].as_str().expect("child key is a string");
+            assert!(parent_set.contains(value), "orphan child key {value}");
         }
     }
 }

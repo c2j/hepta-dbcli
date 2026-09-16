@@ -132,7 +132,7 @@ const PERSONAL_NAME_PREFIXES: [&str; 11] = [
 ];
 
 /// Single-token names (including camelCase collapses) that are personal names.
-const WHOLE_NAME_TOKENS: [&str; 13] = [
+const WHOLE_NAME_TOKENS: [&str; 12] = [
     "name",
     "nickname",
     "fullname",
@@ -142,16 +142,13 @@ const WHOLE_NAME_TOKENS: [&str; 13] = [
     "givenname",
     "familyname",
     "personname",
-    "username",
     "displayname",
     "contactname",
     "nick",
 ];
 
-/// Column-name pattern. Matching is anchored on whole tokens: `last == "email"`
-/// or `[email|mail] + [address|addr]`. Substring matching is deliberately not
-/// used, so `is_email_verified`, `microphone`, `mail_id`, `file_name`,
-/// `table_name` and `country_name` stay untouched.
+/// Column-name pattern, matched on whole tokens (never as substrings) with the
+/// type word as the last token.
 fn provider_from_name(column: &str) -> Option<PiiProvider> {
     let name = column.to_ascii_lowercase();
     let tokens = name_tokens(&name);
@@ -176,19 +173,26 @@ fn provider_from_name(column: &str) -> Option<PiiProvider> {
 
     // Email: `email` / `mail` as the last token, `email_address`, or the
     // camelCase collapse.
-    let email_tail = matches!(
-        last,
-        "email" | "mail" | "emailaddress" | "emailaddr" | "mailaddress" | "mailaddr"
-    ) || ((has("email") || has("mail")) && matches!(last, "address" | "addr"));
+    // `mail` only counts as the whole name (`mail`) or inside `mail_address`;
+    // `junk_mail` / `voice_mail` are not address columns.
+    let email_tail = last == "email"
+        || (tokens.len() == 1 && last == "mail")
+        || matches!(
+            last,
+            "emailaddress" | "emailaddr" | "mailaddress" | "mailaddr"
+        )
+        || ((has("email") || has("mail")) && matches!(last, "address" | "addr"));
     if email_tail {
         return Some(PiiProvider::Email);
     }
 
     // Phone: the type word must be the last token (`phone_number` qualifies).
+    // `cell` alone is a spreadsheet cell / fuel cell, so it needs a qualifier.
     if matches!(
         last,
-        "phone" | "mobile" | "tel" | "telephone" | "msisdn" | "cell" | "cellphone"
-    ) || ((has("phone") || has("mobile")) && matches!(last, "number" | "no" | "num"))
+        "phone" | "mobile" | "tel" | "telephone" | "msisdn" | "cellphone"
+    ) || ((has("phone") || has("mobile") || has("cell"))
+        && matches!(last, "number" | "no" | "num"))
     {
         return Some(PiiProvider::Phone);
     }
@@ -382,6 +386,13 @@ mod tests {
             "customer_id",
             "status",
             "amount",
+            "fuel_cell",
+            "cell",
+            "junk_mail",
+            "direct_mail",
+            "voice_mail",
+            "user_mail",
+            "username",
         ] {
             assert_eq!(
                 provider_from_name(column),

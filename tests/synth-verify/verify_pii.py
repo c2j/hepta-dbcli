@@ -132,6 +132,35 @@ def main():
         "`sdtype: keep` leaves the model column unmarked",
     )
 
+    # Natural-key PII parent (email PRIMARY KEY) referenced by a child: training
+    # must anonymize the key, keep it unique, and keep the child referencable.
+    account_model_text = (out / "natural_models" / "pii_accounts.model.json").read_text()
+    account_model = json.loads(account_model_text)
+    check(
+        account_model["columns"]["email"].get("pii") == "email",
+        "a trained email primary key is marked PII",
+    )
+    check(
+        all(f"owner{i}@corp-example.cn" not in account_model_text for i in range(40)),
+        "the email primary key keeps no observed value in the model",
+    )
+    accounts = read_rows(out / "natural" / "pii_accounts.csv")
+    account_emails = [row["email"] for row in accounts if row["email"]]
+    check(
+        len(set(account_emails)) == len(account_emails) == 40,
+        f"the anonymized email key stays unique ({len(set(account_emails))}/{len(account_emails)})",
+    )
+    check(
+        all(EMAIL_RE.match(value) for value in account_emails),
+        "anonymized primary-key emails are format valid",
+    )
+    logins = read_rows(out / "natural" / "pii_logins.csv")
+    known = set(account_emails)
+    check(
+        all(row["account_email"] in known for row in logins if row["account_email"]),
+        "the child still references generated parent keys",
+    )
+
     if failures:
         print(f"\n{len(failures)} PII check(s) failed")
         return 1
