@@ -119,6 +119,57 @@ fn keyed_merge(
     out
 }
 
+/// Keyless full-row multiset difference over canonical fingerprints
+/// (issue #87 D6: the keyless naivediff mode is a bucketdiff superset —
+/// it carries row payloads instead of hash counts). Rows cancel
+/// min(left, right) per fingerprint; leftover right rows come first in
+/// right scan order as MissingLeft, leftover left rows follow in left
+/// scan order as MissingRight. There is no Modified status: without a
+/// key there is no row identity to compare across sides.
+fn keyless_merge(
+    lrows: &[Vec<Value>],
+    rrows: &[Vec<Value>],
+    lnum: &[bool],
+    rnum: &[bool],
+) -> Vec<DiffRow> {
+    let combined: Vec<bool> = lnum
+        .iter()
+        .zip(rnum.iter())
+        .map(|(l, r)| *l && *r)
+        .collect();
+
+    let mut left_map: HashMap<Vec<Fingerprint>, Vec<usize>> = HashMap::new();
+    for (i, row) in lrows.iter().enumerate() {
+        left_map
+            .entry(fingerprint_row(row, &combined))
+            .or_default()
+            .push(i);
+    }
+
+    let mut out = Vec::new();
+    let mut consumed = vec![false; lrows.len()];
+    for rrow in rrows {
+        let paired = left_map
+            .get_mut(&fingerprint_row(rrow, &combined))
+            .and_then(|indices| indices.pop());
+        match paired {
+            Some(li) => consumed[li] = true,
+            None => out.push(rowdiff::diff_row_n(
+                rrow,
+                0,
+                false,
+                DiffStatus::MissingLeft,
+            )),
+        }
+    }
+    for (li, row) in lrows.iter().enumerate() {
+        if !consumed[li] {
+            out.push(rowdiff::diff_row_n(row, 0, true, DiffStatus::MissingRight));
+        }
+    }
+    out
+}
+
 #[async_trait::async_trait]
 impl DiffStrategy for NaiveDiffer {
     fn name(&self) -> &'static str {
@@ -226,5 +277,54 @@ mod tests {
         let rrows = vec![vec![json!("k"), json!("1.5")]];
         let rows = keyed_merge(&lrows, &rrows, 1, &[false, true], &[false, true]);
         assert!(rows.is_empty(), "1.50 == 1.5 numerically: {rows:?}");
+    }
+
+    #[test]
+    fn keyless_merge_reports_only_missing_statuses() {
+        let lrows = vec![vec![json!("same")], vec![json!("left-only")]];
+        let rrows = vec![vec![json!("same")], vec![json!("right-only")]];
+        let rows = keyless_merge(&lrows, &rrows, &[false], &[false]);
+        assert_eq!(rows.len(), 2, "identical rows cancel: {rows:?}");
+        assert!(rows.iter().all(|r| r.status != DiffStatus::Modified));
+        assert!(rows
+            .iter()
+            .any(|r| r.status == DiffStatus::MissingRight && r.left.is_some()));
+        assert!(rows
+            .iter()
+            .any(|r| r.status == DiffStatus::MissingLeft && r.right.is_some()));
+    }
+
+    #[test]
+    fn keyless_merge_multiset_cancel_counts() {
+        let lrows = vec![vec![json!("x")], vec![json!("x")]];
+        let rrows = vec![vec![json!("x")]];
+        let rows = keyless_merge(&lrows, &rrows, &[false], &[false]);
+        assert_eq!(rows.len(), 1, "2 left vs 1 right cancels one: {rows:?}");
+        assert_eq!(rows[0].status, DiffStatus::MissingRight);
+    }
+
+    #[test]
+    fn keyless_merge_null_and_empty_string_are_distinct_fingerprints() {
+        let lrows = vec![vec![Value::Null]];
+        let rrows = vec![vec![json!("")]];
+        let rows = keyless_merge(&lrows, &rrows, &[false], &[false]);
+        assert_eq!(
+            rows.len(),
+            2,
+            "NULL and '' must never cancel each other (Java §6.1): {rows:?}"
+        );
+    }
+
+    #[test]
+    fn keyless_merge_numeric_equivalence_across_scales() {
+        let lrows = vec![vec![json!(1)], vec![json!(1.0)]];
+        let rrows = vec![vec![json!("1.0")]];
+        let rows = keyless_merge(&lrows, &rrows, &[true], &[true]);
+        assert_eq!(
+            rows.len(),
+            1,
+            "1 / 1.0 / \"1.0\" are one fingerprint value: {rows:?}"
+        );
+        assert_eq!(rows[0].status, DiffStatus::MissingRight);
     }
 }
