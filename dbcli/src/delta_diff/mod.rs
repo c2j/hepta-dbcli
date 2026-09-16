@@ -22,6 +22,7 @@ pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
+pub(crate) mod naive_diff;
 pub(crate) mod output;
 pub(crate) mod pairing;
 pub(crate) mod progress;
