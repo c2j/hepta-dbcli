@@ -709,7 +709,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 必填：`left_connection`、`right_connection`、`table`。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。
 
 `where_condition` 禁止包含分号。`update_column` 与 `where_condition` 互斥，同时提供会被拒绝。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
@@ -778,6 +778,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | `joindiff` | 同一连接 + MySQL 系 + 单列整数键 | 同库两表联邦 JOIN |
 | `iblt` | 跨连接（或非 MySQL）+ 单列整数键 | 可逆布隆表快路径；`--strict` 时解码失败 exit 2 而不回退 |
 | `hashdiff` | `auto` **不会**选它 | `--strategy hashdiff` 强制二分 checksum |
+| `naivediff` | `auto` **不会**选它 | `--strategy naivediff` 强制「每侧一次全扫描 + 客户端归并」：裸键 ORDER BY、无 NLSSORT/COLLATE、无 LIMIT，正确性不依赖库端行序；适合单日数万行、复合 VARCHAR 主键、经常零差/少量差的日对账。超过 `--naive-max-rows` 行数硬顶直接拒绝并提示改用 keyeddiff；无键表走全行多重集差（不回退 bucketdiff） |
 
 DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致（含 `--update-column`/`--update-since` 增量窗口）。`BLOB` / `JSON` / `TEXT` 列不参与行哈希（预检排除并给出 warning）；`TIMESTAMPTZ` 以 UTC 文本规范化（bundled 构建无 ICU，不受影响）。**增量窗口时区语义**：bundled 构建无 ICU，会话时区固定为 UTC，窗口 cutoff 是 UTC 墙钟（与本地时间相差机器 UTC 偏移）；两侧使用同一 cutoff，比对结果自洽，但短窗口覆盖的行范围可能与本地时间直觉不同。跨引擎注意：UUID / BLOB / 非有限浮点（NaN/Infinity）在 DuckDB 与 GaussDB/Oracle 的规范化行为不同——相应列会被响亮排除或可能报差异，跨引擎比对时先核对。
 
@@ -863,6 +864,7 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 | `--bisection-threshold` | 16384 | hashdiff 行级阈值 |
 | `--iblt-capacity` | 65536 | IBLT 预期差异容量 |
 | `--fetch-all-threshold` | 4096 | keyeddiff：`max(COUNT)` 不超过此值时一次拉全量 |
+| `--naive-max-rows` | 200000 | naivediff：`max(COUNT)` 超过此值时拒绝（exit 2）并提示改用 `--strategy keyeddiff`；`0` = 不设顶（大表物化内存自负） |
 | `--verbose` | 关 | 分片进度与每步 SQL 打到 stderr |
 
 ---
