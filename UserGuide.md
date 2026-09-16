@@ -1146,10 +1146,36 @@ tables:
 | P2 | ogagila pagila 三表（customer–rental–payment）：门禁 = 可插入 0 错误、孤儿 FK = 0、**payment.amount on-grid ≥ 0.95**；P2-2 每 customer 扇出 KS **仅记录**（uniform 0.1888 / zipf 0.7238，empirical fan-out 不在本里程碑）；1-hop 相关仅记录 | [tests/benchmark/p2/REPORT.md](../tests/benchmark/p2/REPORT.md) | `tests/benchmark/p2/run_p2.sh` |
 | M1 验收 | synth M1 端到端（真实 MySQL fixture）：datetime 格式还原与值域、NULL 比例复现、DECIMAL 标度、字典列全档、FK 引用完整性、SQL schema 限定、同 seed 逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m1.sh` |
 | M2 验收 | synth M2 端到端（同一 fixture）：边际自动择优（非整表 Normal）、留出集摘要隐私、report 的 shapes/pairs/fk 三节、劣化检出与 `--min-score` 退出码、离线（生成父键）与真库（`--against-db`）FK join-rate、缺 baseline / 缺数据的 skip 与 `--strict`、两次报告逐字节一致 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m2.sh` |
+| M4 验收（#82） | SQL 导出主键唯一：12 键表 `--rows 200` 外推后可回灌 200 唯一 id、20×20 复合键 200 唯一元组、非数值键 fail-fast 且报列名+行数 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_pk.sh` |
+| M4 验收（#72） | 子表基数：模型学习分布精确 `{0:.5,1:.3,2:.2}`、modeled 生成形状复现（零占比 [0.4,0.6]、TV<0.1）、report 带 `cardinality tv`、默认 exact_rows 保持 `--rows` | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_cardinality.sh` |
+| M4 验收（#71） | PII：模型/剖面双泄漏面清除、生成值与训练值零交集且格式合法、同 seed 可复现、stable_mapping 同档同值、`sdtype: keep` 保留值域 | [tests/synth-verify/README.md](../tests/synth-verify/README.md) | `HEPTA_DBCLI_TEST_URL=... bash tests/synth-verify/run_m4_pii.sh` |
 
 CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（零外部服务）；Case A / P2 为 `workflow_dispatch` 且需仓库变量 `OGAGILA_DIR`（ogagila 检出 URL）。门禁断言决定 job 成败，报告作为 artifact 上传。on-grid 门禁在 P2 强制执行（P1 不含 payment 表）。
 
 范围声明：Case B（vs CTGAN / TVAE / TabDDPM / GReaT）与 Case C（vs SDV HMA / ClavaDDPM / REaLTabFormer）**不在本里程碑**；SynMeter / torch / SDV 仅存在于 benchmark venv（`tests/benchmark/requirements.txt`），不进入 `Cargo.toml`。
+
+### 10.7 能力矩阵（对照 SDV / shadow-seed）
+
+图例：✅ 开箱可用；⚠️ 部分/需额外组件；❌ 不具备。仅列 synth 相关能力，均为 M1-M4 结束后的状态（2026-09）。
+
+| 能力 | hepta-dbcli | SDV（社区版） | shadow-seed |
+|------|-------------|---------------|-------------|
+| 便携模型（纯 JSON，无 Python） | ✅ | ❌（pkl / Python 栈） | ❌ |
+| 单表边际 + copula | ✅ Normal/Beta/Gamma/Uniform/ECDF 自动择优 | ✅ 多种合成器 | ✅ copula |
+| 日期/时间列 | ✅ 格式还原 + epoch 边际 | ✅ | ⚠️ 部分 |
+| NULL 复现（含 pairwise-complete 相关修正） | ✅ | ✅ | ⚠️ 部分 |
+| FK 图拓扑排序 + 引用完整性 | ✅ | ✅ | ✅（固定模式） |
+| 子表基数建模（HMA-lite） | ✅ `cardinality: modeled` | ✅ HMA 全量 | ❌ |
+| 主键唯一性（SQL 导出可回灌） | ✅ 含数值外推 | ✅ 内建 id 处理 | ✅ |
+| PII 识别 + 不可逆匿名化 | ✅ email/phone/name/id_card，默认匿名、可 `keep` | ✅ AnonymizedFaker（40+ locale） | ❌（有意保留真实键值） |
+| 可逆伪匿名化 | ❌（明确不做，见 #73） | ✅ PseudoAnonymizedFaker | ❌ |
+| 差分隐私保证 | ❌（明确不做） | ⚠️ 企业版 | ❌ |
+| 条件规则 / 固定值 / 派生列 / 分支覆盖 | ✅ `fixed`/`values`/`fixed_range`/`derive`/`branches` + rules-draft 2.0 | ⚠️ constraints 子集 | ✅ 业务规则修复层 |
+| 离线质量报告（留出集 KS/TV/pairs/FK/基数 TV） | ✅ `synth report` | ✅ SDMetrics | ❌ |
+| 多方言直连训练（MySQL/Oracle/GaussDB/DuckDB） | ✅ | ❌（只吃 DataFrame） | ❌ |
+| 部署形态 | ✅ 单二进制，无 Python | ❌ Python 依赖栈 | ❌ |
+
+当前 `synth report` 基线（M1 fixture：日期/金额/字典/可空/FK 多表）为 **0.733**，明细见 [docs/plans/2026-09-16-synth-report-baseline.md](../docs/plans/2026-09-16-synth-report-baseline.md)；路线的 ≥0.85 目标尚未达成（差在 FK 列与高基数类列的 1-KS/1-TV）。
 
 ---
 
