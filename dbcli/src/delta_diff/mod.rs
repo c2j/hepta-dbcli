@@ -22,6 +22,7 @@ pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
+pub(crate) mod naive_diff;
 pub(crate) mod output;
 pub(crate) mod pairing;
 pub(crate) mod progress;
@@ -508,6 +509,7 @@ async fn execute_diff_inner(
         checkpoint,
         iblt_capacity: args.iblt_capacity,
         fetch_all_threshold: args.fetch_all_threshold,
+        naive_max_rows: args.naive_max_rows,
         strict: args.strict,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,
@@ -820,6 +822,7 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
     match strategy {
         "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
         "bucketdiff" => "  key domain       : (not applicable — bucketdiff)".to_string(),
+        "naivediff" => "  key domain       : (not applicable — naivediff)".to_string(),
         _ => match minmax {
             Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
             None => "  key domain       : (unavailable)".to_string(),
@@ -940,6 +943,14 @@ mod dry_run_format_tests {
         assert_eq!(
             format_key_domain_line("keyeddiff", None),
             "  key domain       : (not applicable — keyeddiff)"
+        );
+    }
+
+    #[test]
+    fn dry_run_shows_naivediff_strategy() {
+        assert_eq!(
+            format_key_domain_line("naivediff", None),
+            "  key domain       : (not applicable — naivediff)"
         );
     }
 

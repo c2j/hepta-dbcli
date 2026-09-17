@@ -7,7 +7,8 @@
 
 use crate::backend::error::DbError;
 use crate::backend::{
-    ChecksumSqlSpec, ColumnNormSpec, Dialect, IbltSqlSpec, KeysetPageSpec, NULL_SENTINEL,
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, IbltSqlSpec, KeysetPageSpec, ScanSqlSpec,
+    NULL_SENTINEL,
 };
 
 pub(crate) struct DuckDbDialect;
@@ -302,6 +303,24 @@ impl Dialect for DuckDbDialect {
         )
     }
 
+    fn render_scan_sql(&self, spec: &ScanSqlSpec) -> String {
+        let table = quoted_table(&spec.schema, &spec.table);
+        let where_clause = spec
+            .filter
+            .as_ref()
+            .map(|f| format!("\nWHERE ({f})"))
+            .unwrap_or_default();
+        let order_by = if spec.order_by.is_empty() {
+            String::new()
+        } else {
+            format!("\nORDER BY {}", spec.order_by.join(", "))
+        };
+        format!(
+            "SELECT {}\nFROM {table}{where_clause}{order_by}",
+            spec.columns.join(", ")
+        )
+    }
+
     fn row_hash_expr(&self, exprs: &[String]) -> String {
         format!("MD5(concat_ws('#', {}))", exprs.join(", "))
     }
@@ -547,6 +566,25 @@ mod tests {
         );
         assert!(sql.contains("ORDER BY \"k1\", \"k2\""));
         assert!(sql.contains("LIMIT 50"));
+    }
+
+    #[test]
+    fn scan_sql_orders_by_raw_key_without_collate() {
+        let d = DuckDbDialect;
+        let spec = ScanSqlSpec {
+            schema: Some("main".into()),
+            table: "t".into(),
+            columns: vec![r#""k1""#.into(), r#""k2""#.into()],
+            order_by: vec![r#""k1""#.into(), r#""k2""#.into()],
+            filter: Some("bcrq='20251215'".into()),
+            scn: None,
+        };
+        let sql = d.render_scan_sql(&spec);
+        assert!(sql.contains("FROM \"main\".\"t\""), "{sql}");
+        assert!(sql.contains("WHERE (bcrq='20251215')"), "{sql}");
+        assert!(sql.contains("ORDER BY \"k1\", \"k2\""), "{sql}");
+        assert!(!sql.contains("COLLATE"), "{sql}");
+        assert!(!sql.contains("LIMIT"), "{sql}");
     }
 
     #[test]

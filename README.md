@@ -324,6 +324,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | `joindiff` | Same-connection MySQL-family with a single integer key |
 | `iblt` | Cross-connection (or non-MySQL) with a single integer key |
 | `hashdiff` | Not chosen by `auto`; pass `--strategy hashdiff` for bisection checksums |
+| `naivediff` | Not chosen by `auto`; pass `--strategy naivediff` for one full scan per side + client-side merge (fast daily reconciliation on composite VARCHAR keys; see `--naive-max-rows`) |
 
 Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dry-run` exits `0` on success.
 

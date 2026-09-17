@@ -1,0 +1,95 @@
+Timing is on.
+SET
+Time: 0.122 ms
+                                                                                                                                                 QUERY PLAN                                                                                                                                                  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=10256.90..10256.91 rows=1 width=8) (actual time=129.184..129.184 rows=1 loops=1)
+   Output: count(*)
+   (Buffers: shared hit=7059)
+   ->  Seq Scan on gaussdb.dat_fund_cjqs_bak  (cost=0.00..10059.00 rows=79160 width=0) (actual time=0.104..123.925 rows=80000 loops=1)
+         Output: xwdm, security_id, bs, trade_type, bcrq, cjsl, cjje, yhs, jsf, jiesf, zgf, ghf, yj, fxj, accrual, pay_type, fund_code, stock_kind, mrcb, scdm, main_xwdm, ghf_dealer, accural_tax, etf_flag, gddm, gddmzm, inst_num, inst_data_date, account_flag, check_type, gh_type, cjbz, sxf, mom_fund
+         Filter: ((dat_fund_cjqs_bak.bcrq)::text = '20251215'::text)
+         Rows Removed by Filter: 160000
+         (Buffers: shared hit=7059)
+ Total runtime: 129.711 ms
+(9 rows)
+
+Time: 133.965 ms
+                                                                                                                                                                                                                                              QUERY PLAN                                                                                                                                                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=31234.30..31234.73 rows=10 width=328) (actual time=3098.033..3098.039 rows=5 loops=1)
+   Group By Key: mod(((('x'::text || substr(md5(concat_ws('#'::text, dat_fund_cjqs_bak.xwdm, dat_fund_cjqs_bak.security_id, dat_fund_cjqs_bak.scdm, dat_fund_cjqs_bak.fund_code, dat_fund_cjqs_bak.trade_type, dat_fund_cjqs_bak.bs, dat_fund_cjqs_bak.pay_type, dat_fund_cjqs_bak.stock_kind, dat_fund_cjqs_bak.bcrq, dat_fund_cjqs_bak.etf_flag, dat_fund_cjqs_bak.gddm, dat_fund_cjqs_bak.gddmzm, dat_fund_cjqs_bak.check_type, dat_fund_cjqs_bak.mom_fund)), 1, 8)))::bit(32))::bigint, 5::bigint)
+   (Buffers: shared hit=7059)
+   ->  Seq Scan on dat_fund_cjqs_bak  (cost=0.00..11840.10 rows=79160 width=192) (actual time=0.688..313.197 rows=80000 loops=1)
+         Filter: ((bcrq)::text = '20251215'::text)
+         Rows Removed by Filter: 160000
+         (Buffers: shared hit=7059)
+ Total runtime: 3100.068 ms
+(8 rows)
+
+Time: 3109.576 ms
+                                                                                                                QUERY PLAN                                                                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate  (cost=14214.90..14215.25 rows=10 width=145) (actual time=383.201..383.204 rows=5 loops=1)
+   Group By Key: mod(((('x'::text || substr(md5(concat_ws('#'::text, xwdm, security_id, scdm, fund_code, trade_type, bs, pay_type, stock_kind, bcrq, etf_flag, gddm, gddmzm, check_type, mom_fund)), 1, 8)))::bit(32))::bigint, 5::bigint)
+   (Buffers: shared hit=7059)
+   ->  Seq Scan on dat_fund_cjqs_bak  (cost=0.00..11840.10 rows=79160 width=105) (actual time=0.027..237.155 rows=80000 loops=1)
+         Filter: ((bcrq)::text = '20251215'::text)
+         Rows Removed by Filter: 160000
+         (Buffers: shared hit=7059)
+ Total runtime: 384.902 ms
+(8 rows)
+
+Time: 394.956 ms
+                                                                                                                                                       QUERY PLAN                                                                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=16076.09..16077.08 rows=396 width=105) (actual time=255.453..256.106 rows=8192 loops=1)
+   ->  Sort  (cost=16076.09..16077.08 rows=396 width=105) (actual time=255.293..255.520 rows=8192 loops=1)
+         Sort Key: xwdm COLLATE "C", security_id COLLATE "C", scdm COLLATE "C", fund_code COLLATE "C", trade_type COLLATE "C", bs COLLATE "C", pay_type COLLATE "C", stock_kind COLLATE "C", bcrq COLLATE "C", etf_flag COLLATE "C", gddm COLLATE "C", gddmzm COLLATE "C", check_type COLLATE "C", mom_fund COLLATE "C"
+         Sort Method: quicksort  Memory: 5008kB
+         (Buffers: shared hit=7059)
+         ->  Seq Scan on dat_fund_cjqs_bak  (cost=0.00..16059.00 rows=396 width=105) (actual time=0.050..240.788 rows=15996 loops=1)
+               Filter: (((bcrq)::text = '20251215'::text) AND (mod(((('x'::text || substr(md5(concat_ws('#'::text, xwdm, security_id, scdm, fund_code, trade_type, bs, pay_type, stock_kind, bcrq, etf_flag, gddm, gddmzm, check_type, mom_fund)), 1, 8)))::bit(32))::bigint, 5::bigint) = 0))
+               Rows Removed by Filter: 224004
+               (Buffers: shared hit=7059)
+ Total runtime: 260.509 ms
+(10 rows)
+
+Time: 276.210 ms
+                                                                                                                                                       QUERY PLAN                                                                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=15600.20..15620.68 rows=8192 width=192) (actual time=98.236..98.874 rows=8192 loops=1)
+   ->  Sort  (cost=15600.20..15798.10 rows=79160 width=192) (actual time=98.234..98.445 rows=8192 loops=1)
+         Sort Key: xwdm COLLATE "C", security_id COLLATE "C", scdm COLLATE "C", fund_code COLLATE "C", trade_type COLLATE "C", bs COLLATE "C", pay_type COLLATE "C", stock_kind COLLATE "C", bcrq COLLATE "C", etf_flag COLLATE "C", gddm COLLATE "C", gddmzm COLLATE "C", check_type COLLATE "C", mom_fund COLLATE "C"
+         Sort Method: top-N heapsort  Memory: 8216kB
+         (Buffers: shared hit=7059)
+         ->  Seq Scan on dat_fund_cjqs_bak  (cost=0.00..10059.00 rows=79160 width=192) (actual time=0.022..47.160 rows=80000 loops=1)
+               Filter: ((bcrq)::text = '20251215'::text)
+               Rows Removed by Filter: 160000
+               (Buffers: shared hit=7059)
+ Total runtime: 102.790 ms
+(10 rows)
+
+Time: 107.888 ms
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ [Bypass]
+ Limit  (cost=0.00..6225.68 rows=8192 width=192) (actual time=0.041..9.510 rows=8192 loops=1)
+   ->  Index Scan using pk_fund_cjqs_bak on dat_fund_cjqs_bak  (cost=0.00..60159.28 rows=79160 width=192) (actual time=0.041..9.014 rows=8192 loops=1)
+         Index Cond: ((bcrq)::text = '20251215'::text)
+         (Buffers: shared hit=8935)
+ Total runtime: 10.028 ms
+(6 rows)
+
+Time: 10.740 ms
+                                                          QUERY PLAN                                                           
+-------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=10059.00..10059.01 rows=1 width=8) (actual time=32.821..32.821 rows=1 loops=1)
+   (Buffers: shared hit=7059)
+   ->  Seq Scan on dat_fund_cjqs_bak  (cost=0.00..9459.00 rows=240000 width=0) (actual time=0.004..20.950 rows=240000 loops=1)
+         (Buffers: shared hit=7059)
+ Total runtime: 33.050 ms
+(5 rows)
+
+Time: 33.594 ms
+total time: 4067  ms

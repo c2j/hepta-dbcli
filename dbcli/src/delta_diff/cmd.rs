@@ -19,6 +19,7 @@ pub(crate) enum Strategy {
     Bucketdiff,
     Iblt,
     Keyeddiff,
+    Naivediff,
 }
 
 impl std::fmt::Display for Strategy {
@@ -30,6 +31,7 @@ impl std::fmt::Display for Strategy {
             Strategy::Bucketdiff => "bucketdiff",
             Strategy::Iblt => "iblt",
             Strategy::Keyeddiff => "keyeddiff",
+            Strategy::Naivediff => "naivediff",
         };
         write!(f, "{s}")
     }
@@ -135,7 +137,7 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub update_since: Option<String>,
 
-    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
+    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff | naivediff
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: Strategy,
 
@@ -207,6 +209,10 @@ pub(crate) struct DeltaDiffArgs {
     /// Keyeddiff: pull all filtered rows when max(COUNT) is at most this (default 4096)
     #[arg(long, default_value_t = 4096)]
     pub fetch_all_threshold: u64,
+
+    /// Naivediff: refuse when max(COUNT) exceeds this (0 = unlimited)
+    #[arg(long, default_value_t = 200_000)]
+    pub naive_max_rows: u64,
 
     /// 终端显示全部比对列，不只变化列
     #[arg(long)]
@@ -436,6 +442,31 @@ mod tests {
         .expect("parse");
         assert_eq!(args.strategy, Strategy::Keyeddiff);
         assert_eq!(args.strategy.to_string(), "keyeddiff");
+    }
+
+    #[test]
+    fn naive_max_rows_defaults_to_200k() {
+        let args =
+            parse(&["delta-diff", "--left", "a", "--right", "b", "--table", "t"]).expect("parse");
+        assert_eq!(args.naive_max_rows, 200_000);
+    }
+
+    #[test]
+    fn strategy_naivediff_parses_and_displays() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "l",
+            "--right",
+            "r",
+            "--table",
+            "t",
+            "--strategy",
+            "naivediff",
+        ])
+        .expect("naivediff must be a valid value");
+        assert_eq!(args.strategy, Strategy::Naivediff);
+        assert_eq!(args.strategy.to_string(), "naivediff");
     }
 
     #[test]

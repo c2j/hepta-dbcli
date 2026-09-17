@@ -28,7 +28,12 @@ pub(crate) fn render_sql_patch(
             report.sample_diffs.len()
         ));
     }
-    if report.row_payload == RowPayload::HashCount || report.strategy == "bucketdiff" {
+    // Security invariant: keyless reports have no row identity — without
+    // this check, DELETE/UPDATE would render with an empty WHERE predicate.
+    if report.row_payload == RowPayload::HashCount
+        || report.strategy == "bucketdiff"
+        || report.key_columns.is_empty()
+    {
         for row in &report.sample_diffs {
             match row.status {
                 DiffStatus::Modified => {
@@ -559,5 +564,56 @@ mod tests {
         opts.quote = '`';
         let sql = render_sql_patch(&report_keyed(), &opts).unwrap();
         assert!(sql.contains("`bigfund`.`dat_fund_cjqs`"), "{sql}");
+    }
+
+    fn report_keyless_naive() -> DiffReport {
+        let mut r = report_keyed();
+        r.strategy = "naivediff".into();
+        r.row_payload = RowPayload::Columns;
+        r.key_columns.clear();
+        r.value_columns = vec!["xwdm".into(), "security_id".into(), "cjsl".into()];
+        r
+    }
+
+    #[test]
+    fn sql_keyless_naivediff_refuses_delete() {
+        let mut r = report_keyless_naive();
+        r.sample_diffs = vec![DiffRow {
+            key: Value::from("015d418e4e99…(keyless)"),
+            left: Some(vec![
+                Value::from("59267"),
+                Value::from("600000"),
+                Value::from(100),
+            ]),
+            right: None,
+            status: DiffStatus::MissingRight,
+            confirmed: true,
+        }];
+        r.summary.missing_right = 1;
+        r.summary.missing_left = 0;
+        r.summary.modified = 0;
+        let err = render_sql_patch(&r, &opts_left()).unwrap_err();
+        assert!(err.contains("DELETE"), "{err}");
+    }
+
+    #[test]
+    fn sql_keyless_naivediff_allows_hydrated_insert() {
+        let mut r = report_keyless_naive();
+        r.sample_diffs = vec![DiffRow {
+            key: Value::from("015d418e4e99…(keyless)"),
+            left: None,
+            right: Some(vec![
+                Value::from("59267"),
+                Value::from("600000"),
+                Value::from(100),
+            ]),
+            status: DiffStatus::MissingLeft,
+            confirmed: true,
+        }];
+        r.summary.missing_left = 1;
+        r.summary.missing_right = 0;
+        let sql = render_sql_patch(&r, &opts_left()).unwrap();
+        assert!(sql.contains("INSERT INTO"), "{sql}");
+        assert!(!sql.contains("WHERE ;"), "{sql}");
     }
 }

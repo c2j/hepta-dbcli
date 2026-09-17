@@ -1,0 +1,121 @@
+{
+  "started_at": "2026-09-16T06:08:48.749669Z",
+  "finished_at": "2026-09-16T06:08:54.035187Z",
+  "left": {
+    "connection": "dota_l",
+    "schema": "gaussdb",
+    "table": "dat_fund_cjqs_bak"
+  },
+  "right": {
+    "connection": "dota_r",
+    "schema": "gaussdb",
+    "table": "dat_fund_cjqs_bak_r"
+  },
+  "strategy": "keyeddiff",
+  "consistency": "snapshot",
+  "hash_algorithm": "md5",
+  "summary": {
+    "left_total": 80000,
+    "right_total": 80000,
+    "missing_left": 0,
+    "missing_right": 0,
+    "modified": 0,
+    "diff_rate": 0.0
+  },
+  "perf": {
+    "queries_total": 22,
+    "shard_duration_p50_ms": 0,
+    "shard_duration_p99_ms": 0
+  },
+  "shards": [
+    {
+      "shard_id": "keyed-all",
+      "key_range": [
+        null,
+        null
+      ],
+      "left_count": 80000,
+      "right_count": 80000,
+      "diff_count": 0,
+      "status": "Match",
+      "duration_ms": 0
+    }
+  ],
+  "sample_diffs": [],
+  "warnings": [],
+  "row_payload": "columns",
+  "key_columns": [
+    "xwdm",
+    "security_id",
+    "scdm",
+    "fund_code",
+    "trade_type",
+    "bs",
+    "pay_type",
+    "stock_kind",
+    "bcrq",
+    "etf_flag",
+    "gddm",
+    "gddmzm",
+    "check_type",
+    "mom_fund"
+  ],
+  "value_columns": [
+    "cjsl",
+    "cjje",
+    "yhs",
+    "jsf",
+    "jiesf",
+    "zgf",
+    "ghf",
+    "yj",
+    "fxj",
+    "accrual",
+    "mrcb",
+    "main_xwdm",
+    "ghf_dealer",
+    "accural_tax",
+    "inst_num",
+    "inst_data_date",
+    "account_flag",
+    "gh_type",
+    "cjbz",
+    "sxf"
+  ],
+  "column_data_types": [
+    "character varying(7)",
+    "character varying(19)",
+    "character varying(3)",
+    "character varying(8)",
+    "character varying(2)",
+    "character varying(2)",
+    "character varying(2)",
+    "character varying(4)",
+    "character varying(8)",
+    "character varying(1)",
+    "character varying(16)",
+    "character varying(12)",
+    "character varying(4)",
+    "character varying(8)",
+    "numeric(15,2)",
+    "numeric(15,3)",
+    "numeric(15,2)",
+    "numeric(15,2)",
+    "numeric(15,2)",
+    "numeric(15,2)",
+    "numeric(15,2)",
+    "numeric(20,8)",
+    "numeric(20,2)",
+    "numeric(20,8)",
+    "numeric(15,2)",
+    "character varying(6)",
+    "numeric(20,8)",
+    "numeric(20,8)",
+    "numeric(24,0)",
+    "character varying(8)",
+    "character varying(1)",
+    "character varying(1)",
+    "character varying(3)",
+    "numeric(15,2)"
+  ]
+}

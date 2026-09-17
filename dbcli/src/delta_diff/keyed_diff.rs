@@ -276,7 +276,7 @@ fn batch_spec(
     })
 }
 
-fn render_count_sql(
+pub(crate) fn render_count_sql(
     scheme: &str,
     quote: char,
     schema: Option<&str>,
@@ -307,7 +307,7 @@ fn fetch_count_mismatch_warning(
     ))
 }
 
-fn parse_count(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
+pub(crate) fn parse_count(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
     parse_count_value(result.rows.first().and_then(|r| r.first()))
 }
 
@@ -415,7 +415,7 @@ fn full_row_spec(
     })
 }
 
-fn full_row_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
+pub(crate) fn full_row_numeric_flags(ctx: &DiffContext, is_left: bool) -> Vec<bool> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let side_keys = ctx.side_key_columns(is_left);
     let mut columns = side_keys.to_vec();
@@ -603,6 +603,7 @@ mod tests {
             checkpoint: None,
             iblt_capacity: 65_536,
             fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
             strict: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,

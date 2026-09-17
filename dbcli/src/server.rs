@@ -1141,6 +1141,7 @@ fn parse_delta_diff_strategy(
         Some("bucketdiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Bucketdiff)),
         Some("iblt") => Ok(Some(crate::delta_diff::cmd::Strategy::Iblt)),
         Some("keyeddiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Keyeddiff)),
+        Some("naivediff") => Ok(Some(crate::delta_diff::cmd::Strategy::Naivediff)),
         Some(other) => Err(format!("unknown strategy '{other}'")),
     }
 }
@@ -1215,6 +1216,7 @@ fn build_mcp_diff_options(
     Ok(crate::delta_diff::api::DiffOptions {
         iblt_capacity: 65536,
         fetch_all_threshold: 4096,
+        naive_max_rows: 200_000,
         strict: false,
         strategy,
         key: params.key_columns.clone().unwrap_or_default(),
@@ -1243,6 +1245,14 @@ mod delta_diff_strategy_tests {
         assert_eq!(
             parse_delta_diff_strategy(Some("keyeddiff")).unwrap(),
             Some(Strategy::Keyeddiff)
+        );
+    }
+
+    #[test]
+    fn parses_naivediff() {
+        assert_eq!(
+            parse_delta_diff_strategy(Some("naivediff")).unwrap(),
+            Some(Strategy::Naivediff)
         );
     }
 

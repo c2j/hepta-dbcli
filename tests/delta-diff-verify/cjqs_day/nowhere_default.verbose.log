@@ -1,0 +1,5 @@
+error: the argument '--where <CONDITION>' cannot be used multiple times
+
+Usage: hepta_dbcli delta-diff [OPTIONS] --left <LEFT> --right <RIGHT>
+
+For more information, try '--help'.

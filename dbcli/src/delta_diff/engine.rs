@@ -11,7 +11,7 @@ use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
 use crate::delta_diff::metadata::TablePlan;
 use crate::delta_diff::pairing::{find_unique_ci, pair_plans};
 use crate::delta_diff::strategy::DiffStrategy;
-use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff};
+use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff, naive_diff};
 
 pub(crate) struct Route {
     pub(crate) strategy: Box<dyn DiffStrategy>,
@@ -185,6 +185,16 @@ fn route_impl(
                 key_columns,
                 warnings,
             ));
+        }
+        Strategy::Naivediff => {
+            if key_columns.is_empty() {
+                warnings.push(
+                    "note: keyless naivediff reports row-content multiset differences only \
+                     (source-only / target-only rows, no Modified)"
+                        .to_string(),
+                );
+            }
+            Box::new(naive_diff::NaiveDiffer)
         }
     };
 
@@ -693,5 +703,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.strategy.name(), "bucketdiff");
+    }
+
+    #[test]
+    fn explicit_naivediff_routes_composite_key() {
+        let r = route_impl(
+            &plan(vec!["k1", "k2"], "varchar"),
+            &plan(vec!["k1", "k2"], "varchar"),
+            "oracle://a",
+            "oracle://b",
+            Some(Strategy::Naivediff),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "naivediff");
+    }
+
+    #[test]
+    fn explicit_naivediff_keyless_keeps_naivediff() {
+        let r = route_impl(
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+            "mysql://a",
+            "mysql://b",
+            Some(Strategy::Naivediff),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "naivediff");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("keyless")),
+            "must warn keyless semantics"
+        );
+    }
+
+    #[test]
+    fn auto_never_picks_naivediff() {
+        let r = route_impl(
+            &plan(vec!["k1", "k2"], "varchar"),
+            &plan(vec!["k1", "k2"], "varchar"),
+            "oracle://a",
+            "oracle://b",
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
     }
 }

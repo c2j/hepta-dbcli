@@ -207,7 +207,7 @@ fn as_u64(v: &Value) -> Option<u64> {
     }
 }
 
-fn value_text(v: &Value) -> String {
+pub(crate) fn value_text(v: &Value) -> String {
     v.as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| v.to_string())
@@ -252,7 +252,7 @@ pub(crate) fn values_equal(left: &Value, right: &Value, numeric: bool) -> bool {
     cmp_value(left, right, numeric) == std::cmp::Ordering::Equal
 }
 
-fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> bool {
+pub(crate) fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> bool {
     left.len() == right.len()
         && left.len() == numeric_value.len()
         && left
@@ -262,7 +262,7 @@ fn row_values_equal(left: &[Value], right: &[Value], numeric_value: &[bool]) -> 
             .all(|((left, right), numeric)| values_equal(left, right, *numeric))
 }
 
-fn diff_key(row: &[Value], arity: usize) -> Value {
+pub(crate) fn diff_key(row: &[Value], arity: usize) -> Value {
     if arity <= 1 {
         row.first().cloned().unwrap_or(Value::Null)
     } else {
@@ -270,7 +270,12 @@ fn diff_key(row: &[Value], arity: usize) -> Value {
     }
 }
 
-fn diff_row_n(row: &[Value], arity: usize, is_left: bool, status: DiffStatus) -> DiffRow {
+pub(crate) fn diff_row_n(
+    row: &[Value],
+    arity: usize,
+    is_left: bool,
+    status: DiffStatus,
+) -> DiffRow {
     DiffRow {
         key: diff_key(row, arity),
         left: if is_left { Some(row.to_vec()) } else { None },

@@ -1,0 +1,22 @@
+# Local dota-gaussdb (opengauss/opengauss:5.0.0 on :5433). Two names, one instance.
+# Fill in your own password before use, or run `hepta_dbcli store-password --name dota_r`
+# to migrate it to the OS keychain (the original fixture password is not committed).
+default_connection = "dota_l"
+
+[connections.dota_l]
+database = "postgres"
+driver = "gaussdb"
+host = "127.0.0.1"
+password = "keyring"
+port = 5433
+sslmode = "disable"
+user = "gaussdb"
+
+[connections.dota_r]
+database = "postgres"
+driver = "gaussdb"
+host = "127.0.0.1"
+password = "changeme"
+port = 5433
+sslmode = "disable"
+user = "gaussdb"
