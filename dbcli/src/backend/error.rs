@@ -85,6 +85,25 @@ impl DbError {
     }
 }
 
+/// Heuristic: does this error mean the connection is dead and must be
+/// re-established? A `ConnectionFailed` kind always qualifies; some drivers
+/// (oracle-rs 0.1.7 on invalid SQL) surface a killed session as a
+/// `QueryFailed` whose message names the closed connection.
+pub(crate) fn is_connection_lost(err: &DbError) -> bool {
+    if err.kind == DbErrorKind::ConnectionFailed {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "connection closed",
+        "closed the connection",
+        "connection closed unexpectedly",
+        "connection reset",
+        "broken pipe",
+    ];
+    let message = err.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| message.contains(marker))
+}
+
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.message)?;
@@ -133,5 +152,42 @@ impl From<&str> for DbError {
             message: s.to_string(),
             source: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_connection_lost_matches_connection_failed_kind() {
+        assert!(is_connection_lost(&DbError::connection("host unreachable")));
+    }
+
+    #[test]
+    fn is_connection_lost_matches_closed_connection_messages() {
+        for msg in [
+            "connection closed",
+            "server closed the connection unexpectedly",
+            "connection closed unexpectedly",
+            "connection reset by peer",
+            "broken pipe",
+            "Oracle closed the connection without an error packet",
+        ] {
+            assert!(is_connection_lost(&DbError::query(msg)), "msg={msg}");
+        }
+    }
+
+    #[test]
+    fn is_connection_lost_rejects_ordinary_query_errors() {
+        assert!(!is_connection_lost(&DbError::query(
+            "syntax error near LIMIT"
+        )));
+        assert!(!is_connection_lost(&DbError::query(
+            "ORA-00933: SQL command not properly ended"
+        )));
+        assert!(!is_connection_lost(&DbError::query(
+            "table or view does not exist"
+        )));
     }
 }
