@@ -131,6 +131,8 @@ user = "root"
 
 ```toml
 default_connection = "dev"
+# 可选：MCP `delta_diff` 的 export/checkpoint 写入根目录，未配置时用系统临时目录
+delta_diff_export_root = "/var/tmp/hepta-exports"
 
 [connections.dev]
 host = "127.0.0.1"
@@ -703,7 +705,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
   - DuckDB：`SELECT`、`EXPLAIN`、`WITH`、`SHOW`、`DESCRIBE`、`DESC`、`SUMMARIZE`（`PRAGMA` 不允许——部分 PRAGMA 有写副作用）
 - **行数限制**：默认 `LIMIT 1000`，可通过 `max_rows` 调整（上限 10000）
 - **超时控制**：支持按查询设置 `timeout_ms`
-- **delta_diff 只读**：可导出 csv/jsonl/json 与写 checkpoint 文件；不会对数据库执行 DML。生成 SQL 补丁请用 CLI `--export *.sql --apply-to`。注意：`export` / `checkpoint` 路径由调用方任意指定，MCP 不做路径白名单
+- **delta_diff 只读**：可导出 csv/jsonl/json 与写 checkpoint 文件；不会对数据库执行 DML。生成 SQL 补丁请用 CLI `--export *.sql --apply-to`。**路径限制**：`export` / `checkpoint` 路径被限制在配置的导出根目录 `delta_diff_export_root` 内（未配置时默认系统临时目录；相对路径相对该根目录解析）。写入前会 `canonicalize` 校验，路径逃逸出根目录（`..` 穿越、指向根目录外的符号链接等）会被拒绝且不写任何文件
 
 ### 8.4 `delta_diff` 工具参数
 

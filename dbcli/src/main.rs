@@ -1070,6 +1070,8 @@ async fn run_mcp_server(
     audit: Arc<audit::AuditSession>,
 ) {
     let config_path_buf = config_path.map(PathBuf::from);
+    let export_root = crate::config::load_delta_diff_export_root(config_path_buf.as_deref())
+        .unwrap_or_else(std::env::temp_dir);
 
     let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
         .unwrap_or_else(|e| {
@@ -1122,7 +1124,7 @@ async fn run_mcp_server(
         DbMcp::new_empty(Arc::clone(&registry), default_name, Arc::clone(&audit))
     };
 
-    let server = Arc::new(server);
+    let server = Arc::new(server.with_export_root(export_root));
 
     tokio::spawn(async {
         let sig = await_shutdown_signal().await;
