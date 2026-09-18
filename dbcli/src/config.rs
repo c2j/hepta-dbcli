@@ -155,6 +155,10 @@ pub(crate) struct MultiConfig {
     pub connection_max_lifetime: Option<String>,
     #[serde(default)]
     pub connections: Option<std::collections::HashMap<String, NamedConnection>>,
+    /// Root directory confining MCP `delta_diff` export/checkpoint writes.
+    /// Unset means the system temp directory.
+    #[serde(default)]
+    pub delta_diff_export_root: Option<String>,
 }
 
 // ─── Resolved Connection ──────────────────────────────────────────────
@@ -233,6 +237,16 @@ pub(crate) fn find_config_path(opt: Option<PathBuf>) -> Result<PathBuf, String> 
             ))
         }
     }
+}
+
+/// Read the configured `delta_diff_export_root` from the same config file the
+/// connection resolver loads. Returns `None` when the file is missing, has no
+/// such key, or cannot be parsed (the caller falls back to the system temp dir).
+pub(crate) fn load_delta_diff_export_root(config_path: Option<&Path>) -> Option<PathBuf> {
+    let path = find_config_path(config_path.map(Path::to_path_buf)).ok()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let multi: MultiConfig = toml::from_str(&content).ok()?;
+    multi.delta_diff_export_root.map(PathBuf::from)
 }
 
 pub(crate) fn read_config(config_path: Option<PathBuf>) -> Result<McpRawConfig, String> {
@@ -1145,5 +1159,37 @@ database = "mysql"
 
         let url = build_db_url("gaussdb", "h", 5432, "u", None, None, Some("verify-full"));
         assert!(url.ends_with("?sslmode=verify-full"));
+    }
+
+    #[test]
+    fn test_load_delta_diff_export_root_reads_configured_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(
+            &path,
+            "delta_diff_export_root = \"/var/tmp/hepta-exports\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_delta_diff_export_root(Some(&path)),
+            Some(PathBuf::from("/var/tmp/hepta-exports"))
+        );
+    }
+
+    #[test]
+    fn test_load_delta_diff_export_root_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.toml");
+        std::fs::write(&path, "host = \"127.0.0.1\"\n").unwrap();
+
+        assert_eq!(load_delta_diff_export_root(Some(&path)), None);
+    }
+
+    #[test]
+    fn test_load_delta_diff_export_root_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        assert_eq!(load_delta_diff_export_root(Some(&path)), None);
     }
 }

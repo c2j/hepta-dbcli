@@ -6,6 +6,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -207,6 +208,8 @@ pub struct DbMcp {
     audit: Arc<AuditSession>,
     /// MCP client name reported by `initialize`, when the client sent one.
     client: std::sync::Mutex<Option<String>>,
+    /// Root directory confining `delta_diff` export/checkpoint writes.
+    export_root: PathBuf,
 }
 
 impl DbMcp {
@@ -228,6 +231,7 @@ impl DbMcp {
             default_name,
             audit,
             client: std::sync::Mutex::new(None),
+            export_root: std::env::temp_dir(),
         }
     }
 
@@ -251,6 +255,7 @@ impl DbMcp {
             default_name,
             audit,
             client: std::sync::Mutex::new(None),
+            export_root: std::env::temp_dir(),
         }
     }
 
@@ -265,7 +270,14 @@ impl DbMcp {
             default_name,
             audit,
             client: std::sync::Mutex::new(None),
+            export_root: std::env::temp_dir(),
         }
+    }
+
+    /// Confine `delta_diff` export/checkpoint writes to `root`.
+    pub fn with_export_root(mut self, root: PathBuf) -> Self {
+        self.export_root = root;
+        self
     }
 
     pub async fn try_connect(&self) {
@@ -966,12 +978,29 @@ impl DbMcp {
     )]
     async fn delta_diff(
         &self,
-        Parameters(params): Parameters<DeltaDiffParams>,
+        Parameters(mut params): Parameters<DeltaDiffParams>,
     ) -> Result<CallToolResult, McpError> {
         info!(
             "tool called: delta_diff left={} right={} table={}",
             params.left_connection, params.right_connection, params.table
         );
+
+        // Confine caller-supplied export/checkpoint paths to the configured
+        // root before anything is written or handed to the diff engine.
+        if let Some(path) = params.export.as_deref() {
+            match crate::delta_diff::paths::resolve_output_path(Path::new(path), &self.export_root)
+            {
+                Ok(resolved) => params.export = Some(resolved.to_string_lossy().into_owned()),
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+            }
+        }
+        if let Some(path) = params.checkpoint.as_deref() {
+            match crate::delta_diff::paths::resolve_output_path(Path::new(path), &self.export_root)
+            {
+                Ok(resolved) => params.checkpoint = Some(resolved.to_string_lossy().into_owned()),
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+            }
+        }
 
         let opts = match build_mcp_diff_options(&params) {
             Ok(opts) => opts,
@@ -1430,6 +1459,35 @@ mod client_stamp_tests {
             "unknown client must be omitted, not invented"
         );
         assert_eq!(events[1]["actor"]["client"], "opencode");
+    }
+}
+
+#[cfg(test)]
+mod export_root_tests {
+    use super::*;
+    use crate::audit::{AuditConfig, AuditSession};
+
+    fn server() -> DbMcp {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = Arc::new(AuditSession::new(&AuditConfig {
+            dir: Some(dir.path().join("audit")),
+            enabled: true,
+            fsync: false,
+            meta: false,
+            retention_days: 0,
+        }));
+        DbMcp::new_empty(Arc::new(BackendRegistry::new()), "default".into(), audit)
+    }
+
+    #[test]
+    fn default_export_root_is_system_temp_dir() {
+        assert_eq!(server().export_root, std::env::temp_dir());
+    }
+
+    #[test]
+    fn with_export_root_overrides_the_default() {
+        let server = server().with_export_root(PathBuf::from("/var/tmp/hepta-exports"));
+        assert_eq!(server.export_root, PathBuf::from("/var/tmp/hepta-exports"));
     }
 }
 
