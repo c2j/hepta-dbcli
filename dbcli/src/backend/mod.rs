@@ -145,6 +145,12 @@ pub trait Dialect: Send + Sync {
     /// Append a row-limiting clause to a SELECT query if it doesn't already have one.
     fn add_limit(&self, sql: &str, n: usize) -> String;
 
+    /// Return an actionable hint when `sql` uses syntax this dialect does not
+    /// support (e.g. MySQL-style `LIMIT` on Oracle). Default: no hint.
+    fn statement_syntax_hint(&self, _sql: &str) -> Option<String> {
+        None
+    }
+
     /// Build an EXPLAIN (or EXPLAIN ANALYZE) statement in the requested format.
     fn build_explain(&self, sql: &str, analyze: bool, format: &str) -> String;
 
@@ -369,6 +375,83 @@ pub struct ScanSqlSpec {
     pub filter: Option<String>,
     /// Oracle AS OF SCN anchor (snapshot mode); other dialects ignore.
     pub scn: Option<u64>,
+}
+
+/// Detect a bare `LIMIT` keyword in `sql`, ignoring single-quoted string
+/// literals, `--` line comments, `/* */` block comments, and double-quoted
+/// identifiers. Used to warn before a MySQL-only `LIMIT` reaches a dialect
+/// (Oracle) that cannot parse it.
+pub(crate) fn contains_bare_limit(sql: &str) -> bool {
+    const KEYWORD: &[u8] = b"LIMIT";
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'l' | b'L' => {
+                if matches_keyword_at(bytes, i, KEYWORD) {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+fn matches_keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
+    let end = start + keyword.len();
+    if end > bytes.len() || !bytes[start..end].eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    let before_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+    let after_ok = end >= bytes.len() || !is_identifier_byte(bytes[end]);
+    before_ok && after_ok
+}
+
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#'
 }
 
 pub(crate) fn quote_ident(quote: char, name: &str) -> String {
@@ -834,5 +917,37 @@ mod tests {
         let dialect = TestDialect;
         let sql = dialect.foreign_keys_sql("test_schema");
         let _ = sql;
+    }
+
+    #[test]
+    fn contains_bare_limit_detects_bare_keyword_case_insensitively() {
+        assert!(contains_bare_limit("SELECT * FROM dual LIMIT 2"));
+        assert!(contains_bare_limit("select * from dual limit 2"));
+        assert!(contains_bare_limit("SELECT * FROM dual\nLIMIT 2;"));
+    }
+
+    #[test]
+    fn contains_bare_limit_ignores_string_literals() {
+        assert!(!contains_bare_limit("SELECT 'LIMIT' FROM dual"));
+        assert!(!contains_bare_limit("SELECT 'a''LIMIT''b' FROM dual"));
+    }
+
+    #[test]
+    fn contains_bare_limit_ignores_comments() {
+        assert!(!contains_bare_limit("SELECT * FROM dual -- LIMIT 2"));
+        assert!(!contains_bare_limit("SELECT * FROM dual /* LIMIT 2 */"));
+    }
+
+    #[test]
+    fn contains_bare_limit_ignores_identifiers() {
+        assert!(!contains_bare_limit("SELECT LIMITED FROM dual"));
+        assert!(!contains_bare_limit("SELECT limit_col FROM dual"));
+        assert!(!contains_bare_limit("SELECT \"LIMIT\" FROM dual"));
+    }
+
+    #[test]
+    fn mysql_dialect_has_no_oracle_limit_hint() {
+        let d = crate::backend::mysql::dialect::MySqlDialect;
+        assert!(d.statement_syntax_hint("SELECT * FROM t LIMIT 1").is_none());
     }
 }

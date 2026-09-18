@@ -150,12 +150,24 @@ impl Dialect for OracleDialect {
 
     fn add_limit(&self, sql: &str, n: usize) -> String {
         let upper = sql.trim().to_uppercase();
-        if upper.contains("FETCH FIRST") || upper.contains("ROWNUM") {
+        if upper.contains("LIMIT") || upper.contains("FETCH FIRST") || upper.contains("ROWNUM") {
             sql.trim().to_string()
         } else if self.fetch_first {
             format!("{} FETCH FIRST {} ROWS ONLY", sql.trim(), n)
         } else {
             format!("SELECT * FROM ({}) t WHERE ROWNUM <= {}", sql.trim(), n)
+        }
+    }
+
+    fn statement_syntax_hint(&self, sql: &str) -> Option<String> {
+        if crate::backend::contains_bare_limit(sql) {
+            Some(
+                "Oracle does not support MySQL-style LIMIT; use `FETCH FIRST n ROWS ONLY` \
+                 (12c+) or ROWNUM."
+                    .to_string(),
+            )
+        } else {
+            None
         }
     }
 
@@ -633,6 +645,31 @@ mod tests {
         let d = OracleDialect::new();
         let result = d.add_limit("SELECT * FROM dual FETCH FIRST 5 ROWS ONLY", 10);
         assert_eq!(result, "SELECT * FROM dual FETCH FIRST 5 ROWS ONLY");
+    }
+
+    #[test]
+    fn test_add_limit_leaves_mysql_limit_untouched() {
+        let d = OracleDialect::new();
+        assert_eq!(
+            d.add_limit("SELECT * FROM dual LIMIT 2", 10),
+            "SELECT * FROM dual LIMIT 2"
+        );
+    }
+
+    #[test]
+    fn test_statement_syntax_hint_flags_bare_limit() {
+        let d = OracleDialect::new();
+        let hint = d
+            .statement_syntax_hint("SELECT * FROM dual LIMIT 2")
+            .expect("bare LIMIT should produce a hint");
+        assert!(hint.contains("FETCH FIRST"), "{hint}");
+        assert!(hint.contains("ROWNUM"), "{hint}");
+        assert!(d
+            .statement_syntax_hint("SELECT * FROM dual FETCH FIRST 2 ROWS ONLY")
+            .is_none());
+        assert!(d
+            .statement_syntax_hint("SELECT 'LIMIT' FROM dual")
+            .is_none());
     }
 
     #[test]

@@ -553,6 +553,27 @@ async fn connect(
     Ok(conn)
 }
 
+/// Drop a dead or timed-out connection and establish a fresh one. The failed
+/// statement is never re-executed, so a write cannot be applied twice.
+async fn reconnect(
+    conn: &mut Box<dyn DbConn + Send>,
+    target: &crate::config::ResolvedConnection,
+    effective_timeout: &TimeoutConfig,
+    registry: &BackendRegistry,
+    allow_write: bool,
+    audit: &AuditSession,
+    reason: &str,
+) {
+    eprintln!("{reason}: reconnecting...");
+    if let Some(kill_sql) = conn.dialect().kill_own_connection_sql() {
+        let _ = conn.query_drop(&kill_sql).await;
+    }
+    match connect(target, effective_timeout, registry, allow_write, audit).await {
+        Ok(new_conn) => *conn = new_conn,
+        Err(e) => eprintln!("warning: reconnect failed: {}", e),
+    }
+}
+
 // ─── REPL audit helpers (pure, unit-tested) ─────────────────────────
 
 pub(crate) async fn run_interactive(
@@ -742,6 +763,13 @@ pub(crate) async fn run_interactive(
                 );
                 continue;
             }
+            // Reject MySQL-only syntax (e.g. LIMIT on Oracle) before it reaches
+            // the server, where it would kill the connection instead of
+            // reporting why.
+            if let Some(hint) = conn.dialect().statement_syntax_hint(stmt) {
+                eprintln!("error: {hint}");
+                continue;
+            }
             let is_write = matches!(
                 statement_class,
                 StatementClass::DataChange | StatementClass::Call
@@ -779,6 +807,10 @@ pub(crate) async fn run_interactive(
                     ))
                 }
             }
+            // A dead connection poisons the whole session; reconnect rather
+            // than failing every later statement.
+            let connection_lost =
+                matches!(&query_result, Err(e) if crate::backend::error::is_connection_lost(e));
             match query_result.map_err(|e| format!("Query failed: {}", e)) {
                 Ok(query_result) => {
                     last_result = Some(query_result.clone());
@@ -799,28 +831,24 @@ pub(crate) async fn run_interactive(
                 }
                 Err(e) => {
                     eprintln!("error: {}", e);
-                    // Apply timeout_action on query error
-                    if args.timeout_action.as_deref() == Some("disconnect") {
-                        eprintln!("timeout_action=disconnect: reconnecting...");
-                        if let Some(kill_sql) = conn.dialect().kill_own_connection_sql() {
-                            let _ = conn.query_drop(&kill_sql).await;
-                        }
-                        match connect(
+                    // Reconnect on a dead connection, or when the user asked
+                    // timeout_action=disconnect. Never re-run the statement.
+                    if connection_lost || args.timeout_action.as_deref() == Some("disconnect") {
+                        let reason = if connection_lost {
+                            "connection lost"
+                        } else {
+                            "timeout_action=disconnect"
+                        };
+                        reconnect(
+                            &mut conn,
                             &target,
                             &effective_timeout,
                             registry,
                             args.allow_write,
                             audit,
+                            reason,
                         )
-                        .await
-                        {
-                            Ok(new_conn) => {
-                                conn = new_conn;
-                            }
-                            Err(reconnect_err) => {
-                                eprintln!("warning: reconnect failed: {}", reconnect_err);
-                            }
-                        }
+                        .await;
                     }
                 }
             }

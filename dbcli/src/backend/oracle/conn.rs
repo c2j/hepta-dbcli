@@ -119,7 +119,7 @@ impl DbConn for OracleConn {
             .conn
             .query(sql, &[])
             .await
-            .map_err(|e| DbError::query_with_source("Oracle query failed", e))?;
+            .map_err(oracle_query_error)?;
         drain_result(&self.conn, result).await
     }
 
@@ -174,9 +174,35 @@ fn is_alter_session_decode_error(sql: &str, error: &str) -> bool {
         && error.starts_with("invalid length indicator:")
 }
 
+/// oracle-rs 0.1.7 hardcodes this misleading text when the server closes the
+/// connection without sending an error packet (typically an invalid statement,
+/// e.g. MySQL-only `LIMIT`, or a killed session). Rewrite it into something
+/// actionable; every other message is returned unchanged.
+pub(crate) fn rewrite_oracle_error_message(message: &str) -> String {
+    const GENERIC: &str = "closed the connection without providing error details";
+    if message.contains(GENERIC) {
+        "Oracle closed the connection without an error packet; the statement may be \
+         invalid for Oracle (check for MySQL-only syntax such as LIMIT) or the session \
+         was killed."
+            .to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+fn oracle_query_error(err: impl std::error::Error + Send + Sync + 'static) -> DbError {
+    let text = err.to_string();
+    let rewritten = rewrite_oracle_error_message(&text);
+    if rewritten == text {
+        DbError::query_with_source("Oracle query failed", err)
+    } else {
+        DbError::query(rewritten)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_alter_session_decode_error;
+    use super::{is_alter_session_decode_error, rewrite_oracle_error_message};
 
     #[test]
     fn alter_session_tolerates_oracle_rs_post_execute_decode_bug() {
@@ -192,5 +218,29 @@ mod tests {
             "ALTER SESSION SET NLS_SORT = BINARY",
             "ORA-00922: missing or invalid option"
         ));
+    }
+
+    #[test]
+    fn rewrite_oracle_error_message_replaces_generic_driver_text() {
+        let generic = "Oracle closed the connection without providing error details. \
+                       This typically indicates insufficient privileges or the object doesn't exist.";
+        let rewritten = rewrite_oracle_error_message(generic);
+        assert_ne!(rewritten, generic);
+        assert!(rewritten.contains("LIMIT"), "{rewritten}");
+        assert!(
+            !rewritten.contains("insufficient privileges"),
+            "misleading text must not survive: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_oracle_error_message_leaves_other_messages_unchanged() {
+        for msg in [
+            "ORA-00942: table or view does not exist",
+            "ORA-00933: SQL command not properly ended",
+            "Oracle query failed",
+        ] {
+            assert_eq!(rewrite_oracle_error_message(msg), msg);
+        }
     }
 }

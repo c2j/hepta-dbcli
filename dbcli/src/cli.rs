@@ -702,6 +702,11 @@ pub(crate) async fn run_cli(
         );
         return Err(write_gate_message(gate));
     }
+    // Reject MySQL-only syntax (e.g. LIMIT on Oracle) before it reaches the
+    // server, where it would kill the connection instead of reporting why.
+    if let Some(hint) = conn.dialect().statement_syntax_hint(&sql) {
+        return Err(hint);
+    }
     let is_write = matches!(
         statement_class,
         StatementClass::DataChange | StatementClass::Call
