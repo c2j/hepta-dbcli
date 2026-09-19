@@ -38,6 +38,9 @@ pub(crate) struct PreflightSide<'a> {
 pub(crate) struct DiffOptions {
     pub(crate) strategy: Option<crate::delta_diff::cmd::Strategy>,
     pub(crate) iblt_capacity: u64,
+    /// IBLT 自适应两轮：置位后 ctx.iblt_capacity 用哨兵 0（见 iblt_diff.rs），
+    /// 忽略 iblt_capacity 字段
+    pub(crate) iblt_auto: bool,
     pub(crate) fetch_all_threshold: u64,
     pub(crate) naive_max_rows: u64,
     pub(crate) strict: bool,
@@ -150,7 +153,10 @@ pub(crate) async fn run_diff(
         recheck: opts.recheck,
         route_warnings: warnings,
         checkpoint,
-        iblt_capacity: opts.iblt_capacity.max(16),
+        iblt_capacity: crate::delta_diff::iblt_diff::normalize_iblt_capacity(
+            opts.iblt_auto,
+            opts.iblt_capacity,
+        ),
         fetch_all_threshold: opts.fetch_all_threshold,
         naive_max_rows: opts.naive_max_rows,
         strict: opts.strict,
@@ -540,6 +546,7 @@ mod duckdb_e2e_tests {
         DiffOptions {
             strategy,
             iblt_capacity: 65536,
+            iblt_auto: false,
             // 5 probe rows stay below any full-fetch degrade threshold,
             // so Auto keeps the IBLT route visible in tests.
             fetch_all_threshold: 1,

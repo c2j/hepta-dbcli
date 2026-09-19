@@ -202,6 +202,11 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long, default_value_t = 65536)]
     pub iblt_capacity: u64,
 
+    /// IBLT 自适应两轮：忽略 --iblt-capacity，第一轮 m=64，失败后按
+    /// d̂=⌈Σ|cnt|/2⌉ 放大一轮 m=clamp(3·d̂)，两轮都失败才回退 hashdiff
+    #[arg(long, default_value_t = false)]
+    pub iblt_auto_capacity: bool,
+
     /// 与 --strategy iblt 联用：解码失败时报错（exit 2）而非回退
     #[arg(long)]
     pub strict: bool,

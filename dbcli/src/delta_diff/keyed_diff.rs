@@ -544,7 +544,7 @@ fn assemble(
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gaussdb"))]
 mod tests {
     use super::*;
     use crate::backend::BackendFactory;
