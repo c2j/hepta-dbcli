@@ -1372,19 +1372,20 @@ mod range_tests {
 
     // ── WP2-fix regression: slice checksum SQL must carry the PK range ──
 
-    /// 记录收到的 checksum SQL 的 mock 连接。
+    /// 记录收到的 checksum SQL 的 mock 连接（MySQL 方言；mysql 模块
+    /// 无 feature 门控，与 range_tests 的 duckdb 门控正交）。
     struct SqlCaptureConn {
-        dialect: MySqlDialect,
+        dialect: crate::backend::mysql::dialect::MySqlDialect,
         last_sql: std::sync::Arc<std::sync::Mutex<String>>,
     }
 
     #[async_trait::async_trait]
     impl DbConn for SqlCaptureConn {
-        async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        async fn query(&mut self, sql: &str) -> Result<crate::backend::QueryResult, DbError> {
             *self.last_sql.lock().unwrap() = sql.to_string();
             // render_batch_checksum_sql 的聚合无 GROUP BY，每支 1 行：
             // bkt=0, cnt=0, s1..s4 全 0。
-            Ok(QueryResult {
+            Ok(crate::backend::QueryResult {
                 columns: vec![
                     "bkt".into(),
                     "cnt".into(),
@@ -1394,24 +1395,28 @@ mod range_tests {
                     "s4".into(),
                 ],
                 rows: vec![vec![
-                    json!(0),
-                    json!(0),
-                    json!(0),
-                    json!(0),
-                    json!(0),
-                    json!(0),
+                    serde_json::json!(0),
+                    serde_json::json!(0),
+                    serde_json::json!(0),
+                    serde_json::json!(0),
+                    serde_json::json!(0),
+                    serde_json::json!(0),
                 ]],
                 row_count: 1,
                 rows_affected: None,
             })
         }
-        async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+        async fn exec(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<crate::backend::QueryResult, DbError> {
             Err(DbError::unsupported("capture"))
         }
         async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
             Ok(())
         }
-        fn dialect(&self) -> &dyn Dialect {
+        fn dialect(&self) -> &dyn crate::backend::Dialect {
             &self.dialect
         }
     }
@@ -1424,13 +1429,17 @@ mod range_tests {
         // SQL 断言同时含 quoted key_column 与 `>= lo` / `< hi+1` 谓词。
         let ctx = test_ctx();
         let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let mut conn = SqlCaptureConn {
-            dialect: MySqlDialect,
-            last_sql: std::sync::Arc::clone(&last),
-        };
         let plan = RangePlan::new("id", 0, 999, 16);
         let mut queries = 0u64;
-        run_range_checksum_maps(&mut conn, &mut conn, &ctx, &plan, &mut queries)
+        let mut lconn = SqlCaptureConn {
+            dialect: crate::backend::mysql::dialect::MySqlDialect,
+            last_sql: std::sync::Arc::clone(&last),
+        };
+        let mut rconn = SqlCaptureConn {
+            dialect: crate::backend::mysql::dialect::MySqlDialect,
+            last_sql: std::sync::Arc::clone(&last),
+        };
+        run_range_checksum_maps(&mut lconn, &mut rconn, &ctx, &plan, &mut queries)
             .await
             .expect("slice checksums");
         assert_eq!(queries, 32, "2 statements per bucket x 16 buckets");

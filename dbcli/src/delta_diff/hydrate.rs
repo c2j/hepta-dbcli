@@ -401,7 +401,7 @@ async fn pull_raw_side(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gaussdb"))]
 mod tests {
     use super::*;
     use crate::backend::BackendFactory;
