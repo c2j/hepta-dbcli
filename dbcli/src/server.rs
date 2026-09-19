@@ -1244,6 +1244,7 @@ fn build_mcp_diff_options(
     };
     Ok(crate::delta_diff::api::DiffOptions {
         iblt_capacity: 65536,
+        iblt_auto: false,
         fetch_all_threshold: 4096,
         naive_max_rows: 200_000,
         strict: false,
