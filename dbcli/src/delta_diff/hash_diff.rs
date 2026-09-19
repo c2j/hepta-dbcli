@@ -24,8 +24,13 @@ use crate::delta_diff::report::{
 use crate::delta_diff::rowdiff::row_level_diff;
 use crate::delta_diff::strategy::{ConsistencyMode, DiffContext, DiffStrategy};
 
+/// 每条 UNION ALL 语句覆盖的段数（WP3）。8 段/语句在实测中平衡了
+/// 语句数削减（2n → 2⌈n/8⌉）与 DB 端串行化损失（UNION ALL 分支在
+/// 服务器内串行执行，过宽的语句反而慢于并发逐段查询）。
+const UNION_BRANCHES: usize = 8;
+
 /// 宽聚合结果条目：段范围 + 该段精确 checksum 五元组（UNION ALL 第 k
-/// 行对应 segments[k]）。
+/// 行对应该 chunk 的第 k 段）。
 type SegmentAgg = (i64, i64, ChecksumTuple);
 
 pub(crate) struct HashDiffer;
@@ -143,10 +148,11 @@ impl HashDiffer {
                 }
             }
             ConsistencyMode::None => {
-                // WP3 pushdown: ONE wide aggregate SQL per side replaces the
-                // per-segment sweep. Segment tuples decode client-side;
-                // matching segments become Match shards with zero row
-                // transfer, mismatches fall through to the bisection path.
+                // WP3 pushdown: chunks of UNION ALL aggregate statements
+                // (per side) replace the per-segment query sweep. Segment
+                // tuples come back one row per segment; matching segments
+                // become Match shards with zero row transfer, mismatches
+                // fall through to the bisection path.
                 let first = self
                     .first_pass_aggregate(left, right, ctx, &segments, counters)
                     .await?;
@@ -171,15 +177,18 @@ impl HashDiffer {
         Ok((shards, diffs))
     }
 
-    /// none 档首轮快筛（WP3 聚合下推）：每侧一条 UNION ALL 宽聚合语句，
-    /// 把全部首段的 (cnt, s1..s4) 一次拉回——结果第 k 行即第 k 段的精确
-    /// 校验元组（复用各方言 render_checksum_sql，键域谓词互斥，UNION ALL
-    /// 语义安全；见 checksum.rs 顶注与 render_segment_aggregate_sql）。
+    /// none 档首轮快筛（WP3 聚合下推）：每侧把全部首段按
+    /// `UNION_BRANCHES` 段一组串成 UNION ALL 宽聚合语句，共
+    /// ⌈n/UNION_BRANCHES⌉ 条；语句经两侧连接池并发执行（每侧
+    /// ⌈threads/2⌉ 并发会话，§8.4，与旧逐段并行扫一致的并发度）。
+    /// 结果第 k 行即第 k 段的精确 (cnt, s1..s4)——复用各方言
+    /// render_checksum_sql（键域谓词互斥，UNION ALL 语义安全），查询
+    /// 数从 2n 降到 2⌈n/UNION_BRANCHES⌉。
     ///
-    /// 并行结构不变：左右两侧 tokio::join! 各一条查询（侧间并行）；
-    /// 快筛后失配段顺序走既有 compare_segment 二分（侧内串行，快照
-    /// 兼容语义不变，§8.2）。SQL 在主连接预渲染后 vlog（与原实现相同
-    /// 的 [sql:left]/[sql:right] 通道），执行经两侧主连接会话。
+    /// 全部分支到齐后按段序与旧实现相同的输出；快筛后失配段顺序走
+    /// 既有 compare_segment 二分（侧内串行，快照兼容语义不变，§8.2）。
+    /// SQL 在主连接预渲染后 vlog（与原实现相同的 [sql:left]/
+    /// [sql:right] 通道）。
     async fn first_pass_aggregate(
         &self,
         left: &mut (dyn DbConn + Send),
@@ -188,30 +197,112 @@ impl HashDiffer {
         segments: &[(i64, i64)],
         counters: &mut Counters,
     ) -> Result<Vec<(i64, i64, ChecksumTuple, ChecksumTuple, u64)>, DbError> {
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Semaphore;
+
         let t0 = Instant::now();
-        let lspecs: Vec<ChecksumSqlSpec> = segments
-            .iter()
-            .map(|&seg| checksum_spec(ctx, true, seg, left.dialect()))
-            .collect::<Result<_, _>>()?;
-        let rspecs: Vec<ChecksumSqlSpec> = segments
-            .iter()
-            .map(|&seg| checksum_spec(ctx, false, seg, right.dialect()))
-            .collect::<Result<_, _>>()?;
-        let lagg = render_segment_aggregate_sql(&lspecs, segments, left.dialect());
-        let ragg = render_segment_aggregate_sql(&rspecs, segments, right.dialect());
-        ctx.vlog(format!("[sql:left] {lagg}"));
-        ctx.vlog(format!("[sql:right] {ragg}"));
-        let (l, r) = tokio::join!(
-            run_wide_segment_aggregate(left, &lagg, segments),
-            run_wide_segment_aggregate(right, &ragg, segments)
-        );
-        let (l, r) = (l?, r?);
-        counters.queries += 2;
+        // Per-side chunk SQL, pre-rendered on the dialect-owning main conn.
+        let mut lsqls: Vec<String> = Vec::new();
+        let mut rsqls: Vec<String> = Vec::new();
+        for chunk in segments.chunks(UNION_BRANCHES) {
+            let lspecs: Vec<ChecksumSqlSpec> = chunk
+                .iter()
+                .map(|&seg| checksum_spec(ctx, true, seg, left.dialect()))
+                .collect::<Result<_, _>>()?;
+            let rspecs: Vec<ChecksumSqlSpec> = chunk
+                .iter()
+                .map(|&seg| checksum_spec(ctx, false, seg, right.dialect()))
+                .collect::<Result<_, _>>()?;
+            lsqls.push(render_segment_aggregate_sql(&lspecs, chunk, left.dialect()));
+            rsqls.push(render_segment_aggregate_sql(
+                &rspecs,
+                chunk,
+                right.dialect(),
+            ));
+        }
+        for sql in &lsqls {
+            ctx.vlog(format!("[sql:left] {sql}"));
+        }
+        for sql in &rsqls {
+            ctx.vlog(format!("[sql:right] {sql}"));
+        }
+
+        // Execute both sides' chunks through the pools (side-parallel;
+        // per-side concurrency capped like the old per-segment sweep).
+        // Each task tags its result with the side, so pairing is exact
+        // regardless of JoinSet completion order.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Side {
+            L,
+            R,
+        }
+        let sem = StdArc::new(Semaphore::new((ctx.threads / 2).max(1) * 2));
+        let mut set: tokio::task::JoinSet<Result<(Side, Vec<SegmentAgg>), DbError>> =
+            tokio::task::JoinSet::new();
+        let sides = [
+            (Side::L, &ctx.left_pool, lsqls),
+            (Side::R, &ctx.right_pool, rsqls),
+        ];
+        for (side, pool, sqls) in sides {
+            for sql in sqls {
+                let pool = StdArc::clone(pool);
+                let sem = StdArc::clone(&sem);
+                set.spawn(async move {
+                    let _permit = sem
+                        .acquire()
+                        .await
+                        .map_err(|e| DbError::query(format!("semaphore: {e}")))?;
+                    let mut conn = pool.acquire().await?;
+                    let rows = run_wide_segment_aggregate(&mut *conn, &sql).await?;
+                    Ok((side, rows))
+                });
+            }
+        }
+
+        // Collect per-side chunk results keyed by their first segment lo
+        // (chunk partitions are identical on both sides).
+        let mut left_by_lo: std::collections::BTreeMap<i64, Vec<SegmentAgg>> = Default::default();
+        let mut right_by_lo: std::collections::BTreeMap<i64, Vec<SegmentAgg>> = Default::default();
+        let mut statement_count = 0usize;
+        while let Some(res) = set.join_next().await {
+            let (side, rows) = res.map_err(|e| DbError::query(format!("join: {e}")))??;
+            let first_lo = rows[0].0;
+            match side {
+                Side::L => left_by_lo.insert(first_lo, rows),
+                Side::R => right_by_lo.insert(first_lo, rows),
+            };
+            statement_count += 1;
+        }
+        counters.queries += statement_count as u64;
+        debug_assert_eq!(left_by_lo.len(), right_by_lo.len());
+
+        // Flatten left/right in segment order (chunks are contiguous
+        // partition slices, so ordered concatenation = segment order).
+        let flatten = |by_lo: &std::collections::BTreeMap<i64, Vec<SegmentAgg>>| {
+            by_lo
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<SegmentAgg>>()
+        };
+        let lflat = flatten(&left_by_lo);
+        let rflat = flatten(&right_by_lo);
+        debug_assert_eq!(lflat.len(), segments.len());
+        debug_assert_eq!(rflat.len(), segments.len());
+
+        // SegmentAgg carries only lo (decoded from the row marker); the
+        // authoritative hi comes from the segment partition, which both
+        // sides' chunk SQL were rendered from.
         let elapsed_ms = t0.elapsed().as_millis() as u64;
-        let out = l
+        let out = lflat
             .iter()
-            .zip(r.iter())
-            .map(|(lk, rk)| (lk.0, lk.1, lk.2, rk.2, elapsed_ms))
+            .zip(rflat.iter())
+            .zip(segments.iter())
+            .map(|((lk, rk), &(lo, hi))| {
+                debug_assert_eq!(lk.0, lo);
+                debug_assert_eq!(rk.0, lo);
+                (lo, hi, lk.2, rk.2, elapsed_ms)
+            })
             .collect();
         Ok(out)
     }
@@ -408,21 +499,27 @@ fn render_segment_aggregate_sql(
 async fn run_wide_segment_aggregate(
     conn: &mut (dyn DbConn + Send),
     sql: &str,
-    segments: &[(i64, i64)],
 ) -> Result<Vec<SegmentAgg>, DbError> {
     let result = conn.query(sql).await?;
-    if result.rows.len() != segments.len() {
-        return Err(DbError::query(format!(
-            "delta-diff: wide segment aggregate returned {} rows, expected {}",
-            result.rows.len(),
-            segments.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(segments.len());
-    for (row, &(lo, hi)) in result.rows.iter().zip(segments.iter()) {
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
         // row = [seg_lo, cnt, s1, s2, s3, s4]; skip the marker column.
+        let lo = row
+            .first()
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.trim().split('.').next()?.parse().ok(),
+                _ => None,
+            })
+            .ok_or_else(|| DbError::query("delta-diff: wide chunk row missing seg_lo marker"))?;
         let wide = parse_wide_aggregate_row(&row[1..])?;
-        out.push((lo, hi, wide));
+        out.push((lo, lo, wide));
+    }
+    // Result order follows ORDER BY seg_lo, so rows are ascending by lo.
+    if out.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return Err(DbError::query(
+            "delta-diff: wide chunk rows not strictly ordered by seg_lo",
+        ));
     }
     Ok(out)
 }
@@ -737,6 +834,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     // ── split_range / percentile (existing) ──
 
@@ -909,13 +1007,12 @@ mod tests {
             row_count: 2,
             rows_affected: None,
         };
-        let segments = [(0, 50), (50, 100)];
         let mut conn = WideConn {
             responses: VecDeque::from([result]),
             last_sql: String::new(),
             dialect: MySqlDialect,
         };
-        let out = run_wide_segment_aggregate(&mut conn, "SELECT ...", &segments)
+        let out = run_wide_segment_aggregate(&mut conn, "SELECT ...")
             .await
             .unwrap();
         assert_eq!(out.len(), 2);
@@ -923,34 +1020,82 @@ mod tests {
             out[0],
             (
                 0,
-                50,
+                0,
                 ChecksumTuple {
                     count: 50,
                     s: [1, 2, 3, 4]
                 }
             )
         );
-        assert_eq!(out[1], (50, 100, ChecksumTuple::zero()));
+        assert_eq!(out[1], (50, 50, ChecksumTuple::zero()));
     }
 
     #[tokio::test]
-    async fn run_wide_aggregate_row_count_mismatch_is_error() {
+    async fn run_wide_aggregate_disordered_rows_are_error() {
+        // Rows must arrive ascending by seg_lo (ORDER BY seg_lo in the
+        // rendered statement); disorder means the marker/parse contract
+        // broke, so fail loudly instead of pairing mismatched segments.
         let result = QueryResult {
-            columns: vec!["seg_lo".into(), "cnt".into()],
-            rows: vec![agg_row(0, 50, [1, 2, 3, 4])],
-            row_count: 1,
+            columns: vec![
+                "seg_lo".into(),
+                "cnt".into(),
+                "s1".into(),
+                "s2".into(),
+                "s3".into(),
+                "s4".into(),
+            ],
+            rows: vec![agg_row(50, 0, [0, 0, 0, 0]), agg_row(0, 50, [1, 2, 3, 4])],
+            row_count: 2,
             rows_affected: None,
         };
-        let segments = [(0, 50), (50, 100)];
         let mut conn = WideConn {
             responses: VecDeque::from([result]),
             last_sql: String::new(),
             dialect: MySqlDialect,
         };
-        let err = run_wide_segment_aggregate(&mut conn, "SELECT ...", &segments)
+        let err = run_wide_segment_aggregate(&mut conn, "SELECT ...")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("expected 2"));
+        assert!(err.to_string().contains("not strictly ordered"));
+    }
+
+    #[tokio::test]
+    async fn run_wide_aggregate_marker_as_string_parses() {
+        // Some drivers/materializations hand back the marker as a string
+        // (e.g. "0" or "0.0" from DECIMAL); the parser must still recover lo.
+        let result = QueryResult {
+            columns: vec![
+                "seg_lo".into(),
+                "cnt".into(),
+                "s1".into(),
+                "s2".into(),
+                "s3".into(),
+                "s4".into(),
+            ],
+            rows: vec![
+                vec![json!("0"), json!(7), json!(1), json!(2), json!(3), json!(4)],
+                vec![
+                    json!("8.0"),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                ],
+            ],
+            row_count: 2,
+            rows_affected: None,
+        };
+        let mut conn = WideConn {
+            responses: VecDeque::from([result]),
+            last_sql: String::new(),
+            dialect: MySqlDialect,
+        };
+        let out = run_wide_segment_aggregate(&mut conn, "SELECT ...")
+            .await
+            .unwrap();
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[1].0, 8);
     }
 
     // ── WP3 integration shape: full HashDiffer over two segments ──
@@ -988,23 +1133,45 @@ mod tests {
         }
     }
 
-    fn dummy_pool() -> std::sync::Arc<dyn crate::backend::DbPool> {
-        struct Pool;
+    fn scripted_pool(
+        responses: std::sync::Arc<Mutex<VecDeque<QueryResult>>>,
+    ) -> std::sync::Arc<dyn crate::backend::DbPool> {
+        struct Pool(std::sync::Arc<Mutex<VecDeque<QueryResult>>>);
         #[async_trait]
         impl crate::backend::DbPool for Pool {
             async fn acquire(&self) -> Result<Box<dyn DbConn + Send>, DbError> {
-                Err(DbError::unsupported("dummy"))
+                Ok(Box::new(WideConn {
+                    responses: self.0.lock().unwrap().clone(),
+                    last_sql: String::new(),
+                    dialect: MySqlDialect,
+                }))
             }
         }
-        std::sync::Arc::new(Pool)
+        std::sync::Arc::new(Pool(responses))
+    }
+
+    fn wide_result(rows: Vec<Vec<Value>>) -> QueryResult {
+        QueryResult {
+            columns: vec![
+                "seg_lo".into(),
+                "cnt".into(),
+                "s1".into(),
+                "s2".into(),
+                "s3".into(),
+                "s4".into(),
+            ],
+            row_count: rows.len(),
+            rows,
+            rows_affected: None,
+        }
     }
 
     fn ctx() -> DiffContext {
         DiffContext {
             left: side(),
             right: side(),
-            left_pool: dummy_pool(),
-            right_pool: dummy_pool(),
+            left_pool: scripted_pool(Default::default()),
+            right_pool: scripted_pool(Default::default()),
             key_column: "id".into(),
             key_columns: vec!["id".into()],
             left_key_columns: vec!["id".into()],
@@ -1077,7 +1244,13 @@ mod tests {
             last_sql: String::new(),
             dialect: MySqlDialect,
         };
-        let ctx = ctx();
+        let mut ctx = ctx();
+        ctx.left_pool = scripted_pool(std::sync::Arc::new(Mutex::new(VecDeque::from([wide(
+            lwide.clone(),
+        )]))));
+        ctx.right_pool = scripted_pool(std::sync::Arc::new(Mutex::new(VecDeque::from([wide(
+            rwide.clone(),
+        )]))));
         HashDiffer.diff(&mut lconn, &mut rconn, &ctx).await
     }
 
