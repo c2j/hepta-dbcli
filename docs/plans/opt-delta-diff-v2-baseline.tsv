@@ -22,3 +22,10 @@ base	iblt	39.30s	280625152B	100
 # base	main bucketdiff (post-eval re-run): 109.7s rss~27.5MB diffs=200
 # base	main hashdiff: 2.05/2.03/2.12s rss~16.8MB
 # base	main iblt: 38.4/46.6/39.3s rss~280MB
+postfix-r1	hashdiff	2.27s	16809984B	100	review-fix fbcee33, none mode
+postfix-r1	bucketdiff	7.25s	25378816B	200	review-fix fbcee33, none mode (union key domain + NULL fail-closed)
+postfix-r1	bucketdiff	7.48s	24821760B	200	review-fix fbcee33, none mode, run 2
+postfix-r1	iblt	27.60s	281034752B	100	review-fix fbcee33, fixed capacity 64
+postfix-r1	iblt-auto	44.97s	18382848B	100	review-fix fbcee33, auto 2-round fail -> hashdiff fallback (incl.)
+postfix-r1	iblt-auto	47.92s	17399808B	100	review-fix fbcee33, SNAPSHOT mode auto fail -> COMMIT -> hashdiff fallback (B1 verified)
+postfix-r1	bucketdiff	7.49s	24625152B	200	review-fix fbcee33, SNAPSHOT mode

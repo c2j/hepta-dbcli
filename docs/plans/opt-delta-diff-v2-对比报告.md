@@ -78,3 +78,33 @@ cd ~/Projects/Desktop_Projects/DB/hepta-dbcli && git checkout opt/delta-diff-v2 
 ```
 
 全部原始数据：`docs/plans/opt-delta-diff-v2-baseline.tsv`；设计文档：`docs/plans/opt-delta-diff-v2-design.md`。
+
+---
+
+## 附录：评审修复复测（PR #91 review，commit fbcee33 / rebase 后 90edb91）
+
+评审指出 6 个问题（3 正确性 + 1 release 静默 + 1 缺测试 + 1 CLI 语义），全部修复：
+
+| # | 问题 | 修复 | 回归测试 |
+|---|------|------|----------|
+| B1 | iblt 失败路径不再 COMMIT，Oracle snapshot 回退会 ORA-01453 | 所有失败臂（capacity 回退 / strict 报错 / Db 错误）先 `close_snapshot`（COMMIT）再回退/报错，恢复 main（1951c96）语义 | `snapshot_mode_capacity_fallback_commits_before_hashdiff` 等 3 条（mock 记录 query_drop 语句序） |
+| B2 | bucketdiff 键域取交集，部分重叠时静默漏 diff；NULL 键不可见 | 改并集 `[min(l,r), max(l,r)]`；probe 查询顺带计数 NULL 键，检测到即失败关闭回退 MOD bucketing | `probe_uses_union_of_two_sides`、`probe_partial_overlap_is_not_disjoint`、`probe_null_key_fails_closed_to_mod_fallback` |
+| B3 | hashdiff UNION ALL 包装 `) AS wide` 在 Oracle 非法（ORA-00933） | 按 `url_scheme()=="oracle"` 渲染 `) wide`，其余方言保持 `) AS wide` | `wide_sql_table_alias_is_dialect_correct`（oracle feature 下断言 Oracle 分支） |
+| B4 | 行数校验从硬错误降为 `debug_assert`，release 下 zip 截断可静默假 Match | 恢复 runtime `DbError`：行数不齐、空 chunk 行、`seg_lo` 错位全部报错 | 既有 wide 执行测试覆盖；错误路径改为显式返回 |
+| B5 | WP2-fix（`key_column`+`range` 渲染）无防回归测试 | 新增 SqlCaptureConn 断言切片 checksum SQL 同时含 quoted `key_column` 与 `>= lo` / `< hi+1` | `range_slice_checksum_sql_carries_quoted_key_and_range` |
+| B6 | CLI `--iblt-capacity 0` 撞上 AUTO 哨兵 0（MCP/API 走 `.max(16)`，两入口语义分叉） | 提取共享 `normalize_iblt_capacity(auto, requested)`，CLI 与 api.rs 共用 | `capacity_normalizer_keeps_cli_and_api_consistent` |
+
+另按评审建议：`--iblt-auto-capacity` 补入 UserGuide §8.4（注明 MCP 不暴露）；与本 PR 无关的 synth #89 文档 commit（原 cf576b7）已 rebase 拆出分支。
+
+### 复测基准（同 1M 行 dbench，`/usr/bin/time -l`，10GB 内存压力下取 r2/r3）
+
+| 策略 | wall | RSS | diffs | 说明 |
+|------|------|-----|-------|------|
+| hashdiff | 2.27s | 16.8MB | 100 | 与修复前持平（修复不涉热路径） |
+| bucketdiff | 7.25–7.48s | 24.6–26.0MB | 200 | 并集键域 + NULL 探测后仍稳定在 7s 档（修复前 6.7s，差异在探测 SQL 多一列 SUM(CASE) 与本次机器负载） |
+| iblt（固定 c=64） | 27.60s | 281MB | 100 | 不受影响（对照） |
+| iblt auto（none） | 44.97s | 18.4MB | 100 | 两轮失败 → hashdiff 回退，行为与修复前一致 |
+| **iblt auto（snapshot）** | 47.92s | 17.4MB | 100 | **B1 修复验证**：snapshot 模式下两轮失败 → COMMIT → hashdiff 回退全程成功（修复前此路径在 Oracle 上会硬错） |
+| bucketdiff（snapshot） | 7.49s | 24.6MB | 200 | snapshot 模式对照 |
+
+测试：`cargo test --bin hepta_dbcli` 1065 通过（新增 5 条）；`cargo fmt --check` / `cargo clippy` 干净。原始数据追加于 `docs/plans/opt-delta-diff-v2-baseline.tsv`（postfix-r1 段）。
