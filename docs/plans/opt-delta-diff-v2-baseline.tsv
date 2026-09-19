@@ -1,0 +1,9 @@
+base	hashdiff	2.05s	16777216B	100
+base	hashdiff	2.03s	16809984B	100
+base	hashdiff	2.12s	16678912B	100
+base	bucketdiff	94.29s	27557888B	200
+base	bucketdiff	93.47s	28196864B	200
+base	bucketdiff	97.61s	27492352B	200
+base	iblt	38.42s	280674304B	100
+base	iblt	46.61s	280707072B	100
+base	iblt	39.30s	280625152B	100
