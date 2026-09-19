@@ -4,6 +4,11 @@
 // produced by Dialect::render_checksum_sql and parses the single result
 // row into a ChecksumTuple {count, s1..s4}. Cross-database equality of
 // the tuple is the consistency assertion for a shard.
+//
+// The wide segment aggregate (opt-v2 WP3) is the associativity trick that
+// lets the hashdiff first pass push per-segment checksums into ONE query
+// per side: the per-segment checksum SELECTs are chained with UNION ALL,
+// one row per segment — same tuples, one round trip per side.
 
 use std::collections::BTreeMap;
 
@@ -83,6 +88,43 @@ pub(crate) async fn run_batch_checksum(
     }
     let result = conn.query(&sql).await?;
     parse_batch_rows(&result.rows)
+}
+
+// ─── Wide segment aggregate (opt-v2 WP3: hashdiff first-pass pushdown) ──
+//
+// The hashdiff first pass sends ONE statement per side: the per-segment
+// checksum SELECTs (Dialect::render_checksum_sql, one disjoint key range
+// each) chained with UNION ALL. Row k of the result is segment k's exact
+// (cnt, s1..s4) — the alias `WideAggregate` names one such row. Segments
+// partition the key domain, so UNION ALL cannot double count, and the
+// statement replaces the old per-segment query sweep 1:1.
+
+/// One UNION ALL row: segment k's checksum tuple. Identical in shape and
+/// parse semantics to a single-shard checksum row.
+pub(crate) type WideAggregate = ChecksumTuple;
+
+/// Parse one wide aggregate row: [count, s1, s2, s3, s4].
+///
+/// The DB emits NULL for every aggregate over an empty row set
+/// (`COUNT` still returns 0, the slice `SUM`s are NULL); `value_to_u64`
+/// normalizes those to zeros, so an untouched segment is
+/// `ChecksumTuple::zero()`.
+pub(crate) fn parse_wide_aggregate_row(row: &[Value]) -> Result<WideAggregate, DbError> {
+    if row.len() < 5 {
+        return Err(DbError::query(format!(
+            "delta-diff: wide aggregate row has {} columns, expected 5",
+            row.len()
+        )));
+    }
+    Ok(ChecksumTuple {
+        count: value_to_u64(&row[0])?,
+        s: [
+            value_to_u64(&row[1])?,
+            value_to_u64(&row[2])?,
+            value_to_u64(&row[3])?,
+            value_to_u64(&row[4])?,
+        ],
+    })
 }
 
 fn parse_batch_rows(rows: &[Vec<Value>]) -> Result<BTreeMap<u64, ChecksumTuple>, DbError> {
@@ -333,6 +375,30 @@ mod tests {
     fn parse_tuple_row_short_row_errors() {
         let row = vec![json!(1), json!(2)];
         assert!(parse_tuple_row(&row).is_err());
+    }
+
+    // ── Wide segment aggregate (opt-v2 WP3: UNION ALL batch) ──
+
+    #[test]
+    fn parse_wide_aggregate_row_nulls_and_short_rows() {
+        let row = vec![json!(0), Value::Null, Value::Null, Value::Null, Value::Null];
+        let w = parse_wide_aggregate_row(&row).unwrap();
+        assert_eq!(w, ChecksumTuple::zero(), "empty segment parses as zeros");
+
+        let mixed = vec![
+            json!(7),
+            json!("18446744073709551615"),
+            json!(2),
+            Value::Null,
+            json!("3.0"),
+        ];
+        let w = parse_wide_aggregate_row(&mixed).unwrap();
+        assert_eq!(w.count, 7);
+        assert_eq!(w.s[0], u64::MAX);
+        assert_eq!(w.s[2], 0);
+
+        let w = parse_wide_aggregate_row(&[json!(1), json!(2)]);
+        assert!(w.is_err());
     }
 
     // ── Execution chain: render → execute → parse ──
