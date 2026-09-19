@@ -521,8 +521,10 @@ async fn run_range_checksum_maps(
     for b in 0..plan.n {
         let (lo, hi) = plan.range(b);
         let mut lspec = bucket_checksum_spec(ctx, true, 1, 0, left.dialect())?;
+        lspec.key_column = Some(plan.key_column.clone());
         lspec.range = Some((lo, hi + 1));
         let mut rspec = bucket_checksum_spec(ctx, false, 1, 0, right.dialect())?;
+        rspec.key_column = Some(plan.key_column.clone());
         rspec.range = Some((lo, hi + 1));
         ctx.vlog(format!(
             "[delta-diff] bucketdiff checksum slice {b}: [{lo}..={hi}]"
