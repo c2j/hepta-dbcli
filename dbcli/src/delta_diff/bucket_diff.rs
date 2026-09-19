@@ -1244,8 +1244,10 @@ mod range_tests {
         BucketPlan::probe(&mut *lc, &mut *rc, &spec, &ctx, &mut queries).await
     }
 
+    /// B2 并集语义：键域取两侧并集（部分重叠时交集会静默丢行），
+    /// 这里验证重叠场景的并集边界正确。
     #[tokio::test]
-    async fn probe_returns_overlapping_domain_and_bucket_count() {
+    async fn probe_returns_union_domain_and_bucket_count() {
         let (l, r) = (duck_pool().await, duck_pool().await);
         let p = probe(
             &*l,
@@ -1258,7 +1260,7 @@ mod range_tests {
         .await
         .expect("probe");
         assert_eq!(p.min, 3);
-        assert_eq!(p.max, 8);
+        assert_eq!(p.max, 9, "union of [3,9] and [3,8] must reach 9");
         assert_eq!(p.n, 4);
         assert_eq!(p.key_column, "id");
     }
@@ -1354,10 +1356,14 @@ mod range_tests {
         assert_eq!(p.n, 4, "probe keeps the requested count; RangePlan shrinks");
     }
 
+    /// B2 并集语义回归：不相交的键域不再报错（旧 fail-closed 基于
+    /// 交集，会静默丢行）；并集 [1,10] 下单侧独有的区间 checksum
+    /// 恒为 0，成为正常 diff 输出。全 NULL 键的 fail-closed 路径由
+    /// probe_all_null_keys_fails_with_key_domain_error 覆盖。
     #[tokio::test]
-    async fn probe_disjoint_domains_fails_closed() {
+    async fn probe_disjoint_domains_resolve_to_union() {
         let (l, r) = (duck_pool().await, duck_pool().await);
-        let err = probe(
+        let p = probe(
             &*l,
             &*r,
             &[(1, "a"), (2, "b")],
@@ -1366,8 +1372,10 @@ mod range_tests {
             None,
         )
         .await
-        .expect_err("disjoint domains must fail closed");
-        assert!(err.to_string().contains("key domain"), "{err}");
+        .expect("disjoint domains resolve to their union");
+        assert_eq!(p.min, 1);
+        assert_eq!(p.max, 10);
+        assert_eq!(p.n, 4);
     }
 
     // ── WP2-fix regression: slice checksum SQL must carry the PK range ──
@@ -1376,13 +1384,19 @@ mod range_tests {
     /// 无 feature 门控，与 range_tests 的 duckdb 门控正交）。
     struct SqlCaptureConn {
         dialect: crate::backend::mysql::dialect::MySqlDialect,
-        last_sql: std::sync::Arc<std::sync::Mutex<String>>,
+        first_sql: std::sync::Arc<std::sync::Mutex<String>>,
     }
 
     #[async_trait::async_trait]
     impl DbConn for SqlCaptureConn {
         async fn query(&mut self, sql: &str) -> Result<crate::backend::QueryResult, DbError> {
-            *self.last_sql.lock().unwrap() = sql.to_string();
+            // 只记录第一条 SQL（bucket 0）：左右连接各持一个 Arc，
+            // 共享 Arc 只能看到最后一条（bucket 15），断言无从谈起。
+            let mut slot = self.first_sql.lock().unwrap();
+            if slot.is_empty() {
+                *slot = sql.to_string();
+            }
+            drop(slot);
             // render_batch_checksum_sql 的聚合无 GROUP BY，每支 1 行：
             // bkt=0, cnt=0, s1..s4 全 0。
             Ok(crate::backend::QueryResult {
@@ -1428,27 +1442,30 @@ mod range_tests {
         // 且排序归并前提被破坏）。对 run_range_checksum_maps 实际下发的
         // SQL 断言同时含 quoted key_column 与 `>= lo` / `< hi+1` 谓词。
         let ctx = test_ctx();
-        let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let lfirst = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let rfirst = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let plan = RangePlan::new("id", 0, 999, 16);
         let mut queries = 0u64;
         let mut lconn = SqlCaptureConn {
             dialect: crate::backend::mysql::dialect::MySqlDialect,
-            last_sql: std::sync::Arc::clone(&last),
+            first_sql: std::sync::Arc::clone(&lfirst),
         };
         let mut rconn = SqlCaptureConn {
             dialect: crate::backend::mysql::dialect::MySqlDialect,
-            last_sql: std::sync::Arc::clone(&last),
+            first_sql: std::sync::Arc::clone(&rfirst),
         };
         run_range_checksum_maps(&mut lconn, &mut rconn, &ctx, &plan, &mut queries)
             .await
             .expect("slice checksums");
         assert_eq!(queries, 32, "2 statements per bucket x 16 buckets");
-        let sql = last.lock().unwrap().clone();
-        assert!(
-            sql.contains("`id` >= 0") && sql.contains("`id` < 63"),
-            "first slice must constrain the PK range with the quoted key: {sql}"
-        );
-        assert!(sql.contains("GROUP BY"), "checksum shape unchanged: {sql}");
+        for (side, sql_slot) in [("left", &lfirst), ("right", &rfirst)] {
+            let sql = sql_slot.lock().unwrap().clone();
+            assert!(
+                sql.contains("`id` >= 0") && sql.contains("`id` < 63"),
+                "{side} slice must constrain the PK range with the quoted key: {sql}"
+            );
+            assert!(sql.contains("GROUP BY"), "checksum shape unchanged: {sql}");
+        }
     }
 
     // ── drill-down pull: only rows inside the PK range are fetched ──
