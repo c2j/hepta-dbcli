@@ -80,8 +80,12 @@ impl BucketPlan {
         let ((lmin, lmax), lq) = l?;
         let ((rmin, rmax), rq) = r?;
         *queries += lq + rq;
-        let min = lmin.max(rmin);
-        let max = lmax.min(rmax);
+        // 键域取两侧并集：交集在部分重叠时会静默丢弃重叠区外的行
+        //（如左 1..=1000 / 右 500..=1500 时，左 1-499 与右 1001-1500
+        // 不进任何 checksum/multiset，与旧 MOD 路径计入全部行不一致）。
+        // 并集下只有一侧有行的区间 checksum 天然为 0，成为正常 diff。
+        let min = lmin.min(rmin);
+        let max = lmax.max(rmax);
         if min > max {
             return Err(DbError::query(
                 "key domain unresolved: sides' key ranges do not overlap \
@@ -107,7 +111,8 @@ impl BucketPlan {
         let scheme = conn.dialect().url_scheme().to_owned();
         let quote = conn.dialect().identifier_quote();
         let mut sql = format!(
-            "SELECT MIN({key_column}) AS mn, MAX({key_column}) AS mx FROM {}",
+            "SELECT MIN({key_column}) AS mn, MAX({key_column}) AS mx, \
+             SUM(CASE WHEN {key_column} IS NULL THEN 1 ELSE 0 END) AS nulls FROM {}",
             crate::backend::quote_table_scheme(&scheme, quote, schema.as_deref(), table)
         );
         if let Some(f) = filter {
@@ -137,6 +142,26 @@ impl BucketPlan {
         };
         let cols: Vec<Option<&Value>> = (0..2).map(|i| row.get(i)).collect();
         let (mn, mx) = (parse(cols[0])?, parse(cols[1])?);
+        // NULL 键在范围谓词 `k >= a AND k <= b` 下永远不可见，而旧 MOD
+        // 路径按内容哈希计入这些行；检测到 NULL 键时失败关闭（回退
+        // MOD bucketing），保持与旧行为一致。同一查询内顺带计数，
+        // 不额外增加探查成本。
+        let nulls = row
+            .get(2)
+            .and_then(|v| match v {
+                Value::Null => Some(0),
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if nulls > 0 {
+            return Err(DbError::query(format!(
+                "key domain probe found {nulls} NULL {key_column} values in {table} \
+                 (range bucketing cannot see NULL keys; bucketdiff falls back \
+                 to MOD(rowHash, N) bucketing)"
+            )));
+        }
         match (mn, mx) {
             (Some(a), Some(b)) if a <= b => Ok(((a, b), used)),
             _ => Err(DbError::query(format!(
@@ -1257,19 +1282,59 @@ mod range_tests {
     }
 
     #[tokio::test]
-    async fn probe_uses_narrower_overlap_of_two_sides() {
+    async fn probe_uses_union_of_two_sides() {
+        // 评审修复：键域取并集。旧交集实现（3..=5）会静默丢弃左
+        // 1..=2、右 6..=10，部分重叠时漏 diff；并集下这些区间只有
+        // 一侧有行，checksum 自然为 0，成为正常差异。
         let (l, r) = (duck_pool().await, duck_pool().await);
         let p = probe(
             &*l,
             &*r,
-            &[(1, "a"), (10, "b")],
-            &[(3, "a"), (5, "b")],
+            &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+            &[(3, "a"), (4, "b"), (5, "c"), (6, "f"), (10, "g")],
             None,
             None,
         )
         .await
         .expect("probe");
-        assert_eq!((p.min, p.max), (3, 5));
+        assert_eq!((p.min, p.max), (1, 10), "union covers both sides' keys");
+    }
+
+    #[tokio::test]
+    async fn probe_partial_overlap_is_not_disjoint() {
+        let (l, r) = (duck_pool().await, duck_pool().await);
+        let p = probe(
+            &*l,
+            &*r,
+            &[(1, "a"), (10, "b")],
+            &[(5, "a"), (20, "b")],
+            None,
+            None,
+        )
+        .await
+        .expect("partial overlap must resolve, not fall back");
+        assert_eq!((p.min, p.max), (1, 20));
+    }
+
+    #[tokio::test]
+    async fn probe_null_key_fails_closed_to_mod_fallback() {
+        // NULL 键在范围谓词下不可见而旧 MOD 路径会计入：检测到即
+        // 失败关闭，回退 MOD(rowHash, N) bucketing。
+        let pool = duck_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query("CREATE OR REPLACE TABLE t (id BIGINT, v VARCHAR)")
+            .await
+            .expect("create");
+        conn.query("INSERT INTO t VALUES (NULL, 'n'), (1, 'a')")
+            .await
+            .expect("insert");
+        drop(conn);
+        let lpool = duck_pool().await;
+        make_table(&*lpool, &[(1, "a")]).await;
+        let err = probe(&*lpool, &*pool, &[(1, "a")], &[], None, None)
+            .await
+            .expect_err("NULL keys must fail closed");
+        assert!(err.to_string().contains("NULL"), "{err}");
     }
 
     #[tokio::test]
@@ -1303,6 +1368,78 @@ mod range_tests {
         .await
         .expect_err("disjoint domains must fail closed");
         assert!(err.to_string().contains("key domain"), "{err}");
+    }
+
+    // ── WP2-fix regression: slice checksum SQL must carry the PK range ──
+
+    /// 记录收到的 checksum SQL 的 mock 连接。
+    struct SqlCaptureConn {
+        dialect: MySqlDialect,
+        last_sql: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DbConn for SqlCaptureConn {
+        async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            *self.last_sql.lock().unwrap() = sql.to_string();
+            // render_batch_checksum_sql 的聚合无 GROUP BY，每支 1 行：
+            // bkt=0, cnt=0, s1..s4 全 0。
+            Ok(QueryResult {
+                columns: vec![
+                    "bkt".into(),
+                    "cnt".into(),
+                    "s1".into(),
+                    "s2".into(),
+                    "s3".into(),
+                    "s4".into(),
+                ],
+                rows: vec![vec![
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                    json!(0),
+                ]],
+                row_count: 1,
+                rows_affected: None,
+            })
+        }
+        async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            Err(DbError::unsupported("capture"))
+        }
+        async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn dialect(&self) -> &dyn Dialect {
+            &self.dialect
+        }
+    }
+
+    #[tokio::test]
+    async fn range_slice_checksum_sql_carries_quoted_key_and_range() {
+        // 5796485 回归防复发：`spec.range` 有值但 `key_column: None` 时
+        // 方言不渲染范围谓词，每个切片退化为全表扫描（性能曾 110s→349s，
+        // 且排序归并前提被破坏）。对 run_range_checksum_maps 实际下发的
+        // SQL 断言同时含 quoted key_column 与 `>= lo` / `< hi+1` 谓词。
+        let ctx = test_ctx();
+        let last = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut conn = SqlCaptureConn {
+            dialect: MySqlDialect,
+            last_sql: std::sync::Arc::clone(&last),
+        };
+        let plan = RangePlan::new("id", 0, 999, 16);
+        let mut queries = 0u64;
+        run_range_checksum_maps(&mut conn, &mut conn, &ctx, &plan, &mut queries)
+            .await
+            .expect("slice checksums");
+        assert_eq!(queries, 32, "2 statements per bucket x 16 buckets");
+        let sql = last.lock().unwrap().clone();
+        assert!(
+            sql.contains("`id` >= 0") && sql.contains("`id` < 63"),
+            "first slice must constrain the PK range with the quoted key: {sql}"
+        );
+        assert!(sql.contains("GROUP BY"), "checksum shape unchanged: {sql}");
     }
 
     // ── drill-down pull: only rows inside the PK range are fetched ──

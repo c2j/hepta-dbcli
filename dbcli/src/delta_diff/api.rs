@@ -153,11 +153,10 @@ pub(crate) async fn run_diff(
         recheck: opts.recheck,
         route_warnings: warnings,
         checkpoint,
-        iblt_capacity: if opts.iblt_auto {
-            crate::delta_diff::iblt_diff::IBLT_AUTO_CAPACITY
-        } else {
-            opts.iblt_capacity.max(16)
-        },
+        iblt_capacity: crate::delta_diff::iblt_diff::normalize_iblt_capacity(
+            opts.iblt_auto,
+            opts.iblt_capacity,
+        ),
         fetch_all_threshold: opts.fetch_all_threshold,
         naive_max_rows: opts.naive_max_rows,
         strict: opts.strict,

@@ -266,7 +266,17 @@ impl HashDiffer {
         let mut statement_count = 0usize;
         while let Some(res) = set.join_next().await {
             let (side, rows) = res.map_err(|e| DbError::query(format!("join: {e}")))??;
-            let first_lo = rows[0].0;
+            // 聚合无 GROUP BY 时每支恰 1 行，但这是拆掉 debug_assert 后
+            // 重新加固的安全网：空结果直接段错位（237eb2f 引入的回归）。
+            let first_lo = rows
+                .first()
+                .ok_or_else(|| {
+                    DbError::query(
+                        "delta-diff: wide chunk aggregate returned no rows (expected one \
+                     row per segment)",
+                    )
+                })?
+                .0;
             match side {
                 Side::L => left_by_lo.insert(first_lo, rows),
                 Side::R => right_by_lo.insert(first_lo, rows),
@@ -274,7 +284,13 @@ impl HashDiffer {
             statement_count += 1;
         }
         counters.queries += statement_count as u64;
-        debug_assert_eq!(left_by_lo.len(), right_by_lo.len());
+        if left_by_lo.len() != right_by_lo.len() {
+            return Err(DbError::query(format!(
+                "delta-diff: wide chunk statements mismatched: left {} vs right {}",
+                left_by_lo.len(),
+                right_by_lo.len()
+            )));
+        }
 
         // Flatten left/right in segment order (chunks are contiguous
         // partition slices, so ordered concatenation = segment order).
@@ -287,8 +303,16 @@ impl HashDiffer {
         };
         let lflat = flatten(&left_by_lo);
         let rflat = flatten(&right_by_lo);
-        debug_assert_eq!(lflat.len(), segments.len());
-        debug_assert_eq!(rflat.len(), segments.len());
+        // 行数校验是硬错误（非 debug_assert）：左右行数不齐时 zip 会按
+        // 最短截断、段错位配对，release 下可能静默假 Match。
+        if lflat.len() != segments.len() || rflat.len() != segments.len() {
+            return Err(DbError::query(format!(
+                "delta-diff: wide aggregate returned {} left / {} right rows, expected {} segments",
+                lflat.len(),
+                rflat.len(),
+                segments.len()
+            )));
+        }
 
         // SegmentAgg carries only lo (decoded from the row marker); the
         // authoritative hi comes from the segment partition, which both
@@ -299,11 +323,15 @@ impl HashDiffer {
             .zip(rflat.iter())
             .zip(segments.iter())
             .map(|((lk, rk), &(lo, hi))| {
-                debug_assert_eq!(lk.0, lo);
-                debug_assert_eq!(rk.0, lo);
-                (lo, hi, lk.2, rk.2, elapsed_ms)
+                if lk.0 != lo || rk.0 != lo {
+                    return Err(DbError::query(format!(
+                        "delta-diff: wide chunk row seg_lo mismatch: got ({}, {}), expected {lo}",
+                        lk.0, rk.0
+                    )));
+                }
+                Ok((lo, hi, lk.2, rk.2, elapsed_ms))
             })
-            .collect();
+            .collect::<Result<Vec<_>, DbError>>()?;
         Ok(out)
     }
 
@@ -485,8 +513,16 @@ fn render_segment_aggregate_sql(
         let expanded = sql.replacen("SELECT ", &format!("SELECT {lo} AS seg_lo, "), 1);
         parts.push(expanded);
     }
+    // 表别名不能按方言硬编码：Oracle 的 FROM 子查询别名不允许 AS
+    //（ORA-00933），MySQL/PG/DuckDB/GaussDB 则两者皆可。与仓库其余
+    // 方言渲染一致（见 oracle/dialect.rs 的 `FROM (...) t`）。
+    let wrapper = if dialect.url_scheme() == "oracle" {
+        " wide"
+    } else {
+        " AS wide"
+    };
     format!(
-        "SELECT seg_lo, cnt, s1, s2, s3, s4 FROM (\n  {}\n) AS wide ORDER BY seg_lo",
+        "SELECT seg_lo, cnt, s1, s2, s3, s4 FROM (\n  {}\n){wrapper} ORDER BY seg_lo",
         parts.join("\n  UNION ALL\n  ")
     )
 }
@@ -928,6 +964,27 @@ mod tests {
         let sql = render_segment_aggregate_sql(&specs, &segments, &d);
         assert!(!sql.contains("UNION ALL"));
         assert!(sql.contains("0 AS seg_lo"));
+    }
+
+    #[test]
+    fn wide_sql_table_alias_is_dialect_correct() {
+        // 回归：`) AS wide` 在 Oracle 上非法（ORA-00933，FROM 子查询别名
+        // 不允许 AS）。MySQL 系保留 `) AS wide`，Oracle 必须是 `) wide`。
+        let d = MySqlDialect;
+        let segments = [(0, 50)];
+        let specs = vec![agg_spec((0, 50))];
+        let sql = render_segment_aggregate_sql(&specs, &segments, &d);
+        assert!(sql.contains(") AS wide"), "mysql: {sql}");
+
+        #[cfg(feature = "oracle")]
+        {
+            use crate::backend::oracle_native::dialect::OracleDialect;
+            let sql = render_segment_aggregate_sql(&specs, &segments, &OracleDialect::new());
+            assert!(
+                sql.contains(") wide") && !sql.contains(") AS wide"),
+                "oracle must not use AS for the table alias: {sql}"
+            );
+        }
     }
 
     #[test]

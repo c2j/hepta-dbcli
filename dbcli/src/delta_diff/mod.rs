@@ -508,11 +508,10 @@ async fn execute_diff_inner(
         recheck: args.recheck_effective(),
         route_warnings: warnings,
         checkpoint,
-        iblt_capacity: if args.iblt_auto_capacity {
-            iblt_diff::IBLT_AUTO_CAPACITY
-        } else {
-            args.iblt_capacity
-        },
+        iblt_capacity: iblt_diff::normalize_iblt_capacity(
+            args.iblt_auto_capacity,
+            args.iblt_capacity,
+        ),
         fetch_all_threshold: args.fetch_all_threshold,
         naive_max_rows: args.naive_max_rows,
         strict: args.strict,

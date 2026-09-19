@@ -711,7 +711,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 必填：`left_connection`、`right_connection`、`table`。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 
 `where_condition` 禁止包含分号。`update_column` 与 `where_condition` 互斥，同时提供会被拒绝。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
@@ -864,7 +864,8 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 | `--statement-timeout` | 300 | 单条查询超时，**秒** |
 | `--bisection-factor` | 32 | hashdiff 二分因子 |
 | `--bisection-threshold` | 16384 | hashdiff 行级阈值 |
-| `--iblt-capacity` | 65536 | IBLT 预期差异容量 |
+| `--iblt-capacity` | 65536 | IBLT 预期差异容量（小于 16 按 16 处理） |
+| `--iblt-auto-capacity` | 关 | IBLT 自适应两轮：第一轮 m=64，解码失败后按估计差异量 d̂ 放大一轮重试（m₂=clamp(3·d̂)），两轮都失败才回退 hashdiff；内存占用固定在桶表，不随容量预分配增长 |
 | `--fetch-all-threshold` | 4096 | keyeddiff：`max(COUNT)` 不超过此值时一次拉全量 |
 | `--naive-max-rows` | 200000 | naivediff：`max(COUNT)` 超过此值时拒绝（exit 2）并提示改用 `--strategy keyeddiff`；`0` = 不设顶（大表物化内存自负） |
 | `--verbose` | 关 | 分片进度与每步 SQL 打到 stderr |

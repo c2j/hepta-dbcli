@@ -32,6 +32,20 @@ type Summary = HashMap<(u8, u64), Cell>;
 /// 0 表示两轮自协商容量（选项层负责翻译，strategy 路由不读该值）。
 pub(crate) const IBLT_AUTO_CAPACITY: u64 = 0;
 
+/// 非 auto 固定容量的下限：同时是用户显式传 `--iblt-capacity 0` 时与
+/// AUTO 哨兵（0）冲突的防碰撞折迭值（评审 B6）。
+pub(crate) const IBLT_MIN_CAPACITY: u64 = 16;
+
+/// CLI 与 MCP/API 共用的容量归一：auto 走哨兵；固定容量折叠到
+/// [`IBLT_MIN_CAPACITY`]，保证两个入口对同一输入语义一致。
+pub(crate) fn normalize_iblt_capacity(auto: bool, requested: u64) -> u64 {
+    if auto {
+        IBLT_AUTO_CAPACITY
+    } else {
+        requested.max(IBLT_MIN_CAPACITY)
+    }
+}
+
 /// 自适应协议第一轮子表桶数 m₁（最小可行；d ≤ ⌈4m/3⌉-1 时一轮完成）
 const AUTO_MIN_CELLS: u64 = 64;
 
@@ -107,6 +121,10 @@ impl DiffStrategy for IbltDiffer {
                 // WP1 自适应两轮在 try_iblt 内完成（同一快照内重试）；
                 // 两轮都失败才落到这里走既有 hashdiff 回退。
                 let _ = diff;
+                // 回退前先关掉快照事务：hashdiff 会开自己的快照，而
+                // Oracle 在已开事务上 SET TRANSACTION READ ONLY 会
+                // ORA-01453。main 的行为是先 COMMIT 再 result?（1951c96）。
+                close_snapshot(left, right, ctx).await;
                 ctx.vlog(format!(
                     "[delta-diff] iblt capacity exceeded (d > {}), falling back to hashdiff",
                     capacity_label(ctx)
@@ -116,6 +134,8 @@ impl DiffStrategy for IbltDiffer {
                 Ok(report)
             }
             Err(IbltFailure::Capacity(diff)) => {
+                // --strict 报错前同样先关快照，让调用方能直接重试或回退。
+                close_snapshot(left, right, ctx).await;
                 let detail = if ctx.iblt_capacity == IBLT_AUTO_CAPACITY {
                     // d̂/m₂ 从第一轮摘要确定性重算，与已尝试的第二轮一致
                     let dhat = estimate_diff_count(&diff);
@@ -131,9 +151,10 @@ impl DiffStrategy for IbltDiffer {
                     detail
                 )))
             }
-            // §2.3 + §16.3-F8：方言能力不足（如 Oracle 19c 无 BIT_XOR_AGG）也透明回退；
-            // --strict 下原样报错
             Err(IbltFailure::Db(e)) if !ctx.strict => {
+                // §2.3 + §16.3-F8：方言能力不足（如 Oracle 19c 无 BIT_XOR_AGG）也透明回退；
+                // --strict 下原样报错
+                close_snapshot(left, right, ctx).await;
                 ctx.vlog(format!(
                     "[delta-diff] iblt unavailable on this backend ({}), falling back to hashdiff",
                     e
@@ -145,8 +166,26 @@ impl DiffStrategy for IbltDiffer {
                 ));
                 Ok(report)
             }
-            Err(IbltFailure::Db(e)) => Err(e),
+            Err(IbltFailure::Db(e)) => {
+                close_snapshot(left, right, ctx).await;
+                Err(e)
+            }
         }
+    }
+}
+
+/// 关闭两侧快照事务（snapshot 模式下的收尾/回退清理）。与 main
+///（1951c96）一致：失败路径也要 COMMIT，否则 hashdiff 回退会在 Oracle
+/// 已开事务上 SET TRANSACTION READ ONLY 而 ORA-01453。best-effort。
+async fn close_snapshot(
+    left: &mut (dyn DbConn + Send),
+    right: &mut (dyn DbConn + Send),
+    ctx: &DiffContext,
+) {
+    if ctx.consistency == ConsistencyMode::Snapshot {
+        ctx.vlog("[sql] COMMIT");
+        let _ = left.query_drop("COMMIT").await;
+        let _ = right.query_drop("COMMIT").await;
     }
 }
 
@@ -719,6 +758,26 @@ mod tests {
     // ── Pure estimation math ─────────────────────────────────────────
 
     #[test]
+    fn capacity_normalizer_keeps_cli_and_api_consistent() {
+        // 评审 B6：哨兵 0 只能来自 auto 标志；显式容量 0/1/16 在两个
+        // 入口都折叠到 IBLT_MIN_CAPACITY，不会静默切换成两轮协议。
+        assert_eq!(normalize_iblt_capacity(true, 0), IBLT_AUTO_CAPACITY);
+        assert_eq!(normalize_iblt_capacity(true, 999), IBLT_AUTO_CAPACITY);
+        assert_eq!(normalize_iblt_capacity(false, 0), IBLT_MIN_CAPACITY);
+        assert_eq!(normalize_iblt_capacity(false, 1), IBLT_MIN_CAPACITY);
+        assert_eq!(normalize_iblt_capacity(false, 16), 16);
+        assert_eq!(normalize_iblt_capacity(false, 65_536), 65_536);
+        // 哨兵不可达性：任何非 auto 输入都不产生 AUTO 哨兵。
+        for req in [0u64, 1, 15, 16, 1024, u64::MAX] {
+            assert_ne!(
+                normalize_iblt_capacity(false, req),
+                IBLT_AUTO_CAPACITY,
+                "requested={req}"
+            );
+        }
+    }
+
+    #[test]
     fn should_estimate_zero_for_empty_summary() {
         let diff = Summary::new();
         assert_eq!(estimate_diff_count(&diff), 0);
@@ -863,6 +922,8 @@ mod tests {
         /// None → serve identical rows on both sides (equal summaries).
         entries: Option<(RawEntries, RawEntries)>,
         queries: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// 记录 query_drop 收到的语句（COMMIT 关快照测试用）。
+        drops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl MockIbltConn {
@@ -871,6 +932,7 @@ mod tests {
                 dialect: MySqlDialect,
                 entries: None,
                 queries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                drops: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -879,6 +941,7 @@ mod tests {
                 dialect: MySqlDialect,
                 entries: Some((left, right)),
                 queries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                drops: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -979,6 +1042,25 @@ mod tests {
                     rows_affected: None,
                 });
             }
+            // 1b) snapshot-mode segment checksum (starts with the bare
+            //     COUNT(*) projection; the wide UNION SQL starts with
+            //     "SELECT seg_lo" so it must NOT match this branch):
+            //     return identical zero tuples so bisection sees Match and
+            //     the fallback completes without row pulls.
+            if sql.starts_with("SELECT COUNT(*) AS cnt") && sql.contains("MD5(") {
+                return Ok(QueryResult {
+                    columns: vec![
+                        "cnt".into(),
+                        "s1".into(),
+                        "s2".into(),
+                        "s3".into(),
+                        "s4".into(),
+                    ],
+                    rows: vec![vec![json!(0), json!(0), json!(0), json!(0), json!(0)]],
+                    row_count: 1,
+                    rows_affected: None,
+                });
+            }
             // 2) wide segment aggregate (WP3 none-mode first pass): each
             //    branch embeds "SELECT {lo} AS seg_lo" — echo those lo
             //    values with matching (cnt, s1..s4) tuples so segments
@@ -1041,7 +1123,8 @@ mod tests {
             Ok(QueryResult::empty())
         }
 
-        async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+        async fn query_drop(&mut self, sql: &str) -> Result<(), DbError> {
+            self.drops.lock().unwrap().push(sql.to_string());
             Ok(())
         }
 
@@ -1096,6 +1179,7 @@ mod tests {
                     dialect: MySqlDialect,
                     entries: self.0.entries.clone(),
                     queries: std::sync::Arc::clone(&self.0.queries),
+                    drops: std::sync::Arc::clone(&self.0.drops),
                 }))
             }
         }
@@ -1103,6 +1187,7 @@ mod tests {
             dialect: MySqlDialect,
             entries: seed.entries.clone(),
             queries: std::sync::Arc::clone(&seed.queries),
+            drops: std::sync::Arc::clone(&seed.drops),
         }))
     }
 
@@ -1335,5 +1420,94 @@ mod tests {
         };
         let sql = d.render_iblt_sql(&spec).expect("mysql render");
         assert_eq!(MockIbltConn::iblt_m_from_sql(&sql), Some(64));
+    }
+
+    // ── B1 回归：snapshot 失败路径必须先 COMMIT 再回退/报错 ──
+
+    fn ctx_snapshot(capacity: u64) -> DiffContext {
+        let mut ctx = ctx_with_capacity(capacity);
+        ctx.consistency = ConsistencyMode::Snapshot;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn snapshot_mode_capacity_fallback_commits_before_hashdiff() {
+        // 评审 B1：WP1 之前（1951c96）失败路径也会 COMMIT 关掉快照，
+        // hashdiff 回退才能在自己的连接上开新快照；Oracle 在已开事务上
+        // SET TRANSACTION READ ONLY 会 ORA-01453。回退路径必须先 COMMIT。
+        let d = 5000;
+        let mut l = MockIbltConn::with_entries(colliding_entries(d), vec![]);
+        let mut r = MockIbltConn::identical();
+        let mut ctx = ctx_snapshot(0);
+        ctx.left_pool = mock_pool(&l);
+        ctx.right_pool = mock_pool(&r);
+
+        let report = run_iblt(&mut l, &mut r, &ctx).await.expect("fallback");
+        assert_eq!(report.strategy, "hashdiff");
+        let drops_l = l.drops.lock().unwrap().clone();
+        let drops_r = r.drops.lock().unwrap().clone();
+        assert!(
+            drops_l.iter().any(|s| s == "COMMIT"),
+            "left must COMMIT before hashdiff fallback: {drops_l:?}"
+        );
+        assert!(
+            drops_r.iter().any(|s| s == "COMMIT"),
+            "right must COMMIT before hashdiff fallback: {drops_r:?}"
+        );
+        // 回退后（hashdiff 成功路径）各自再开一次快照；先 COMMIT 后 START。
+        let start_before_commit = |drops: &[String]| {
+            let commit = drops.iter().position(|s| s == "COMMIT").unwrap();
+            drops[commit + 1..]
+                .iter()
+                .any(|s| s.contains("START TRANSACTION"))
+        };
+        assert!(start_before_commit(&drops_l));
+        assert!(start_before_commit(&drops_r));
+    }
+
+    #[tokio::test]
+    async fn snapshot_mode_strict_error_still_commits() {
+        // --strict 下解码失败报错，但快照同样必须关闭（调用方可能直接
+        // 重试同一连接）。
+        let d = 5000;
+        let mut l = MockIbltConn::with_entries(colliding_entries(d), vec![]);
+        let mut r = MockIbltConn::identical();
+        let mut ctx = ctx_snapshot(0);
+        ctx.strict = true;
+
+        let err = run_iblt(&mut l, &mut r, &ctx)
+            .await
+            .expect_err("strict must surface capacity error");
+        assert!(err.to_string().contains("capacity exceeded"), "{err}");
+        assert!(l.drops.lock().unwrap().iter().any(|s| s == "COMMIT"));
+        assert!(r.drops.lock().unwrap().iter().any(|s| s == "COMMIT"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_mode_success_commits_exactly_once() {
+        // 成功路径行为不变：finish() 里 COMMIT 一次；close_snapshot 在
+        // 失败臂才会触发，不得重复提交。
+        let mut l = MockIbltConn::with_entries(left_only_entries(10), vec![]);
+        let mut r = MockIbltConn::identical();
+        let ctx = ctx_snapshot(0);
+
+        let report = run_iblt(&mut l, &mut r, &ctx).await.expect("decode");
+        assert_eq!(report.summary.missing_right, 10);
+        let commits_l = l
+            .drops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "COMMIT")
+            .count();
+        let commits_r = r
+            .drops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.as_str() == "COMMIT")
+            .count();
+        assert_eq!(commits_l, 1);
+        assert_eq!(commits_r, 1);
     }
 }
