@@ -7,3 +7,18 @@ base	bucketdiff	97.61s	27492352B	200
 base	iblt	38.42s	280674304B	100
 base	iblt	46.61s	280707072B	100
 base	iblt	39.30s	280625152B	100
+# === optimized (opt/delta-diff-v2 @ 5796485) clustered-100 (101-row diff incl id=0) ===
+# opt	hashdiff	x3: 2.12/2.07/2.07s (~1.9s @ --threads 8)	rss ~16.6MB	diffs=100
+# opt	hashdiff (WP1 early build 237eb2f)	2.6s median / 76q
+# opt	bucketdiff (after WP2-fix 5796485)	x3: 6.94/6.61/6.76s	rss ~23.2MB	diffs=200
+# opt	iblt --iblt-auto-capacity x3: 37.7/40.1/42.7s	rss ~17.6MB	diffs=100 (falls back to hashdiff at d=100)
+# opt	iblt --iblt-capacity 1024: 20.6s	rss 18.1MB	diffs=100
+# === identical (0 diffs) ===
+# opt	identical hashdiff 3.21s rss14.9MB | bucketdiff 5.67s rss14.3MB | iblt auto 21.96s rss14.4MB | iblt cap1024 21.03s
+# === spread-101 ===
+# opt	spread hashdiff 2.89s rss16.1 | bucketdiff 6.92s rss23.8 | iblt auto 43.8s rss17.5 | iblt cap1024 19.9s
+# === d=1 ===
+# opt	d1 iblt auto 25.8s rss14.6 | cap1024 28.7s | cap65536 46.3s rss267.5MB
+# base	main bucketdiff (post-eval re-run): 109.7s rss~27.5MB diffs=200
+# base	main hashdiff: 2.05/2.03/2.12s rss~16.8MB
+# base	main iblt: 38.4/46.6/39.3s rss~280MB
