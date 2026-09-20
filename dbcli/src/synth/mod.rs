@@ -940,6 +940,7 @@ async fn mine_tables(
         confidence: mine.mine_confidence,
         support: mine.mine_support,
         max_pairs: mine.mine_max_pairs,
+        exclude_pii: !mine.keep_pii_columns,
         ..crate::synth::mine::MineConfig::default()
     };
 
@@ -971,6 +972,13 @@ async fn mine_tables(
                 ""
             }
         );
+        if !report.pii_skipped.is_empty() {
+            eprintln!(
+                "mining table '{}': PII filter skipped column(s): {}",
+                table,
+                report.pii_skipped.join(", ")
+            );
+        }
         if !report.candidates.is_empty() {
             mined.push(crate::synth::mine::TableCandidates {
                 table: table.clone(),
@@ -1046,8 +1054,9 @@ fn draft_cycle_warning(rules: &crate::synth::rules::SynthRules) -> Option<String
         Err(msg) => Some(format!(
             "draft references form a {} — `synth generate` would fail. \
              Review the relationships in this draft (same-name timestamp \
-             columns are a common false positive) and delete the ones that \
-             are not real foreign keys.",
+             columns and self-references like employee.manager_id → \
+             employee.id are common false positives) and delete the ones \
+             that are not real foreign keys.",
             msg
         )),
     }

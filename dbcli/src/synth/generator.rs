@@ -235,7 +235,8 @@ fn generate_with(
             TableStrategy::Weighted => SelectionStrategy::Weighted,
         };
 
-        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
+        let mut rel_pools =
+            build_rel_pools(table_name, rule, &column_pools, models, strategy, row_count)?;
 
         // `cardinality: modeled` (issue #72) replaces the fixed row count and
         // the independent FK draw with one sampled count per parent key.
@@ -382,25 +383,6 @@ fn generate_with(
                 }
 
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
-                    let child_p_null = rule
-                        .columns
-                        .get(col_name)
-                        .and_then(|c| c.null_rate)
-                        .unwrap_or(0.0);
-                    let unique_demand = (row_count as f64 * (1.0 - child_p_null)).ceil() as usize;
-                    if rel.unique && unique_demand > rel.pool_size {
-                        // Preflight (known-limitation #5): requesting more
-                        // unique FK values than the parent pool holds can
-                        // never finish; say so with the capacity and remedies
-                        // before any rows are built.
-                        return Err(format!(
-                            "table '{}': unique FK '{}' requests {} unique value(s) but its \
-                             parent pool holds only {} distinct value(s) observed at train \
-                             time — increase train --sample and retrain, set unique: false, \
-                             or give the parent key an explicit values pool",
-                            table_name, rel.column, unique_demand, rel.pool_size
-                        ));
-                    }
                     let value = if rel.unique {
                         rel.pool
                             .sample_unique(rel.strategy, &mut rng)
@@ -548,10 +530,10 @@ fn generate_with(
                     if attempts >= 10_000 {
                         return Err(format!(
                             "referenced column '{}.{}' exhausted its value space after \
-                             {attempts} redraws (degenerate marginal?); duplicated parent \
-                             keys cannot satisfy an FK-enforced load — increase train \
-                             --sample and retrain, set unique: false, or give the parent \
-                             key an explicit values pool",
+                             {attempts} redraws; duplicated parent keys cannot satisfy an \
+                             FK-enforced load — if this column is continuous, raise the \
+                             parent table's row count or its value space (train --sample / \
+                             explicit values pool); otherwise set unique: false",
                             table_name, col_name
                         ));
                     }
@@ -2350,6 +2332,7 @@ fn build_rel_pools(
     column_pools: &HashMap<String, Vec<Value>>,
     models: &HashMap<String, TableModel>,
     strategy: SelectionStrategy,
+    row_count: usize,
 ) -> Result<Vec<RelPool>, String> {
     let mut rel_pools = Vec::new();
     for rel in &rule.relationships {
@@ -2390,6 +2373,47 @@ fn build_rel_pools(
 
         let pool_size = pool.len();
 
+        // Unique-FK preflight (known-limitation #5), hoisted out of the
+        // per-row loop. The pool holds the parent table's *generated* values,
+        // so its size is bounded by the parent's row count, not by what train
+        // observed. The parent column's own observed capacity (Ecdf knots /
+        // categorical levels / trained sample size) says whether retraining
+        // with a larger --sample can actually grow the pool.
+        if unique {
+            let child_p_null = rule
+                .columns
+                .get(&rel.pk)
+                .and_then(|c| c.null_rate)
+                .unwrap_or(0.0);
+            let unique_demand = (row_count as f64 * (1.0 - child_p_null)).ceil() as usize;
+            if unique_demand > pool_size {
+                let (parent_table, parent_col) = match ref_str.split_once('.') {
+                    Some(pair) => pair,
+                    None => (ref_str.as_str(), ""),
+                };
+                let observed = parent_observed_capacity(models, parent_table, parent_col);
+                let hint = match observed {
+                    Some(capacity) if capacity >= unique_demand => format!(
+                        "; the parent column observed {capacity} distinct value(s) at train \
+                         time, so increasing the parent table's row count in the rules \
+                         will grow the pool"
+                    ),
+                    Some(capacity) => format!(
+                        "; the parent column itself only observed {capacity} distinct \
+                         value(s) at train time — increase train --sample and retrain to \
+                         widen it"
+                    ),
+                    None => String::new(),
+                };
+                return Err(format!(
+                    "table '{}': unique FK '{}' requests {} unique value(s) but its parent \
+                     pool '{}' holds only {} generated value(s){} — or set unique: false, \
+                     or give the parent key an explicit values pool",
+                    table_name, rel.pk, unique_demand, ref_str, pool_size, hint
+                ));
+            }
+        }
+
         rel_pools.push(RelPool {
             column: rel.pk.clone(),
             pool,
@@ -2399,6 +2423,23 @@ fn build_rel_pools(
         });
     }
     Ok(rel_pools)
+}
+
+/// Observed distinct-value capacity of a parent key column at train time:
+/// categorical levels, Ecdf knots, or (for continuous marginals) the training
+/// sample size. `None` when the model or column is missing.
+fn parent_observed_capacity(
+    models: &HashMap<String, TableModel>,
+    parent_table: &str,
+    parent_column: &str,
+) -> Option<usize> {
+    let model = models.get(parent_table)?;
+    let column = model.columns.get(parent_column)?;
+    match &column.marginal {
+        crate::synth::marginal::Marginal::Categorical(p) => Some(p.values.len()),
+        crate::synth::marginal::Marginal::Ecdf(p) => Some(p.knots.len()),
+        _ => model.provenance.trained_rows,
+    }
 }
 
 #[cfg(test)]
@@ -3615,11 +3656,16 @@ mod tests {
             "error should name the column: {}",
             err
         );
-        // Known-limitation #5: the preflight now states the observed parent
-        // capacity and the remedies instead of exhausting the pool first.
-        assert!(err.contains("3 distinct value(s)"), "error: {}", err);
+        // Known-limitation #5: the preflight states the generated pool size,
+        // the parent column's observed capacity, and the remedies.
+        assert!(err.contains("3 generated value(s)"), "error: {}", err);
         assert!(
-            err.contains("--sample") && err.contains("unique: false"),
+            err.contains("observed 5 distinct value(s) at train time"),
+            "error should distinguish observed capacity: {}",
+            err
+        );
+        assert!(
+            err.contains("unique: false") && err.contains("values pool"),
             "error should list remedies: {}",
             err
         );

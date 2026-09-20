@@ -232,6 +232,12 @@ pub struct MineArgs {
     /// Write the full candidate list to this path (comments stay in the YAML)
     #[arg(long)]
     pub emit_candidates: Option<String>,
+
+    /// Mine PII-looking columns anyway. Default skips them so raw training
+    /// values never surface in candidate comments; only use this on data you
+    /// know is fake PII-shaped.
+    #[arg(long, default_value_t = false)]
+    pub keep_pii_columns: bool,
 }
 
 impl Default for MineArgs {
@@ -242,6 +248,7 @@ impl Default for MineArgs {
             mine_support: 0.05,
             mine_max_pairs: 2000,
             emit_candidates: None,
+            keep_pii_columns: false,
         }
     }
 }

@@ -227,9 +227,6 @@ pub struct TableStats {
 
 pub struct ColumnStats {
     pub cardinality: usize,
-    /// Logical type from the profile; used to keep `datetime` bookkeeping
-    /// columns (`last_update`) out of implicit relationship inference.
-    pub logical_type: String,
 }
 
 pub fn generate_draft_from_profiles(
@@ -257,7 +254,6 @@ fn table_stats_from_profiles(
                         col_name.clone(),
                         ColumnStats {
                             cardinality: col_profile.cardinality,
-                            logical_type: col_profile.logical_type.clone(),
                         },
                     )
                 })
@@ -536,13 +532,7 @@ mod tests {
         }];
 
         let mut columns = std::collections::HashMap::new();
-        columns.insert(
-            "user_id".to_string(),
-            ColumnStats {
-                cardinality: 100,
-                logical_type: "categorical".to_string(),
-            },
-        );
+        columns.insert("user_id".to_string(), ColumnStats { cardinality: 100 });
         let mut stats = std::collections::HashMap::new();
         stats.insert(
             "orders".to_string(),

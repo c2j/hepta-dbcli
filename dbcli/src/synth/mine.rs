@@ -76,6 +76,8 @@ pub struct MineReport {
     pub participating_columns: usize,
     pub pairs_total: usize,
     pub pairs_considered: usize,
+    /// Columns excluded from mining by the PII filter (names, input order).
+    pub pii_skipped: Vec<String>,
 }
 
 impl MineReport {
@@ -170,12 +172,14 @@ fn build_levels(rows: &[Vec<Value>], column: usize, max_levels: usize) -> Option
 /// skipped too: mining them would copy raw training values into the candidate
 /// report.
 pub fn mine_candidates(columns: &[String], rows: &[Vec<Value>], config: &MineConfig) -> MineReport {
+    let mut pii_skipped: Vec<String> = Vec::new();
     let participating: Vec<(usize, Levels)> = (0..columns.len())
         .filter_map(|i| {
             if config.exclude_pii {
                 let samples: Vec<Value> =
                     rows.iter().filter_map(|row| row.get(i).cloned()).collect();
                 if super::pii::detect(&columns[i], &samples, None).is_some() {
+                    pii_skipped.push(columns[i].clone());
                     return None;
                 }
             }
@@ -222,6 +226,7 @@ pub fn mine_candidates(columns: &[String], rows: &[Vec<Value>], config: &MineCon
         participating_columns: p,
         pairs_total,
         pairs_considered,
+        pii_skipped,
     }
 }
 
@@ -681,6 +686,20 @@ mod tests {
             !report.candidates.is_empty(),
             "exclusion disabled: the strong rule must be found again"
         );
+    }
+
+    /// The report lists which columns the PII filter skipped, so callers can
+    /// surface them on stderr (review feedback on the limitation fix).
+    #[test]
+    fn should_report_which_columns_the_pii_filter_skipped() {
+        let mut rows = Vec::new();
+        for i in 0..6000 {
+            let email = if i < 4000 { "a@x.com" } else { "b@x.com" };
+            let tag = if i < 4000 { "0" } else { "1" };
+            rows.push(vec![json!(email), json!(tag)]);
+        }
+        let report = mine_candidates(&columns(&["email", "tag"]), &rows, &config());
+        assert_eq!(report.pii_skipped, vec!["email".to_string()]);
     }
 
     /// A column named `email` is PII by name pattern even when the sampled
