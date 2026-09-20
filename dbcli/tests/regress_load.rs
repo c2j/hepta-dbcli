@@ -543,6 +543,14 @@ mod mysql_tests {
             out.status.success(),
             "load should succeed, stderr: {stderr}, stdout: {stdout}"
         );
+        // The FK order must be visible in the run itself: orders loads only
+        // after users, regardless of alphabetical file order.
+        let users_pos = stdout.find(&users_table).expect("users in stdout");
+        let orders_pos = stdout.find(&orders_table).expect("orders in stdout");
+        assert!(
+            users_pos < orders_pos,
+            "users must be reported before orders: {stdout}"
+        );
         assert!(
             stdout.contains(&format!("loaded 4 rows into 2 table(s)")),
             "unexpected stdout: {stdout}"

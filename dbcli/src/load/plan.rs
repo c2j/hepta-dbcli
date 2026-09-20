@@ -128,6 +128,33 @@ pub(crate) fn parse_table_schemas(
         .collect()
 }
 
+/// Schema to run `foreign_keys_sql` against. Precedence: explicit `--schema`,
+/// then the connection's configured default schema, then the schema the
+/// planned tables were actually listed under. Only schemas that hold one of
+/// the planned tables qualify for that last step — a server hosting many
+/// schemas must not let an unrelated same-named table's schema win (the FK
+/// query would return edges for foreign tables and the topological order
+/// would degenerate to alphabetical). Ties resolve alphabetically, so the
+/// choice is deterministic.
+pub(crate) fn schema_for_fk_lookup(
+    explicit: Option<String>,
+    target_default: Option<String>,
+    listed_schemas: &std::collections::HashMap<String, Option<String>>,
+    planned_tables: &[String],
+) -> Option<String> {
+    if let Some(schema) = explicit.or(target_default) {
+        return Some(schema);
+    }
+    let mut candidates: Vec<String> = planned_tables
+        .iter()
+        .filter_map(|t| listed_schemas.get(t).cloned().flatten())
+        .filter(|s| !s.is_empty())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates.into_iter().next()
+}
+
 /// Column names from a `table_columns()` result
 /// (`[column_name, data_type, nullable, ...]`).
 pub(crate) fn parse_column_names(result: &QueryResult) -> Vec<String> {
@@ -523,6 +550,57 @@ mod tests {
         let err = match_files_to_db_tables(&files, &db_tables).unwrap_err();
         assert!(err.contains("ghost"), "error must name the file: {err}");
         assert!(err.contains("never creates tables"), "{err}");
+    }
+
+    #[test]
+    fn should_pick_fk_schema_from_the_tables_being_loaded() {
+        // A server with many schemas: only the schemas of the tables being
+        // loaded are candidates. Any other listed schema must be ignored, so
+        // the FK query cannot land on an unrelated schema's edges.
+        let listed = listed_result(&[
+            ("testdb", "orders"),
+            ("rev81", "users"),
+            ("synth_guard", "events"),
+        ]);
+        let listed_schemas = parse_table_schemas(&listed);
+        assert_eq!(listed_schemas.len(), 3);
+
+        let planned_tables = ["orders".to_string(), "users".to_string()];
+
+        let explicit = schema_for_fk_lookup(
+            Some("shop".to_string()),
+            None,
+            &listed_schemas,
+            &planned_tables,
+        );
+        assert_eq!(explicit.as_deref(), Some("shop"));
+
+        let from_target = schema_for_fk_lookup(
+            None,
+            Some("testdb".to_string()),
+            &listed_schemas,
+            &planned_tables,
+        );
+        assert_eq!(from_target.as_deref(), Some("testdb"));
+
+        // No explicit schema and no configured default: the candidate set is
+        // exactly the schemas of the planned tables. orders lives in testdb,
+        // users in rev81 — the alphabetically first candidate wins, which is
+        // deterministic and provably holds one of the planned tables.
+        let inferred = schema_for_fk_lookup(None, None, &listed_schemas, &planned_tables)
+            .expect("planned tables identify their schema");
+        assert_eq!(inferred, "rev81", "sorted candidates pick the first");
+    }
+
+    #[test]
+    fn should_return_none_for_fk_schema_when_planned_tables_have_no_schema() {
+        let listed_schemas: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        let planned_tables = vec!["users".to_string()];
+        assert_eq!(
+            schema_for_fk_lookup(None, None, &listed_schemas, &planned_tables),
+            None
+        );
     }
 
     #[test]

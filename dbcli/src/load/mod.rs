@@ -167,20 +167,18 @@ pub(crate) async fn run(
     };
 
     // FK edges drive the topological load order. The FK query needs a schema;
-    // explicit --schema wins, else the schema the tables were listed under.
+    // explicit --schema wins, then the connection's configured default, then
+    // the schema the planned tables were listed under (never an unrelated
+    // schema that happens to host a same-named table).
     let listed_schemas = plan::parse_table_schemas(&listed);
-    let fk_schema = args
-        .schema
-        .clone()
-        .or_else(|| target.default_schema.clone())
-        .or_else(|| {
-            listed_schemas
-                .values()
-                .find(|s| s.is_some())
-                .cloned()
-                .flatten()
-        })
-        .unwrap_or_default();
+    let planned_tables: Vec<String> = matched.iter().map(|f| f.table.clone()).collect();
+    let fk_schema = plan::schema_for_fk_lookup(
+        args.schema.clone(),
+        target.default_schema.clone(),
+        &listed_schemas,
+        &planned_tables,
+    )
+    .unwrap_or_default();
     let fk_result = if fk_schema.is_empty() {
         crate::backend::QueryResult {
             columns: Vec::new(),
@@ -277,6 +275,15 @@ pub(crate) async fn run(
                 inserted,
             ));
             println!("loaded {inserted} rows into {} table(s)", table_names.len());
+            // Per-table receipt in load order: counts only, never row data.
+            for entry in &plan_data.entries {
+                println!(
+                    "  {} ({} rows from {})",
+                    entry.table,
+                    entry.row_count,
+                    entry.path.display()
+                );
+            }
             0
         }
         Err(e) => {
