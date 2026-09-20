@@ -1080,8 +1080,16 @@ async fn run_mcp_server(
 
     let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
         .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
+            // No config is no longer fatal for MCP: tools that take inline
+            // URLs (delta_diff left_url/right_url) work without any named
+            // connection. A tool needing a named connection reports the
+            // missing entry itself.
+            if std::env::var_os("HEPTA_DBCLI_URL").is_some() {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+            eprintln!("warning: no connection configuration loaded ({}); inline-URL tools still available", e);
+            (Vec::new(), "default".to_string())
         });
 
     let mut eager_entries = Vec::new();
