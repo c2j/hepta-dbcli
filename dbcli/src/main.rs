@@ -35,7 +35,7 @@ use crate::server::{format_error_chain, DbMcp};
 
 // ─── CLI Structure ─────────────────────────────────────────────────────
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "hepta_dbcli", version, about = concat!("CLI and MCP server for MySQL/PolarDB-X/Oracle database introspection — v", env!("CARGO_PKG_VERSION")),
     after_long_help = concat!(
         "CONFIGURATION:\n",
@@ -68,6 +68,11 @@ struct Cli {
     #[arg(long, global = true)]
     name: Option<String>,
 
+    /// Connection URL for ad-hoc use (e.g. duckdb:///tmp/shop.duckdb).
+    /// Skips config file and keyring entirely; conflicts with --name.
+    #[arg(long, global = true, conflicts_with = "name")]
+    url: Option<String>,
+
     /// Directory for the JSONL audit log (default: <data-dir>/hepta-dbcli/audit)
     #[arg(long, global = true)]
     audit_dir: Option<String>,
@@ -90,7 +95,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Run as MCP server (default when no subcommand given)
     Mcp,
@@ -1235,6 +1240,7 @@ async fn main() {
                     sql,
                     file,
                     connection_name: cli.name,
+                    url: cli.url,
                     config_path: cli.config,
                     format: fmt,
                     statement_timeout,
@@ -1254,6 +1260,7 @@ async fn main() {
                     sql,
                     file,
                     connection_name: cli.name,
+                    url: cli.url,
                     config_path: cli.config,
                     format: fmt,
                     statement_timeout,
@@ -1309,5 +1316,61 @@ mod gaussdb_hint_tests {
         let hints =
             gaussdb_failure_hints("GaussDB connect failed: error communicating with the server");
         assert!(!hints.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod inline_url_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn global_url_flag_parses_for_cli_subcommand() {
+        let cli = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb:///tmp/shop.duckdb",
+            "cli",
+            "--sql",
+            "SELECT 1",
+        ])
+        .expect("global --url should parse");
+        assert_eq!(cli.url.as_deref(), Some("duckdb:///tmp/shop.duckdb"));
+    }
+
+    #[test]
+    fn global_url_reaches_delta_diff_subcommand() {
+        let cli = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb://:memory:",
+            "delta-diff",
+            "--left-url",
+            "duckdb://:memory:",
+            "--right-url",
+            "duckdb://:memory:",
+            "--table",
+            "t",
+        ])
+        .expect("--url should parse before subcommand");
+        assert_eq!(cli.url.as_deref(), Some("duckdb://:memory:"));
+    }
+
+    #[test]
+    fn url_conflicts_with_name() {
+        let err = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb://:memory:",
+            "--name",
+            "prod",
+            "check",
+        ])
+        .expect_err("--url and --name must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
