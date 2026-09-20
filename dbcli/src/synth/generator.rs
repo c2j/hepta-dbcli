@@ -235,7 +235,8 @@ fn generate_with(
             TableStrategy::Weighted => SelectionStrategy::Weighted,
         };
 
-        let mut rel_pools = build_rel_pools(table_name, rule, &column_pools, models, strategy)?;
+        let mut rel_pools =
+            build_rel_pools(table_name, rule, &column_pools, models, strategy, row_count)?;
 
         // `cardinality: modeled` (issue #72) replaces the fixed row count and
         // the independent FK draw with one sampled count per parent key.
@@ -529,8 +530,10 @@ fn generate_with(
                     if attempts >= 10_000 {
                         return Err(format!(
                             "referenced column '{}.{}' exhausted its value space after \
-                             {attempts} redraws (degenerate marginal?); duplicated parent \
-                             keys cannot satisfy an FK-enforced load",
+                             {attempts} redraws; duplicated parent keys cannot satisfy an \
+                             FK-enforced load — if this column is continuous, raise the \
+                             parent table's row count or its value space (train --sample / \
+                             explicit values pool); otherwise set unique: false",
                             table_name, col_name
                         ));
                     }
@@ -2329,6 +2332,7 @@ fn build_rel_pools(
     column_pools: &HashMap<String, Vec<Value>>,
     models: &HashMap<String, TableModel>,
     strategy: SelectionStrategy,
+    row_count: usize,
 ) -> Result<Vec<RelPool>, String> {
     let mut rel_pools = Vec::new();
     for rel in &rule.relationships {
@@ -2369,6 +2373,47 @@ fn build_rel_pools(
 
         let pool_size = pool.len();
 
+        // Unique-FK preflight (known-limitation #5), hoisted out of the
+        // per-row loop. The pool holds the parent table's *generated* values,
+        // so its size is bounded by the parent's row count, not by what train
+        // observed. The parent column's own observed capacity (Ecdf knots /
+        // categorical levels / trained sample size) says whether retraining
+        // with a larger --sample can actually grow the pool.
+        if unique {
+            let child_p_null = rule
+                .columns
+                .get(&rel.pk)
+                .and_then(|c| c.null_rate)
+                .unwrap_or(0.0);
+            let unique_demand = (row_count as f64 * (1.0 - child_p_null)).ceil() as usize;
+            if unique_demand > pool_size {
+                let (parent_table, parent_col) = match ref_str.split_once('.') {
+                    Some(pair) => pair,
+                    None => (ref_str.as_str(), ""),
+                };
+                let observed = parent_observed_capacity(models, parent_table, parent_col);
+                let hint = match observed {
+                    Some(capacity) if capacity >= unique_demand => format!(
+                        "; the parent column observed {capacity} distinct value(s) at train \
+                         time, so increasing the parent table's row count in the rules \
+                         will grow the pool"
+                    ),
+                    Some(capacity) => format!(
+                        "; the parent column itself only observed {capacity} distinct \
+                         value(s) at train time — increase train --sample and retrain to \
+                         widen it"
+                    ),
+                    None => String::new(),
+                };
+                return Err(format!(
+                    "table '{}': unique FK '{}' requests {} unique value(s) but its parent \
+                     pool '{}' holds only {} generated value(s){} — or set unique: false, \
+                     or give the parent key an explicit values pool",
+                    table_name, rel.pk, unique_demand, ref_str, pool_size, hint
+                ));
+            }
+        }
+
         rel_pools.push(RelPool {
             column: rel.pk.clone(),
             pool,
@@ -2378,6 +2423,23 @@ fn build_rel_pools(
         });
     }
     Ok(rel_pools)
+}
+
+/// Observed distinct-value capacity of a parent key column at train time:
+/// categorical levels, Ecdf knots, or (for continuous marginals) the training
+/// sample size. `None` when the model or column is missing.
+fn parent_observed_capacity(
+    models: &HashMap<String, TableModel>,
+    parent_table: &str,
+    parent_column: &str,
+) -> Option<usize> {
+    let model = models.get(parent_table)?;
+    let column = model.columns.get(parent_column)?;
+    match &column.marginal {
+        crate::synth::marginal::Marginal::Categorical(p) => Some(p.values.len()),
+        crate::synth::marginal::Marginal::Ecdf(p) => Some(p.knots.len()),
+        _ => model.provenance.trained_rows,
+    }
 }
 
 #[cfg(test)]
@@ -2391,6 +2453,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
+        numerical_model_trained(table, column, loc, scale, 5)
+    }
+
+    fn numerical_model_trained(
+        table: &str,
+        column: &str,
+        loc: f64,
+        scale: f64,
+        trained_rows: usize,
+    ) -> TableModel {
         let mut columns = HashMap::new();
         columns.insert(
             column.to_string(),
@@ -2414,6 +2486,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: Some(trained_rows),
             },
             pk: vec![column.to_string()],
             columns,
@@ -2469,6 +2542,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![column.to_string()],
             columns,
@@ -2599,6 +2673,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -2732,6 +2807,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["k".to_string()],
             columns,
@@ -2801,6 +2877,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -2880,6 +2957,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -2970,6 +3048,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -3060,6 +3139,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec!["id".to_string()],
                 columns: modeled_columns,
@@ -3182,6 +3262,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -3323,6 +3404,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3364,6 +3446,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3488,6 +3571,53 @@ mod tests {
     }
 
     #[test]
+    fn referenced_continuous_column_preflight_names_capacity_and_remedies() {
+        // 已知限制 #5 修复：连续边际的 referenced 列在进入 10000 次重抽前，
+        // 预检就应报出父列的观测唯一值容量与三条解法提示。
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 10.0, 2.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                        cardinality: Default::default(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let mut config = config(&["orders"], 300);
+        config.rows_per_table.insert("users".to_string(), 5);
+
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(
+            err.contains("5 distinct value(s)"),
+            "error should state the observed parent capacity: {}",
+            err
+        );
+        assert!(
+            err.contains("--sample") && err.contains("unique: false") && err.contains("values"),
+            "error should list the remedies: {}",
+            err
+        );
+    }
+
+    #[test]
     fn unique_fk_errors_when_child_exceeds_parent_pool() {
         let mut models = HashMap::new();
         models.insert(
@@ -3526,7 +3656,19 @@ mod tests {
             "error should name the column: {}",
             err
         );
-        assert!(err.contains("3 parent rows"), "error: {}", err);
+        // Known-limitation #5: the preflight states the generated pool size,
+        // the parent column's observed capacity, and the remedies.
+        assert!(err.contains("3 generated value(s)"), "error: {}", err);
+        assert!(
+            err.contains("observed 5 distinct value(s) at train time"),
+            "error should distinguish observed capacity: {}",
+            err
+        );
+        assert!(
+            err.contains("unique: false") && err.contains("values pool"),
+            "error should list remedies: {}",
+            err
+        );
     }
 
     #[test]
@@ -3629,6 +3771,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3687,6 +3830,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3745,6 +3889,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3806,6 +3951,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3923,6 +4069,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -4046,6 +4193,7 @@ tables:
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -4160,6 +4308,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: child_columns,
@@ -4304,6 +4453,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: child_columns,
@@ -4405,6 +4555,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4462,6 +4613,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4570,6 +4722,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -4626,6 +4779,7 @@ tables:
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -4743,6 +4897,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4776,6 +4931,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5016,6 +5172,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5128,6 +5285,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string()],
             columns,
@@ -5311,6 +5469,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5445,6 +5604,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5661,6 +5821,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -6899,6 +7060,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,
@@ -6972,6 +7134,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,
@@ -7199,6 +7362,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -7383,6 +7547,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![column.to_string()],
             columns,
@@ -7487,6 +7652,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,

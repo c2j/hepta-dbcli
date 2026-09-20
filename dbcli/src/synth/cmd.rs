@@ -232,6 +232,12 @@ pub struct MineArgs {
     /// Write the full candidate list to this path (comments stay in the YAML)
     #[arg(long)]
     pub emit_candidates: Option<String>,
+
+    /// Mine PII-looking columns anyway. Default skips them so raw training
+    /// values never surface in candidate comments; only use this on data you
+    /// know is fake PII-shaped.
+    #[arg(long, default_value_t = false)]
+    pub keep_pii_columns: bool,
 }
 
 impl Default for MineArgs {
@@ -242,6 +248,7 @@ impl Default for MineArgs {
             mine_support: 0.05,
             mine_max_pairs: 2000,
             emit_candidates: None,
+            keep_pii_columns: false,
         }
     }
 }
@@ -399,6 +406,7 @@ pub(crate) fn build_model_with_overrides(
             converter_version: None,
             sdv_version: None,
             truncated: false,
+            trained_rows: Some(rows.len()),
         },
         pk,
         columns,
@@ -1404,6 +1412,42 @@ mod tests {
         assert_eq!(skipped, vec!["last_update".to_string()]);
         assert_eq!(model.copula.column_order, vec!["id"]);
         assert!(!model.columns.contains_key("last_update"));
+    }
+
+    #[test]
+    fn build_model_keeps_catalog_datetime_even_when_driver_emits_placeholders() {
+        // 已知限制 B1 根因修复：GaussDB 驱动把 timestamptz 渲染成占位串，
+        // 但 catalog 明确该列是 timestamp。profile 按 datetime 建模（不跳过），
+        // 生成端才能保留该列。占位串内容全部相同 → 无可推断格式 → 走兜底
+        // 建模而不是被扔出模型。
+        let placeholder = "<unsupported type timestamptz>: \\x0002b0cf204c2000";
+        let rows: Vec<Vec<Value>> = (0..4)
+            .map(|i| vec![Value::from(i), Value::from(placeholder)])
+            .collect();
+        let columns = vec!["id".to_string(), "payment_date".to_string()];
+        let mut profile = TableProfile::from_rows("t", &columns, &rows);
+        // 模拟 catalog 修正：把占位串列改成 datetime（train 的真实路径经
+        // from_samples_typed 完成，这里直接断言建模消费端的行为）。
+        let col = profile.columns.get_mut("payment_date").unwrap();
+        col.logical_type = "datetime".to_string();
+
+        let (model, skipped) =
+            build_model_with_overrides("t", "gaussdb", &profile, &rows, vec![], None, None)
+                .unwrap();
+        assert!(skipped.is_empty(), "skipped: {:?}", skipped);
+        let col_model = model
+            .columns
+            .get("payment_date")
+            .expect("datetime column must be modeled, not skipped");
+        let modeled = match &col_model.marginal {
+            crate::synth::marginal::Marginal::Categorical(p) => !p.values.is_empty(),
+            _ => true,
+        };
+        assert!(
+            modeled,
+            "datetime column must get a usable marginal, got {:?}",
+            col_model.marginal
+        );
     }
 
     #[test]

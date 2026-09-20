@@ -321,6 +321,7 @@ mod tests {
             config_path: None,
             plaintext_password: None,
             timeout_config: crate::config::TimeoutConfig::default(),
+            default_schema: None,
         }
     }
 

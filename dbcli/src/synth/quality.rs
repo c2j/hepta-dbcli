@@ -1237,6 +1237,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: map,

@@ -327,6 +327,24 @@ fn split_tables(tables: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reject `schema.table` dotted names up front. The rest of the pipeline
+/// quotes the name as a single identifier, so a dotted name surfaces much
+/// later as a confusing `relation "db.schema.table" does not exist`
+/// (double qualification) instead of pointing at the flag to use.
+#[cfg(feature = "synth")]
+fn check_table_names(tables: &[String]) -> Result<(), String> {
+    if let Some(dotted) = tables.iter().find(|t| t.contains('.')) {
+        let (schema, table) = dotted.split_once('.').expect("checked contains '.'");
+        return Err(format!(
+            "--tables entry '{dotted}' uses schema-qualified `schema.table` \
+             notation, which is not supported; pass the table list without \
+             the qualifier and select the schema with `--schema {schema}` \
+             (table: '{table}')"
+        ));
+    }
+    Ok(())
+}
+
 /// Shared `--schema` resolution for train and rules-draft: an explicit
 /// non-empty value wins, otherwise the connection default schema.
 fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String {
@@ -336,20 +354,49 @@ fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String 
     }
 }
 
+/// Known-limitation #11: the warning shown when `--against-db` names a
+/// connection while `HEPTA_DBCLI_URL` is set (env connections are always
+/// named `default`). Pure so tests can exercise both branches.
+fn against_db_env_warning(name: Option<&str>, env_url_set: bool) -> Option<String> {
+    name.filter(|_| env_url_set).map(|name| {
+        format!(
+            "warning: HEPTA_DBCLI_URL is set, so the --against-db connection name \
+                 '{}' is ignored (the env-var connection is always named \
+                 'default'); pass a --config file to address a named connection",
+            name
+        )
+    })
+}
+
+/// Schema precedence shared by `train` / `rules-draft` / `report`: an explicit
+/// `--schema` flag beats the configured `[connections.X] schema`, which beats
+/// the driver probe. `Some(explicit)/Some(configured)` short-circuit without
+/// touching the connection; `None` means "probe the driver".
+fn schema_priority(
+    explicit: Option<&str>,
+    connection_default_schema: Option<&str>,
+) -> Option<String> {
+    if let Some(s) = explicit.filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    // Configured `[connections.X] schema` beats the driver probe, but an
+    // explicit `--schema` flag beats both.
+    connection_default_schema
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 async fn resolved_side_schema(
     explicit: Option<&str>,
     conn: &mut (dyn crate::backend::DbConn + Send),
     url: &str,
     name: &str,
+    connection_default_schema: Option<&str>,
 ) -> Result<String, String> {
-    if explicit.map(|s| !s.is_empty()).unwrap_or(false) {
-        Ok(resolve_schema(explicit, String::new()))
-    } else {
-        Ok(resolve_schema(
-            explicit,
-            crate::delta_diff::side_schema_from_conn(conn, url, name).await?,
-        ))
+    if let Some(s) = schema_priority(explicit, connection_default_schema) {
+        return Ok(s);
     }
+    crate::delta_diff::side_schema_from_conn(conn, url, name).await
 }
 
 #[cfg(feature = "synth")]
@@ -396,6 +443,7 @@ async fn run_train(
         holdout_ratio,
     } = options;
     let tables = split_tables(tables);
+    check_table_names(&tables)?;
     if tables.is_empty() {
         return Err("--tables must list at least one table".to_string());
     }
@@ -439,7 +487,14 @@ async fn run_train(
         .map(|i| side.connection_url[..i].to_string())
         .unwrap_or_else(|| "mysql".to_string());
 
-    let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
+    let schema = resolved_side_schema(
+        schema,
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+        side.default_schema.as_deref(),
+    )
+    .await?;
 
     // Foreign keys are read once so training can learn each child table's
     // rows-per-parent-key distribution (issue #72). A dialect without FK
@@ -814,6 +869,7 @@ async fn run_rules_draft(
     config_path: Option<String>,
 ) -> Result<(), String> {
     let tables = split_tables(tables);
+    check_table_names(&tables)?;
     if tables.is_empty() {
         return Err("--tables must list at least one table".to_string());
     }
@@ -829,6 +885,7 @@ async fn run_rules_draft(
         &mut *conn,
         &side.connection_url,
         &side.name,
+        side.default_schema.as_deref(),
     )
     .await?;
 
@@ -869,6 +926,9 @@ async fn run_rules_draft(
     }
 
     let mut yaml = serde_yaml::to_string(&rules).map_err(|e| format!("serialize rules: {}", e))?;
+    if let Some(warning) = draft_cycle_warning(&rules) {
+        eprintln!("warning: {}", warning);
+    }
 
     if mine.mine {
         let mined = mine_tables(&mut *conn, &schema, &tables, &mine).await?;
@@ -907,6 +967,7 @@ async fn mine_tables(
         confidence: mine.mine_confidence,
         support: mine.mine_support,
         max_pairs: mine.mine_max_pairs,
+        exclude_pii: !mine.keep_pii_columns,
         ..crate::synth::mine::MineConfig::default()
     };
 
@@ -938,6 +999,13 @@ async fn mine_tables(
                 ""
             }
         );
+        if !report.pii_skipped.is_empty() {
+            eprintln!(
+                "mining table '{}': PII filter skipped column(s): {}",
+                table,
+                report.pii_skipped.join(", ")
+            );
+        }
         if !report.candidates.is_empty() {
             mined.push(crate::synth::mine::TableCandidates {
                 table: table.clone(),
@@ -987,6 +1055,38 @@ fn write_report_baseline(
         path.display()
     );
     Ok(())
+}
+
+/// Pre-check a freshly drafted rules file for reference cycles. `generate`
+/// would fail later with `cycle detected`; warning here (draft time) points
+/// the user at the offending YAML before they build on it. Returns the
+/// warning text, or `None` when the dependency graph is acyclic.
+#[cfg(feature = "synth")]
+fn draft_cycle_warning(rules: &crate::synth::rules::SynthRules) -> Option<String> {
+    let nodes: Vec<String> = rules.tables.iter().map(|t| t.name.clone()).collect();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for table in &rules.tables {
+        for rel in &table.relationships {
+            for reference in &rel.references {
+                if let Some((parent, _col)) = reference.split_once('.') {
+                    if nodes.iter().any(|n| n == parent) {
+                        edges.push((parent.to_string(), table.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    match crate::synth::graph::topological_sort(&nodes, &edges) {
+        Ok(_) => None,
+        Err(msg) => Some(format!(
+            "draft references form a {} — `synth generate` would fail. \
+             Review the relationships in this draft (same-name timestamp \
+             columns and self-references like employee.manager_id → \
+             employee.id are common false positives) and delete the ones \
+             that are not real foreign keys.",
+            msg
+        )),
+    }
 }
 
 /// The implicit-FK heuristic skips a child column that is its own primary key,
@@ -1167,6 +1267,15 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         Some(connection) => {
             // A bare `--against-db` (empty value) means the default connection.
             let name = (!connection.is_empty()).then(|| connection.to_string());
+            // Known-limitation #11: with `HEPTA_DBCLI_URL` the connection is
+            // always named `default`; a user-supplied name would resolve
+            // against the env-var config and fail confusingly.
+            if let Some(warning) = against_db_env_warning(
+                name.as_deref(),
+                std::env::var(crate::config::ENV_VAR_URL).is_ok(),
+            ) {
+                eprintln!("{}", warning);
+            }
             (
                 load_real_key_pools(&relations, &name, config_path).await?,
                 "database",
@@ -1341,7 +1450,14 @@ async fn load_real_key_pools(
         crate::config::read_config(config_path.map(PathBuf::from)).map_err(|e| e.to_string())?;
     let side = resolve_connection(&raw, connection)?;
     let mut conn = connect(&side).await?;
-    let schema = resolved_side_schema(None, &mut *conn, &side.connection_url, &side.name).await?;
+    let schema = resolved_side_schema(
+        None,
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+        side.default_schema.as_deref(),
+    )
+    .await?;
 
     for (table, column) in wanted {
         let sql = {
@@ -1388,6 +1504,42 @@ const KEY_POOL_LIMIT: usize = 100_000;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema_flag_beats_connection_schema_beats_driver_probe() {
+        // 已知限制 #2（H）：`--schema` > 连接段 `schema` > 驱动探测。
+        // Some(explicit) / Some(configured) 表示不用探测；None 才探测。
+        assert_eq!(
+            schema_priority(Some("cli"), Some("conn")),
+            Some("cli".to_string())
+        );
+        assert_eq!(
+            schema_priority(None, Some("conn")),
+            Some("conn".to_string())
+        );
+        assert_eq!(schema_priority(None, None), None);
+        // 空串视为未配置
+        assert_eq!(
+            schema_priority(Some(""), Some("conn")),
+            Some("conn".to_string())
+        );
+        assert_eq!(schema_priority(None, Some("")), None);
+    }
+
+    #[test]
+    fn against_db_name_warns_only_when_env_url_is_set() {
+        // 已知限制 #11（E）：env 连接恒名 default，用户给的名字会被忽略。
+        let warning = against_db_env_warning(Some("prod"), true).expect("warning expected");
+        assert!(
+            warning.contains("--against-db connection name 'prod' is ignored"),
+            "{}",
+            warning
+        );
+        assert!(warning.contains("always named"), "{}", warning);
+        // 名字为空（裸 --against-db）或 env 未设置时不警告
+        assert!(against_db_env_warning(None, true).is_none());
+        assert!(against_db_env_warning(Some("prod"), false).is_none());
+    }
+
     use super::*;
 
     fn profile_for(table: &str) -> crate::synth::profile::TableProfile {
@@ -1444,6 +1596,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["order_id".to_string()],
             columns: HashMap::new(),
@@ -1508,6 +1661,26 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert!(split_tables(" , ").is_empty());
+    }
+
+    #[test]
+    fn schema_qualified_table_name_is_rejected_with_actionable_error() {
+        let err = check_table_names(&["staging.customer".to_string()])
+            .expect_err("dotted names must fail fast");
+        assert!(err.contains("--schema"), "must point at --schema: {err}");
+        assert!(
+            err.contains("staging.customer"),
+            "must echo the name: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_table_names_pass_the_dotted_name_check() {
+        assert!(check_table_names(&["customer".to_string(), "orders".to_string()]).is_ok());
+        assert!(
+            check_table_names(&[]).is_ok(),
+            "emptiness is checked elsewhere"
+        );
     }
 
     #[test]
@@ -1606,6 +1779,63 @@ mod tests {
         assert_eq!(e.decision, Decision::Error);
     }
 
+    // ─── rules-draft cycle pre-check (limitation #3) ──────────────────────
+
+    fn draft_rule(name: &str, relationships: Vec<(&str, &str)>) -> crate::synth::rules::TableRule {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "relationships": relationships
+                .iter()
+                .map(|(pk, refs)| serde_json::json!({
+                    "pk": pk,
+                    "references": [refs],
+                    "pool_strategy": { "projection": { "unique": false } }
+                }))
+                .collect::<Vec<_>>(),
+            "strategy": "uniform"
+        }))
+        .expect("table rule fixture")
+    }
+
+    #[test]
+    fn cycle_warning_names_the_cycle_path() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                draft_rule("customer", vec![("last_update", "rental.last_update")]),
+                draft_rule("rental", vec![("last_update", "customer.last_update")]),
+            ],
+        };
+        let warning = draft_cycle_warning(&rules).expect("mutual reference must warn");
+        assert!(warning.contains("customer"), "{warning}");
+        assert!(warning.contains("rental"), "{warning}");
+        assert!(warning.contains("cycle"), "{warning}");
+    }
+
+    #[test]
+    fn acyclic_draft_produces_no_cycle_warning() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                draft_rule("users", vec![]),
+                draft_rule("orders", vec![("user_id", "users.id")]),
+            ],
+        };
+        assert!(draft_cycle_warning(&rules).is_none());
+    }
+
+    #[test]
+    fn self_reference_is_reported_as_cycle() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![draft_rule("employee", vec![("manager_id", "employee.id")])],
+        };
+        assert!(
+            draft_cycle_warning(&rules).is_some(),
+            "self-loop is a cycle"
+        );
+    }
+
     // ─── report CLI (#67) ────────────────────────────────────────────────
 
     fn report_fixture_model() -> crate::synth::model::TableModel {
@@ -1651,6 +1881,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: HashMap::from([
@@ -1926,6 +2157,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: map,

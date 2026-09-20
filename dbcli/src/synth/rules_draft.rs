@@ -102,6 +102,17 @@ pub fn infer_implicit_relationships(
             if primary_keys.get(child).map(String::as_str) == Some(column.as_str()) {
                 continue;
             }
+            // Same-name timestamp columns (`last_update`) are unique per row
+            // by construction; inferring them as keys links tables into
+            // mutual references and `generate` fails with a cycle.
+            if child_profile
+                .columns
+                .get(column)
+                .map(|stats| stats.logical_type == "datetime")
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if foreign_keys
                 .iter()
                 .any(|fk| fk.from_table == *child && fk.from_column == *column)
@@ -114,7 +125,7 @@ pub fn infer_implicit_relationships(
                 if parent == child {
                     continue;
                 }
-                if is_unique_key(profiles.get(parent), column) {
+                if is_unique_datetime_safe(profiles.get(parent), column) {
                     parents.push(parent.as_str());
                 }
             }
@@ -156,6 +167,26 @@ fn is_unique_key(profile: Option<&crate::synth::profile::TableProfile>, column: 
         .get(column)
         .map(|stats| stats.cardinality == profile.row_count)
         .unwrap_or(false)
+}
+
+/// Like [`is_unique_key`], but datetime columns never qualify as a parent
+/// key: a per-row-unique timestamp is an artifact of `last_update`-style
+/// bookkeeping, not a join key.
+fn is_unique_datetime_safe(
+    profile: Option<&crate::synth::profile::TableProfile>,
+    column: &str,
+) -> bool {
+    if let Some(profile) = profile {
+        if profile
+            .columns
+            .get(column)
+            .map(|stats| stats.logical_type == "datetime")
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    is_unique_key(profile, column)
 }
 
 /// `generate_draft_from_profiles` plus the implicit relationships from
@@ -518,5 +549,113 @@ mod tests {
         } else {
             panic!("expected Projection pool strategy");
         }
+    }
+
+    fn profile_with_types(
+        table: &str,
+        row_count: usize,
+        columns: &[(&str, usize, &str)],
+    ) -> TableProfile {
+        let columns_json: serde_json::Map<String, serde_json::Value> = columns
+            .iter()
+            .map(|(name, cardinality, logical_type)| {
+                (
+                    (*name).to_string(),
+                    json!({
+                        "logical_type": logical_type,
+                        "null_rate": 0.0,
+                        "cardinality": cardinality,
+                        "min": null,
+                        "max": null,
+                        "mean": null,
+                        "std_dev": null,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "table": table,
+            "row_count": row_count,
+            "columns": columns_json,
+        }))
+        .expect("test profile")
+    }
+
+    /// Same-name timestamp columns (`last_update` on customer/rental/...) are
+    /// unique per row by construction, so the implicit heuristic links them
+    /// into mutual references and `generate` dies with a cycle (real pagila
+    /// data; see UserGuide §10.5 limitation #3). Datetime columns must never
+    /// be inferred as relationship keys.
+    #[test]
+    fn should_not_infer_datetime_columns_as_implicit_relationships() {
+        let tables = vec!["customer".to_string(), "rental".to_string()];
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "customer".to_string(),
+            profile_with_types(
+                "customer",
+                602,
+                &[
+                    ("customer_id", 602, "numerical"),
+                    ("last_update", 602, "datetime"),
+                ],
+            ),
+        );
+        profiles.insert(
+            "rental".to_string(),
+            profile_with_types(
+                "rental",
+                17679,
+                &[
+                    ("rental_id", 17679, "numerical"),
+                    ("last_update", 17679, "datetime"),
+                ],
+            ),
+        );
+        let primary_keys = std::collections::HashMap::from([
+            ("customer".to_string(), "customer_id".to_string()),
+            ("rental".to_string(), "rental_id".to_string()),
+        ]);
+
+        let inferred = infer_implicit_relationships(&tables, &[], &profiles, &primary_keys);
+        assert!(
+            inferred.is_empty(),
+            "unique datetime columns must not be inferred as FKs: {inferred:?}"
+        );
+    }
+
+    /// The datetime guard must not over-fire: a *non-datetime* unique column
+    /// keeps the existing 1:1 inference.
+    #[test]
+    fn should_still_infer_non_datetime_unique_columns() {
+        let tables = vec!["users".to_string(), "orders".to_string()];
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "users".to_string(),
+            profile_with_types("users", 100, &[("account_no", 100, "categorical")]),
+        );
+        profiles.insert(
+            "orders".to_string(),
+            profile_with_types(
+                "orders",
+                300,
+                &[
+                    ("order_id", 300, "categorical"),
+                    ("account_no", 300, "categorical"),
+                ],
+            ),
+        );
+        let primary_keys =
+            std::collections::HashMap::from([("orders".to_string(), "order_id".to_string())]);
+
+        let inferred = infer_implicit_relationships(&tables, &[], &profiles, &primary_keys);
+        assert_eq!(
+            inferred.len(),
+            2,
+            "both order_id->users.account_no style links inferred"
+        );
+        assert!(inferred
+            .iter()
+            .any(|fk| fk.from_column == "account_no" && fk.to_table == "users"));
     }
 }

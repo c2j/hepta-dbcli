@@ -124,6 +124,11 @@ pub(crate) struct NamedConnection {
     pub password: Option<String>,
     #[serde(alias = "dbname")]
     pub database: Option<String>,
+    /// Default schema for tools that take a `--schema` (synth train/
+    /// rules-draft/report). Explicit CLI flags still win; unset falls back to
+    /// the driver probe (`current_schema()` / URL database / user name).
+    #[serde(default)]
+    pub schema: Option<String>,
     pub sslmode: Option<String>,
     pub statement_timeout: Option<String>,
     pub connection_max_lifetime: Option<String>,
@@ -172,6 +177,9 @@ pub(crate) struct ResolvedConnection {
     pub config_path: Option<PathBuf>,
     pub plaintext_password: Option<String>,
     pub timeout_config: TimeoutConfig,
+    /// Connection-level default schema (`[connections.X] schema = "..."`).
+    /// `None` for env-var connections and legacy constructors.
+    pub default_schema: Option<String>,
 }
 
 // ─── Lazy Connection Entry ───────────────────────────────────────────
@@ -260,6 +268,7 @@ pub(crate) fn read_config(config_path: Option<PathBuf>) -> Result<McpRawConfig, 
             user: None,
             password: None,
             database: None,
+            schema: None,
             sslmode: None,
             statement_timeout: None,
             connection_max_lifetime: None,
@@ -326,6 +335,7 @@ pub(crate) fn resolve_named_connections(multi: &MultiConfig) -> Vec<NamedConnect
                 user: conn.user.clone(),
                 password: conn.password.clone(),
                 database: conn.database.clone(),
+                schema: conn.schema.clone(),
                 sslmode: conn.sslmode.clone(),
                 statement_timeout: conn
                     .statement_timeout
@@ -352,6 +362,7 @@ pub(crate) fn resolve_named_connections(multi: &MultiConfig) -> Vec<NamedConnect
                     user: multi.user.clone(),
                     password: multi.password.clone(),
                     database: multi.database.clone(),
+                    schema: None,
                     sslmode: multi.sslmode.clone(),
                     statement_timeout: multi.statement_timeout.clone(),
                     connection_max_lifetime: multi.connection_max_lifetime.clone(),
@@ -371,6 +382,7 @@ pub(crate) fn resolve_named_connections(multi: &MultiConfig) -> Vec<NamedConnect
             user: multi.user.clone(),
             password: multi.password.clone(),
             database: multi.database.clone(),
+            schema: None,
             sslmode: multi.sslmode.clone(),
             statement_timeout: multi.statement_timeout.clone(),
             connection_max_lifetime: multi.connection_max_lifetime.clone(),
@@ -636,6 +648,7 @@ pub(crate) fn resolve_single_connection(
         config_path,
         plaintext_password,
         timeout_config,
+        default_schema: conn.schema.clone(),
     })
 }
 
@@ -668,6 +681,7 @@ pub(crate) fn resolve_env_var_connection(url: String) -> ResolvedConnection {
         config_path: None,
         plaintext_password: None,
         timeout_config,
+        default_schema: None,
     }
 }
 
@@ -824,6 +838,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_connection_accepts_schema_field() {
+        // 已知限制 #2 修复：TOML `[connections.X]` 支持 `schema` 字段，
+        // 未显式传 --schema 时作为默认 schema 使用（不再被静默忽略）。
+        let toml = r#"
+[connections.dev]
+host = "127.0.0.1"
+user = "root"
+database = "db"
+schema = "staging"
+"#;
+        let cfg: MultiConfig = toml::from_str(toml).expect("parse");
+        let conn = cfg.connections.as_ref().unwrap().get("dev").unwrap();
+        assert_eq!(conn.schema.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn named_connection_without_schema_still_parses() {
+        let toml = r#"
+[connections.dev]
+host = "127.0.0.1"
+user = "root"
+database = "db"
+"#;
+        let cfg: MultiConfig = toml::from_str(toml).expect("parse");
+        let conn = cfg.connections.as_ref().unwrap().get("dev").unwrap();
+        assert!(conn.schema.is_none());
+    }
+
+    #[test]
     fn test_build_url_no_password() {
         let url = build_mysql_url("127.0.0.1", 3306, "root", None, Some("mysql"), None);
         assert_eq!(url, "mysql://root@127.0.0.1:3306/mysql");
@@ -884,6 +927,7 @@ mod tests {
             user: None,
             password: Some("ignored".into()),
             database: Some("/tmp/shop.duckdb".into()),
+            schema: None,
             sslmode: None,
             statement_timeout: None,
             connection_max_lifetime: None,
@@ -904,6 +948,7 @@ mod tests {
             user: None,
             password: None,
             database: None,
+            schema: None,
             sslmode: None,
             statement_timeout: None,
             connection_max_lifetime: None,
@@ -923,6 +968,7 @@ mod tests {
             user: None,
             password: None,
             database: Some(":memory:".into()),
+            schema: None,
             sslmode: None,
             statement_timeout: None,
             connection_max_lifetime: None,
@@ -998,6 +1044,7 @@ mod tests {
             user: Some("root".to_string()),
             password: None,
             database: None,
+            schema: None,
             sslmode: None,
             statement_timeout: None,
             connection_max_lifetime: None,

@@ -34,6 +34,12 @@ pub struct Provenance {
     /// may be distorted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Training sample size (rows seen by `synth train`). Continuous marginals
+    /// (Normal/Beta/Gamma/Uniform) cannot state their own distinct-value
+    /// capacity, so the sample size is the best capacity estimate for the
+    /// unique-parent preflight. Old models without the field load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +176,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -239,6 +246,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: HashMap::new(),
