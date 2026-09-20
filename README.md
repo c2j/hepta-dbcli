@@ -135,6 +135,19 @@ export HEPTA_DBCLI_URL="duckdb:///data/analytics/shop.duckdb"
 
 When `HEPTA_DBCLI_URL` is set, the connection name is `default` and the OS keychain is not used. Optional `HEPTA_DBCLI_PASSWORD` supplies the password separately.
 
+### Inline URL (`--url`)
+
+Skip config files entirely: point `--url` at any connection URL for one-shot CLI/REPL sessions. It conflicts with `--name` and takes priority over `HEPTA_DBCLI_URL` and the config file. Typical use: DuckDB files you never want in `~/.hepta-dbcli.toml`.
+
+```bash
+hepta_dbcli --url "duckdb:///data/analytics/shop.duckdb?mode=ro" cli --sql "SELECT 42"
+hepta_dbcli --url "duckdb://:memory:" cli --interactive
+hepta_dbcli --url "mysql://user:password@host:3306/shop" cli --sql "SHOW TABLES"
+```
+
+The same works for MCP: if no config file exists at all, the server still starts (with an empty connection table) as long as tools only use inline URLs.
+
+
 ### Timeout settings
 
 ```toml
@@ -289,6 +302,10 @@ Compare table data on two named connections. Default: `auto` strategy, `snapshot
 ```bash
 # Same table name on both sides
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders
+
+# Ad-hoc side as a URL — no config entry needed (handy for local DuckDB files)
+hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
+  --right mysql_dev --table orders
 
 # Different table / schema names
 hepta_dbcli delta-diff --left mysql_dev --right ora_dev \

@@ -224,7 +224,29 @@ export HEPTA_DBCLI_PASSWORD="secret"
 
 使用环境变量时，连接名固定为 `default`，不使用钥匙串。
 
-### 3.6 超时设置
+### 3.6 免配置内联 URL（`--url`）
+
+临时连接（典型场景：随手查询一个 DuckDB 文件）不值得写进配置文件。URL 可以直接放在命令行上：
+
+```bash
+# CLI / REPL 一次性连接（与 --name 互斥，优先级高于环境变量和配置文件）
+hepta_dbcli --url "duckdb:///data/analytics/shop.duckdb?mode=ro" cli --sql "SELECT 42"
+hepta_dbcli --url "duckdb://:memory:" cli --interactive
+
+# delta-diff 任一侧可用 URL 替代连接名（两侧可混搭）
+hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
+  --right mysql_dev --table orders
+```
+
+规则：
+
+- 每侧「URL 与连接名」二选一，同时给出会被拒绝；
+- URL 必须带 `scheme://`（如 `duckdb://`、`mysql://`），缺失时启动前即报错；
+- `delta-diff` 两侧都是 URL 时完全不读取配置文件；
+- REPL 内的 `.connect <名字>` 仍只接受连接名，内联 URL 只在进程启动时生效；
+- MCP 无配置文件也能启动（连接表为空），配合 `delta_diff` 的 `left_url` / `right_url` 即可全程免配置。
+
+### 3.7 超时设置
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -427,6 +449,10 @@ Options:
           Path to config file
       --name <NAME>
           Target connection name
+      --url <URL>
+          Inline connection URL (e.g. duckdb:///tmp/a.duckdb);
+          conflicts with --name, overrides HEPTA_DBCLI_URL and the
+          config file
       --audit-dir <AUDIT_DIR>
           Directory for the JSONL audit log
           (default: <data-dir>/hepta-dbcli/audit)
@@ -683,6 +709,8 @@ hepta_dbcli --config /path/to/config.toml
 
 MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cursor）通信。
 
+配置文件缺失**不再是致命错误**：进程会以空连接表启动并在 stderr 打警告。此时 `list_connections` 等按名字取连接的工具会逐调用报错，但配合 `delta_diff` 的 `left_url` / `right_url`（见 §8.4）即可全程免配置使用。
+
 ### 8.2 提供的工具
 
 | 工具 | 说明 |
@@ -693,7 +721,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 | `execute_query` | 执行只读 SQL（按方言前缀校验） |
 | `get_execution_plan` | 获取 SQL 执行计划（EXPLAIN / EXPLAIN ANALYZE；Oracle 走 EXPLAIN PLAN + DBMS_XPLAN） |
 | `list_connections` | 列出所有配置的连接及其状态 |
-| `delta_diff` | 跨库表比对（只读）。支持增量（`update_column`/`update_since`）、`checkpoint`、csv/jsonl/json `export`。SQL 补丁 `--apply-to` 仅 CLI |
+| `delta_diff` | 跨库表比对（只读）。每侧可用 `left_url`/`right_url` 免配置接入。支持增量（`update_column`/`update_since`）、`checkpoint`、csv/jsonl/json `export`。SQL 补丁 `--apply-to` 仅 CLI |
 
 `execute_query` 自动追加行数限制：MySQL / GaussDB 为 `LIMIT N`，Oracle 12c+ 为 `FETCH FIRST N ROWS ONLY`，Oracle 11g 为 `ROWNUM`，DuckDB 仅对 `SELECT` / `WITH` 形语句追加 `LIMIT N`（`SHOW` / `DESCRIBE` / `SUMMARIZE` 不追加）。`max_rows` 默认 1000，上限 10000。
 
@@ -709,7 +737,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 ### 8.4 `delta_diff` 工具参数
 
-必填：`left_connection`、`right_connection`、`table`。
+必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理）；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
 
 可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 
@@ -741,6 +769,10 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 ```bash
 # 左右同表名
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders
+
+# 任一侧可用内联 URL 替代连接名，无需配置（适合本地 DuckDB 文件）
+hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
+  --right mysql_dev --table orders
 
 # 异名表 / 指定 schema
 hepta_dbcli delta-diff --left mysql_dev --right ora_dev \
@@ -1383,6 +1415,7 @@ hepta_dbcli --config /path/to/config.toml
 
 # 跨库比对
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders
+hepta_dbcli delta-diff --left-url duckdb:///tmp/a.duckdb --right mysql_dev --table orders
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-run
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --update-column updated_at --update-since "1 day" \
