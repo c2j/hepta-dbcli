@@ -50,6 +50,11 @@ pub struct MineConfig {
     pub max_pairs: usize,
     /// Distinct-level cap for a column to take part.
     pub max_levels: usize,
+    /// Skip columns that `pii::detect` flags as PII. Raw values of such
+    /// columns would otherwise surface verbatim in candidate comments /
+    /// `--emit-candidates` files. On by default; disabling it is for
+    /// fixtures with fake PII-shaped data.
+    pub exclude_pii: bool,
 }
 
 impl Default for MineConfig {
@@ -59,6 +64,7 @@ impl Default for MineConfig {
             support: 0.05,
             max_pairs: 2000,
             max_levels: DEFAULT_MAX_LEVELS,
+            exclude_pii: true,
         }
     }
 }
@@ -159,10 +165,22 @@ fn build_levels(rows: &[Vec<Value>], column: usize, max_levels: usize) -> Option
 /// Mine `A=a => B=b` candidates from sampled rows.
 ///
 /// `columns` names the columns of every row vector; columns whose sampled
-/// cardinality is outside `1 < levels <= max_levels` are skipped.
+/// cardinality is outside `1 < levels <= max_levels` are skipped. When
+/// `config.exclude_pii` is set (the default), columns detected as PII are
+/// skipped too: mining them would copy raw training values into the candidate
+/// report.
 pub fn mine_candidates(columns: &[String], rows: &[Vec<Value>], config: &MineConfig) -> MineReport {
     let participating: Vec<(usize, Levels)> = (0..columns.len())
-        .filter_map(|i| build_levels(rows, i, config.max_levels).map(|levels| (i, levels)))
+        .filter_map(|i| {
+            if config.exclude_pii {
+                let samples: Vec<Value> =
+                    rows.iter().filter_map(|row| row.get(i).cloned()).collect();
+                if super::pii::detect(&columns[i], &samples, None).is_some() {
+                    return None;
+                }
+            }
+            build_levels(rows, i, config.max_levels).map(|levels| (i, levels))
+        })
         .collect();
     let p = participating.len();
     let pairs_total = p.saturating_mul(p.saturating_sub(1));
@@ -619,6 +637,67 @@ mod tests {
         assert_eq!(
             render_candidate_report(&[]),
             "# hepta-dbcli rules-draft --mine candidate list (NOT enabled)\n# no candidates\n"
+        );
+    }
+
+    /// A low-cardinality PII column (few emails repeated across rows) would
+    /// otherwise surface *raw training values* in the candidate comments.
+    /// PII columns must never take part in mining (found by real-data
+    /// verification, see UserGuide §10.5 limitation #4).
+    #[test]
+    fn should_skip_pii_columns_by_default() {
+        let mut rows = Vec::new();
+        for i in 0..6000 {
+            let email = if i < 4000 { "a@x.com" } else { "b@x.com" };
+            let tag = if i < 4000 { "0" } else { "1" };
+            rows.push(vec![json!(email), json!(tag)]);
+        }
+        let report = mine_candidates(&columns(&["email", "tag"]), &rows, &config());
+        assert!(
+            report.candidates.is_empty(),
+            "PII columns must not produce candidates (raw values would leak): {:?}",
+            report.candidates
+        );
+        assert_eq!(
+            report.participating_columns, 1,
+            "only the non-PII column should participate"
+        );
+    }
+
+    /// Opt-out switch for fixtures with fake PII-shaped data: the old
+    /// behavior must remain reachable when `exclude_pii` is false.
+    #[test]
+    fn should_mine_pii_columns_when_exclusion_is_disabled() {
+        let mut rows = Vec::new();
+        for i in 0..6000 {
+            let email = if i < 4000 { "a@x.com" } else { "b@x.com" };
+            let tag = if i < 4000 { "0" } else { "1" };
+            rows.push(vec![json!(email), json!(tag)]);
+        }
+        let mut cfg = config();
+        cfg.exclude_pii = false;
+        let report = mine_candidates(&columns(&["email", "tag"]), &rows, &cfg);
+        assert!(
+            !report.candidates.is_empty(),
+            "exclusion disabled: the strong rule must be found again"
+        );
+    }
+
+    /// A column named `email` is PII by name pattern even when the sampled
+    /// content looks odd (name vote wins in `pii::detect`).
+    #[test]
+    fn should_skip_pii_columns_detected_by_name_alone() {
+        let mut rows = Vec::new();
+        for i in 0..6000 {
+            let code = if i < 4000 { "alpha" } else { "beta" };
+            let tag = if i < 4000 { "0" } else { "1" };
+            rows.push(vec![json!(code), json!(tag)]);
+        }
+        let report = mine_candidates(&columns(&["email", "tag"]), &rows, &config());
+        assert!(
+            report.candidates.is_empty(),
+            "column named `email` must be treated as PII: {:?}",
+            report.candidates
         );
     }
 }
