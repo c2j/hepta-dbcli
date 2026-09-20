@@ -243,7 +243,7 @@ hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
 
 - 每侧「URL 与连接名」二选一，同时给出会被拒绝；
 - URL 必须带 `scheme://`（如 `duckdb://`、`mysql://`），缺失时启动前即报错；
-- `--url` 支持 `cli`（含 `--check-connection`）、REPL 与 `check` 子命令；`delta-diff` 用侧级的 `--left-url` / `--right-url`，`store-password` 与 `synth` 不支持 `--url`（显式报错退出码 2）；
+- `--url` 支持 `cli`（含 `--check-connection`）、REPL 与 `check` 子命令；`delta-diff` 用侧级的 `--left-url` / `--right-url`；`mcp`、`store-password` 与 `synth` 不支持 `--url`（显式报错退出码 2）；
 - `delta-diff` 两侧都是 URL 时完全不读取配置文件；
 - REPL 内的 `.connect <名字>` 仍只接受连接名，内联 URL 只在进程启动时生效；
 - MCP 无配置文件也能启动（连接表为空），配合 `delta_diff` 的 `left_url` / `right_url` 即可全程免配置。
@@ -711,7 +711,7 @@ hepta_dbcli --config /path/to/config.toml
 
 MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cursor）通信。
 
-配置文件缺失**不再是致命错误**：进程会以空连接表启动并在 stderr 打警告。此时 `list_connections` 等按名字取连接的工具会逐调用报错，但配合 `delta_diff` 的 `left_url` / `right_url`（见 §8.4）即可全程免配置使用。注意：配置文件**存在但损坏**（toml 语法错误、不可读、`--config` 指向的文件不存在）仍会导致启动失败（exit 1）。
+配置文件缺失**不再是致命错误**：进程会以空连接表启动并在 stderr 打警告。此时 `list_connections` 等按名字取连接的工具会逐调用报错，但配合 `delta_diff` 的 `left_url` / `right_url`（见 §8.4）即可全程免配置使用。降级仅在「未传 `--config`、home 下无默认配置文件且未设 `HEPTA_DBCLI_URL`」时发生；显式 `--config` 存在时，任何配置错误（toml 语法错误、不可读、文件不存在）都会启动失败（exit 1）。另外 `hepta_dbcli --url ... mcp` 会被显式拒绝（exit 2），MCP 的免配置路径是工具参数 `left_url`/`right_url`。
 
 > **信任边界**：允许 MCP 客户端传 `left_url` / `right_url` 意味着它可以让服务器连接任意主机，`duckdb://` 还能读取进程权限可达的任意本地文件。只有 `delta_diff` 接受内联 URL；`execute_query` 等其余工具仍只能用命名连接。请用只读权限最小的账号运行 MCP 服务器，并把内联 URL 当作交给受信客户端的凭据对待。
 

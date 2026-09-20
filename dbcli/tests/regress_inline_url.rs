@@ -18,16 +18,19 @@ use std::process::{Command, Stdio};
 const BIN: &str = env!("CARGO_BIN_EXE_hepta_dbcli");
 
 /// Empty HOME keeps the "no config file" path deterministic even on
-/// developer machines that do have ~/.hepta-dbcli.toml.
-fn isolated(mut command: Command) -> Command {
-    let home = tempfile::tempdir().expect("tempdir").keep();
-    command.env("HOME", home).env_remove("HEPTA_DBCLI_URL");
-    command
+/// developer machines that do have ~/.hepta-dbcli.toml. The tempdir is
+/// removed when the returned guard is dropped (end of test).
+fn isolated(command: Command) -> (Command, tempfile::TempDir) {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut cmd = command;
+    cmd.env("HOME", home.path()).env_remove("HEPTA_DBCLI_URL");
+    (cmd, home)
 }
 
 #[test]
 fn check_with_inline_url_probes_without_config() {
-    let out = isolated(Command::new(BIN))
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
         .args(["--url", "duckdb://:memory:", "check"])
         .output()
         .expect("spawn check");
@@ -40,7 +43,8 @@ fn check_with_inline_url_probes_without_config() {
 
 #[test]
 fn store_password_rejects_inline_url_loudly() {
-    let out = isolated(Command::new(BIN))
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
         .args(["--url", "duckdb://:memory:", "store-password"])
         .output()
         .expect("spawn store-password");
@@ -54,7 +58,8 @@ fn store_password_rejects_inline_url_loudly() {
 
 #[test]
 fn synth_rejects_inline_url_loudly() {
-    let out = isolated(Command::new(BIN))
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
         .args([
             "--url",
             "duckdb://:memory:",
@@ -88,6 +93,74 @@ fn seed_duckdb(path: &std::path::Path, rows: &str) {
 }
 
 #[test]
+fn mcp_with_broken_explicit_config_fails_closed() {
+    // `--config` 指向坏文件时必须 exit 1，绝不降级为空连接表
+    // （HOME 下没有默认配置也不能掩盖显式配置的错误）。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let broken = dir.path().join("broken.toml");
+    std::fs::write(&broken, "not valid toml {{{{").expect("write");
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
+        .args(["--config"])
+        .arg(&broken)
+        .arg("mcp")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn mcp");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "broken --config must exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error"),
+        "must print an error, not a degrading warning: {stderr}"
+    );
+    assert!(
+        !stderr.contains("warning: no connection configuration"),
+        "must not degrade with --config present: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_with_missing_explicit_config_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("nope.toml");
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
+        .args(["--config"])
+        .arg(&missing)
+        .arg("mcp")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn mcp");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "missing --config must exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn mcp_rejects_global_url_loudly() {
+    let (mut cmd, _home) = isolated(Command::new(BIN));
+    let out = cmd
+        .args(["--url", "duckdb://:memory:", "mcp"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn mcp");
+    assert_eq!(out.status.code(), Some(2), "must exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--url"),
+        "rejection must mention --url: {stderr}"
+    );
+}
+
+#[test]
 fn mcp_configless_startup_serves_inline_url_diff_and_rejects_named() {
     let dir = tempfile::tempdir().expect("tempdir");
     let left = dir.path().join("left.duckdb");
@@ -96,7 +169,8 @@ fn mcp_configless_startup_serves_inline_url_diff_and_rejects_named() {
     seed_duckdb(&right, "INSERT INTO t VALUES (1,'a'), (2,'CHANGED')");
 
     let call = |payload: String| {
-        let mut child = isolated(Command::new(BIN))
+        let (mut mcp_cmd, _home) = isolated(Command::new(BIN));
+        let mut child = mcp_cmd
             .arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

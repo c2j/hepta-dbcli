@@ -1100,16 +1100,19 @@ async fn run_mcp_server(
     let export_root = crate::config::load_delta_diff_export_root(config_path_buf.as_deref())
         .unwrap_or_else(std::env::temp_dir);
 
-    let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
-        .unwrap_or_else(|e| {
-            // Only "no config file at all" degrades to an empty connection
-            // table (inline-URL tools like delta_diff left_url/right_url
-            // still work). A config that exists but is broken (bad toml,
-            // unreadable, explicit --config missing) fails closed: MCP
-            // clients rarely surface stderr, so a silent fail-open would
-            // turn every named-connection tool call into a confusing
-            // per-call unknown_connection error.
-            if config::no_config_file_exists() && std::env::var_os("HEPTA_DBCLI_URL").is_none() {
+    let (lazy_entries, default_name) =
+        resolve_all_connections_lazy(config_path_buf.clone()).unwrap_or_else(|e| {
+            // Only "no config requested and none on disk" degrades to an
+            // empty connection table (inline-URL tools like delta_diff
+            // left_url/right_url still work). An explicit --config (broken
+            // toml, unreadable, missing path) must fail closed: MCP clients
+            // rarely surface stderr, so a silent fail-open would turn every
+            // named-connection tool call into a confusing per-call
+            // unknown_connection error.
+            if config_path_buf.is_none()
+                && config::no_config_file_exists()
+                && std::env::var_os("HEPTA_DBCLI_URL").is_none()
+            {
                 eprintln!(
                     "warning: no connection configuration found; only inline-URL tools (delta_diff left_url/right_url) are available"
                 );
@@ -1227,6 +1230,12 @@ async fn main() {
             if cli.allow_write {
                 eprintln!(
                     "error: --allow-write is not valid for the MCP server; MCP execute_query stays read-only"
+                );
+                std::process::exit(2);
+            }
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by the MCP server; use delta_diff left_url/right_url tool arguments instead"
                 );
                 std::process::exit(2);
             }
