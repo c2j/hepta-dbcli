@@ -332,9 +332,10 @@ impl ColumnProfile {
             None
         };
 
-        let (logical_type, mut min, mut max, mut mean, mut std_dev) = if non_null
-            .iter()
-            .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
+        let (logical_type, mut min, mut max, mut mean, mut std_dev) = if !schema_datetime
+            && non_null
+                .iter()
+                .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false))
         {
             ("unsupported".to_string(), None, None, None, None)
         } else if non_null.is_empty() {
@@ -429,7 +430,13 @@ impl ColumnProfile {
             && cardinality <= NUMERIC_TOP_VALUES_MAX;
         let top_values = if logical_type == "categorical"
             || is_repeated_low_cardinality_numeric
-            || (logical_type == "datetime" && !non_null.is_empty() && !is_numeric_datetime)
+            || (logical_type == "datetime"
+                && !non_null.is_empty()
+                && !is_numeric_datetime
+                // Driver placeholders are opaque strings, not usable datetime values.
+                && !non_null
+                    .iter()
+                    .any(|v| v.as_str().map(is_unsupported_placeholder).unwrap_or(false)))
         {
             frequency_top_values(&non_null, top_k)
         } else {
@@ -796,6 +803,21 @@ mod tests {
             .collect();
         let profile = ColumnProfile::from_samples(&samples);
         assert_eq!(profile.logical_type, "categorical");
+    }
+
+    #[test]
+    fn column_profile_trusts_schema_datetime_over_driver_placeholder() {
+        // GaussDB 驱动把 timestamptz 值渲染成 `<unsupported type ...>` 占位串；
+        // catalog 明确说该列是 timestamp 时，应按 datetime 处理而非 unsupported。
+        let placeholder = "<unsupported type timestamptz>: \\x0002b0cf204c2000";
+        let samples = vec![Value::from(placeholder), Value::from(placeholder)];
+        let profile = ColumnProfile::from_samples_typed(
+            &samples,
+            Some("timestamp with time zone"),
+            Some(TOP_VALUES_CAP),
+        );
+        assert_eq!(profile.logical_type, "datetime");
+        assert!(profile.top_values.is_none());
     }
 
     #[test]

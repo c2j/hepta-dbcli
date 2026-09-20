@@ -327,6 +327,24 @@ fn split_tables(tables: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reject `schema.table` dotted names up front. The rest of the pipeline
+/// quotes the name as a single identifier, so a dotted name surfaces much
+/// later as a confusing `relation "db.schema.table" does not exist`
+/// (double qualification) instead of pointing at the flag to use.
+#[cfg(feature = "synth")]
+fn check_table_names(tables: &[String]) -> Result<(), String> {
+    if let Some(dotted) = tables.iter().find(|t| t.contains('.')) {
+        let (schema, table) = dotted.split_once('.').expect("checked contains '.'");
+        return Err(format!(
+            "--tables entry '{dotted}' uses schema-qualified `schema.table` \
+             notation, which is not supported; pass the table list without \
+             the qualifier and select the schema with `--schema {schema}` \
+             (table: '{table}')"
+        ));
+    }
+    Ok(())
+}
+
 /// Shared `--schema` resolution for train and rules-draft: an explicit
 /// non-empty value wins, otherwise the connection default schema.
 fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String {
@@ -396,6 +414,7 @@ async fn run_train(
         holdout_ratio,
     } = options;
     let tables = split_tables(tables);
+    check_table_names(&tables)?;
     if tables.is_empty() {
         return Err("--tables must list at least one table".to_string());
     }
@@ -814,6 +833,7 @@ async fn run_rules_draft(
     config_path: Option<String>,
 ) -> Result<(), String> {
     let tables = split_tables(tables);
+    check_table_names(&tables)?;
     if tables.is_empty() {
         return Err("--tables must list at least one table".to_string());
     }
@@ -869,6 +889,9 @@ async fn run_rules_draft(
     }
 
     let mut yaml = serde_yaml::to_string(&rules).map_err(|e| format!("serialize rules: {}", e))?;
+    if let Some(warning) = draft_cycle_warning(&rules) {
+        eprintln!("warning: {}", warning);
+    }
 
     if mine.mine {
         let mined = mine_tables(&mut *conn, &schema, &tables, &mine).await?;
@@ -987,6 +1010,37 @@ fn write_report_baseline(
         path.display()
     );
     Ok(())
+}
+
+/// Pre-check a freshly drafted rules file for reference cycles. `generate`
+/// would fail later with `cycle detected`; warning here (draft time) points
+/// the user at the offending YAML before they build on it. Returns the
+/// warning text, or `None` when the dependency graph is acyclic.
+#[cfg(feature = "synth")]
+fn draft_cycle_warning(rules: &crate::synth::rules::SynthRules) -> Option<String> {
+    let nodes: Vec<String> = rules.tables.iter().map(|t| t.name.clone()).collect();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for table in &rules.tables {
+        for rel in &table.relationships {
+            for reference in &rel.references {
+                if let Some((parent, _col)) = reference.split_once('.') {
+                    if nodes.iter().any(|n| n == parent) {
+                        edges.push((parent.to_string(), table.name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    match crate::synth::graph::topological_sort(&nodes, &edges) {
+        Ok(_) => None,
+        Err(msg) => Some(format!(
+            "draft references form a {} — `synth generate` would fail. \
+             Review the relationships in this draft (same-name timestamp \
+             columns are a common false positive) and delete the ones that \
+             are not real foreign keys.",
+            msg
+        )),
+    }
 }
 
 /// The implicit-FK heuristic skips a child column that is its own primary key,
@@ -1511,6 +1565,26 @@ mod tests {
     }
 
     #[test]
+    fn schema_qualified_table_name_is_rejected_with_actionable_error() {
+        let err = check_table_names(&["staging.customer".to_string()])
+            .expect_err("dotted names must fail fast");
+        assert!(err.contains("--schema"), "must point at --schema: {err}");
+        assert!(
+            err.contains("staging.customer"),
+            "must echo the name: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_table_names_pass_the_dotted_name_check() {
+        assert!(check_table_names(&["customer".to_string(), "orders".to_string()]).is_ok());
+        assert!(
+            check_table_names(&[]).is_ok(),
+            "emptiness is checked elsewhere"
+        );
+    }
+
+    #[test]
     fn synth_subcommand_detail_maps_every_variant() {
         use cmd::SynthCommand;
         assert_eq!(
@@ -1604,6 +1678,63 @@ mod tests {
     fn synth_error_outcome_marks_decision_error() {
         let e = synth_outcome_event("train", "tables=users", AuditOutcome::error(3, "synth"));
         assert_eq!(e.decision, Decision::Error);
+    }
+
+    // ─── rules-draft cycle pre-check (limitation #3) ──────────────────────
+
+    fn draft_rule(name: &str, relationships: Vec<(&str, &str)>) -> crate::synth::rules::TableRule {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "relationships": relationships
+                .iter()
+                .map(|(pk, refs)| serde_json::json!({
+                    "pk": pk,
+                    "references": [refs],
+                    "pool_strategy": { "projection": { "unique": false } }
+                }))
+                .collect::<Vec<_>>(),
+            "strategy": "uniform"
+        }))
+        .expect("table rule fixture")
+    }
+
+    #[test]
+    fn cycle_warning_names_the_cycle_path() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                draft_rule("customer", vec![("last_update", "rental.last_update")]),
+                draft_rule("rental", vec![("last_update", "customer.last_update")]),
+            ],
+        };
+        let warning = draft_cycle_warning(&rules).expect("mutual reference must warn");
+        assert!(warning.contains("customer"), "{warning}");
+        assert!(warning.contains("rental"), "{warning}");
+        assert!(warning.contains("cycle"), "{warning}");
+    }
+
+    #[test]
+    fn acyclic_draft_produces_no_cycle_warning() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                draft_rule("users", vec![]),
+                draft_rule("orders", vec![("user_id", "users.id")]),
+            ],
+        };
+        assert!(draft_cycle_warning(&rules).is_none());
+    }
+
+    #[test]
+    fn self_reference_is_reported_as_cycle() {
+        let rules = crate::synth::rules::SynthRules {
+            version: "1".to_string(),
+            tables: vec![draft_rule("employee", vec![("manager_id", "employee.id")])],
+        };
+        assert!(
+            draft_cycle_warning(&rules).is_some(),
+            "self-loop is a cycle"
+        );
     }
 
     // ─── report CLI (#67) ────────────────────────────────────────────────
