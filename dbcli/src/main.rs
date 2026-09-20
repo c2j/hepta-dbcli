@@ -35,7 +35,7 @@ use crate::server::{format_error_chain, DbMcp};
 
 // ─── CLI Structure ─────────────────────────────────────────────────────
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "hepta_dbcli", version, about = concat!("CLI and MCP server for MySQL/PolarDB-X/Oracle database introspection — v", env!("CARGO_PKG_VERSION")),
     after_long_help = concat!(
         "CONFIGURATION:\n",
@@ -68,6 +68,11 @@ struct Cli {
     #[arg(long, global = true)]
     name: Option<String>,
 
+    /// Connection URL for ad-hoc use (e.g. duckdb:///tmp/shop.duckdb).
+    /// Skips config file and keyring entirely; conflicts with --name.
+    #[arg(long, global = true, conflicts_with = "name")]
+    url: Option<String>,
+
     /// Directory for the JSONL audit log (default: <data-dir>/hepta-dbcli/audit)
     #[arg(long, global = true)]
     audit_dir: Option<String>,
@@ -90,7 +95,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Run as MCP server (default when no subcommand given)
     Mcp,
@@ -940,11 +945,33 @@ async fn handle_check_connection(
 
 async fn handle_check_connection_cmd(
     conn_arg: Option<String>,
+    inline_url: Option<String>,
     verbose: bool,
     config_path: Option<PathBuf>,
     registry: &BackendRegistry,
     audit: &audit::AuditSession,
 ) {
+    // --url short-circuits config resolution (same priority as cli/REPL).
+    if let Some(u) = inline_url {
+        let resolved =
+            crate::config::resolve_inline_url_connection_result(&u).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+        if audit.meta_enabled() {
+            audit.record_best_effort(cli::action_event(
+                audit::event::Channel::Cli,
+                "check",
+                &resolved.name,
+                &resolved.connection_url,
+                audit::event::ActionClass::Meta,
+                audit::event::Decision::Allow,
+            ));
+        }
+        handle_check_connection(&resolved, verbose, registry).await;
+        return;
+    }
+
     let raw = read_config(config_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -1073,10 +1100,27 @@ async fn run_mcp_server(
     let export_root = crate::config::load_delta_diff_export_root(config_path_buf.as_deref())
         .unwrap_or_else(std::env::temp_dir);
 
-    let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
+    let (lazy_entries, default_name) =
+        resolve_all_connections_lazy(config_path_buf.clone()).unwrap_or_else(|e| {
+            // Only "no config requested and none on disk" degrades to an
+            // empty connection table (inline-URL tools like delta_diff
+            // left_url/right_url still work). An explicit --config (broken
+            // toml, unreadable, missing path) must fail closed: MCP clients
+            // rarely surface stderr, so a silent fail-open would turn every
+            // named-connection tool call into a confusing per-call
+            // unknown_connection error.
+            if config_path_buf.is_none()
+                && config::no_config_file_exists()
+                && std::env::var_os("HEPTA_DBCLI_URL").is_none()
+            {
+                eprintln!(
+                    "warning: no connection configuration found; only inline-URL tools (delta_diff left_url/right_url) are available"
+                );
+                (Vec::new(), "default".to_string())
+            } else {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
         });
 
     let mut eager_entries = Vec::new();
@@ -1189,25 +1233,50 @@ async fn main() {
                 );
                 std::process::exit(2);
             }
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by the MCP server; use delta_diff left_url/right_url tool arguments instead"
+                );
+                std::process::exit(2);
+            }
             let audit = Arc::new(audit::AuditSession::new(&audit_config));
             run_mcp_server(cli.config, Arc::clone(&registry), audit).await;
         }
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);
             let audit = audit::AuditSession::new(&audit_config);
-            handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit).await;
+            handle_check_connection_cmd(cli.name, cli.url, verbose, config_path, &registry, &audit)
+                .await;
         }
         Some(Commands::StorePassword {}) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by store-password; it needs a named connection from the config file"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             handle_store_password(cli.name, cli.config, &audit);
         }
         Some(Commands::DeltaDiff { args }) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by delta-diff; use --left-url / --right-url per side"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             let code = delta_diff::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]
         Some(Commands::Synth { args }) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by synth; add the connection to the config file or set HEPTA_DBCLI_URL"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             let code = synth::run(*args, cli.config, &audit).await;
             std::process::exit(code);
@@ -1227,14 +1296,22 @@ async fn main() {
             if check_connection {
                 let config_path = cli.config.map(PathBuf::from);
                 let audit = audit::AuditSession::new(&audit_config);
-                handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit)
-                    .await;
+                handle_check_connection_cmd(
+                    cli.name,
+                    cli.url,
+                    verbose,
+                    config_path,
+                    &registry,
+                    &audit,
+                )
+                .await;
             } else if interactive {
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {
                     sql,
                     file,
                     connection_name: cli.name,
+                    url: cli.url,
                     config_path: cli.config,
                     format: fmt,
                     statement_timeout,
@@ -1254,6 +1331,7 @@ async fn main() {
                     sql,
                     file,
                     connection_name: cli.name,
+                    url: cli.url,
                     config_path: cli.config,
                     format: fmt,
                     statement_timeout,
@@ -1309,5 +1387,61 @@ mod gaussdb_hint_tests {
         let hints =
             gaussdb_failure_hints("GaussDB connect failed: error communicating with the server");
         assert!(!hints.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod inline_url_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn global_url_flag_parses_for_cli_subcommand() {
+        let cli = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb:///tmp/shop.duckdb",
+            "cli",
+            "--sql",
+            "SELECT 1",
+        ])
+        .expect("global --url should parse");
+        assert_eq!(cli.url.as_deref(), Some("duckdb:///tmp/shop.duckdb"));
+    }
+
+    #[test]
+    fn global_url_reaches_delta_diff_subcommand() {
+        let cli = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb://:memory:",
+            "delta-diff",
+            "--left-url",
+            "duckdb://:memory:",
+            "--right-url",
+            "duckdb://:memory:",
+            "--table",
+            "t",
+        ])
+        .expect("--url should parse before subcommand");
+        assert_eq!(cli.url.as_deref(), Some("duckdb://:memory:"));
+    }
+
+    #[test]
+    fn url_conflicts_with_name() {
+        let err = parse(&[
+            "hepta_dbcli",
+            "--url",
+            "duckdb://:memory:",
+            "--name",
+            "prod",
+            "check",
+        ])
+        .expect_err("--url and --name must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

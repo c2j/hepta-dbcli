@@ -203,10 +203,46 @@ pub(crate) struct McpRawConfig {
     pub is_env_var: bool,
 }
 
+impl McpRawConfig {
+    /// Empty connection table for inline-URL paths (`--url`, per-side
+    /// `--left-url` / `--right-url`): no toml, no keyring, no env var.
+    pub(crate) fn empty() -> Self {
+        Self {
+            connections: Vec::new(),
+            default_name: "default".to_string(),
+            config_path: None,
+            base_timeout: None,
+            is_env_var: false,
+        }
+    }
+}
+
 // ─── Config Helpers ───────────────────────────────────────────────────
 
 pub(crate) fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join(format!(".{}", DEFAULT_CONFIG_FILENAME)))
+}
+
+/// True when neither the new (`.{DEFAULT_CONFIG_FILENAME}`) nor the legacy
+/// (`.{OLD_DEFAULT_CONFIG_FILENAME}`) default config exists under `home`.
+/// Used by the MCP bootstrap to distinguish "no config at all" (degradable
+/// to an empty connection table) from "config exists but is broken"
+/// (fail closed with exit 1).
+pub(crate) fn no_config_in_home(home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return true;
+    };
+    let new_cfg = home.join(format!(".{}", DEFAULT_CONFIG_FILENAME));
+    if new_cfg.exists() {
+        return false;
+    }
+    let old_cfg = home.join(format!(".{}", OLD_DEFAULT_CONFIG_FILENAME));
+    !old_cfg.exists()
+}
+
+/// `no_config_in_home` against the real user home.
+pub(crate) fn no_config_file_exists() -> bool {
+    no_config_in_home(dirs::home_dir().as_deref())
 }
 
 pub(crate) fn find_config_path(opt: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -685,6 +721,44 @@ pub(crate) fn resolve_env_var_connection(url: String) -> ResolvedConnection {
     }
 }
 
+/// Resolve a connection given directly as a URL (e.g. `--url`, delta-diff
+/// `--left-url/--right-url`, MCP `left_url/right_url`). The URL is used as-is;
+/// no keyring, env-var or config lookup happens. Embedded databases (DuckDB)
+/// carry no credentials at all; for user:pass URLs the credentials stay inside
+/// the URL (audit redaction handles DSN scrubbing).
+pub(crate) fn resolve_inline_url_connection_result(
+    url: &str,
+) -> Result<ResolvedConnection, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || !trimmed.contains("://") {
+        return Err(format!(
+            "invalid connection URL '{}': expected scheme://... (e.g. duckdb:///tmp/shop.duckdb)",
+            url
+        ));
+    }
+    let scheme = trimmed.split("://").next().unwrap_or_default();
+    Ok(ResolvedConnection {
+        name: format!("inline-{}", scheme.to_lowercase()),
+        connection_url: trimmed.to_string(),
+        password_source: PasswordSource::None,
+        keyring_username: format!(
+            "inline-{}#{}",
+            scheme.to_lowercase(),
+            config_path_hash(None)
+        ),
+        config_path: None,
+        plaintext_password: None,
+        timeout_config: TimeoutConfig::default(),
+        default_schema: None,
+    })
+}
+
+/// Panicking convenience wrapper for tests and call sites that already
+/// validated the URL shape.
+pub(crate) fn resolve_inline_url_connection(url: &str) -> ResolvedConnection {
+    resolve_inline_url_connection_result(url).expect("valid inline connection URL")
+}
+
 // ─── Lazy Resolver ───────────────────────────────────────────────────
 
 pub(crate) fn build_lazy_resolver(
@@ -838,6 +912,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_config_in_home_detects_missing_new_and_legacy_files() {
+        // 空目录：新旧两个默认文件名都不存在 => true。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            no_config_in_home(Some(tmp.path())),
+            "empty home => no default config file"
+        );
+
+        // 新默认文件存在 => false。
+        let new_cfg = tmp.path().join(format!(".{}", DEFAULT_CONFIG_FILENAME));
+        std::fs::write(&new_cfg, "[connections.dev]\nhost = \"h\"\n").expect("write");
+        assert!(
+            !no_config_in_home(Some(tmp.path())),
+            "default config exists"
+        );
+
+        // 只剩旧默认文件（≤0.2.7 迁移场景）=> false。
+        std::fs::remove_file(&new_cfg).expect("cleanup");
+        let old_cfg = tmp.path().join(format!(".{}", OLD_DEFAULT_CONFIG_FILENAME));
+        std::fs::write(&old_cfg, "[connections.dev]\nhost = \"h\"\n").expect("write");
+        assert!(!no_config_in_home(Some(tmp.path())), "legacy config exists");
+
+        // 无 home（罕见环境）=> 按缺配置处理。
+        assert!(no_config_in_home(None), "no home => treat as no config");
+    }
+
+    #[test]
     fn named_connection_accepts_schema_field() {
         // 已知限制 #2 修复：TOML `[connections.X]` 支持 `schema` 字段，
         // 未显式传 --schema 时作为默认 schema 使用（不再被静默忽略）。
@@ -914,6 +1015,28 @@ database = "db"
         assert!(build_duckdb_url(None).is_err());
         assert!(build_duckdb_url(Some("")).is_err());
         assert!(build_duckdb_url(Some("  ")).is_err());
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_keeps_url_and_skips_credentials() {
+        let resolved = resolve_inline_url_connection("duckdb:///tmp/shop.duckdb");
+        assert_eq!(resolved.connection_url, "duckdb:///tmp/shop.duckdb");
+        assert!(matches!(resolved.password_source, PasswordSource::None));
+        assert_eq!(resolved.plaintext_password, None);
+        assert_eq!(resolved.default_schema, None);
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_names_side_from_scheme() {
+        let resolved = resolve_inline_url_connection("mysql://u:p@127.0.0.1:3306/db");
+        assert_eq!(resolved.name, "inline-mysql");
+        assert_eq!(resolved.connection_url, "mysql://u:p@127.0.0.1:3306/db");
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_rejects_scheme_less_string() {
+        assert!(resolve_inline_url_connection_result("/tmp/shop.duckdb").is_err());
+        assert!(resolve_inline_url_connection_result("").is_err());
     }
 
     #[test]

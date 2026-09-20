@@ -72,22 +72,28 @@ pub(crate) async fn run(
         return EXIT_ERROR;
     }
 
-    let raw = match config::read_config(config_path.map(PathBuf::from)) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return EXIT_ERROR;
+    // URL 直连的一侧不查配置；两侧都是 URL 时连配置文件都不必存在。
+    let needs_config = args.left_url.is_none() || args.right_url.is_none();
+    let raw = if needs_config {
+        match config::read_config(config_path.map(PathBuf::from)) {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return EXIT_ERROR;
+            }
         }
+    } else {
+        config::McpRawConfig::empty()
     };
 
-    let left = match resolve_named(&raw, &args.left) {
+    let left = match resolve_side(&raw, args.left.as_deref(), args.left_url.as_deref()) {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("error: {}", e);
             return EXIT_ERROR;
         }
     };
-    let right = match resolve_named(&raw, &args.right) {
+    let right = match resolve_side(&raw, args.right.as_deref(), args.right_url.as_deref()) {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -791,6 +797,22 @@ fn resolve_named(
     }
 }
 
+/// 解析一侧数据源：给了 URL 就直连（免配置），否则按连接名查配置。
+/// validate() 已保证二者必居其一；这里对 URL 形态做最终校验。
+fn resolve_side(
+    raw: &config::McpRawConfig,
+    name: Option<&str>,
+    url: Option<&str>,
+) -> Result<config::ResolvedConnection, String> {
+    match (url, name) {
+        (Some(u), _) => config::resolve_inline_url_connection_result(u),
+        (None, Some(n)) => resolve_named(raw, n),
+        (None, None) => {
+            Err("missing side: specify --left/--right or --left-url/--right-url".to_string())
+        }
+    }
+}
+
 fn describe_side(
     conn: &config::ResolvedConnection,
     schema: Option<&str>,
@@ -831,6 +853,39 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
             Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
             None => "  key domain       : (unavailable)".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod resolve_side_tests {
+    use super::resolve_side;
+    use crate::config;
+
+    /// URL 提供的一侧直接生效，即使配置文件缺失/无连接也不查配置。
+    #[test]
+    fn url_side_resolves_without_touching_config() {
+        let raw = config::McpRawConfig::empty();
+        let resolved = resolve_side(&raw, None, Some("duckdb:///tmp/copy.duckdb"))
+            .expect("url side should resolve");
+        assert_eq!(resolved.connection_url, "duckdb:///tmp/copy.duckdb");
+        assert_eq!(resolved.name, "inline-duckdb");
+    }
+
+    /// 缺配置时按名解析应报错（保持原行为），而不是 panic 或静默。
+    #[test]
+    fn named_side_reports_missing_connection() {
+        let raw = config::McpRawConfig::empty();
+        let err = resolve_side(&raw, Some("ghost"), None).expect_err("missing name must error");
+        assert!(err.contains("ghost"), "unexpected error: {err}");
+    }
+
+    /// 混搭：URL 侧优先于名字侧各自解析。
+    #[test]
+    fn side_resolution_prefers_url_when_both_given() {
+        let raw = config::McpRawConfig::empty();
+        let resolved =
+            resolve_side(&raw, Some("ghost"), Some("duckdb://:memory:")).expect("url wins");
+        assert_eq!(resolved.connection_url, "duckdb://:memory:");
     }
 }
 

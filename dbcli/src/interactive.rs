@@ -25,8 +25,7 @@ use crate::cli::{
     WriteGate,
 };
 use crate::config::{
-    read_config, resolve_env_var_connection, resolve_single_connection,
-    rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
+    read_config, rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
 };
 
 // ─── SqlTokenizer (MySQL variant: supports backtick quoting, # comments) ───
@@ -450,31 +449,13 @@ fn print_banner(name: &str) {
 
 fn resolve_target(
     name: Option<&str>,
+    url: Option<&str>,
     raw: &crate::config::McpRawConfig,
     statement_timeout: Option<&str>,
     connection_max_lifetime: Option<&str>,
 ) -> Result<(crate::config::ResolvedConnection, TimeoutConfig), String> {
-    let target_name = name.unwrap_or(&raw.default_name);
-    let target_conn = raw
-        .connections
-        .iter()
-        .find(|c| c.name == target_name)
-        .ok_or_else(|| {
-            format!(
-                "Connection '{}' not found. Available: {:?}",
-                target_name,
-                raw.connections.iter().map(|c| &c.name).collect::<Vec<_>>()
-            )
-        })?;
-    let target = if raw.is_env_var {
-        resolve_env_var_connection(target_conn.url.clone().unwrap())
-    } else {
-        resolve_single_connection(
-            target_conn,
-            raw.config_path.clone(),
-            raw.base_timeout.as_ref(),
-        )?
-    };
+    // --url short-circuits config resolution entirely (no toml, no keyring).
+    let target = crate::cli::resolve_cli_target(Some(raw), url, name)?;
     let effective_timeout = TimeoutConfig::from_overrides(
         statement_timeout,
         connection_max_lifetime,
@@ -581,10 +562,16 @@ pub(crate) async fn run_interactive(
     registry: &BackendRegistry,
     audit: &AuditSession,
 ) -> Result<(), String> {
-    let raw = read_config(args.config_path.map(PathBuf::from))?;
+    let raw = if args.url.is_some() {
+        // --url short-circuits config: no toml needed at all.
+        crate::config::McpRawConfig::empty()
+    } else {
+        read_config(args.config_path.map(PathBuf::from))?
+    };
 
     let (mut target, effective_timeout) = resolve_target(
         args.connection_name.as_deref(),
+        args.url.as_deref(),
         &raw,
         args.statement_timeout.as_deref(),
         args.connection_max_lifetime.as_deref(),
@@ -676,6 +663,7 @@ pub(crate) async fn run_interactive(
             };
             match resolve_target(
                 Some(&resolved_name),
+                None,
                 &raw,
                 args.statement_timeout.as_deref(),
                 args.connection_max_lifetime.as_deref(),

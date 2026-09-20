@@ -135,6 +135,21 @@ export HEPTA_DBCLI_URL="duckdb:///data/analytics/shop.duckdb"
 
 When `HEPTA_DBCLI_URL` is set, the connection name is `default` and the OS keychain is not used. Optional `HEPTA_DBCLI_PASSWORD` supplies the password separately.
 
+### Inline URL (`--url`)
+
+Skip config files entirely: point `--url` at any connection URL for one-shot CLI/REPL sessions. It conflicts with `--name` and takes priority over `HEPTA_DBCLI_URL` and the config file. Typical use: DuckDB files you never want in `~/.hepta-dbcli.toml`.
+
+```bash
+hepta_dbcli --url "duckdb:///data/analytics/shop.duckdb?mode=ro" cli --sql "SELECT 42"
+hepta_dbcli --url "duckdb://:memory:" cli --interactive
+hepta_dbcli --url "mysql://user:password@host:3306/shop" cli --sql "SHOW TABLES"
+```
+
+The same works for MCP: if no config file exists at all, the server still starts (with an empty connection table) as long as tools only use inline URLs. A config file that exists but is broken (bad toml, unreadable, missing `--config` target) still aborts startup with exit 1.
+
+**Trust note**: an MCP client allowed to call `delta_diff` with `left_url` / `right_url` can point the server at arbitrary hosts and — for `duckdb://` — arbitrary local files the process can read. Only `delta_diff` accepts inline URLs; `execute_query` and every other tool stay tied to named config connections. Run the MCP server under an account with read-scoped access, and treat an inline URL like a credential handed to a trusted client.
+
+
 ### Timeout settings
 
 ```toml
@@ -290,6 +305,10 @@ Compare table data on two named connections. Default: `auto` strategy, `snapshot
 # Same table name on both sides
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders
 
+# Ad-hoc side as a URL — no config entry needed (handy for local DuckDB files)
+hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
+  --right mysql_dev --table orders
+
 # Different table / schema names
 hepta_dbcli delta-diff --left mysql_dev --right ora_dev \
   --left-table orders --right-table ORDERS \
@@ -408,7 +427,7 @@ When running as MCP server, the following tools are available:
 | `list_connections` | List all configured connections and their status |
 | `delta_diff` | Cross-DB table compare (read-only). Supports incremental (`update_column`/`update_since`), `checkpoint`, and csv/jsonl/json `export`. SQL patch `--apply-to` stays on the CLI. |
 
-`delta_diff` parameters: `left_connection`, `right_connection`, `table` (required); optional `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `where_condition`, `update_column` / `update_since`, `checkpoint`, `export`, `export_format` (csv/jsonl/json), `export_rows`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
+`delta_diff` parameters: `left_connection` or `left_url`, `right_connection` or `right_url` (exactly one per side), `table` (required). `left_url` / `right_url` connect without any config entry (e.g. local DuckDB files); in reports and the audit ledger such a side shows up as `inline-<scheme>`. Optional: `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `where_condition`, `update_column` / `update_since`, `checkpoint`, `export`, `export_format` (csv/jsonl/json), `export_rows`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
 
 ## Development
 

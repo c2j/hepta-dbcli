@@ -297,6 +297,13 @@ Or use URL directly:
 url = "oracle://scott:tiger@oracle.internal:1521/FREEPDB1"
 ```
 
+### Inline URLs (no config entry)
+Ad-hoc connections can be passed directly as URLs, bypassing the toml/keyring entirely (config.rs::resolve_inline_url_connection builds a `ResolvedConnection` named `inline-<scheme>` with `PasswordSource::None`). Resolution priority: `--url` > `HEPTA_DBCLI_URL` > config file. Per side, URL and connection name are mutually exclusive:
+- CLI: global `--url <URL>` (conflicts with `--name`) for one-shot `cli`/REPL and `check`; unsupported subcommands (`mcp`, `store-password`, `synth`, `delta-diff` — which has per-side `--left-url`/`--right-url`) reject it with exit 2. REPL `.connect` stays name-only.
+- `delta-diff`: `--left-url` / `--right-url` per side, mixable with `--left` / `--right`; when both sides are URLs the config file is never read.
+- MCP `delta_diff`: `left_url` / `right_url` params (each side: exactly one of name / url, enforced by `validate_mcp_inline_url`); URL sides are registered under a stable synthetic key (`inline-<side>-<16hexhash>`) so pools are reused across calls; audit/report shows `inline-<scheme>`. MCP startup: degrades to an empty connection table only when no config was requested (`--config` absent) and no default file exists on disk and `HEPTA_DBCLI_URL` is unset; every other config error (explicit path broken/unreadable/missing) exits 1. Trust note: inline URLs let an MCP client point the server at arbitrary hosts/local files via delta_diff only — other tools stay named-connection only.
+- `McpRawConfig::empty()` is the shared constructor for inline-URL code paths (no toml, no keyring, no env var).
+
 ### URL Scheme Detection
 The `BackendRegistry` routes connections by URL scheme:
 - `mysql://...` → `MySqlFactory`
@@ -350,7 +357,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 ### MCP Server
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
 - MCP tools (7): `get_database_info`, `list_tables`, `get_table_metadata`, `execute_query`, `get_execution_plan`, `list_connections`, `delta_diff`.
-- `delta_diff` is read-only: compare + csv/jsonl/json export + checkpoint + incremental. SQL patch (`--apply-to`) stays on the CLI.
+- `delta_diff` is read-only: compare + csv/jsonl/json export + checkpoint + incremental. SQL patch (`--apply-to`) stays on the CLI. Each side accepts an inline URL (`left_url`/`right_url`) instead of a connection name (see "Inline URLs" above).
 - All tool calls from MCP enforce **read-only**: only SELECT, EXPLAIN, SHOW, DESCRIBE, DESC are allowed (MySQL). Oracle/GaussDB only allow SELECT, EXPLAIN, WITH. DuckDB allows SELECT, EXPLAIN, WITH, SHOW, DESCRIBE, DESC, SUMMARIZE.
 - `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).

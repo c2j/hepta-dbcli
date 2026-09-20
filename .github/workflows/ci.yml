@@ -94,6 +94,7 @@ jobs:
       - run: cargo clippy --all --all-targets --features duckdb
       - run: cargo test --all --features duckdb
       - run: cargo test --features "duckdb,integration" --test regress_duckdb
+      - run: cargo test --features "duckdb,integration" --test regress_inline_url
 
   test:
     name: test

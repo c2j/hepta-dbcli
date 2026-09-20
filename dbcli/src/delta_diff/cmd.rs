@@ -81,13 +81,21 @@ pub(crate) enum SampleMode {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DeltaDiffArgs {
-    /// 左数据源连接名（对应配置文件中的 connections）
-    #[arg(long)]
-    pub left: String,
+    /// 左数据源连接名（对应配置文件中的 connections；与 --left-url 二选一）
+    #[arg(long, conflicts_with = "left_url")]
+    pub left: Option<String>,
 
-    /// 右数据源连接名
-    #[arg(long)]
-    pub right: String,
+    /// 左数据源 URL（免配置直连，如 duckdb:///tmp/copy.duckdb；与 --left 互斥）
+    #[arg(long, conflicts_with = "left")]
+    pub left_url: Option<String>,
+
+    /// 右数据源连接名（与 --right-url 二选一）
+    #[arg(long, conflicts_with = "right_url")]
+    pub right: Option<String>,
+
+    /// 右数据源 URL（免配置直连；与 --right 互斥）
+    #[arg(long, conflicts_with = "right")]
+    pub right_url: Option<String>,
 
     /// 表名（左右相同）
     #[arg(long, conflicts_with_all = ["left_table", "right_table"])]
@@ -274,6 +282,31 @@ impl DeltaDiffArgs {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.left.is_none() && self.left_url.is_none() {
+            return Err(
+                "missing left side: specify --left <connection> or --left-url <url>".to_string(),
+            );
+        }
+        if self.right.is_none() && self.right_url.is_none() {
+            return Err(
+                "missing right side: specify --right <connection> or --right-url <url>".to_string(),
+            );
+        }
+        for (flag, url) in [
+            ("--left-url", &self.left_url),
+            ("--right-url", &self.right_url),
+        ] {
+            if let Some(u) = url {
+                let trimmed = u.trim();
+                if trimmed.is_empty() || !trimmed.contains("://") {
+                    return Err(format!(
+                        "{flag} expects scheme://... (e.g. duckdb:///tmp/copy.duckdb), got '{}'",
+                        u
+                    ));
+                }
+            }
+        }
+
         if let Some(cond) = &self.where_condition {
             if cond.contains(';') {
                 return Err(
@@ -368,6 +401,108 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<DeltaDiffArgs, clap::Error> {
         TestCli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    #[test]
+    fn left_url_and_right_url_parse_as_inline_sides() {
+        let args = parse(&[
+            "delta-diff",
+            "--left-url",
+            "mysql://u:p@127.0.0.1:3306/db",
+            "--right-url",
+            "duckdb:///tmp/copy.duckdb",
+            "--table",
+            "t",
+        ])
+        .expect("args should parse");
+        assert_eq!(
+            args.left_url.as_deref(),
+            Some("mysql://u:p@127.0.0.1:3306/db")
+        );
+        assert_eq!(args.right_url.as_deref(), Some("duckdb:///tmp/copy.duckdb"));
+        // Sides may be mixed: name on one side, URL on the other.
+        assert_eq!(args.left, None);
+        assert_eq!(args.right, None);
+    }
+
+    #[test]
+    fn left_url_conflicts_with_left_name() {
+        let err = parse(&[
+            "delta-diff",
+            "--left",
+            "prod",
+            "--left-url",
+            "mysql://u:p@127.0.0.1:3306/db",
+            "--right",
+            "staging",
+            "--table",
+            "t",
+        ])
+        .expect_err("--left-url must conflict with --left");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn right_url_conflicts_with_right_name() {
+        let err = parse(&[
+            "delta-diff",
+            "--left",
+            "prod",
+            "--right",
+            "staging",
+            "--right-url",
+            "duckdb:///tmp/copy.duckdb",
+            "--table",
+            "t",
+        ])
+        .expect_err("--right-url must conflict with --right");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn url_side_requires_url_or_name_before_validation() {
+        // Both sides given as URLs: names are not needed.
+        let args = parse(&[
+            "delta-diff",
+            "--left-url",
+            "duckdb:///tmp/a.duckdb",
+            "--right-url",
+            "duckdb:///tmp/b.duckdb",
+            "--table",
+            "t",
+        ])
+        .expect("url-only invocation should parse");
+        assert!(args.validate().is_ok());
+
+        // Neither --left nor --left-url: parse succeeds, validate() rejects.
+        let args = parse(&[
+            "delta-diff",
+            "--right-url",
+            "duckdb:///tmp/b.duckdb",
+            "--table",
+            "t",
+        ])
+        .expect("args should parse");
+        let err = args.validate().expect_err("missing left side must fail");
+        assert!(err.contains("--left"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn left_url_rejects_scheme_less_value_at_validation() {
+        let args = parse(&[
+            "delta-diff",
+            "--left-url",
+            "/tmp/not-a-url.duckdb",
+            "--right",
+            "staging",
+            "--table",
+            "t",
+        ])
+        .expect("args should parse");
+        let err = args
+            .validate()
+            .expect_err("scheme-less URL must be rejected");
+        assert!(err.contains("--left-url"), "unexpected error: {err}");
     }
 
     #[test]

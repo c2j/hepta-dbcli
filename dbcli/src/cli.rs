@@ -48,6 +48,8 @@ pub(crate) struct CliArgs {
     pub sql: Option<String>,
     pub file: Option<String>,
     pub connection_name: Option<String>,
+    /// `--url`: ad-hoc connection URL; skips config file and keyring.
+    pub url: Option<String>,
     pub config_path: Option<String>,
     pub format: OutputFormat,
     pub statement_timeout: Option<String>,
@@ -568,6 +570,41 @@ pub(crate) fn action_event(
     )
 }
 
+/// `--url`（Some）直接短路为 inline 连接；否则按名解析（现有路径）。
+pub(crate) fn resolve_cli_target(
+    raw: Option<&crate::config::McpRawConfig>,
+    url: Option<&str>,
+    connection_name: Option<&str>,
+) -> Result<crate::config::ResolvedConnection, String> {
+    if let Some(u) = url {
+        return crate::config::resolve_inline_url_connection_result(u);
+    }
+    let raw = raw.expect("config is required when --url is absent");
+    let target_name = connection_name.unwrap_or(&raw.default_name);
+    let target_conn = raw
+        .connections
+        .iter()
+        .find(|c| c.name == target_name)
+        .ok_or_else(|| {
+            format!(
+                "Connection '{}' not found. Available: {:?}",
+                target_name,
+                raw.connections.iter().map(|c| &c.name).collect::<Vec<_>>()
+            )
+        })?;
+    if raw.is_env_var {
+        Ok(resolve_env_var_connection(
+            target_conn.url.clone().unwrap_or_default(),
+        ))
+    } else {
+        resolve_single_connection(
+            target_conn,
+            raw.config_path.clone(),
+            raw.base_timeout.as_ref(),
+        )
+    }
+}
+
 pub(crate) async fn run_cli(
     args: CliArgs,
     registry: &BackendRegistry,
@@ -590,30 +627,18 @@ pub(crate) async fn run_cli(
     }
 
     let config_path = args.config_path.map(PathBuf::from);
-    let raw = read_config(config_path)?;
-
-    let target_name = args.connection_name.as_deref().unwrap_or(&raw.default_name);
-    let target_conn = raw
-        .connections
-        .iter()
-        .find(|c| c.name == target_name)
-        .ok_or_else(|| {
-            format!(
-                "Connection '{}' not found. Available: {:?}",
-                target_name,
-                raw.connections.iter().map(|c| &c.name).collect::<Vec<_>>()
-            )
-        })?;
-
-    let target = if raw.is_env_var {
-        resolve_env_var_connection(target_conn.url.clone().unwrap())
+    // --url short-circuits config resolution entirely (no toml, no keyring).
+    let raw = if args.url.is_some() {
+        crate::config::McpRawConfig::empty()
     } else {
-        resolve_single_connection(
-            target_conn,
-            raw.config_path.clone(),
-            raw.base_timeout.as_ref(),
-        )?
+        read_config(config_path)?
     };
+
+    let target = resolve_cli_target(
+        Some(&raw),
+        args.url.as_deref(),
+        args.connection_name.as_deref(),
+    )?;
 
     let effective_timeout = TimeoutConfig::from_overrides(
         args.statement_timeout.as_deref(),
@@ -772,6 +797,37 @@ pub(crate) async fn run_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_cli_target_url_short_circuits_config() {
+        // 无配置文件环境：--url 直接生效，不查 toml、不碰 keyring。
+        let raw = crate::config::McpRawConfig::empty();
+        let target = resolve_cli_target(Some(&raw), Some("duckdb:///tmp/shop.duckdb"), None)
+            .expect("url target should resolve");
+        assert_eq!(target.connection_url, "duckdb:///tmp/shop.duckdb");
+        assert_eq!(target.name, "inline-duckdb");
+    }
+
+    #[test]
+    fn resolve_cli_target_rejects_bad_url_shape() {
+        let raw = crate::config::McpRawConfig::empty();
+        let err = resolve_cli_target(Some(&raw), Some("not-a-url"), None)
+            .expect_err("scheme-less --url must fail");
+        assert!(err.contains("invalid connection URL"), "{err}");
+    }
+
+    #[test]
+    fn resolve_cli_target_resolves_url_without_any_config() {
+        // `check --url` 复用本函数：raw=None 时 URL 必须独立生效，
+        // 名字参数被忽略；URL 形态非法时报错而不是 panic。
+        let resolved = resolve_cli_target(None, Some("duckdb:///tmp/copy.duckdb"), None)
+            .expect("valid url resolves without config");
+        assert_eq!(resolved.name, "inline-duckdb");
+
+        let err = resolve_cli_target(None, Some("not-a-url"), None)
+            .expect_err("scheme-less url must fail");
+        assert!(err.contains("invalid connection URL"), "{err}");
+    }
 
     #[test]
     fn test_strip_leading_comments_plain() {
