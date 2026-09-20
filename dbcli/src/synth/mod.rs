@@ -354,6 +354,38 @@ fn resolve_schema(explicit: Option<&str>, connection_default: String) -> String 
     }
 }
 
+/// Known-limitation #11: the warning shown when `--against-db` names a
+/// connection while `HEPTA_DBCLI_URL` is set (env connections are always
+/// named `default`). Pure so tests can exercise both branches.
+fn against_db_env_warning(name: Option<&str>, env_url_set: bool) -> Option<String> {
+    name.filter(|_| env_url_set).map(|name| {
+        format!(
+            "warning: HEPTA_DBCLI_URL is set, so the --against-db connection name \
+                 '{}' is ignored (the env-var connection is always named \
+                 'default'); pass a --config file to address a named connection",
+            name
+        )
+    })
+}
+
+/// Schema precedence shared by `train` / `rules-draft` / `report`: an explicit
+/// `--schema` flag beats the configured `[connections.X] schema`, which beats
+/// the driver probe. `Some(explicit)/Some(configured)` short-circuit without
+/// touching the connection; `None` means "probe the driver".
+fn schema_priority(
+    explicit: Option<&str>,
+    connection_default_schema: Option<&str>,
+) -> Option<String> {
+    if let Some(s) = explicit.filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    // Configured `[connections.X] schema` beats the driver probe, but an
+    // explicit `--schema` flag beats both.
+    connection_default_schema
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 async fn resolved_side_schema(
     explicit: Option<&str>,
     conn: &mut (dyn crate::backend::DbConn + Send),
@@ -361,13 +393,8 @@ async fn resolved_side_schema(
     name: &str,
     connection_default_schema: Option<&str>,
 ) -> Result<String, String> {
-    if explicit.map(|s| !s.is_empty()).unwrap_or(false) {
-        return Ok(explicit.unwrap().to_string());
-    }
-    // Configured `[connections.X] schema` beats the driver probe, but an
-    // explicit `--schema` flag beats both.
-    if let Some(s) = connection_default_schema.filter(|s| !s.is_empty()) {
-        return Ok(s.to_string());
+    if let Some(s) = schema_priority(explicit, connection_default_schema) {
+        return Ok(s);
     }
     crate::delta_diff::side_schema_from_conn(conn, url, name).await
 }
@@ -1243,12 +1270,11 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
             // Known-limitation #11: with `HEPTA_DBCLI_URL` the connection is
             // always named `default`; a user-supplied name would resolve
             // against the env-var config and fail confusingly.
-            if name.is_some() && std::env::var(crate::config::ENV_VAR_URL).is_ok() {
-                eprintln!(
-                    "warning: HEPTA_DBCLI_URL is set, so the --against-db connection name \
-                     '{connection}' is ignored (the env-var connection is always named \
-                     'default'); pass a --config file to address a named connection"
-                );
+            if let Some(warning) = against_db_env_warning(
+                name.as_deref(),
+                std::env::var(crate::config::ENV_VAR_URL).is_ok(),
+            ) {
+                eprintln!("{}", warning);
             }
             (
                 load_real_key_pools(&relations, &name, config_path).await?,
@@ -1478,6 +1504,42 @@ const KEY_POOL_LIMIT: usize = 100_000;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema_flag_beats_connection_schema_beats_driver_probe() {
+        // 已知限制 #2（H）：`--schema` > 连接段 `schema` > 驱动探测。
+        // Some(explicit) / Some(configured) 表示不用探测；None 才探测。
+        assert_eq!(
+            schema_priority(Some("cli"), Some("conn")),
+            Some("cli".to_string())
+        );
+        assert_eq!(
+            schema_priority(None, Some("conn")),
+            Some("conn".to_string())
+        );
+        assert_eq!(schema_priority(None, None), None);
+        // 空串视为未配置
+        assert_eq!(
+            schema_priority(Some(""), Some("conn")),
+            Some("conn".to_string())
+        );
+        assert_eq!(schema_priority(None, Some("")), None);
+    }
+
+    #[test]
+    fn against_db_name_warns_only_when_env_url_is_set() {
+        // 已知限制 #11（E）：env 连接恒名 default，用户给的名字会被忽略。
+        let warning = against_db_env_warning(Some("prod"), true).expect("warning expected");
+        assert!(
+            warning.contains("--against-db connection name 'prod' is ignored"),
+            "{}",
+            warning
+        );
+        assert!(warning.contains("always named"), "{}", warning);
+        // 名字为空（裸 --against-db）或 env 未设置时不警告
+        assert!(against_db_env_warning(None, true).is_none());
+        assert!(against_db_env_warning(Some("prod"), false).is_none());
+    }
+
     use super::*;
 
     fn profile_for(table: &str) -> crate::synth::profile::TableProfile {
