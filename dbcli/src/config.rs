@@ -203,10 +203,46 @@ pub(crate) struct McpRawConfig {
     pub is_env_var: bool,
 }
 
+impl McpRawConfig {
+    /// Empty connection table for inline-URL paths (`--url`, per-side
+    /// `--left-url` / `--right-url`): no toml, no keyring, no env var.
+    pub(crate) fn empty() -> Self {
+        Self {
+            connections: Vec::new(),
+            default_name: "default".to_string(),
+            config_path: None,
+            base_timeout: None,
+            is_env_var: false,
+        }
+    }
+}
+
 // ─── Config Helpers ───────────────────────────────────────────────────
 
 pub(crate) fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join(format!(".{}", DEFAULT_CONFIG_FILENAME)))
+}
+
+/// True when neither the new (`.{DEFAULT_CONFIG_FILENAME}`) nor the legacy
+/// (`.{OLD_DEFAULT_CONFIG_FILENAME}`) default config exists under `home`.
+/// Used by the MCP bootstrap to distinguish "no config at all" (degradable
+/// to an empty connection table) from "config exists but is broken"
+/// (fail closed with exit 1).
+pub(crate) fn no_config_in_home(home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return true;
+    };
+    let new_cfg = home.join(format!(".{}", DEFAULT_CONFIG_FILENAME));
+    if new_cfg.exists() {
+        return false;
+    }
+    let old_cfg = home.join(format!(".{}", OLD_DEFAULT_CONFIG_FILENAME));
+    !old_cfg.exists()
+}
+
+/// `no_config_in_home` against the real user home.
+pub(crate) fn no_config_file_exists() -> bool {
+    no_config_in_home(dirs::home_dir().as_deref())
 }
 
 pub(crate) fn find_config_path(opt: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -874,6 +910,33 @@ pub(crate) fn rewrite_password_to_sentinel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_config_in_home_detects_missing_new_and_legacy_files() {
+        // 空目录：新旧两个默认文件名都不存在 => true。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            no_config_in_home(Some(tmp.path())),
+            "empty home => no default config file"
+        );
+
+        // 新默认文件存在 => false。
+        let new_cfg = tmp.path().join(format!(".{}", DEFAULT_CONFIG_FILENAME));
+        std::fs::write(&new_cfg, "[connections.dev]\nhost = \"h\"\n").expect("write");
+        assert!(
+            !no_config_in_home(Some(tmp.path())),
+            "default config exists"
+        );
+
+        // 只剩旧默认文件（≤0.2.7 迁移场景）=> false。
+        std::fs::remove_file(&new_cfg).expect("cleanup");
+        let old_cfg = tmp.path().join(format!(".{}", OLD_DEFAULT_CONFIG_FILENAME));
+        std::fs::write(&old_cfg, "[connections.dev]\nhost = \"h\"\n").expect("write");
+        assert!(!no_config_in_home(Some(tmp.path())), "legacy config exists");
+
+        // 无 home（罕见环境）=> 按缺配置处理。
+        assert!(no_config_in_home(None), "no home => treat as no config");
+    }
 
     #[test]
     fn named_connection_accepts_schema_field() {

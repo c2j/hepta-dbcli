@@ -629,13 +629,7 @@ pub(crate) async fn run_cli(
     let config_path = args.config_path.map(PathBuf::from);
     // --url short-circuits config resolution entirely (no toml, no keyring).
     let raw = if args.url.is_some() {
-        crate::config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        }
+        crate::config::McpRawConfig::empty()
     } else {
         read_config(config_path)?
     };
@@ -807,13 +801,7 @@ mod tests {
     #[test]
     fn resolve_cli_target_url_short_circuits_config() {
         // 无配置文件环境：--url 直接生效，不查 toml、不碰 keyring。
-        let raw = crate::config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        };
+        let raw = crate::config::McpRawConfig::empty();
         let target = resolve_cli_target(Some(&raw), Some("duckdb:///tmp/shop.duckdb"), None)
             .expect("url target should resolve");
         assert_eq!(target.connection_url, "duckdb:///tmp/shop.duckdb");
@@ -822,15 +810,22 @@ mod tests {
 
     #[test]
     fn resolve_cli_target_rejects_bad_url_shape() {
-        let raw = crate::config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        };
+        let raw = crate::config::McpRawConfig::empty();
         let err = resolve_cli_target(Some(&raw), Some("not-a-url"), None)
             .expect_err("scheme-less --url must fail");
+        assert!(err.contains("invalid connection URL"), "{err}");
+    }
+
+    #[test]
+    fn resolve_cli_target_resolves_url_without_any_config() {
+        // `check --url` 复用本函数：raw=None 时 URL 必须独立生效，
+        // 名字参数被忽略；URL 形态非法时报错而不是 panic。
+        let resolved = resolve_cli_target(None, Some("duckdb:///tmp/copy.duckdb"), None)
+            .expect("valid url resolves without config");
+        assert_eq!(resolved.name, "inline-duckdb");
+
+        let err = resolve_cli_target(None, Some("not-a-url"), None)
+            .expect_err("scheme-less url must fail");
         assert!(err.contains("invalid connection URL"), "{err}");
     }
 

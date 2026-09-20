@@ -232,6 +232,7 @@ export HEPTA_DBCLI_PASSWORD="secret"
 # CLI / REPL 一次性连接（与 --name 互斥，优先级高于环境变量和配置文件）
 hepta_dbcli --url "duckdb:///data/analytics/shop.duckdb?mode=ro" cli --sql "SELECT 42"
 hepta_dbcli --url "duckdb://:memory:" cli --interactive
+hepta_dbcli --url "duckdb://:memory:" check          # 探活，同样免配置
 
 # delta-diff 任一侧可用 URL 替代连接名（两侧可混搭）
 hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
@@ -242,6 +243,7 @@ hepta_dbcli delta-diff --left-url duckdb:///tmp/orders_copy.duckdb \
 
 - 每侧「URL 与连接名」二选一，同时给出会被拒绝；
 - URL 必须带 `scheme://`（如 `duckdb://`、`mysql://`），缺失时启动前即报错；
+- `--url` 支持 `cli`（含 `--check-connection`）、REPL 与 `check` 子命令；`delta-diff` 用侧级的 `--left-url` / `--right-url`，`store-password` 与 `synth` 不支持 `--url`（显式报错退出码 2）；
 - `delta-diff` 两侧都是 URL 时完全不读取配置文件；
 - REPL 内的 `.connect <名字>` 仍只接受连接名，内联 URL 只在进程启动时生效；
 - MCP 无配置文件也能启动（连接表为空），配合 `delta_diff` 的 `left_url` / `right_url` 即可全程免配置。
@@ -709,7 +711,9 @@ hepta_dbcli --config /path/to/config.toml
 
 MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cursor）通信。
 
-配置文件缺失**不再是致命错误**：进程会以空连接表启动并在 stderr 打警告。此时 `list_connections` 等按名字取连接的工具会逐调用报错，但配合 `delta_diff` 的 `left_url` / `right_url`（见 §8.4）即可全程免配置使用。
+配置文件缺失**不再是致命错误**：进程会以空连接表启动并在 stderr 打警告。此时 `list_connections` 等按名字取连接的工具会逐调用报错，但配合 `delta_diff` 的 `left_url` / `right_url`（见 §8.4）即可全程免配置使用。注意：配置文件**存在但损坏**（toml 语法错误、不可读、`--config` 指向的文件不存在）仍会导致启动失败（exit 1）。
+
+> **信任边界**：允许 MCP 客户端传 `left_url` / `right_url` 意味着它可以让服务器连接任意主机，`duckdb://` 还能读取进程权限可达的任意本地文件。只有 `delta_diff` 接受内联 URL；`execute_query` 等其余工具仍只能用命名连接。请用只读权限最小的账号运行 MCP 服务器，并把内联 URL 当作交给受信客户端的凭据对待。
 
 ### 8.2 提供的工具
 
@@ -737,7 +741,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 ### 8.4 `delta_diff` 工具参数
 
-必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理）；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
+必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理），两者皆缺会明确报错；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
 
 可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 

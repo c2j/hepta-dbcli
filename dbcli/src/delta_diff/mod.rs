@@ -83,13 +83,7 @@ pub(crate) async fn run(
             }
         }
     } else {
-        config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        }
+        config::McpRawConfig::empty()
     };
 
     let left = match resolve_side(&raw, args.left.as_deref(), args.left_url.as_deref()) {
@@ -870,13 +864,7 @@ mod resolve_side_tests {
     /// URL 提供的一侧直接生效，即使配置文件缺失/无连接也不查配置。
     #[test]
     fn url_side_resolves_without_touching_config() {
-        let raw = config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        };
+        let raw = config::McpRawConfig::empty();
         let resolved = resolve_side(&raw, None, Some("duckdb:///tmp/copy.duckdb"))
             .expect("url side should resolve");
         assert_eq!(resolved.connection_url, "duckdb:///tmp/copy.duckdb");
@@ -886,13 +874,7 @@ mod resolve_side_tests {
     /// 缺配置时按名解析应报错（保持原行为），而不是 panic 或静默。
     #[test]
     fn named_side_reports_missing_connection() {
-        let raw = config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        };
+        let raw = config::McpRawConfig::empty();
         let err = resolve_side(&raw, Some("ghost"), None).expect_err("missing name must error");
         assert!(err.contains("ghost"), "unexpected error: {err}");
     }
@@ -900,13 +882,7 @@ mod resolve_side_tests {
     /// 混搭：URL 侧优先于名字侧各自解析。
     #[test]
     fn side_resolution_prefers_url_when_both_given() {
-        let raw = config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        };
+        let raw = config::McpRawConfig::empty();
         let resolved =
             resolve_side(&raw, Some("ghost"), Some("duckdb://:memory:")).expect("url wins");
         assert_eq!(resolved.connection_url, "duckdb://:memory:");

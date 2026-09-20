@@ -945,11 +945,33 @@ async fn handle_check_connection(
 
 async fn handle_check_connection_cmd(
     conn_arg: Option<String>,
+    inline_url: Option<String>,
     verbose: bool,
     config_path: Option<PathBuf>,
     registry: &BackendRegistry,
     audit: &audit::AuditSession,
 ) {
+    // --url short-circuits config resolution (same priority as cli/REPL).
+    if let Some(u) = inline_url {
+        let resolved =
+            crate::config::resolve_inline_url_connection_result(&u).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+        if audit.meta_enabled() {
+            audit.record_best_effort(cli::action_event(
+                audit::event::Channel::Cli,
+                "check",
+                &resolved.name,
+                &resolved.connection_url,
+                audit::event::ActionClass::Meta,
+                audit::event::Decision::Allow,
+            ));
+        }
+        handle_check_connection(&resolved, verbose, registry).await;
+        return;
+    }
+
     let raw = read_config(config_path).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -1080,16 +1102,22 @@ async fn run_mcp_server(
 
     let (lazy_entries, default_name) = resolve_all_connections_lazy(config_path_buf)
         .unwrap_or_else(|e| {
-            // No config is no longer fatal for MCP: tools that take inline
-            // URLs (delta_diff left_url/right_url) work without any named
-            // connection. A tool needing a named connection reports the
-            // missing entry itself.
-            if std::env::var_os("HEPTA_DBCLI_URL").is_some() {
+            // Only "no config file at all" degrades to an empty connection
+            // table (inline-URL tools like delta_diff left_url/right_url
+            // still work). A config that exists but is broken (bad toml,
+            // unreadable, explicit --config missing) fails closed: MCP
+            // clients rarely surface stderr, so a silent fail-open would
+            // turn every named-connection tool call into a confusing
+            // per-call unknown_connection error.
+            if config::no_config_file_exists() && std::env::var_os("HEPTA_DBCLI_URL").is_none() {
+                eprintln!(
+                    "warning: no connection configuration found; only inline-URL tools (delta_diff left_url/right_url) are available"
+                );
+                (Vec::new(), "default".to_string())
+            } else {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             }
-            eprintln!("warning: no connection configuration loaded ({}); inline-URL tools still available", e);
-            (Vec::new(), "default".to_string())
         });
 
     let mut eager_entries = Vec::new();
@@ -1208,19 +1236,38 @@ async fn main() {
         Some(Commands::Check { verbose }) => {
             let config_path = cli.config.map(PathBuf::from);
             let audit = audit::AuditSession::new(&audit_config);
-            handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit).await;
+            handle_check_connection_cmd(cli.name, cli.url, verbose, config_path, &registry, &audit)
+                .await;
         }
         Some(Commands::StorePassword {}) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by store-password; it needs a named connection from the config file"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             handle_store_password(cli.name, cli.config, &audit);
         }
         Some(Commands::DeltaDiff { args }) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by delta-diff; use --left-url / --right-url per side"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             let code = delta_diff::run(*args, cli.config, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]
         Some(Commands::Synth { args }) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by synth; add the connection to the config file or set HEPTA_DBCLI_URL"
+                );
+                std::process::exit(2);
+            }
             let audit = audit::AuditSession::new(&audit_config);
             let code = synth::run(*args, cli.config, &audit).await;
             std::process::exit(code);
@@ -1240,8 +1287,15 @@ async fn main() {
             if check_connection {
                 let config_path = cli.config.map(PathBuf::from);
                 let audit = audit::AuditSession::new(&audit_config);
-                handle_check_connection_cmd(cli.name, verbose, config_path, &registry, &audit)
-                    .await;
+                handle_check_connection_cmd(
+                    cli.name,
+                    cli.url,
+                    verbose,
+                    config_path,
+                    &registry,
+                    &audit,
+                )
+                .await;
             } else if interactive {
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {

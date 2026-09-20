@@ -138,12 +138,12 @@ pub struct GetExecutionPlanParams {
 /// delta_diff 工具参数（§13.1）
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeltaDiffParams {
-    /// 左数据源连接名（与 left_url 互斥；给 left_url 时留空或不传）
+    /// 左数据源连接名（与 left_url 互斥；每侧二选一）
     #[serde(default)]
-    pub left_connection: String,
-    /// 右数据源连接名（与 right_url 互斥；给 right_url 时留空或不传）
+    pub left_connection: Option<String>,
+    /// 右数据源连接名（与 right_url 互斥；每侧二选一）
     #[serde(default)]
-    pub right_connection: String,
+    pub right_connection: Option<String>,
     /// 左数据源 URL 直连（如 duckdb:///tmp/copy.duckdb；免配置，与 left_connection 互斥）
     pub left_url: Option<String>,
     /// 右数据源 URL 直连（与 right_connection 互斥）
@@ -988,7 +988,9 @@ impl DbMcp {
     ) -> Result<CallToolResult, McpError> {
         info!(
             "tool called: delta_diff left={} right={} table={}",
-            params.left_connection, params.right_connection, params.table
+            params.left_connection.as_deref().unwrap_or("<url>"),
+            params.right_connection.as_deref().unwrap_or("<url>"),
+            params.table
         );
 
         // Confine caller-supplied export/checkpoint paths to the configured
@@ -1034,8 +1036,8 @@ impl DbMcp {
                 (key, display)
             }
             None => (
-                params.left_connection.clone(),
-                params.left_connection.clone(),
+                params.left_connection.clone().unwrap_or_default(),
+                params.left_connection.clone().unwrap_or_default(),
             ),
         };
         let (right_name, right_display) = match params.right_url.as_deref() {
@@ -1046,8 +1048,8 @@ impl DbMcp {
                 (key, display)
             }
             None => (
-                params.right_connection.clone(),
-                params.right_connection.clone(),
+                params.right_connection.clone().unwrap_or_default(),
+                params.right_connection.clone().unwrap_or_default(),
             ),
         };
 
@@ -1227,29 +1229,34 @@ fn parse_delta_diff_strategy(
 /// Validate delta_diff inline URL params: a side must not carry both a
 /// connection name override and a URL, and URL shape must be scheme://.
 pub(crate) fn validate_mcp_inline_url(params: &DeltaDiffParams) -> Result<(), String> {
-    let check = |url_field: &str, url: Option<&str>, name_field: &str, name: &str| {
-        if let Some(u) = url {
-            crate::config::resolve_inline_url_connection_result(u)
-                .map_err(|e| format!("{url_field}: {e}"))?;
-            if !name.trim().is_empty() {
-                return Err(format!(
-                    "{url_field} and {name_field} are mutually exclusive; pass only one per side"
-                ));
-            }
+    // Per side: exactly one of name / url. An empty-string name counts as
+    // missing (older clients send "" as a placeholder).
+    let check = |url_field: &str, url: Option<&str>, name_field: &str, name: Option<&str>| {
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        match (url, name) {
+            (Some(_), Some(_)) => Err(format!(
+                "{url_field} and {name_field} are mutually exclusive; pass only one per side"
+            )),
+            (Some(u), None) => crate::config::resolve_inline_url_connection_result(u)
+                .map(|_| ())
+                .map_err(|e| format!("{url_field}: {e}")),
+            (None, Some(_)) => Ok(()),
+            (None, None) => Err(format!(
+                "either {url_field} or {name_field} is required (exactly one per side)"
+            )),
         }
-        Ok(())
     };
     check(
         "left_url",
         params.left_url.as_deref(),
         "left_connection",
-        &params.left_connection,
+        params.left_connection.as_deref(),
     )?;
     check(
         "right_url",
         params.right_url.as_deref(),
         "right_connection",
-        &params.right_connection,
+        params.right_connection.as_deref(),
     )?;
     Ok(())
 }
@@ -1361,8 +1368,8 @@ mod delta_diff_url_side_tests {
 
     fn base_params() -> DeltaDiffParams {
         DeltaDiffParams {
-            left_connection: "l".into(),
-            right_connection: "r".into(),
+            left_connection: Some("l".into()),
+            right_connection: Some("r".into()),
             left_url: None,
             right_url: None,
             table: "t".into(),
@@ -1403,10 +1410,9 @@ mod delta_diff_url_side_tests {
 
     #[test]
     fn inline_url_params_accept_mixed_sides() {
-        // Real clients leave the URL side's name as an empty placeholder;
-        // the name on the *other* side is fine.
+        // URL 侧不传名字（None），另一侧用名字 —— 混搭合法。
         let mut p = base_params();
-        p.left_connection = String::new();
+        p.left_connection = None;
         p.left_url = Some("duckdb:///tmp/a.duckdb".into());
         validate_mcp_inline_url(&p).expect("name+url mix across sides is fine");
     }
@@ -1418,6 +1424,36 @@ mod delta_diff_url_side_tests {
         p.left_url = Some("duckdb:///tmp/a.duckdb".into());
         let err = validate_mcp_inline_url(&p).expect_err("url + non-empty name must conflict");
         assert!(err.contains("left_connection"), "{err}");
+    }
+
+    #[test]
+    fn inline_url_params_require_name_or_url_per_side() {
+        // 每侧必须提供 left_connection 或 left_url 之一；两者皆缺时
+        // 必须明确报「二选一」，而不是把空连接名传给 get_connection。
+        let mut p = base_params();
+        p.left_connection = None;
+        let err = validate_mcp_inline_url(&p).expect_err("left side needs name or url");
+        assert!(
+            err.contains("left_connection") && err.contains("left_url"),
+            "{err}"
+        );
+
+        let mut p = base_params();
+        p.right_connection = None;
+        let err = validate_mcp_inline_url(&p).expect_err("right side needs name or url");
+        assert!(
+            err.contains("right_connection") && err.contains("right_url"),
+            "{err}"
+        );
+
+        // 空字符串名字与缺字段等价（老客户端会传 "" 占位）。
+        let mut p = base_params();
+        p.left_connection = Some(String::new());
+        let err = validate_mcp_inline_url(&p).expect_err("empty name counts as missing");
+        assert!(
+            err.contains("left_connection") && err.contains("left_url"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1473,8 +1509,8 @@ mod delta_diff_mcp_plan_tests {
 
     fn base_params() -> DeltaDiffParams {
         DeltaDiffParams {
-            left_connection: "l".into(),
-            right_connection: "r".into(),
+            left_connection: Some("l".into()),
+            right_connection: Some("r".into()),
             left_url: None,
             right_url: None,
             table: "t".into(),

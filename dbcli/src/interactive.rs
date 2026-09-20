@@ -564,13 +564,7 @@ pub(crate) async fn run_interactive(
 ) -> Result<(), String> {
     let raw = if args.url.is_some() {
         // --url short-circuits config: no toml needed at all.
-        crate::config::McpRawConfig {
-            connections: Vec::new(),
-            default_name: "default".to_string(),
-            config_path: None,
-            base_timeout: None,
-            is_env_var: false,
-        }
+        crate::config::McpRawConfig::empty()
     } else {
         read_config(args.config_path.map(PathBuf::from))?
     };
