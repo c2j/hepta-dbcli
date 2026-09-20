@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod connection;
 mod delta_diff;
+mod graph;
 mod interactive;
 mod logger;
 mod output;
@@ -13,6 +14,7 @@ mod queries;
 mod server;
 #[cfg(feature = "synth")]
 mod synth;
+mod tabular;
 
 use clap::{Parser, Subcommand};
 use keyring::Entry;
