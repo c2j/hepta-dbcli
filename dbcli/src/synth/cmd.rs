@@ -399,6 +399,7 @@ pub(crate) fn build_model_with_overrides(
             converter_version: None,
             sdv_version: None,
             truncated: false,
+            trained_rows: Some(rows.len()),
         },
         pk,
         columns,
