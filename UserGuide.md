@@ -1147,9 +1147,9 @@ tables:
 
 以下条目均在 MySQL 8 / GaussDB(opengauss 5.0.0) / Oracle 26ai / DuckDB 四后端上实测得出，使用前请留意：
 
-1. **`--tables` 不接受 `schema.table` 点号形式**：点号会被当作表名的一部分，GaussDB 上报 `relation "gaussdb.staging.customer" does not exist`（双重限定）。跨 schema 请始终用 `--schema`。
+1. **`--tables` 不接受 `schema.table` 点号形式（fail-fast 拒绝）**：点号写法会在连接前被直接拒绝（GaussDB 实测原文）：``--tables entry 'staging.customer' uses schema-qualified `schema.table` notation, which is not supported; pass the table list without the qualifier and select the schema with `--schema staging` (table: 'customer')``。跨 schema 请始终用 `--schema`。
 2. **TOML `[connections.X]` 不支持 `options` 字段**：写了会被静默忽略；`schema` 字段自 0.5.x 起已生效（优先级：`--schema` > 连接段 `schema` > 驱动探测）。synth 省略 `--schema` 且连接段未配 `schema` 时的默认推断是：MySQL 取 URL 里的数据库名，Oracle 取 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')`，GaussDB/DuckDB 取 `current_schema()`。GaussDB URL 也不接受 `?currentSchema=` 查询参数（驱动报 `unknown option currentSchema`）。
-3. **rules-draft 隐式推断可能产生伪环**：`last_update` 这类多表同名的更新时间戳列会被连成互指关系（`customer.last_update ↔ rental.last_update`），draft 直接 `generate` 会报 `cycle detected: "customer" -> "rental" -> "customer"`。用 draft 前请手工删除这类伪 relationship。
+3. **rules-draft 隐式推断已跳过 datetime 列**：`last_update` 这类多表同名的更新时间戳列不再被连成互指关系（推断层跳过 datetime 子列，自引用一律跳过）。若 draft 仍因其他原因成环，落盘前会打 `warning: draft references form a cycle ...`（含同一错误文案里点名的两类常见误报），此时按提示手工删除残余伪 relationship 再 `generate`。
 4. **`--mine` 默认跳过 PII 列**：挖掘器在「档数 ≤ 50 且非标识符」之外还会用 PII 识别过滤列（被跳过的列名打在 stderr），低基数的 email/phone 列不会再把**训练原值**写进 YAML 注释与 `--emit-candidates` 文件。确知数据是假 PII 形状时可加 `--keep-pii-columns` 恢复旧行为。
 5. **父键 `unique: true` 受父池大小约束**：生成开始前预检——需求唯一值数超过父表**已生成**行数即报错并给出两条线索：父池当前大小、父列训练时观测到的 distinct 容量。容量足够时提示增大父表 rules 行数，容量不足时提示增大 train `--sample` 重新训练；也可以改 `unique: false` 或给父键配 `values` 池。例：users rules 只生成 3 行、orders `unique: true` 请求 300 行会直接报 `unique FK 'user_id' requests 300 unique value(s) but its parent pool 'users.id' holds only 3 generated value(s)`。
 6. **`derive` 目标列不能是布尔表达式**：比较运算（`==`、`>` 等）产生布尔值，与目标列的数值/字符串求值不兼容，`derive: expr: "active == 1 && store_id > 0"` 会报 `operator \`decimal result\` cannot be applied to boolean`。比较+逻辑组合只能用于 `branches[].predicate`；`derive` 也没有 `if/then/else` 或条件函数（白名单只有字面量、列引用、算术、比较、`&& ||`）。
@@ -1157,7 +1157,7 @@ tables:
 8. **Oracle（oracle-rs 驱动）**：表不存在时报 `Oracle closed the connection without an error packet…`，语义误导（实为对象不存在被驱动吞掉）；采样超 100 行会被驱动静默截断（见上文截断告警逻辑）。
 9. **DuckDB**：连接串指向的数据库文件必须已存在，CLI 不自动创建（报 `DuckDB database file not found`）；DuckDB 引擎不支持 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`，外键必须在建表 DDL 中内联，`rules-draft` 才能扫到。
 10. **synth 全部子命令写审计日志**：channel=`synth`、class=`meta`，detail 记录子命令名与 models/rules 路径，不含任何生成数据行（见 §4.5）。
-11. **`report --against-db` 的连接名**：用 `HEPTA_DBCLI_URL` 环境变量连接时连接名固定为 `default`（不是配置文件中的名字），此时 `--against-db` 必须写 `default`。
+11. **`report --against-db` 的连接名**：用 `HEPTA_DBCLI_URL` 环境变量连接时连接名固定为 `default`（不是配置文件中的名字），此时 `--against-db` 必须写 `default`；写成其他名字会在运行前收到 stderr 告警（该名字被忽略），要指名连接请改用 `--config` 文件。
 
 ### 10.6 基准测试与评测
 
@@ -1309,9 +1309,9 @@ esac
 | GaussDB TLS / SSL 失败 | 服务器未开 TLS | 连接段加 `sslmode = "disable"` |
 | GaussDB `28P01` 密码被拒 | 密码错误，或钥匙串不是这一套 | 本工具 service 是 `hepta-dbcli`，与独立 `gaussdb` CLI 的钥匙串**不共享** |
 | `No backend registered for scheme '…'` | 二进制未编入对应 feature | 用默认 feature 重新 `cargo build --release -p polar-mysql` |
-| synth `relation "db.schema.table" does not exist`（双重限定） | `--tables` 写了 `schema.table` 点号形式 | 拆开：`--tables customer --schema staging` |
-| synth `referenced column 'X.Y' exhausted its value space` | `unique: true` 父池观测唯一值数 < 请求行数 | 增大 train `--sample`、改 `unique: false`、或给父键配 `values` 池（见 §10.5 已知限制 5） |
-| synth rules-draft 后 generate 报 `cycle detected` | 隐式推断把同名时间戳列（如 `last_update`）连成互指 | 手工删除 draft YAML 中的伪 relationship（见 §10.5 已知限制 3） |
+| synth ``--tables entry 'x.y' uses schema-qualified `schema.table` notation`` | `--tables` 写了 `schema.table` 点号形式（fail-fast 拒绝） | 拆开：`--tables customer --schema staging` |
+| synth `unique FK '...' requests N unique value(s) but its parent pool '...' holds only M generated value(s)` | `unique: true` 父表生成行数（或训练观测容量）< 请求行数 | 按报错里的两条线索：父表 rules 行数不够就增大行数，训练观测不够就增大 train `--sample` 重训；也可改 `unique: false` 或给父键配 `values` 池（见 §10.5 已知限制 5） |
+| synth rules-draft 报 `warning: draft references form a cycle` | 残余的隐式误报关系成环（同名时间戳已被跳过；自引用也已被跳过） | 按警告提示手工删除 draft YAML 中的伪 relationship（见 §10.5 已知限制 3） |
 | synth derive `operator decimal result cannot be applied to boolean` | derive 表达式是布尔比较，不能赋给目标列 | 改成算术表达式，或把该条件挪到 `branches[].predicate`（见 §10.5 已知限制 6） |
 | GaussDB synth 连接报 `unknown option currentSchema` | URL 查询参数不被 gaussdb 驱动接受 | 去掉参数，改用 `--schema` |
 | DuckDB `database file not found` | CLI 不自动创建 DuckDB 文件 | 先用任意 DuckDB 客户端建库再连接 |
