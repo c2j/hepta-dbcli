@@ -198,13 +198,14 @@ pub(crate) async fn run(
             }
         }
     };
-    let plan_data = match plan::build_plan(matched, args.schema.clone(), &fk_result) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return EXIT_ERROR;
-        }
-    };
+    let plan_data =
+        match plan::build_plan(matched, args.schema.clone(), &fk_result, &listed_schemas) {
+            Ok(plan) => plan,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_ERROR;
+            }
+        };
 
     // Per-table schema (for column lookup): explicit --schema wins, else the
     // schema each table was listed under.

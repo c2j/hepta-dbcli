@@ -94,6 +94,9 @@ jobs:
       - run: cargo clippy --all --all-targets --features duckdb
       - run: cargo test --all --features duckdb
       - run: cargo test --features "duckdb,integration" --test regress_duckdb
+      # Issue #98: end-to-end load tests (drive the real binary against the
+      # embedded DuckDB file; MySQL part self-skips without its env var).
+      - run: cargo test --features "duckdb,integration" --test regress_load
       - run: cargo test --features "duckdb,integration" --test regress_inline_url
 
   test:

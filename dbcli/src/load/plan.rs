@@ -204,6 +204,7 @@ pub(crate) fn build_plan(
     files: Vec<TableFile>,
     schema: Option<String>,
     fk_result: &QueryResult,
+    listed_schemas: &std::collections::HashMap<String, Option<String>>,
 ) -> Result<LoadPlan, String> {
     let edges = fk_edges(fk_result)?;
     let mut names: Vec<String> = files.iter().map(|f| f.table.clone()).collect();
@@ -215,7 +216,13 @@ pub(crate) fn build_plan(
         .into_iter()
         .filter_map(|table| {
             by_table.remove(&table).map(|file| PlanEntry {
-                schema: schema.clone(),
+                // Explicit --schema wins; otherwise the schema the table was
+                // listed under flows into the entry so per-table column
+                // lookups bind a real TABLE_SCHEMA even for URL connections
+                // that carry no configured default schema.
+                schema: schema
+                    .clone()
+                    .or_else(|| listed_schemas.get(&table).cloned().flatten()),
                 table: file.table,
                 columns: file.columns,
                 row_count: file.row_count,
@@ -408,6 +415,10 @@ mod tests {
         }
     }
 
+    fn empty_schemas() -> std::collections::HashMap<String, Option<String>> {
+        std::collections::HashMap::new()
+    }
+
     fn fk_row(child: &str, parent: &str) -> Vec<Value> {
         vec![
             Value::from("shop"),
@@ -433,6 +444,37 @@ mod tests {
         fk_result(&["table_name", "referenced_table"], Vec::new())
     }
 
+    /// `list_tables()` result rows as `(schema_name, table_name)` pairs.
+    fn listed_result(rows: &[(&str, &str)]) -> QueryResult {
+        QueryResult {
+            columns: vec![
+                "schema_name".to_string(),
+                "table_name".to_string(),
+                "table_type".to_string(),
+                "engine".to_string(),
+                "row_count".to_string(),
+                "total_size".to_string(),
+                "comment".to_string(),
+            ],
+            row_count: rows.len(),
+            rows: rows
+                .iter()
+                .map(|(schema, table)| {
+                    vec![
+                        Value::from(*schema),
+                        Value::from(*table),
+                        Value::from("table"),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]
+                })
+                .collect(),
+            rows_affected: None,
+        }
+    }
+
     #[test]
     fn should_plan_topological_order_from_fk_edges() {
         // orders references users; users must load first.
@@ -452,11 +494,26 @@ mod tests {
             ],
             vec![fk_row("orders", "users")],
         );
-        let plan = build_plan(files, Some("shop".to_string()), &fk).unwrap();
+        let plan = build_plan(files, Some("shop".to_string()), &fk, &empty_schemas()).unwrap();
         let tables: Vec<&str> = plan.entries.iter().map(|e| e.table.as_str()).collect();
         assert_eq!(tables, vec!["users", "orders"]);
         assert_eq!(plan.entries[0].schema.as_deref(), Some("shop"));
         assert_eq!(plan.entries[0].row_count, 3);
+    }
+
+    #[test]
+    fn should_inherit_listed_schema_into_plan_entries_without_explicit_schema() {
+        // A named connection with no `schema` field (e.g. a URL connection):
+        // the schema each table was listed under must flow into the plan so
+        // per-table column lookups bind a real TABLE_SCHEMA.
+        let files = vec![file("users", &["id"], 2)];
+        let listed_schemas = parse_table_schemas(&listed_result(&[("testdb", "users")]));
+        let plan = build_plan(files, None, &empty_fk(), &listed_schemas).unwrap();
+        assert_eq!(
+            plan.entries[0].schema.as_deref(),
+            Some("testdb"),
+            "plan entry must carry the schema the table was listed under"
+        );
     }
 
     #[test]
@@ -503,7 +560,7 @@ mod tests {
             file("alpha", &["id"], 2),
             file("mid", &["id"], 3),
         ];
-        let plan = build_plan(files, None, &empty_fk()).unwrap();
+        let plan = build_plan(files, None, &empty_fk(), &empty_schemas()).unwrap();
         let tables: Vec<&str> = plan.entries.iter().map(|e| e.table.as_str()).collect();
         assert_eq!(tables, vec!["alpha", "mid", "zeta"]);
     }
@@ -518,7 +575,7 @@ mod tests {
                 vec![Value::from("b"), Value::from("a")],
             ],
         );
-        let err = build_plan(files, None, &fk).unwrap_err();
+        let err = build_plan(files, None, &fk, &empty_schemas()).unwrap_err();
         assert!(err.contains("cycle"), "{err}");
     }
 
