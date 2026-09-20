@@ -685,6 +685,44 @@ pub(crate) fn resolve_env_var_connection(url: String) -> ResolvedConnection {
     }
 }
 
+/// Resolve a connection given directly as a URL (e.g. `--url`, delta-diff
+/// `--left-url/--right-url`, MCP `left_url/right_url`). The URL is used as-is;
+/// no keyring, env-var or config lookup happens. Embedded databases (DuckDB)
+/// carry no credentials at all; for user:pass URLs the credentials stay inside
+/// the URL (audit redaction handles DSN scrubbing).
+pub(crate) fn resolve_inline_url_connection_result(
+    url: &str,
+) -> Result<ResolvedConnection, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || !trimmed.contains("://") {
+        return Err(format!(
+            "invalid connection URL '{}': expected scheme://... (e.g. duckdb:///tmp/shop.duckdb)",
+            url
+        ));
+    }
+    let scheme = trimmed.split("://").next().unwrap_or_default();
+    Ok(ResolvedConnection {
+        name: format!("inline-{}", scheme.to_lowercase()),
+        connection_url: trimmed.to_string(),
+        password_source: PasswordSource::None,
+        keyring_username: format!(
+            "inline-{}#{}",
+            scheme.to_lowercase(),
+            config_path_hash(None)
+        ),
+        config_path: None,
+        plaintext_password: None,
+        timeout_config: TimeoutConfig::default(),
+        default_schema: None,
+    })
+}
+
+/// Panicking convenience wrapper for tests and call sites that already
+/// validated the URL shape.
+pub(crate) fn resolve_inline_url_connection(url: &str) -> ResolvedConnection {
+    resolve_inline_url_connection_result(url).expect("valid inline connection URL")
+}
+
 // ─── Lazy Resolver ───────────────────────────────────────────────────
 
 pub(crate) fn build_lazy_resolver(
@@ -914,6 +952,28 @@ database = "db"
         assert!(build_duckdb_url(None).is_err());
         assert!(build_duckdb_url(Some("")).is_err());
         assert!(build_duckdb_url(Some("  ")).is_err());
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_keeps_url_and_skips_credentials() {
+        let resolved = resolve_inline_url_connection("duckdb:///tmp/shop.duckdb");
+        assert_eq!(resolved.connection_url, "duckdb:///tmp/shop.duckdb");
+        assert!(matches!(resolved.password_source, PasswordSource::None));
+        assert_eq!(resolved.plaintext_password, None);
+        assert_eq!(resolved.default_schema, None);
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_names_side_from_scheme() {
+        let resolved = resolve_inline_url_connection("mysql://u:p@127.0.0.1:3306/db");
+        assert_eq!(resolved.name, "inline-mysql");
+        assert_eq!(resolved.connection_url, "mysql://u:p@127.0.0.1:3306/db");
+    }
+
+    #[test]
+    fn test_resolve_inline_url_connection_rejects_scheme_less_string() {
+        assert!(resolve_inline_url_connection_result("/tmp/shop.duckdb").is_err());
+        assert!(resolve_inline_url_connection_result("").is_err());
     }
 
     #[test]
