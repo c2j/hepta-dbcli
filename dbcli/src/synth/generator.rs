@@ -382,6 +382,25 @@ fn generate_with(
                 }
 
                 if let Some(rel) = rel_pools.iter_mut().find(|r| &r.column == col_name) {
+                    let child_p_null = rule
+                        .columns
+                        .get(col_name)
+                        .and_then(|c| c.null_rate)
+                        .unwrap_or(0.0);
+                    let unique_demand = (row_count as f64 * (1.0 - child_p_null)).ceil() as usize;
+                    if rel.unique && unique_demand > rel.pool_size {
+                        // Preflight (known-limitation #5): requesting more
+                        // unique FK values than the parent pool holds can
+                        // never finish; say so with the capacity and remedies
+                        // before any rows are built.
+                        return Err(format!(
+                            "table '{}': unique FK '{}' requests {} unique value(s) but its \
+                             parent pool holds only {} distinct value(s) observed at train \
+                             time — increase train --sample and retrain, set unique: false, \
+                             or give the parent key an explicit values pool",
+                            table_name, rel.column, unique_demand, rel.pool_size
+                        ));
+                    }
                     let value = if rel.unique {
                         rel.pool
                             .sample_unique(rel.strategy, &mut rng)
@@ -530,7 +549,9 @@ fn generate_with(
                         return Err(format!(
                             "referenced column '{}.{}' exhausted its value space after \
                              {attempts} redraws (degenerate marginal?); duplicated parent \
-                             keys cannot satisfy an FK-enforced load",
+                             keys cannot satisfy an FK-enforced load — increase train \
+                             --sample and retrain, set unique: false, or give the parent \
+                             key an explicit values pool",
                             table_name, col_name
                         ));
                     }
@@ -2391,6 +2412,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn numerical_model(table: &str, column: &str, loc: f64, scale: f64) -> TableModel {
+        numerical_model_trained(table, column, loc, scale, 5)
+    }
+
+    fn numerical_model_trained(
+        table: &str,
+        column: &str,
+        loc: f64,
+        scale: f64,
+        trained_rows: usize,
+    ) -> TableModel {
         let mut columns = HashMap::new();
         columns.insert(
             column.to_string(),
@@ -2414,6 +2445,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: Some(trained_rows),
             },
             pk: vec![column.to_string()],
             columns,
@@ -2469,6 +2501,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![column.to_string()],
             columns,
@@ -2599,6 +2632,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -2732,6 +2766,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["k".to_string()],
             columns,
@@ -2801,6 +2836,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -2880,6 +2916,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -2970,6 +3007,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -3060,6 +3098,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec!["id".to_string()],
                 columns: modeled_columns,
@@ -3182,6 +3221,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![column.to_string()],
                 columns,
@@ -3323,6 +3363,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3364,6 +3405,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3488,6 +3530,53 @@ mod tests {
     }
 
     #[test]
+    fn referenced_continuous_column_preflight_names_capacity_and_remedies() {
+        // 已知限制 #5 修复：连续边际的 referenced 列在进入 10000 次重抽前，
+        // 预检就应报出父列的观测唯一值容量与三条解法提示。
+        let mut models = HashMap::new();
+        models.insert(
+            "users".to_string(),
+            numerical_model("users", "id", 0.0, 1.0),
+        );
+        models.insert(
+            "orders".to_string(),
+            numerical_model("orders", "total", 10.0, 2.0),
+        );
+
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![
+                single_rule(
+                    "orders",
+                    vec![Relationship {
+                        pk: "total".to_string(),
+                        references: vec!["users.id".to_string()],
+                        pool_strategy: PoolStrategy::Projection { unique: true },
+                        null_label: "null".to_string(),
+                        cardinality: Default::default(),
+                    }],
+                ),
+                single_rule("users", vec![]),
+            ],
+        };
+
+        let mut config = config(&["orders"], 300);
+        config.rows_per_table.insert("users".to_string(), 5);
+
+        let err = generate(&models, &rules, &config).unwrap_err();
+        assert!(
+            err.contains("5 distinct value(s)"),
+            "error should state the observed parent capacity: {}",
+            err
+        );
+        assert!(
+            err.contains("--sample") && err.contains("unique: false") && err.contains("values"),
+            "error should list the remedies: {}",
+            err
+        );
+    }
+
+    #[test]
     fn unique_fk_errors_when_child_exceeds_parent_pool() {
         let mut models = HashMap::new();
         models.insert(
@@ -3526,7 +3615,14 @@ mod tests {
             "error should name the column: {}",
             err
         );
-        assert!(err.contains("3 parent rows"), "error: {}", err);
+        // Known-limitation #5: the preflight now states the observed parent
+        // capacity and the remedies instead of exhausting the pool first.
+        assert!(err.contains("3 distinct value(s)"), "error: {}", err);
+        assert!(
+            err.contains("--sample") && err.contains("unique: false"),
+            "error should list remedies: {}",
+            err
+        );
     }
 
     #[test]
@@ -3629,6 +3725,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3687,6 +3784,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -3745,6 +3843,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3806,6 +3905,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: HashMap::from([(
@@ -3923,6 +4023,7 @@ mod tests {
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -4046,6 +4147,7 @@ tables:
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns: order_columns,
@@ -4160,6 +4262,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: child_columns,
@@ -4304,6 +4407,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: child_columns,
@@ -4405,6 +4509,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4462,6 +4567,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4570,6 +4676,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["id".to_string()],
             columns,
@@ -4626,6 +4733,7 @@ tables:
                     converter_version: None,
                     sdv_version: None,
                     truncated: false,
+                    trained_rows: None,
                 },
                 pk: vec![],
                 columns,
@@ -4743,6 +4851,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -4776,6 +4885,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5016,6 +5126,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5128,6 +5239,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string()],
             columns,
@@ -5311,6 +5423,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5445,6 +5558,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -5661,6 +5775,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -6899,6 +7014,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,
@@ -6972,6 +7088,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,
@@ -7199,6 +7316,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns,
@@ -7383,6 +7501,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![column.to_string()],
             columns,
@@ -7487,6 +7606,7 @@ tables:
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["a".to_string(), "b".to_string()],
             columns,

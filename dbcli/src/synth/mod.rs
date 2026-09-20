@@ -359,15 +359,17 @@ async fn resolved_side_schema(
     conn: &mut (dyn crate::backend::DbConn + Send),
     url: &str,
     name: &str,
+    connection_default_schema: Option<&str>,
 ) -> Result<String, String> {
     if explicit.map(|s| !s.is_empty()).unwrap_or(false) {
-        Ok(resolve_schema(explicit, String::new()))
-    } else {
-        Ok(resolve_schema(
-            explicit,
-            crate::delta_diff::side_schema_from_conn(conn, url, name).await?,
-        ))
+        return Ok(explicit.unwrap().to_string());
     }
+    // Configured `[connections.X] schema` beats the driver probe, but an
+    // explicit `--schema` flag beats both.
+    if let Some(s) = connection_default_schema.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    crate::delta_diff::side_schema_from_conn(conn, url, name).await
 }
 
 #[cfg(feature = "synth")]
@@ -458,7 +460,14 @@ async fn run_train(
         .map(|i| side.connection_url[..i].to_string())
         .unwrap_or_else(|| "mysql".to_string());
 
-    let schema = resolved_side_schema(schema, &mut *conn, &side.connection_url, &side.name).await?;
+    let schema = resolved_side_schema(
+        schema,
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+        side.default_schema.as_deref(),
+    )
+    .await?;
 
     // Foreign keys are read once so training can learn each child table's
     // rows-per-parent-key distribution (issue #72). A dialect without FK
@@ -849,6 +858,7 @@ async fn run_rules_draft(
         &mut *conn,
         &side.connection_url,
         &side.name,
+        side.default_schema.as_deref(),
     )
     .await?;
 
@@ -1221,6 +1231,16 @@ async fn run_report(options: ReportRunOptions, config_path: Option<String>) -> R
         Some(connection) => {
             // A bare `--against-db` (empty value) means the default connection.
             let name = (!connection.is_empty()).then(|| connection.to_string());
+            // Known-limitation #11: with `HEPTA_DBCLI_URL` the connection is
+            // always named `default`; a user-supplied name would resolve
+            // against the env-var config and fail confusingly.
+            if name.is_some() && std::env::var(crate::config::ENV_VAR_URL).is_ok() {
+                eprintln!(
+                    "warning: HEPTA_DBCLI_URL is set, so the --against-db connection name \
+                     '{connection}' is ignored (the env-var connection is always named \
+                     'default'); pass a --config file to address a named connection"
+                );
+            }
             (
                 load_real_key_pools(&relations, &name, config_path).await?,
                 "database",
@@ -1395,7 +1415,14 @@ async fn load_real_key_pools(
         crate::config::read_config(config_path.map(PathBuf::from)).map_err(|e| e.to_string())?;
     let side = resolve_connection(&raw, connection)?;
     let mut conn = connect(&side).await?;
-    let schema = resolved_side_schema(None, &mut *conn, &side.connection_url, &side.name).await?;
+    let schema = resolved_side_schema(
+        None,
+        &mut *conn,
+        &side.connection_url,
+        &side.name,
+        side.default_schema.as_deref(),
+    )
+    .await?;
 
     for (table, column) in wanted {
         let sql = {
@@ -1498,6 +1525,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec!["order_id".to_string()],
             columns: HashMap::new(),
@@ -1782,6 +1810,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: HashMap::from([
@@ -2057,6 +2086,7 @@ mod tests {
                 converter_version: None,
                 sdv_version: None,
                 truncated: false,
+                trained_rows: None,
             },
             pk: vec![],
             columns: map,
