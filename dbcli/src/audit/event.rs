@@ -23,6 +23,7 @@ pub(crate) enum Channel {
     Repl,
     DeltaDiff,
     Synth,
+    Load,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -515,6 +516,7 @@ mod tests {
             (Channel::Repl, "repl"),
             (Channel::DeltaDiff, "delta_diff"),
             (Channel::Synth, "synth"),
+            (Channel::Load, "load"),
         ] {
             let conn = ConnectionInfo::from_url("d", "mysql://h/db", false);
             let e = AuditEvent::stamp(
@@ -526,6 +528,17 @@ mod tests {
             );
             assert_eq!(serde_json::to_value(&e).unwrap()["channel"], want);
         }
+    }
+
+    #[test]
+    fn load_channel_serializes_and_is_copy() {
+        let load = Channel::Load;
+        let copied = load;
+        assert_eq!(
+            serde_json::to_value(Channel::Load).unwrap(),
+            serde_json::json!("load")
+        );
+        assert_eq!(copied, Channel::Load);
     }
 
     #[test]
