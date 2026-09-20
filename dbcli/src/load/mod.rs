@@ -267,7 +267,7 @@ pub(crate) async fn run(
     }
     let started = std::time::Instant::now();
 
-    match loader::execute(&mut *conn, &plan_data).await {
+    match loader::execute(&mut *conn, &plan_data, audit, &conn_info).await {
         Ok(inserted) => {
             let duration_ms = started.elapsed().as_millis() as u64;
             audit.record_best_effort(load_outcome_event(
