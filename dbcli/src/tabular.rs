@@ -40,7 +40,7 @@ pub(crate) fn read_generated_table(
     Ok(None)
 }
 
-fn read_jsonl(path: &Path) -> Result<GeneratedTable, String> {
+pub(crate) fn read_jsonl(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut columns: Vec<String> = Vec::new();
@@ -64,7 +64,7 @@ fn read_jsonl(path: &Path) -> Result<GeneratedTable, String> {
     Ok((columns, rows))
 }
 
-fn read_json(path: &Path) -> Result<GeneratedTable, String> {
+pub(crate) fn read_json(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let objects: Vec<serde_json::Map<String, Value>> =
@@ -91,7 +91,7 @@ fn read_json(path: &Path) -> Result<GeneratedTable, String> {
 /// reader over the whole file rather than `csv::Reader`: the crate cannot tell
 /// those two apart, and quoted fields may contain the line break the record
 /// splitter would otherwise treat as a row.
-fn read_csv(path: &Path) -> Result<GeneratedTable, String> {
+pub(crate) fn read_csv(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let records = parse_csv_records(&content);
