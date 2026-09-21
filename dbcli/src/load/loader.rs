@@ -255,12 +255,28 @@ async fn load_table(
         }
     }
 
-    conn.query_drop("COMMIT").await.map_err(|e| {
-        (
-            rows.len(),
-            format!("commit failed, transaction rolled back: {e}"),
-        )
-    })?;
+    if let Err(e) = conn.query_drop("COMMIT").await {
+        // COMMIT failed: the transaction is still open (or the session is
+        // gone). Best-effort ROLLBACK so the open txn does not linger, and
+        // word the message by what actually happened.
+        match conn.query_drop("ROLLBACK").await {
+            Ok(()) => {
+                return Err((
+                    rows.len(),
+                    format!("commit failed, transaction rolled back: {e}"),
+                ));
+            }
+            Err(rb) => {
+                return Err((
+                    rows.len(),
+                    format!(
+                        "commit failed and rollback also failed ({rb}); \
+                         the connection should be discarded: {e}"
+                    ),
+                ));
+            }
+        }
+    }
     Ok(rows.len())
 }
 

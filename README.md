@@ -283,7 +283,7 @@ $XDG_DATA_HOME/hepta-dbcli/audit/hepta-dbcli-audit.YYYY-MM-DD.jsonl
 ```
 
 - One JSON object per line (schema `v: 1`): envelope (`ts`, `event_id`, `session_id`, `seq`, `channel`, `actor`, `connection`, `action`, `class`, `decision`) plus action detail (`sql`, `outcome`, `deny_reason`, `detail`).
-- `channel` is one of `mcp`, `cli`, `repl`, `delta_diff`, `synth`.
+- `channel` is one of `mcp`, `cli`, `repl`, `delta_diff`, `synth`, `load`.
 - Enabled by default; the directory and files are created `0700` / `0600`. Passwords and DSN userinfo are stripped, and result rows / EXPLAIN bodies are never written.
 - A rejected statement is recorded even though it never reached the engine: MCP's read-only gate as `deny_reason: "prefix"`, the CLI write gate as `write_flag_required` / `destructive_ddl`. Query errors are `decision: "error"` with `error_kind` + `sqlstate`.
 
@@ -392,6 +392,26 @@ being averaged away.
 Tables are generated in FK topological order (cycles rejected). Child FK values are drawn from the parent's generated keys; `pool_strategy: !projection { unique: true }` samples them without replacement. `--seed` derives a stable per-table RNG stream. See [UserGuide.md](UserGuide.md) §10 for the rules YAML reference.
 
 Benchmarks: Case A (synthetic 4-column vs SDV-GC, [report](tests/benchmark/REPORT.md)), P1 (SynMeter real single-table, Adult-only: Wasserstein / MLA / QueryError gates, [report](tests/benchmark/p1/REPORT.md)) and P2 (ogagila multi-table FK: insert/orphan/amount-on-grid gated; fan-out KS recorded, [report](tests/benchmark/p2/REPORT.md)) live under `tests/benchmark/` with gates enforced by the `synth-benchmark` CI workflow (P2 is dispatch-only). Case B (CTGAN/TabDDPM/GReaT) and Case C (HMA/ClavaDDPM) comparisons are out of scope for this milestone; SynMeter/torch/SDV exist only in the benchmark venv, never in `Cargo.toml`.
+
+### Bulk load data files
+
+Load generated or user-supplied data files (JSONL / JSON array / CSV) back into an **existing** database: `load` never creates tables and does no schema mapping, so data files must match the target table's columns and types. CLI-only, needs `--allow-write`.
+
+```bash
+# Load every *.jsonl|json|csv file in the directory, FK-safe order
+hepta_dbcli --allow-write load --name dev --data synth-out
+
+# Plan only: show order, files, row counts; writes nothing
+hepta_dbcli --allow-write load --name dev --data synth-out --dry-run
+
+# Restrict to a subset and qualify the schema
+hepta_dbcli --allow-write load --name dev --data synth-out --tables users,orders --schema testdb
+
+# Force a format instead of auto-discovery
+hepta_dbcli --allow-write load --name dev --data synth-out --format csv
+```
+
+Tables load parents-first (FK topological order; cycles rejected). Each table runs in its own transaction with fail-fast rollback; if a later table fails the error lists the completed set. Per-table intent/outcome events go to the audit ledger (row counts only, never row data). CSV semantics: empty unquoted field = NULL, quoted `""` = empty string, headers are matched by name.
 
 ### Cross-database delta-diff
 

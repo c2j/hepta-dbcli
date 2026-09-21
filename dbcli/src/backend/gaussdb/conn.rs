@@ -42,8 +42,8 @@ impl gaussdb::types::ToSql for ParamValue {
         use gaussdb::types::Type;
         match (self, ty) {
             (ParamValue::Null, _) => Option::<String>::None.to_sql(ty, out),
-            (ParamValue::Int(v), &Type::INT2) => (*v as i16).to_sql(ty, out),
-            (ParamValue::Int(v), &Type::INT4) => (*v as i32).to_sql(ty, out),
+            (ParamValue::Int(v), &Type::INT2) => to_sql_int_as_i16(*v)?.to_sql(ty, out),
+            (ParamValue::Int(v), &Type::INT4) => to_sql_int_as_i32(*v)?.to_sql(ty, out),
             (ParamValue::Int(v), &Type::INT8) => v.to_sql(ty, out),
             (ParamValue::Float(v), &Type::FLOAT4) => (*v as f32).to_sql(ty, out),
             (ParamValue::Float(v), &Type::FLOAT8) => v.to_sql(ty, out),
@@ -128,25 +128,41 @@ impl gaussdb::types::ToSql for ParamValue {
 /// (introspection SQL passes schema/table names), numbers become i64/f64 so
 /// the driver picks the matching wire type, and arrays/objects stringify as
 /// before (JSON columns accept their text form).
-fn bind_params(params: &[Value]) -> Vec<ParamValue> {
+fn bind_params(params: &[Value]) -> Result<Vec<ParamValue>, String> {
     params
         .iter()
-        .map(|v| match v {
-            Value::Null => ParamValue::Null,
-            Value::Bool(b) => ParamValue::Bool(*b),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    ParamValue::Int(i)
-                } else if let Some(u) = n.as_u64() {
-                    ParamValue::Int(i64::try_from(u).unwrap_or(i64::MAX))
-                } else {
-                    ParamValue::Float(n.as_f64().unwrap_or_default())
+        .map(|v| {
+            Ok(match v {
+                Value::Null => ParamValue::Null,
+                Value::Bool(b) => ParamValue::Bool(*b),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        ParamValue::Int(i)
+                    } else if let Some(u) = n.as_u64() {
+                        // A u64 above i64::MAX cannot be represented; fail the
+                        // statement instead of silently clamping to i64::MAX.
+                        ParamValue::Int(i64::try_from(u).map_err(|_| {
+                            format!("integer {u} out of range for 64-bit signed binding")
+                        })?)
+                    } else {
+                        ParamValue::Float(n.as_f64().unwrap_or_default())
+                    }
                 }
-            }
-            Value::String(s) => ParamValue::Text(s.clone()),
-            other => ParamValue::Text(other.to_string()),
+                Value::String(s) => ParamValue::Text(s.clone()),
+                other => ParamValue::Text(other.to_string()),
+            })
         })
         .collect()
+}
+
+/// Narrow an i64 to i16 for INT2 binding, rejecting silent truncation.
+fn to_sql_int_as_i16(v: i64) -> Result<i16, String> {
+    i16::try_from(v).map_err(|_| format!("integer {v} out of range for smallint (i16)"))
+}
+
+/// Narrow an i64 to i32 for INT4 binding, rejecting silent truncation.
+fn to_sql_int_as_i32(v: i64) -> Result<i32, String> {
+    i32::try_from(v).map_err(|_| format!("integer {v} out of range for integer (i32)"))
 }
 
 /// Parse a timestamp text form into a NaiveDateTime: full RFC3339, the
@@ -200,7 +216,7 @@ impl DbConn for GaussdbConn {
     }
 
     async fn exec(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, DbError> {
-        let bound = bind_params(params);
+        let bound = bind_params(params).map_err(|e| DbError::query(format!("exec: bind: {e}")))?;
         let param_refs: Vec<&(dyn gaussdb::types::ToSql + Sync)> = bound
             .iter()
             .map(|p| p as &(dyn gaussdb::types::ToSql + Sync))
@@ -275,12 +291,32 @@ mod tests {
             serde_json::json!(null),
             serde_json::json!("text"),
         ];
-        let bound = bind_params(&params);
+        let bound = bind_params(&params).expect("plain scalars must bind");
         assert!(matches!(bound[0], ParamValue::Int(7)));
         assert!(matches!(bound[1], ParamValue::Int(-3)));
         assert!(matches!(bound[2], ParamValue::Float(f) if f == 1.5));
         assert!(matches!(bound[3], ParamValue::Bool(true)));
         assert!(matches!(bound[4], ParamValue::Null));
         assert!(matches!(bound[5], ParamValue::Text(ref s) if s == "text"));
+    }
+    #[test]
+    fn bind_params_reject_u64_above_i64_max() {
+        let params = vec![serde_json::json!(18446744073709551615u64)];
+        let err = bind_params(&params).expect_err("u64 above i64::MAX must error");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn to_sql_int_narrowing_rejects_overflow() {
+        // i64 value that does not fit i16 bound to an INT2 column must error,
+        // not silently truncate to the low 16 bits.
+        let err = to_sql_int_as_i16(70_000).expect_err("70000 does not fit i16");
+        assert!(err.contains("out of range"), "got: {err}");
+        assert!(to_sql_int_as_i16(32_767).is_ok());
+        assert!(to_sql_int_as_i16(-32_768).is_ok());
+
+        let err = to_sql_int_as_i32(3_000_000_000).expect_err("3e9 does not fit i32");
+        assert!(err.contains("out of range"), "got: {err}");
+        assert!(to_sql_int_as_i32(2_147_483_647).is_ok());
     }
 }

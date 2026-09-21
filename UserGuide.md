@@ -14,8 +14,9 @@
 8. [MCP 服务器模式](#8-mcp-服务器模式)
 9. [跨库比对](#9-跨库比对-delta-diff)
 10. [合成数据生成](#10-合成数据生成-synth)
-11. [进阶用法](#11-进阶用法)
-12. [错误排查](#12-错误排查)
+11. [数据回灌](#11-数据回灌-load)
+12. [进阶用法](#12-进阶用法)
+13. [错误排查](#13-错误排查)
 
 ---
 
@@ -1237,9 +1238,40 @@ CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（
 
 ---
 
-## 11. 进阶用法
+## 11. 数据回灌 (load)
 
-### 11.1 多连接切换
+把 `synth generate` 的产物（或任何同结构的 JSONL / JSON 数组 / CSV 文件）批量装回**已存在**的数据库。CLI-only，需要 `--allow-write`；MCP 不暴露。
+
+**合同：`load` 只装数据，不做 schema 映射、不做 DDL。** 目标表必须已存在，数据文件的列名和类型必须与目标表匹配（CSV 表头按名字对齐，顺序可以不同）。
+
+```bash
+# 装载目录下全部 *.jsonl|json|csv 文件，FK 安全顺序（父表先装）
+hepta_dbcli --allow-write load --name dev --data synth-out
+
+# 只看计划（顺序、文件、行数），不写库
+hepta_dbcli --allow-write load --name dev --data synth-out --dry-run
+
+# 只装子集；用 --schema 限定目标 schema
+hepta_dbcli --allow-write load --name dev --data synth-out \
+  --tables users,orders --schema testdb
+
+# 指定格式（默认 auto：jsonl → json → csv）
+hepta_dbcli --allow-write load --name dev --data synth-out --format csv
+```
+
+要点：
+
+- 每张表一个事务，失败快速回滚；多表装载时后失败的表不会回滚已完成的表（错误信息会列出 completed 集合）。
+- CSV 语义：未加引号的空字段 = NULL，`""` = 空字符串；引号内逗号/换行/转义按 RFC 4180。
+- 整数值必须落在目标列类型范围内（GaussDB 绑定溢出会报错而不是截断）。
+- 连接选择用 `--name`；不存在的连接名直接报错退出，不会静默落到默认连接。
+- 每张表写 intent/outcome 审计事件（只有行数，不含行数据）。
+
+---
+
+## 12. 进阶用法
+
+### 12.1 多连接切换
 
 ```bash
 # CLI 模式切换连接
@@ -1253,7 +1285,7 @@ $ .connect prod
 hepta_dbcli interactive -- connected to 'prod'
 ```
 
-### 11.2 超时控制
+### 12.2 超时控制
 
 ```bash
 # 设置单条 SQL 最大 5 分钟
@@ -1266,7 +1298,7 @@ hepta_dbcli cli --connection-max-lifetime 10min --sql "..."
 hepta_dbcli cli --timeout-action disconnect --sql "..."
 ```
 
-### 11.3 使用 PolarDB-X
+### 12.3 使用 PolarDB-X
 
 hepta_dbcli 完全兼容 PolarDB-X（基于 MySQL 协议）：
 
@@ -1291,7 +1323,7 @@ hepta_dbcli cli --sql "SELECT VERSION()"
 
 > **注意**：PolarDB-X 默认端口为 `8527`（非 3306），默认用户 `polardbx_root`。
 
-### 11.4 本地三后端 Docker
+### 12.4 本地三后端 Docker
 
 仓库 `tests/` 下有现成 compose 与 TOML：
 
@@ -1305,7 +1337,7 @@ hepta_dbcli --config tests/docker-all.toml check --name gaussdb
 
 GaussDB 测试配置见 `tests/docker-gaussdb.toml`（`sslmode = "disable"`）。
 
-### 11.5 在脚本中使用
+### 12.5 在脚本中使用
 
 ```bash
 #!/bin/bash
@@ -1326,7 +1358,7 @@ esac
 
 ---
 
-## 12. 错误排查
+## 13. 错误排查
 
 ### 12.1 常见错误
 
@@ -1390,6 +1422,7 @@ hepta_dbcli --help
 hepta_dbcli cli --help
 hepta_dbcli delta-diff --help
 hepta_dbcli synth --help
+hepta_dbcli load --help
 
 # 连接检查
 hepta_dbcli check
