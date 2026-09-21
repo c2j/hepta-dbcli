@@ -150,8 +150,10 @@ pub(crate) async fn run(
         return EXIT_ERROR;
     }
 
-    // Which tables exist? Files without a DB table are an error; DB tables
-    // without a file are skipped and reported.
+    // Which tables exist? Issue #106: the schema in effect (--schema, else
+    // the connection default) takes part in the match so tables from other
+    // schemas do not satisfy it, and a schema with no tables fails with a
+    // schema-level error. Without either, matching stays by bare table name.
     let list_sql = conn.dialect().list_tables().to_string();
     let listed = match conn.query(&list_sql).await {
         Ok(result) => result,
@@ -160,8 +162,15 @@ pub(crate) async fn run(
             return EXIT_ERROR;
         }
     };
-    let db_tables = plan::parse_db_tables(&listed);
-    let (matched, skipped) = match plan::match_files_to_db_tables(&files, &db_tables) {
+    let effective_schema = args
+        .schema
+        .clone()
+        .or_else(|| target.default_schema.clone());
+    let (matched, skipped) = match plan::match_files_to_db_tables_in_schema(
+        &files,
+        &listed,
+        effective_schema.as_deref(),
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {e}");

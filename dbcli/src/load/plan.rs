@@ -245,6 +245,39 @@ pub(crate) fn match_files_to_db_tables(
     Ok((matched, without_file))
 }
 
+/// Issue #106: schema-aware variant of `match_files_to_db_tables`. When a
+/// schema is in effect (`--schema`, else the connection default), only tables
+/// listed under that schema count as existing, and a schema that holds none of
+/// the listed tables fails with its own error instead of the misleading
+/// table-level "no matching table". `schema == None` keeps the old
+/// cross-schema behaviour (list everything, match by bare table name).
+pub(crate) fn match_files_to_db_tables_in_schema(
+    files: &[TableFile],
+    listed: &QueryResult,
+    schema: Option<&str>,
+) -> Result<(Vec<TableFile>, Vec<String>), String> {
+    let Some(schema) = schema.filter(|s| !s.is_empty()) else {
+        let db_tables = parse_db_tables(listed);
+        return match_files_to_db_tables(files, &db_tables);
+    };
+
+    let listed_schemas = parse_table_schemas(listed);
+    let tables_in_schema: Vec<&str> = listed_schemas
+        .iter()
+        .filter(|(_, s)| s.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(schema)))
+        .map(|(t, _)| t.as_str())
+        .collect();
+    if tables_in_schema.is_empty() {
+        return Err(format!(
+            "schema '{schema}' has no tables (does it exist? load never creates tables or schemas)"
+        ));
+    }
+
+    let db_tables: Vec<String> = tables_in_schema.iter().map(|t| (*t).to_string()).collect();
+    let (matched, skipped) = match_files_to_db_tables(files, &db_tables)?;
+    Ok((matched, skipped))
+}
+
 /// Build the full plan: deterministic topo order of the matched tables with
 /// filename order as tiebreak.
 pub(crate) fn build_plan(
@@ -560,6 +593,63 @@ mod tests {
         let err = match_files_to_db_tables(&files, &db_tables).unwrap_err();
         assert!(err.contains("ghost"), "error must name the file: {err}");
         assert!(err.contains("never creates tables"), "{err}");
+    }
+
+    /// Issue #106: `--schema nonexistent` must fail with a schema-level
+    /// error, not the misleading "no matching table" one.
+    #[test]
+    fn should_error_on_schema_with_no_tables() {
+        let files = vec![file("customers", &["id"], 1)];
+        let listed = listed_result(&[("testdb", "customers")]);
+        let err = match_files_to_db_tables_in_schema(&files, &listed, Some("ghost")).unwrap_err();
+        assert!(
+            err.contains("schema 'ghost' has no tables"),
+            "schema-level error must name the schema: {err}"
+        );
+        assert!(
+            err.contains("does it exist"),
+            "error must point at the schema qualifier: {err}"
+        );
+    }
+
+    /// Issue #106: with an explicit --schema, tables listed under other
+    /// schemas must not satisfy the match (the schema takes part in
+    /// filtering), and a table only present in another schema is reported
+    /// as unmatched.
+    #[test]
+    fn should_filter_db_tables_by_the_explicit_schema() {
+        let files = vec![file("customers", &["id"], 1)];
+        let listed = listed_result(&[
+            ("shop", "customers"), // same name, different schema
+            ("testdb", "unrelated"),
+        ]);
+        let err = match_files_to_db_tables_in_schema(&files, &listed, Some("testdb")).unwrap_err();
+        assert!(
+            err.contains("customers"),
+            "customers lives in shop, not testdb: {err}"
+        );
+
+        // And a real match binds only within the requested schema.
+        let listed2 = listed_result(&[
+            ("shop", "customers"),
+            ("testdb", "customers"),
+            ("testdb", "unrelated"),
+        ]);
+        let (matched, skipped) =
+            match_files_to_db_tables_in_schema(&files, &listed2, Some("testdb")).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(skipped, vec!["unrelated".to_string()]);
+    }
+
+    /// Issue #106: without --schema the old cross-schema behaviour holds
+    /// (a URL connection without a default schema still loads what it sees).
+    #[test]
+    fn should_match_across_schemas_when_no_schema_is_given() {
+        let files = vec![file("customers", &["id"], 1)];
+        let listed = listed_result(&[("shop", "customers")]);
+        let (matched, _skipped) =
+            match_files_to_db_tables_in_schema(&files, &listed, None).unwrap();
+        assert_eq!(matched.len(), 1);
     }
 
     #[test]

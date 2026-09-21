@@ -536,6 +536,43 @@ mod duckdb_tests {
     fn json_num(n: i64) -> serde_json::Value {
         serde_json::Value::Number(n.into())
     }
+
+    // ─── Issue #106: --schema takes part in table filtering ──────────────
+
+    #[test]
+    fn load_duckdb_nonexistent_schema_fails_with_schema_level_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        shop_workspace(root.path());
+
+        // --schema ghost: the schema holds none of the listed tables, so the
+        // error must point at the schema qualifier, not "no matching table".
+        let (status, _stdout, stderr) = run_load_jsonl(root.path(), &["--schema", "ghost"]);
+        assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+        assert!(
+            stderr.contains("schema 'ghost' has no tables"),
+            "schema-level error expected: {stderr}"
+        );
+        assert!(
+            stderr.contains("does it exist"),
+            "error must hint the schema may not exist: {stderr}"
+        );
+        assert!(
+            !stderr.contains("no matching table"),
+            "must not fall through to the table-level error: {stderr}"
+        );
+        assert_eq!(count_rows(root.path(), "users"), 0);
+        assert_eq!(count_rows(root.path(), "orders"), 0);
+
+        // The main schema still loads fine with an explicit --schema main
+        // (schema participates in matching but does not break valid loads).
+        let (status2, stdout2, stderr2) = run_load_jsonl(root.path(), &["--schema", "main"]);
+        assert!(
+            status2.success(),
+            "explicit main schema must load, stderr: {stderr2}, stdout: {stdout2}"
+        );
+        assert_eq!(count_rows(root.path(), "users"), 2);
+        assert_eq!(count_rows(root.path(), "orders"), 2);
+    }
 }
 
 // ─── MySQL (env-gated) ──────────────────────────────────────────────────
