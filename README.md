@@ -347,6 +347,8 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 
 Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dry-run` exits `0` on success.
 
+`bucketdiff` buckets by integer key ranges (one `MIN/MAX` probe, then indexed range pulls) only when a single integer key is available; keyless tables and non-integer keys go straight to `MOD(rowHash, N)` content bucketing with no probe. A probe statement the engine rejects is reported as an error with a strategy hint instead of being silently downgraded.
+
 See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--rtrim-char-columns`.
 
 ### Synthetic data generation

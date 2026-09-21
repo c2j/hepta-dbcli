@@ -827,6 +827,13 @@ DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致（含 `
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-run
 ```
 
+`bucketdiff` 有两种分桶方式，按「是否存在可用的单列整数键」自动选择：
+
+- **有单列整数键**（类型为整数/数值/decimal 等）：先探针一次 `MIN/MAX` 拿键域，再按键区间分桶，每个桶的拉取都走索引范围。
+- **无键表，或键类型不可能是整数**（VARCHAR/日期/JSON 等）：不做任何探针，直接按 `MOD(rowHash, N)` 内容分桶。
+
+探针只在能构成整数键域时才发；探针语句本身被库拒绝（例如键列不支持 `MIN()`）会直接报错并给出替代策略提示，不会静默降级。键没有单列整数形态时请改用 `--strategy naivediff` 或 `--strategy keyeddiff`。
+
 ### 9.4 一致性与复核
 
 - `--consistency snapshot`（默认）：单侧快照，snapshot 模式下默认开启差异二次复核
