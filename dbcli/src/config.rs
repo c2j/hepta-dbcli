@@ -573,6 +573,21 @@ pub(crate) fn resolve_single_connection(
     config_path: Option<PathBuf>,
     base_tc: Option<&TimeoutConfig>,
 ) -> Result<ResolvedConnection, String> {
+    let env_password = std::env::var("HEPTA_DBCLI_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty());
+    resolve_single_connection_inner(conn, config_path, base_tc, env_password)
+}
+
+/// Testable seam for [`resolve_single_connection`]: the environment password
+/// is passed in explicitly so tests never depend on the process environment
+/// (#115 review: an empty env value must never clobber an inline password).
+fn resolve_single_connection_inner(
+    conn: &NamedConnection,
+    config_path: Option<PathBuf>,
+    base_tc: Option<&TimeoutConfig>,
+    env_password: Option<String>,
+) -> Result<ResolvedConnection, String> {
     let is_duckdb = is_duckdb_driver(conn.driver.as_deref());
 
     let url = if let Some(ref u) = conn.url {
@@ -604,14 +619,10 @@ pub(crate) fn resolve_single_connection(
         match conn.password.as_deref() {
             Some(p) if p == KEYRING_SENTINEL => PasswordSource::Keyring,
             Some(p) => PasswordSource::Plaintext(p.to_string()),
-            None => {
-                // Check env var
-                if let Ok(_pw) = std::env::var("HEPTA_DBCLI_PASSWORD") {
-                    PasswordSource::EnvVar
-                } else {
-                    PasswordSource::None
-                }
-            }
+            // Set-but-empty counts as unset: an empty env value must never
+            // replace a real secret (#115 review).
+            None if env_password.is_some() => PasswordSource::EnvVar,
+            None => PasswordSource::None,
         }
     };
 
@@ -647,24 +658,22 @@ pub(crate) fn resolve_single_connection(
             )
         }
     } else if matches!(password_source, PasswordSource::EnvVar) {
-        let pw = std::env::var("HEPTA_DBCLI_PASSWORD").unwrap_or_default();
+        // password_source == EnvVar implies env_password is Some (see the
+        // classification above). A URL that already carries a password keeps
+        // it, matching the HEPTA_DBCLI_URL semantics (#115 review).
         if let Some(ref u) = conn.url {
-            inject_password_into_url(u, &pw)?
+            match env_password.as_deref() {
+                Some(pw) if !url_userinfo_has_password(u) => inject_password_into_url(u, pw)?,
+                _ => u.clone(),
+            }
         } else {
+            let pw = env_password.as_deref().unwrap_or_default();
             let host = conn.host.as_deref().unwrap();
             let port = conn.port.unwrap_or(default_port_for_scheme(driver_scheme));
             let user = conn.user.as_deref().unwrap();
             let database = conn.database.as_deref();
             let sslmode = conn.sslmode.as_deref();
-            build_db_url(
-                driver_scheme,
-                host,
-                port,
-                user,
-                Some(&pw),
-                database,
-                sslmode,
-            )
+            build_db_url(driver_scheme, host, port, user, Some(pw), database, sslmode)
         }
     } else {
         url
@@ -1292,6 +1301,59 @@ database = "db"
             resolve_env_var_connection_inner("mysql://user@host:3306/db".to_string(), None)
                 .unwrap();
         assert_eq!(resolved.connection_url, "mysql://user@host:3306/db");
+    }
+
+    // ─── resolve_single_connection EnvVar+URL regression tests (#115 review) ──
+
+    fn env_var_url_conn(url: &str) -> NamedConnection {
+        NamedConnection {
+            name: "dev".to_string(),
+            url: Some(url.to_string()),
+            driver: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            schema: None,
+            sslmode: None,
+            statement_timeout: None,
+            connection_max_lifetime: None,
+        }
+    }
+
+    #[test]
+    fn single_connection_env_url_empty_env_keeps_inline_password() {
+        // HEPTA_DBCLI_PASSWORD set-but-empty must not replace a real inline
+        // secret with nothing (user:secret@ -> user:@).
+        let conn = env_var_url_conn("mysql://user:inline@host:3306/db");
+        let resolved =
+            resolve_single_connection_inner(&conn, None, None, Some(String::new())).unwrap();
+        assert_eq!(resolved.connection_url, "mysql://user:inline@host:3306/db");
+    }
+
+    #[test]
+    fn single_connection_env_url_nonempty_env_is_injected_when_no_inline_password() {
+        let conn = env_var_url_conn("mysql://user@host:3306/db");
+        let resolved =
+            resolve_single_connection_inner(&conn, None, None, Some("s3cret".into())).unwrap();
+        assert_eq!(resolved.connection_url, "mysql://user:s3cret@host:3306/db");
+    }
+
+    #[test]
+    fn single_connection_env_url_inline_password_wins_over_env() {
+        let conn = env_var_url_conn("mysql://user:inline@host:3306/db");
+        let resolved =
+            resolve_single_connection_inner(&conn, None, None, Some("s3cret".into())).unwrap();
+        assert_eq!(resolved.connection_url, "mysql://user:inline@host:3306/db");
+    }
+
+    #[test]
+    fn single_connection_env_url_without_env_stays_passwordless() {
+        let conn = env_var_url_conn("mysql://user@host:3306/db");
+        let resolved = resolve_single_connection_inner(&conn, None, None, None).unwrap();
+        assert_eq!(resolved.connection_url, "mysql://user@host:3306/db");
+        assert!(matches!(resolved.password_source, PasswordSource::None));
     }
 
     #[test]
