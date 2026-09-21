@@ -25,6 +25,12 @@ pub(crate) struct TablePlan {
     pub compare_columns: Vec<String>,
     /// Normalization input specs, parallel to compare_columns.
     pub norm_specs: Vec<ColumnNormSpec>,
+    /// Normalization input specs for the key columns, parallel to
+    /// `key_columns`. Populated from the table's columns, so a key keeps its
+    /// declared type even when --exclude-columns drops it from the compare
+    /// set: routing (`is_int_key`), probe gating and key hashing must not
+    /// treat an excluded key as a column of unknown type.
+    pub key_specs: Vec<ColumnNormSpec>,
     /// Non-fatal issues (e.g. excluded LOB/JSON columns).
     pub warnings: Vec<String>,
 }
@@ -72,9 +78,17 @@ impl TablePlan {
     /// normalization spec report `true` — unknown types are left to the
     /// probe itself instead of being guessed away here.
     pub(crate) fn column_type_may_be_integer(&self, name: &str) -> bool {
-        find_unique_ci(&self.norm_specs, name, |spec| &spec.name)
+        self.spec_for(name)
             .map(|spec| Self::is_numeric_type(&spec.data_type))
             .unwrap_or(true)
+    }
+
+    /// Declared-type spec for a column: the key list is consulted first so a
+    /// key excluded from the compare set (`--columns`/`--exclude-columns`)
+    /// keeps its type instead of looking like an unknown column.
+    pub(crate) fn spec_for(&self, name: &str) -> Option<&ColumnNormSpec> {
+        find_unique_ci(&self.key_specs, name, |spec| &spec.name)
+            .or_else(|| find_unique_ci(&self.norm_specs, name, |spec| &spec.name))
     }
 
     /// Render §九 normalized expressions in compare order.
@@ -121,7 +135,7 @@ impl TablePlan {
     pub(crate) fn string_key_flags_for(&self, keys: &[String]) -> Vec<bool> {
         keys.iter()
             .map(|k| {
-                find_unique_ci(&self.norm_specs, k, |spec| &spec.name)
+                self.spec_for(k)
                     .map(|s| Self::key_is_string(&s.data_type))
                     .unwrap_or(false)
             })
@@ -132,8 +146,13 @@ impl TablePlan {
         let q = dialect.identifier_quote();
         let mut exprs = Vec::new();
         for k in &self.key_columns {
-            if let Some(spec) = self.norm_specs.iter().find(|s| &s.name == k) {
-                exprs.push(dialect.normalize_expr(spec)?);
+            // Prefer the key's own spec; an unnormalizable key type falls back
+            // to the raw identifier, as before.
+            if let Some(expr) = self
+                .spec_for(k)
+                .and_then(|spec| dialect.normalize_expr(spec).ok())
+            {
+                exprs.push(expr);
             } else {
                 exprs.push(crate::backend::quote_ident(q, k));
             }
@@ -306,11 +325,20 @@ pub(crate) async fn build_table_plan(
         !explicit_key.is_empty(),
     );
 
+    // Key specs come from the discovered columns rather than from the compare
+    // set: a key that --columns/--exclude-columns removed still has to answer
+    // "what type is this key?" for routing, probe gating and key hashing.
+    let key_specs: Vec<ColumnNormSpec> = key_columns
+        .iter()
+        .filter_map(|k| find_column_ci(&columns, k).map(|col| col.norm_spec(rtrim_char_columns)))
+        .collect();
+
     Ok(TablePlan {
         url_scheme: conn.dialect().url_scheme().to_string(),
         key_columns,
         compare_columns,
         norm_specs,
+        key_specs,
         warnings,
     })
 }
@@ -619,6 +647,7 @@ mod tests {
                 rtrim_fixed_char: false,
             }],
             warnings: vec![],
+            key_specs: vec![],
         };
         let exprs = plan
             .identity_hash_exprs(&MySqlDialect)
@@ -656,6 +685,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
+            key_specs: vec![],
         };
 
         assert_eq!(
@@ -1270,6 +1300,88 @@ mod tests {
                 .any(|w| w.contains("exclude-columns") && w.contains("c_dec")),
             "{:?}",
             plan.warnings
+        );
+    }
+
+    // ── an excluded key keeps its declared type (review of #109) ──
+
+    #[tokio::test]
+    async fn excluded_non_integer_key_is_still_known_to_be_non_integer() {
+        let mut cols = verify_columns();
+        cols.rows.push(col_row("payload", "text", true, ""));
+        cols.row_count += 1;
+        let mut conn = mock(cols, primary_index("payload"));
+        let exclude = vec!["payload".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.key_columns, vec!["payload"]);
+        assert!(!plan.compare_columns.contains(&"payload".to_string()));
+        assert!(
+            plan.key_specs
+                .iter()
+                .any(|s| s.name == "payload" && s.data_type == "text"),
+            "the key spec must outlive the exclusion: {:?}",
+            plan.key_specs
+        );
+        assert!(
+            !plan.column_type_may_be_integer("payload"),
+            "a text key cannot supply an integer key domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_string_key_still_flags_as_string() {
+        let mut cols = verify_columns();
+        cols.rows.push(col_row("skey", "varchar(64)", false, ""));
+        cols.row_count += 1;
+        let mut conn = mock(cols, primary_index("skey"));
+        let exclude = vec!["skey".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plan.string_key_flags(),
+            vec![true],
+            "keyset paging needs the string flag even when the key is not compared"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_key_hashes_like_the_compared_key() {
+        let exclude = vec!["id".to_string()];
+        let mut with_exclusion = mock(verify_columns(), primary_index("id"));
+        let excluded = build_table_plan(
+            &mut with_exclusion,
+            "verify",
+            "verify_t",
+            &[],
+            &[],
+            false,
+            &exclude,
+        )
+        .await
+        .unwrap();
+        let mut without_exclusion = mock(verify_columns(), primary_index("id"));
+        let compared = build_table_plan(
+            &mut without_exclusion,
+            "verify",
+            "verify_t",
+            &[],
+            &[],
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let dialect = MySqlDialect;
+        assert_eq!(
+            excluded.key_hash_exprs(&dialect).unwrap(),
+            compared.key_hash_exprs(&dialect).unwrap(),
+            "the key hash must not degrade to a raw identifier when the key is excluded"
         );
     }
 }

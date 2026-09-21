@@ -388,6 +388,7 @@ mod tests {
                 })
                 .collect(),
             warnings: Vec::new(),
+            key_specs: vec![],
         }
     }
 

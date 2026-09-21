@@ -423,6 +423,7 @@ mod tests {
                     .collect(),
                 norm_specs: vec![],
                 warnings: vec![],
+                key_specs: vec![],
             },
         }
     }

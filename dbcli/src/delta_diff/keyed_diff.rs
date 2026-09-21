@@ -576,6 +576,7 @@ mod tests {
                 compare_columns: key_columns.iter().map(|name| (*name).into()).collect(),
                 norm_specs: vec![],
                 warnings: vec![],
+                key_specs: vec![],
             },
         }
     }
