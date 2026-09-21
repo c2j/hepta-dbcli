@@ -1,5 +1,5 @@
 use crate::synth::export::{export, ExportFormat};
-use crate::synth::generator::{generate, generate_unique_primary_keys, GeneratorConfig};
+use crate::synth::generator::{generate_unique_primary_keys, GeneratorConfig};
 use crate::synth::marginal::{
     compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
     NormalParams,
@@ -708,12 +708,11 @@ pub fn run_generate(
         enforce_min_max_values: flags.enforce_min_max_values,
     };
 
-    let data = if format == "sql" {
-        // Unique primary keys only matter where a relational constraint will
-        // be applied; see `generate_unique_primary_keys` (issue #82).
+    let data = {
+        // Every export format round-trips through `load`, so primary-key
+        // uniqueness is enforced on all paths (issue #103; formerly the SQL
+        // branch only, see `generate_unique_primary_keys` / issue #82).
         generate_unique_primary_keys(&models, &rules, &config)?
-    } else {
-        generate(&models, &rules, &config)?
     };
 
     let export_format = match format {
@@ -1105,7 +1104,7 @@ mod tests {
                 strategy: crate::synth::rules::TableStrategy::default(),
             }],
         };
-        let data = generate(
+        let data = crate::synth::generator::generate(
             &models,
             &rules,
             &GeneratorConfig {
