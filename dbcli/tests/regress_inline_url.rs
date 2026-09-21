@@ -161,6 +161,144 @@ fn mcp_rejects_global_url_loudly() {
 }
 
 #[test]
+fn mcp_get_table_metadata_resolves_schema_and_fails_loudly_for_missing_table() {
+    // Issue #100: a schema-less get_table_metadata must resolve the
+    // connection's own current schema (DuckDB `main`), never "public", and
+    // a nonexistent table must yield a JSON-RPC error — never a silent
+    // {"columns":[],"indexes":[]} that reads as success.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("meta.duckdb");
+    seed_duckdb(&db, "INSERT INTO t VALUES (1,'a')");
+    let cfg = dir.path().join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!("[connections.test]\nurl = \"duckdb://{}\"\n", db.display()),
+    )
+    .expect("write cfg");
+
+    let call = |payload: String| {
+        let (mut mcp_cmd, _home) = isolated(Command::new(BIN));
+        let mut child = mcp_cmd
+            .arg("--config")
+            .arg(&cfg)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mcp");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write stdio");
+        let out = child.wait_with_output().expect("wait");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    fn rpc(id: u64, tool: &str, args: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args}
+        })
+        .to_string()
+    }
+
+    fn handshake() -> String {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "0"}
+            }
+        });
+        format!(
+            "{init}\n{}\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        )
+    }
+
+    /// Parse each stdout line as JSON-RPC and return the entry with `id`.
+    fn response_for<'a>(stdout: &'a str, id: u64) -> serde_json::Value {
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|msg| msg.get("id") == Some(&serde_json::json!(id)))
+            .unwrap_or_else(|| panic!("no JSON-RPC response with id {id} in: {stdout}"))
+    }
+
+    /// The tool result payload of a successful call (content[0].text parsed).
+    fn tool_payload(result: &serde_json::Value) -> serde_json::Value {
+        let text = result["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool text content");
+        serde_json::from_str(text).expect("tool payload JSON")
+    }
+
+    let handshake = handshake();
+
+    // 1. Schema-less call resolves the connection's current schema and
+    //    returns the real columns.
+    let payload = rpc(
+        2,
+        "get_table_metadata",
+        serde_json::json!({"connection_name": "test", "table_name": "t"}),
+    );
+    let stdout = call(format!("{handshake}{payload}\n"));
+    let response = response_for(&stdout, 2);
+    assert!(
+        response.get("error").is_none(),
+        "schema-less metadata for an existing table must succeed: {stdout}"
+    );
+    let payload_json = tool_payload(&response);
+    let columns = payload_json["columns"].as_array().expect("columns array");
+    let names: Vec<&str> = columns
+        .iter()
+        .filter_map(|c| c["column_name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"id") && names.contains(&"v"),
+        "must return the DuckDB table's real columns (schema resolved to main): {stdout}"
+    );
+
+    // 2. A nonexistent table (schema resolved automatically) must fail
+    //    loudly with a JSON-RPC error, not a silent empty result.
+    let payload = rpc(
+        3,
+        "get_table_metadata",
+        serde_json::json!({"connection_name": "test", "table_name": "no_such_table"}),
+    );
+    let stdout = call(format!("{handshake}{payload}\n"));
+    let response = response_for(&stdout, 3);
+    assert!(
+        response.get("error").is_some(),
+        "metadata for a missing table must be a JSON-RPC error: {stdout}"
+    );
+
+    // 3. Same for an explicit schema: empty metadata must never pass as
+    //    success.
+    let payload = rpc(
+        4,
+        "get_table_metadata",
+        serde_json::json!({
+            "connection_name": "test",
+            "table_name": "no_such_table",
+            "schema_name": "main"
+        }),
+    );
+    let stdout = call(format!("{handshake}{payload}\n"));
+    let response = response_for(&stdout, 4);
+    assert!(
+        response.get("error").is_some(),
+        "metadata for a missing table (explicit schema) must be a JSON-RPC error: {stdout}"
+    );
+}
+
+#[test]
 fn mcp_configless_startup_serves_inline_url_diff_and_rejects_named() {
     let dir = tempfile::tempdir().expect("tempdir");
     let left = dir.path().join("left.duckdb");

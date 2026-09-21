@@ -61,6 +61,10 @@ impl Dialect for GaussdbDialect {
         "SELECT version()::text AS version, current_database()::text AS database, current_user::text AS current_user, inet_server_addr()::text AS hostname, inet_server_port()::text AS port, NULL::text AS os, (SELECT setting FROM pg_settings WHERE name='server_encoding')::text AS charset, (SELECT setting FROM pg_settings WHERE name='lc_collate')::text AS collation, NULL::text AS version_comment"
     }
 
+    fn current_schema_sql(&self) -> Option<&str> {
+        Some("SELECT current_schema()::text")
+    }
+
     fn list_tables(&self) -> &str {
         "SELECT n.nspname AS schema_name, c.relname AS table_name, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' WHEN 'f' THEN 'foreign_table' WHEN 'p' THEN 'partitioned_table' END AS table_type, NULL AS engine, c.reltuples::bigint AS row_count, pg_total_relation_size(c.oid) AS total_size, obj_description(c.oid, 'pg_class') AS comment FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY n.nspname, c.relname"
     }
@@ -413,6 +417,16 @@ impl Dialect for GaussdbDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #100: GaussDB (PG family) resolves the schema-less default via
+    // current_schema().
+    #[test]
+    fn current_schema_sql_selects_current_schema() {
+        let sql = GaussdbDialect
+            .current_schema_sql()
+            .expect("gaussdb has one");
+        assert!(sql.contains("current_schema()"));
+    }
 
     #[test]
     fn foreign_keys_sql_escapes_quote_in_schema() {

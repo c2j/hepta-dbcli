@@ -20,6 +20,10 @@ impl Dialect for DuckDbDialect {
          version() AS version_comment"
     }
 
+    fn current_schema_sql(&self) -> Option<&str> {
+        Some("SELECT current_schema()")
+    }
+
     fn list_tables(&self) -> &str {
         "SELECT schema_name AS schema_name, table_name AS table_name, \
          'table' AS table_type, NULL AS engine, estimated_size AS row_count, \
@@ -388,6 +392,14 @@ fn bucket_cond(row_hash: &str, modulus: u64, bucket: u64) -> String {
 mod tests {
     use super::*;
     use crate::backend::NULL_SENTINEL;
+
+    // Issue #100: DuckDB's default schema is `main`, exposed via
+    // current_schema(); there is no "public".
+    #[test]
+    fn current_schema_sql_selects_current_schema() {
+        let sql = DuckDbDialect.current_schema_sql().expect("duckdb has one");
+        assert!(sql.to_ascii_lowercase().contains("current_schema()"));
+    }
 
     fn col(name: &str, ty: &str, nullable: bool) -> ColumnNormSpec {
         ColumnNormSpec {

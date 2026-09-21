@@ -145,6 +145,15 @@ pub trait Dialect: Send + Sync {
     /// Append a row-limiting clause to a SELECT query if it doesn't already have one.
     fn add_limit(&self, sql: &str, n: usize) -> String;
 
+    /// Query returning the connection's default schema in the first column of
+    /// the first row (issue #100): MySQL `DATABASE()`, PG-family and DuckDB
+    /// `current_schema()`, Oracle `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')`.
+    /// `None` when the dialect has no notion of a current schema; callers
+    /// then require an explicit schema instead of guessing (never "public").
+    fn current_schema_sql(&self) -> Option<&str> {
+        None
+    }
+
     /// Return an actionable hint when `sql` uses syntax this dialect does not
     /// support (e.g. MySQL-style `LIMIT` on Oracle). Default: no hint.
     fn statement_syntax_hint(&self, _sql: &str) -> Option<String> {
