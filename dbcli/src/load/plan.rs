@@ -428,12 +428,15 @@ fn stable_topo_order(nodes: &[String], edges: &[(String, String)]) -> Result<Vec
 /// Column-set validation. In strict mode (`--strict-columns`) the file columns
 /// must equal the DB columns (order-insensitive), matching the pre-#113
 /// behaviour. Otherwise a column the file omits is allowed when the table can
-/// absorb it (nullable, or it has a default) — it loads as NULL — and only a
+/// absorb it (nullable, or it has a default) — the INSERT simply leaves it
+/// out so the server default (or NULL) applies — and only a
 /// NOT NULL column with no default rejects. A column the file carries that the
 /// table does not is always rejected (load never creates columns).
 ///
-/// On success returns, per table, the set of omitted columns that will be
-/// filled with NULL, so the loader binds them instead of failing.
+/// On success returns, per table, the set of omitted columns the INSERT will
+/// not mention, so the loader keeps them out of the column list instead of
+/// binding explicit NULLs (issue #113 B PR review C5: binding NULL would
+/// override a column DEFAULT; omission lets the server decide).
 pub(crate) fn validate_column_sets(
     plan: &LoadPlan,
     db_columns: &std::collections::HashMap<String, Vec<DbColumn>>,
@@ -488,7 +491,7 @@ pub(crate) fn validate_column_sets(
             } else {
                 if !allowed.is_empty() {
                     message.push_str(&format!(
-                        "\n  missing in file (nullable, will insert NULL): {}",
+                        "\n  missing in file (omitted, server default or NULL applies): {}",
                         join_names(allowed.iter().map(|c| c.name.as_str()))
                     ));
                 }
@@ -1067,7 +1070,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("missing in file (nullable, will insert NULL): a, b"),
+            err.contains("missing in file (omitted, server default or NULL applies): a, b"),
             "{err}"
         );
     }

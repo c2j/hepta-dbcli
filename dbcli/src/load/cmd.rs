@@ -46,7 +46,8 @@ pub(crate) struct LoadArgs {
     pub dry_run: bool,
 
     /// Require the file columns to exactly match the table columns. Without
-    /// this, a missing nullable (or defaulted) column loads as NULL and only a
+    /// this, a missing nullable (or defaulted) column is left out of the
+    /// INSERT so the server default (or NULL) applies, and only a
     /// NOT NULL column with no default rejects (issue #113).
     #[arg(long)]
     pub strict_columns: bool,

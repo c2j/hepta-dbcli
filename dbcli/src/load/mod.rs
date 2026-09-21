@@ -225,7 +225,7 @@ pub(crate) async fn run(
     };
 
     // Column metadata for validation (issue #113 B: nullable/default flags
-    // decide which omitted columns can load as NULL).
+    // decide which omitted columns the INSERT may leave out).
     let mut db_columns: HashMap<String, Vec<plan::DbColumn>> = HashMap::new();
     for entry in &plan_data.entries {
         let Some(schema) = schema_of(&entry.table) else {

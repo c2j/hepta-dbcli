@@ -103,12 +103,15 @@ pub(crate) fn align_types(
 
 // ─── Row alignment ──────────────────────────────────────────────────────
 
-/// Align one file row to the plan column order, filling NULL for a column the
-/// file omits when `allowed_missing` approves it (issue #113 B: nullable or
-/// defaulted columns that synth could not train). JSONL/JSON key order can
-/// drift from the discovered column list, so every plan column is looked up by
-/// name (case-insensitive). A missing column that was NOT approved is a named
-/// error — plan validation rejects those, so reaching it here is defensive.
+/// Align one file row to `plan_columns` by name (case-insensitive), because
+/// JSONL/JSON key order can drift from the discovered column list. A missing
+/// column that was NOT approved is a named error — plan validation rejects
+/// those, so reaching it here is defensive. The `allowed_missing` arm keeps
+/// the function total for direct callers, but note that in the production
+/// call shape `plan_columns` IS the file column list (`entry.columns` comes
+/// from the file), so an approved-missing column never reaches this branch:
+/// the INSERT simply omits it and the server default (or NULL) applies
+/// (issue #113 B PR review C5).
 pub(crate) fn align_row_with_defaults(
     file_columns: &[String],
     row: &[serde_json::Value],
