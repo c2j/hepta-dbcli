@@ -471,9 +471,10 @@ impl BucketDiffer {
     }
 
     /// Probe the overlapping integer key domain [min, max] via MIN/MAX on
-    /// both sides. Returns `None` (with a stderr note) when either side has
-    /// no rows, all-NULL keys, non-integer keys, or the ranges are disjoint;
-    /// bucketdiff then keeps the legacy MOD(rowHash, N) bucketing.
+    /// both sides. Returns `None` (with a stderr note) when the table exposes
+    /// no usable integer key, when either side has no rows, all-NULL keys,
+    /// non-integer keys, or the ranges are disjoint; bucketdiff then keeps
+    /// the legacy MOD(rowHash, N) bucketing.
     async fn probe_key_domain(
         &self,
         left: &mut (dyn DbConn + Send),
@@ -482,12 +483,15 @@ impl BucketDiffer {
         n: u64,
         queries: &mut u64,
     ) -> Option<RangePlan> {
+        let Some(key_column) = range_probe_key(ctx) else {
+            ctx.vlog(
+                "[delta-diff] bucketdiff key-domain probe skipped: no single integer \
+                 comparison key; keeping MOD(rowHash, N) bucketing",
+            );
+            return None;
+        };
         let spec = ProbeSpec {
-            key_column: if ctx.key_column.is_empty() {
-                "id".to_owned()
-            } else {
-                ctx.key_column.clone()
-            },
+            key_column,
             left: KeySide {
                 table: table_ref(&ctx.left),
                 filter: side_filter(ctx, left.dialect().url_scheme()),
@@ -606,6 +610,29 @@ fn table_ref(side: &crate::delta_diff::strategy::SideCtx) -> TableRef {
         schema: side.schema.clone(),
         table: side.table.clone(),
     }
+}
+
+/// Key column eligible for the PK-range path, or `None` to keep MOD bucketing
+/// without spending a probe query (issue #108).
+///
+/// A keyless table has no key domain at all, and a key whose declared type
+/// cannot be an integer cannot produce one: `MIN(name)` on a text column
+/// either fails to parse or (on strict engines) makes the range predicate a
+/// type error. Both cases used to run the probe against a hardcoded `id`
+/// column, which aborted the snapshot transaction on PostgreSQL-family
+/// engines and turned every later statement into "current transaction is
+/// aborted".
+fn range_probe_key(ctx: &DiffContext) -> Option<String> {
+    let key = ctx.key_column.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if !ctx.left.plan.column_type_may_be_integer(key)
+        || !ctx.right.plan.column_type_may_be_integer(key)
+    {
+        return None;
+    }
+    Some(key.to_owned())
 }
 
 fn shard_of_range(
@@ -1079,6 +1106,69 @@ mod tests {
         }
     }
 
+    // ── key-domain probe gating (issue #108) ──
+
+    /// Records every SQL it is asked to run and answers with a canned reply,
+    /// so probe gating can be asserted without a database.
+    struct RecordingConn {
+        dialect: crate::backend::mysql::dialect::MySqlDialect,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        reply: ProbeReply,
+    }
+
+    use crate::backend::QueryResult;
+
+    enum ProbeReply {
+        MinMax(QueryResult),
+        Fail(&'static str),
+    }
+
+    impl RecordingConn {
+        fn recording(reply: ProbeReply) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    dialect: crate::backend::mysql::dialect::MySqlDialect,
+                    seen: std::sync::Arc::clone(&seen),
+                    reply,
+                },
+                seen,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DbConn for RecordingConn {
+        async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            self.seen.lock().expect("lock").push(sql.to_string());
+            match &self.reply {
+                ProbeReply::MinMax(r) => Ok(r.clone()),
+                ProbeReply::Fail(msg) => Err(DbError::query((*msg).to_string())),
+            }
+        }
+
+        async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            Err(DbError::unsupported("recording: exec not supported"))
+        }
+
+        async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+            Err(DbError::unsupported("recording: query_drop not supported"))
+        }
+
+        fn dialect(&self) -> &dyn crate::backend::Dialect {
+            &self.dialect
+        }
+    }
+
+    fn min_max_result(min: Value, max: Value, nulls: u64) -> QueryResult {
+        QueryResult {
+            columns: vec!["mn".into(), "mx".into(), "nulls".into()],
+            row_count: 1,
+            rows: vec![vec![min, max, Value::from(nulls)]],
+            rows_affected: None,
+        }
+    }
+
     #[test]
     fn row_estimate_reads_single_cell_catalog_stat() {
         let r = estimate_result(&["row_count"], vec![vec![Value::from(42)]]);
@@ -1117,6 +1207,182 @@ mod tests {
         assert_eq!(parse_row_estimate(&r, Some("s"), "t"), Some(7));
         assert_eq!(parse_row_estimate(&r, None, "missing"), None);
         assert_eq!(parse_row_estimate(&r, Some("nope"), "t"), None);
+    }
+
+    fn probe_plan(columns: &[(&str, &str)]) -> crate::delta_diff::metadata::TablePlan {
+        crate::delta_diff::metadata::TablePlan {
+            url_scheme: "mysql".into(),
+            key_columns: vec![],
+            compare_columns: columns.iter().map(|(n, _)| (*n).to_string()).collect(),
+            norm_specs: columns
+                .iter()
+                .map(|(n, ty)| crate::backend::ColumnNormSpec {
+                    name: (*n).to_string(),
+                    data_type: (*ty).to_string(),
+                    nullable: true,
+                    rtrim_fixed_char: false,
+                })
+                .collect(),
+            warnings: vec![],
+        }
+    }
+
+    /// DiffContext with a single comparison key (`None` = keyless table).
+    fn probe_ctx(key: Option<(&str, &str)>) -> DiffContext {
+        let mut plan = probe_plan(&[("a", "int"), ("b", "varchar(32)")]);
+        if let Some((name, ty)) = key {
+            plan.key_columns = vec![name.to_string()];
+            plan.compare_columns.insert(0, name.to_string());
+            plan.norm_specs.insert(
+                0,
+                crate::backend::ColumnNormSpec {
+                    name: name.to_string(),
+                    data_type: ty.to_string(),
+                    nullable: false,
+                    rtrim_fixed_char: false,
+                },
+            );
+        }
+        let (key_column, key_columns, left_key, right_key) = match key {
+            Some((name, _)) => (
+                name.to_string(),
+                vec![name.to_string()],
+                vec![name.to_string()],
+                vec![name.to_string()],
+            ),
+            None => (String::new(), vec![], vec![], vec![]),
+        };
+        DiffContext {
+            left: crate::delta_diff::strategy::SideCtx {
+                connection_name: "left".into(),
+                schema: None,
+                table: "t".into(),
+                plan: plan.clone(),
+            },
+            right: crate::delta_diff::strategy::SideCtx {
+                connection_name: "right".into(),
+                schema: None,
+                table: "t".into(),
+                plan,
+            },
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column,
+            key_columns,
+            left_key_columns: left_key,
+            right_key_columns: right_key,
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 1,
+            consistency: ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
+            strict: false,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn keyless_context_never_probes_a_key_domain() {
+        let ctx = probe_ctx(None);
+        let (mut left, lseen) = RecordingConn::recording(ProbeReply::MinMax(min_max_result(
+            Value::from(1),
+            Value::from(9),
+            0,
+        )));
+        let (mut right, rseen) = RecordingConn::recording(ProbeReply::MinMax(min_max_result(
+            Value::from(1),
+            Value::from(9),
+            0,
+        )));
+        let mut queries = 0;
+
+        let plan = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await;
+
+        assert!(plan.is_none(), "keyless tables keep MOD(rowHash, N)");
+        assert!(
+            lseen.lock().expect("lock").is_empty() && rseen.lock().expect("lock").is_empty(),
+            "keyless tables must not probe any key domain: {:?} / {:?}",
+            lseen.lock().expect("lock"),
+            rseen.lock().expect("lock")
+        );
+        assert_eq!(queries, 0, "a skipped probe costs no queries");
+    }
+
+    #[tokio::test]
+    async fn text_key_context_never_probes_a_key_domain() {
+        let ctx = probe_ctx(Some(("code", "varchar(64)")));
+        let (mut left, lseen) = RecordingConn::recording(ProbeReply::Fail("probe must not run"));
+        let (mut right, rseen) = RecordingConn::recording(ProbeReply::Fail("probe must not run"));
+        let mut queries = 0;
+
+        let plan = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await;
+
+        assert!(plan.is_none());
+        assert!(
+            lseen.lock().expect("lock").is_empty() && rseen.lock().expect("lock").is_empty(),
+            "a non-integer key cannot yield an integer key domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn integer_key_context_still_probes_a_key_domain() {
+        let ctx = probe_ctx(Some(("id", "bigint")));
+        let (mut left, lseen) = RecordingConn::recording(ProbeReply::MinMax(min_max_result(
+            Value::from(1),
+            Value::from(9),
+            0,
+        )));
+        let (mut right, _rseen) = RecordingConn::recording(ProbeReply::MinMax(min_max_result(
+            Value::from(1),
+            Value::from(9),
+            0,
+        )));
+        let mut queries = 0;
+
+        let plan = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await;
+
+        let plan = plan.expect("integer key keeps the PK-range path");
+        assert_eq!(plan.key_column, "id");
+        assert_eq!((plan.min, plan.max), (1, 9));
+        assert_eq!(queries, 2, "one probe statement per side");
+        assert_eq!(
+            lseen.lock().expect("lock").len(),
+            1,
+            "exactly one probe statement per side"
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_key_domain_still_falls_back_to_mod_bucketing() {
+        let ctx = probe_ctx(Some(("id", "bigint")));
+        let reply = || ProbeReply::MinMax(min_max_result(Value::Null, Value::Null, 3));
+        let (mut left, _lseen) = RecordingConn::recording(reply());
+        let (mut right, _rseen) = RecordingConn::recording(reply());
+        let mut queries = 0;
+
+        let plan = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await;
+
+        assert!(
+            plan.is_none(),
+            "all-NULL keys are a data condition, not a probe failure"
+        );
     }
 }
 

@@ -67,6 +67,16 @@ impl TablePlan {
             .collect()
     }
 
+    /// Whether a column's declared type can supply an integer key domain
+    /// (issue #108: the bucketdiff PK-range path). Columns with no
+    /// normalization spec report `true` — unknown types are left to the
+    /// probe itself instead of being guessed away here.
+    pub(crate) fn column_type_may_be_integer(&self, name: &str) -> bool {
+        find_unique_ci(&self.norm_specs, name, |spec| &spec.name)
+            .map(|spec| Self::is_numeric_type(&spec.data_type))
+            .unwrap_or(true)
+    }
+
     /// Render §九 normalized expressions in compare order.
     pub(crate) fn normalized_exprs(&self, dialect: &dyn Dialect) -> Result<Vec<String>, DbError> {
         self.norm_specs
