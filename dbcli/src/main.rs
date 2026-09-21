@@ -119,7 +119,8 @@ enum Commands {
         args: Box<delta_diff::cmd::DeltaDiffArgs>,
     },
 
-    /// Load generated data files back into an existing database (FK-safe order)
+    /// Load data files (JSONL/JSON/CSV) into an existing database; tables must
+    /// already exist with matching structure (no schema mapping, no DDL)
     Load {
         #[command(flatten)]
         args: Box<load::cmd::LoadArgs>,
@@ -1286,7 +1287,8 @@ async fn main() {
                 std::process::exit(2);
             }
             let audit = audit::AuditSession::new(&audit_config);
-            let code = load::run(*args, cli.config, cli.allow_write, &audit).await;
+            let code =
+                load::run(*args, cli.config, cli.name.clone(), cli.allow_write, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]

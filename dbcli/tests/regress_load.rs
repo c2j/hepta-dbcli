@@ -6,6 +6,8 @@
 // user's real ~/.hepta-dbcli.toml or audit dir) → reopen the file and SELECT.
 //
 // Run: cargo test --features "duckdb,integration" --test regress_load
+// (the MySQL-only module also compiles with plain `--features integration`
+// and is what the CI `test` job runs against the service container)
 
 #[cfg(all(feature = "integration", feature = "duckdb"))]
 mod duckdb_tests {
@@ -417,6 +419,114 @@ mod duckdb_tests {
         assert_eq!(note2, json_str(""), "quoted empty csv field is ''");
     }
 
+    // ─── --name must route to the named connection (two-connection rig) ──
+
+    /// Config with `default_connection = "dev"` plus a second `prod`
+    /// connection. `load --name prod` must write to prod and never to dev.
+    fn write_two_connection_config(root: &Path) {
+        let dev = root.join("dev.duckdb");
+        let prod = root.join("prod.duckdb");
+        boot_db_file(&dev);
+        boot_db_file(&prod);
+        let cfg = root.join("two.toml");
+        write_file(
+            &cfg,
+            &format!(
+                "default_connection = \"dev\"\n\n[connections.dev]\nurl = \"duckdb://{}\"\n\n[connections.prod]\nurl = \"duckdb://{}\"\n",
+                dev.display(),
+                prod.display()
+            ),
+        );
+        write_file(&root.join("data/items.csv"), "id,name\n1,alpha\n2,beta\n");
+    }
+
+    /// A DuckDB file with the `items` table (id, name).
+    fn boot_db_file(path: &Path) {
+        let conn = duckdb::Connection::open(path).expect("bootstrap open");
+        conn.execute_batch("CREATE TABLE items (id BIGINT PRIMARY KEY, name VARCHAR);")
+            .expect("bootstrap items");
+    }
+
+    fn count_items_in(db: &Path) -> i64 {
+        let conn = duckdb::Connection::open(db).expect("reopen");
+        conn.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .expect("count")
+    }
+
+    #[test]
+    fn should_route_load_to_named_connection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_two_connection_config(root.path());
+
+        let out = Command::new(BIN)
+            .env("HOME", root.path())
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "--config",
+                root.path().join("two.toml").to_str().unwrap(),
+                "--audit-dir",
+                root.path().join("audit").to_str().unwrap(),
+                "load",
+                "--allow-write",
+                "--name",
+                "prod",
+                "--data",
+                root.path().join("data").to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn hepta_dbcli");
+        assert!(
+            out.status.success(),
+            "load --name prod failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert_eq!(
+            count_items_in(&root.path().join("prod.duckdb")),
+            2,
+            "rows must land in the connection named on the command line"
+        );
+        assert_eq!(
+            count_items_in(&root.path().join("dev.duckdb")),
+            0,
+            "the default connection must stay untouched when --name is given"
+        );
+    }
+
+    #[test]
+    fn should_fail_load_when_named_connection_missing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_two_connection_config(root.path());
+
+        let out = Command::new(BIN)
+            .env("HOME", root.path())
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "--config",
+                root.path().join("two.toml").to_str().unwrap(),
+                "--audit-dir",
+                root.path().join("audit").to_str().unwrap(),
+                "load",
+                "--allow-write",
+                "--name",
+                "doesnotexist",
+                "--data",
+                root.path().join("data").to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn hepta_dbcli");
+
+        assert!(
+            !out.status.success(),
+            "load --name <unknown> must fail loudly, not silently use the default"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("doesnotexist"),
+            "error must name the missing connection, got: {stderr}"
+        );
+    }
+
     // ─── Tiny JSON literals (kept local to avoid a serde_json re-export) ──
 
     fn json_str(s: &str) -> serde_json::Value {
@@ -429,8 +539,10 @@ mod duckdb_tests {
 }
 
 // ─── MySQL (env-gated) ──────────────────────────────────────────────────
-
-#[cfg(all(feature = "integration", feature = "duckdb"))]
+// Gated on `integration` only (no duckdb requirement): the CI `test` job has
+// the MySQL service but not the duckdb feature, so this module must compile
+// there. It self-skips without HEPTA_DBCLI_TEST_URL.
+#[cfg(feature = "integration")]
 mod mysql_tests {
     use std::process::Command;
 

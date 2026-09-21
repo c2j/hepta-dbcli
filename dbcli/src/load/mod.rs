@@ -66,6 +66,7 @@ fn gate_deny_event() -> DraftEvent {
 pub(crate) async fn run(
     args: cmd::LoadArgs,
     config_path: Option<String>,
+    connection_name: Option<String>,
     allow_write: bool,
     audit: &crate::audit::AuditSession,
 ) -> i32 {
@@ -81,6 +82,8 @@ pub(crate) async fn run(
     }
 
     // (c) Resolve the named connection (load has no inline-URL mode).
+    // `--name` is the only connection selector: an unknown name must fail
+    // loudly instead of silently falling back to the default connection.
     let raw = match crate::config::read_config(config_path.map(PathBuf::from)) {
         Ok(raw) => raw,
         Err(e) => {
@@ -88,7 +91,7 @@ pub(crate) async fn run(
             return EXIT_ERROR;
         }
     };
-    let target = match resolve_connection(&raw, &None) {
+    let target = match resolve_connection(&raw, &connection_name) {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("error: {e}");
@@ -274,7 +277,11 @@ pub(crate) async fn run(
                 AuditOutcome::ok(duration_ms),
                 inserted,
             ));
-            println!("loaded {inserted} rows into {} table(s)", table_names.len());
+            println!(
+                "loaded {inserted} rows into {} table(s) via connection '{}'",
+                table_names.len(),
+                conn_info.name
+            );
             // Per-table receipt in load order: counts only, never row data.
             for entry in &plan_data.entries {
                 println!(
