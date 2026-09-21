@@ -48,9 +48,29 @@ pub(crate) fn read_table_file(
     dir: &Path,
     table: &str,
     format: &str,
-) -> Result<Option<GeneratedTable>, String> {
+) -> Result<Option<(PathBuf, GeneratedTable)>, String> {
     match format {
-        "auto" => crate::tabular::read_generated_table(dir, table),
+        "auto" => {
+            // Discovery order jsonl -> json -> csv; the caller needs the path
+            // that was actually read (the executor re-reads entry.path).
+            let candidates = [
+                (dir.join(format!("{table}.jsonl")), "jsonl"),
+                (dir.join(format!("{table}.json")), "json"),
+                (dir.join(format!("{table}.csv")), "csv"),
+            ];
+            for (path, ext) in candidates {
+                if !path.is_file() {
+                    continue;
+                }
+                let reader = match ext {
+                    "jsonl" => crate::tabular::read_jsonl,
+                    "json" => crate::tabular::read_json,
+                    _ => crate::tabular::read_csv,
+                };
+                return reader(&path).map(|t| Some((path, t)));
+            }
+            Ok(None)
+        }
         ext => {
             let path = dir.join(format!("{table}.{ext}"));
             if !path.is_file() {
@@ -69,7 +89,7 @@ pub(crate) fn read_table_file(
                     ))
                 }
             };
-            reader(&path).map(Some)
+            reader(&path).map(|t| Some((path, t)))
         }
     }
 }
@@ -89,10 +109,10 @@ pub(crate) fn discover_table_files(
     };
     let mut files = Vec::new();
     for table in table_names {
-        if let Some((columns, rows)) = read_table_file(dir, &table, format)? {
+        if let Some((path, (columns, rows))) = read_table_file(dir, &table, format)? {
             files.push(TableFile {
                 row_count: rows.len(),
-                source_path: table_path_for(dir, &table, format),
+                source_path: path,
                 table,
                 columns,
             });
@@ -393,16 +413,6 @@ pub(crate) fn render_plan(
     text
 }
 
-fn table_path_for(dir: &Path, table: &str, format: &str) -> PathBuf {
-    let ext = match format {
-        "auto" | "jsonl" => "jsonl",
-        "json" => "json",
-        "csv" => "csv",
-        _ => "jsonl",
-    };
-    dir.join(format!("{table}.{ext}"))
-}
-
 fn scan_table_names(dir: &Path) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     let entries =
@@ -629,6 +639,35 @@ mod tests {
         assert_eq!(files[0].table, "t");
         assert_eq!(files[0].row_count, 3);
         assert_eq!(files[0].columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn should_record_the_discovered_file_path_in_auto_mode() {
+        // `auto` discovers via the shared jsonl -> json -> csv order; the
+        // recorded source_path must name the file actually read, not a
+        // jsonl guess. The executor reads entry.path, so a wrong path here
+        // fails the load with "No such file or directory" (found on a live
+        // csv-only directory: dry-run counted rows fine, the run did not).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.json"), "[{\"a\":1}]").unwrap();
+        std::fs::write(dir.path().join("u.csv"), "a\n7\n").unwrap();
+        let files = discover_table_files(dir.path(), None, "auto").unwrap();
+        assert_eq!(files.len(), 2);
+        let by_table: std::collections::HashMap<&str, &TableFile> =
+            files.iter().map(|f| (f.table.as_str(), f)).collect();
+        assert_eq!(
+            by_table["t"].source_path,
+            dir.path().join("t.json"),
+            "auto mode must record the discovered json path"
+        );
+        assert_eq!(
+            by_table["u"].source_path,
+            dir.path().join("u.csv"),
+            "auto mode must record the discovered csv path"
+        );
+        // Strict modes keep naming the exact file in that format.
+        let strict = discover_table_files(dir.path(), Some(&["u".to_string()]), "csv").unwrap();
+        assert_eq!(strict[0].source_path, dir.path().join("u.csv"));
     }
 
     #[test]
