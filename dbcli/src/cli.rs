@@ -162,6 +162,12 @@ const PRIVILEGE_KEYWORDS: &[&str] = &["GRANT", "REVOKE"];
 const DATA_CHANGE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "UPSERT", "LOAD", "IMPORT",
 ];
+/// Statement-leading keywords that mutate data but are not INSERT-family.
+/// COPY (server-side bulk load) and SELECT ... INTO (table creation from a
+/// query) run through the read path once a session is writable (--allow-ddl),
+/// so they must classify as DataChange to keep the --allow-write gate
+/// (issue #112 PR review).
+const DATA_CHANGE_LEAD_KEYWORDS: &[&str] = &["COPY", "IMPORT"];
 const CALL_KEYWORDS: &[&str] = &["CALL", "EXEC", "EXECUTE", "DO", "DECLARE", "PERFORM"];
 const READ_ONLY_KEYWORDS: &[&str] = &[
     "SELECT",
@@ -198,7 +204,9 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
     if PRIVILEGE_KEYWORDS.contains(&first.as_str()) {
         return StatementClass::Privilege;
     }
-    if DATA_CHANGE_KEYWORDS.contains(&first.as_str()) {
+    if DATA_CHANGE_KEYWORDS.contains(&first.as_str())
+        || DATA_CHANGE_LEAD_KEYWORDS.contains(&first.as_str())
+    {
         return StatementClass::DataChange;
     }
     if CALL_KEYWORDS.contains(&first.as_str()) {
@@ -212,7 +220,12 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
         if PRIVILEGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
             return StatementClass::Privilege;
         }
-        if DATA_CHANGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+        if DATA_CHANGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k))
+            || DATA_CHANGE_LEAD_KEYWORDS
+                .iter()
+                .any(|k| is_keyword(&upper, k))
+            || upper.contains(" INTO ")
+        {
             return StatementClass::DataChange;
         }
         if CALL_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
@@ -230,6 +243,16 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
         return StatementClass::Other;
     }
     if READ_ONLY_KEYWORDS.contains(&first.as_str()) {
+        // SELECT ... INTO creates a table from a query (a data change), but
+        // only when INTO is followed by a table name — `SELECT ... into_t`
+        // inside a FROM list is still a plain read. The first FROM-position
+        // word check keeps the heuristic conservative (issue #112 PR review).
+        if first == "SELECT" && upper.contains(" INTO ") {
+            // `INTO` immediately after SELECT (SELECT INTO var_list is
+            // PL/SQL) vs `SELECT ... INTO table`: both mutate something, so
+            // stay conservative and require --allow-write.
+            return StatementClass::DataChange;
+        }
         return StatementClass::ReadOnly;
     }
     StatementClass::Other
@@ -1183,6 +1206,36 @@ mod tests {
                 "expected DataChange for {sql:?}"
             );
         }
+    }
+
+    #[test]
+    fn should_classify_session_writable_mutations_as_data_changes() {
+        // PR review (#112): once --allow-ddl opens a writable session, these
+        // statements run through the read path and would skip --allow-write
+        // unless they classify as DataChange.
+        for sql in [
+            "COPY t FROM '/tmp/data.csv' WITH CSV",
+            "copy t (a, b) from stdin",
+            "SELECT * INTO backup_t FROM t",
+            "select a into new_t from old_t where a > 1",
+            "WITH x AS (SELECT 1) SELECT * INTO t2 FROM x",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::DataChange,
+                "expected DataChange for {sql:?}"
+            );
+        }
+        // Plain SELECT stays read-only.
+        assert_eq!(
+            classify_statement("SELECT * FROM t"),
+            StatementClass::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("SELECT * FROM into_t"),
+            StatementClass::ReadOnly,
+            "a table named into_t must not trip the INTO match"
+        );
     }
 
     #[test]
