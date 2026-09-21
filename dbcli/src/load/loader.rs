@@ -17,6 +17,7 @@ pub(crate) fn insert_sql(
     schema: Option<&str>,
     table: &str,
     columns: &[String],
+    types: &[String],
 ) -> String {
     let table_ref = crate::backend::quote_table_scheme(scheme, quote, schema, table);
     let cols: Vec<String> = columns
@@ -25,7 +26,12 @@ pub(crate) fn insert_sql(
         .collect();
     let placeholders: Vec<String> = match scheme {
         "oracle" => (1..=columns.len()).map(|i| format!(":{i}")).collect(),
-        "gaussdb" => (1..=columns.len()).map(|i| format!("${i}")).collect(),
+        "gaussdb" => columns
+            .iter()
+            .zip(types.iter())
+            .enumerate()
+            .map(|(i, (_, ty))| format!("${}::{}", i + 1, pg_base_type(ty)))
+            .collect(),
         _ => vec!["?".to_string(); columns.len()],
     };
     format!(
@@ -33,6 +39,32 @@ pub(crate) fn insert_sql(
         cols.join(", "),
         placeholders.join(", ")
     )
+}
+
+/// Base PostgreSQL type name for a placeholder cast. GaussDB/openGauss report
+/// `information_schema`-style names via `format_type` (`int4`, `character
+/// varying(100)`, `numeric(6,2)`, `timestamp without time zone`, ...); the
+/// base word is a valid cast target and `text` covers everything unknown so
+/// the string-bound parameter still coerces server-side.
+fn pg_base_type(data_type: &str) -> String {
+    let lowered = data_type.trim().to_ascii_lowercase();
+    match lowered.split(['(', ' ']).next().unwrap_or_default() {
+        "int2" | "smallint" | "tinyint" => "int2".to_string(),
+        "int4" | "int" | "integer" | "mediumint" => "int4".to_string(),
+        "int8" | "bigint" => "int8".to_string(),
+        "float4" | "real" => "float4".to_string(),
+        "float8" | "double" | "double precision" => "float8".to_string(),
+        "numeric" | "decimal" | "number" | "dec" => "numeric".to_string(),
+        "bool" | "boolean" => "bool".to_string(),
+        "date" => "date".to_string(),
+        "time" => "time".to_string(),
+        "timestamp" | "datetime" => "timestamp".to_string(),
+        "timestamptz" => "timestamptz".to_string(),
+        "json" => "json".to_string(),
+        "jsonb" => "jsonb".to_string(),
+        "bytea" | "blob" | "raw" => "bytea".to_string(),
+        _ => "text".to_string(),
+    }
 }
 
 // ─── Column type alignment ──────────────────────────────────────────────
@@ -190,6 +222,7 @@ async fn load_table(
         entry.schema.as_deref(),
         &entry.table,
         &entry.columns,
+        &types,
     );
     for (i, row) in rows.iter().enumerate() {
         // Align the file row to the plan column order first (JSONL/JSON key
@@ -523,6 +556,45 @@ mod tests {
         assert_eq!(begin_sql("mysql"), "START TRANSACTION");
         assert_eq!(begin_sql("duckdb"), "BEGIN");
         assert_eq!(begin_sql("gaussdb"), "BEGIN");
+    }
+
+    #[test]
+    fn gaussdb_insert_sql_annotates_placeholders_with_column_types() {
+        // The GaussDB backend binds every parameter as a string, so an
+        // untyped $N fails for int4/numeric/date targets. Each placeholder
+        // must carry an explicit cast so the string literal coerces server-
+        // side.
+        let columns = vec![
+            "id".to_string(),
+            "name".to_string(),
+            "score".to_string(),
+            "joined".to_string(),
+        ];
+        let types = vec![
+            "bigint".to_string(),
+            "character varying(100)".to_string(),
+            "numeric(6,2)".to_string(),
+            "date".to_string(),
+        ];
+        let sql = insert_sql("gaussdb", '"', Some("public"), "t", &columns, &types);
+        assert_eq!(
+            sql,
+            "INSERT INTO \"public\".\"t\" (\"id\", \"name\", \"score\", \"joined\") \
+             VALUES ($1::int8, $2::text, $3::numeric, $4::date)"
+        );
+    }
+
+    #[test]
+    fn mysql_and_oracle_insert_sql_stay_untyped() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let types = vec!["bigint".to_string(), "varchar(100)".to_string()];
+        let mysql = insert_sql("mysql", '`', Some("db"), "t", &columns, &types);
+        assert_eq!(mysql, "INSERT INTO `db`.`t` (`id`, `name`) VALUES (?, ?)");
+        let oracle = insert_sql("oracle", '"', None, "T", &columns, &types);
+        assert_eq!(
+            oracle,
+            "INSERT INTO \"T\" (\"ID\", \"NAME\") VALUES (:1, :2)"
+        );
     }
 
     #[test]
