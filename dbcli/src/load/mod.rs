@@ -329,9 +329,7 @@ fn resolve_connection(
             format!("connection '{target_name}' not found\n  available: {available:?}")
         })?;
     if raw.is_env_var {
-        Ok(crate::config::resolve_env_var_connection(
-            target.url.clone().unwrap_or_default(),
-        ))
+        crate::config::resolve_env_var_connection(target.url.clone().unwrap_or_default())
     } else {
         crate::config::resolve_single_connection(
             target,

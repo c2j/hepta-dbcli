@@ -785,9 +785,7 @@ fn resolve_named(
         })?;
 
     if raw.is_env_var {
-        Ok(config::resolve_env_var_connection(
-            target_conn.url.clone().unwrap_or_default(),
-        ))
+        config::resolve_env_var_connection(target_conn.url.clone().unwrap_or_default())
     } else {
         config::resolve_single_connection(
             target_conn,

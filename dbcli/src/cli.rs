@@ -593,9 +593,7 @@ pub(crate) fn resolve_cli_target(
             )
         })?;
     if raw.is_env_var {
-        Ok(resolve_env_var_connection(
-            target_conn.url.clone().unwrap_or_default(),
-        ))
+        resolve_env_var_connection(target_conn.url.clone().unwrap_or_default())
     } else {
         resolve_single_connection(
             target_conn,

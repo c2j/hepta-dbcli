@@ -1002,7 +1002,10 @@ async fn handle_check_connection_cmd(
     };
 
     let resolved = if raw.is_env_var {
-        resolve_env_var_connection(target_conn.url.clone().unwrap())
+        resolve_env_var_connection(target_conn.url.clone().unwrap()).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        })
     } else {
         resolve_single_connection(
             target_conn,
