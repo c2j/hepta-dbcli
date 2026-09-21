@@ -525,11 +525,23 @@ pub(crate) fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
     s.replace('\'', "''")
 }
 
+/// True when an error is (probably) the SQL_ASCII catalog-comment encoding
+/// failure that the comment-free retry exists for (#111): SQLSTATE 22021 or
+/// an "invalid byte sequence" message. Any other failure (permissions,
+/// timeouts, catalog drift) returns immediately — a retry that happens to
+/// survive an unrelated error would silently degrade the result and hide the
+/// real cause (#111 PR review).
+fn is_catalog_comment_encoding_error(err: &DbError) -> bool {
+    let text = err.to_string();
+    text.contains("22021") || text.contains("invalid byte sequence")
+}
+
 /// Run `list_tables()`, retrying once with the dialect's comment-free variant
-/// when the primary query fails (issue #111: a non-UTF-8 catalog comment on a
-/// SQL_ASCII instance raises SQLSTATE 22021 and would otherwise take down the
-/// whole introspection path). The retry only wins when it succeeds; otherwise
-/// the original error is returned. Degradation warns once on stderr.
+/// when the primary query fails with a catalog-comment encoding error
+/// (issue #111: a non-UTF-8 catalog comment on a SQL_ASCII instance raises
+/// SQLSTATE 22021 and would otherwise take down the whole introspection
+/// path). The retry only wins when it succeeds; otherwise the original error
+/// is returned. Degradation warns once on stderr.
 pub(crate) async fn query_list_tables(
     conn: &mut (dyn DbConn + Send),
 ) -> Result<QueryResult, DbError> {
@@ -537,6 +549,9 @@ pub(crate) async fn query_list_tables(
     match conn.query(&sql).await {
         Ok(result) => Ok(result),
         Err(primary) => {
+            if !is_catalog_comment_encoding_error(&primary) {
+                return Err(primary);
+            }
             let Some(fallback) = conn.dialect().list_tables_without_comments() else {
                 return Err(primary);
             };
@@ -547,7 +562,12 @@ pub(crate) async fn query_list_tables(
                     );
                     Ok(result)
                 }
-                Err(_) => Err(primary),
+                Err(fallback_err) => {
+                    eprintln!(
+                        "warning: comment-free list_tables retry also failed: {fallback_err}"
+                    );
+                    Err(primary)
+                }
             }
         }
     }
@@ -568,6 +588,9 @@ pub(crate) async fn query_table_columns(
     match conn.exec(&sql, &params).await {
         Ok(result) => Ok(result),
         Err(primary) => {
+            if !is_catalog_comment_encoding_error(&primary) {
+                return Err(primary);
+            }
             let Some(fallback) = conn.dialect().table_columns_without_comments() else {
                 return Err(primary);
             };
@@ -578,7 +601,12 @@ pub(crate) async fn query_table_columns(
                     );
                     Ok(result)
                 }
-                Err(_) => Err(primary),
+                Err(fallback_err) => {
+                    eprintln!(
+                        "warning: comment-free table_columns retry also failed: {fallback_err}"
+                    );
+                    Err(primary)
+                }
             }
         }
     }
@@ -1058,6 +1086,33 @@ mod tests {
     struct EncodingFailingConn {
         dialect: crate::backend::gaussdb::GaussdbDialect,
         fallback_fails: bool,
+        /// When true the primary failure is a non-encoding error (permission
+        /// denied), which must NOT trigger the comment-free retry.
+        non_encoding_primary: bool,
+        /// Number of fallback (comment-free) SQL executions, so tests can
+        /// assert the retry never ran.
+        fallback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "gaussdb")]
+    impl EncodingFailingConn {
+        fn encoding(fallback_fails: bool) -> Self {
+            Self {
+                dialect: crate::backend::gaussdb::GaussdbDialect,
+                fallback_fails,
+                non_encoding_primary: false,
+                fallback_attempts: Default::default(),
+            }
+        }
+
+        fn non_encoding() -> Self {
+            Self {
+                dialect: crate::backend::gaussdb::GaussdbDialect,
+                fallback_fails: false,
+                non_encoding_primary: true,
+                fallback_attempts: Default::default(),
+            }
+        }
     }
 
     #[cfg(feature = "gaussdb")]
@@ -1065,12 +1120,20 @@ mod tests {
     impl DbConn for EncodingFailingConn {
         async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
             if sql.contains("obj_description") {
-                return Err(DbError::query(
-                    "SQLSTATE 22021: invalid byte sequence for encoding",
-                ));
+                return Err(if self.non_encoding_primary {
+                    DbError::query(
+                        "GaussDB query failed: [SQLSTATE 42501] permission denied for table orders",
+                    )
+                } else {
+                    DbError::query("SQLSTATE 22021: invalid byte sequence for encoding")
+                });
             }
-            if self.fallback_fails {
-                return Err(DbError::query("fallback also failed"));
+            if sql.contains("NULL AS comment") || sql.contains("NULL::text AS comment") {
+                self.fallback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fallback_fails {
+                    return Err(DbError::query("fallback also failed"));
+                }
             }
             Ok(QueryResult {
                 columns: vec![
@@ -1090,12 +1153,20 @@ mod tests {
 
         async fn exec(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
             if sql.contains("col_description") {
-                return Err(DbError::query(
-                    "SQLSTATE 22021: invalid byte sequence for encoding",
-                ));
+                return Err(if self.non_encoding_primary {
+                    DbError::query(
+                        "GaussDB query failed: [SQLSTATE 42501] permission denied for table orders",
+                    )
+                } else {
+                    DbError::query("SQLSTATE 22021: invalid byte sequence for encoding")
+                });
             }
-            if self.fallback_fails {
-                return Err(DbError::query("fallback also failed"));
+            if sql.contains("NULL::text AS comment") {
+                self.fallback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fallback_fails {
+                    return Err(DbError::query("fallback also failed"));
+                }
             }
             Ok(QueryResult {
                 columns: vec![
@@ -1126,11 +1197,46 @@ mod tests {
 
     #[cfg(feature = "gaussdb")]
     #[tokio::test]
+    async fn query_list_tables_does_not_retry_on_non_encoding_error() {
+        let mut conn = EncodingFailingConn::non_encoding();
+        let err = query_list_tables(&mut conn)
+            .await
+            .expect_err("permission errors are not encoding-related");
+        assert!(
+            err.to_string().contains("42501"),
+            "the primary error must be returned untouched: {err}"
+        );
+        assert_eq!(
+            conn.fallback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the comment-free retry must not run for non-encoding errors"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_does_not_retry_on_non_encoding_error() {
+        let mut conn = EncodingFailingConn::non_encoding();
+        let err = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect_err("permission errors are not encoding-related");
+        assert!(
+            err.to_string().contains("42501"),
+            "the primary error must be returned untouched: {err}"
+        );
+        assert_eq!(
+            conn.fallback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the comment-free retry must not run for non-encoding errors"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
     async fn query_list_tables_retries_without_comments_on_encoding_error() {
-        let mut conn = EncodingFailingConn {
-            dialect: crate::backend::gaussdb::GaussdbDialect,
-            fallback_fails: false,
-        };
+        let mut conn = EncodingFailingConn::encoding(false);
         let result = query_list_tables(&mut conn)
             .await
             .expect("comment-free retry must succeed");
@@ -1140,10 +1246,7 @@ mod tests {
     #[cfg(feature = "gaussdb")]
     #[tokio::test]
     async fn query_table_columns_retries_without_comments_on_encoding_error() {
-        let mut conn = EncodingFailingConn {
-            dialect: crate::backend::gaussdb::GaussdbDialect,
-            fallback_fails: false,
-        };
+        let mut conn = EncodingFailingConn::encoding(false);
         let result = query_table_columns(&mut conn, "public", "orders")
             .await
             .expect("comment-free column retry must succeed");
@@ -1157,10 +1260,7 @@ mod tests {
     #[cfg(feature = "gaussdb")]
     #[tokio::test]
     async fn query_table_columns_propagates_primary_error_when_fallback_fails() {
-        let mut conn = EncodingFailingConn {
-            dialect: crate::backend::gaussdb::GaussdbDialect,
-            fallback_fails: true,
-        };
+        let mut conn = EncodingFailingConn::encoding(true);
         let err = query_table_columns(&mut conn, "public", "orders")
             .await
             .expect_err("both queries failed");
@@ -1173,10 +1273,7 @@ mod tests {
     #[cfg(feature = "gaussdb")]
     #[tokio::test]
     async fn query_list_tables_propagates_primary_error_when_fallback_fails() {
-        let mut conn = EncodingFailingConn {
-            dialect: crate::backend::gaussdb::GaussdbDialect,
-            fallback_fails: true,
-        };
+        let mut conn = EncodingFailingConn::encoding(true);
         let err = query_list_tables(&mut conn)
             .await
             .expect_err("both queries failed");
