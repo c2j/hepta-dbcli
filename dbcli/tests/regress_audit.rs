@@ -352,8 +352,8 @@ async fn destructive_ddl_is_refused_even_with_the_flag() {
     assert!(!out.status.success(), "destructive DDL must be refused");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("destructive DDL"),
-        "refusal must name the reason: {stderr}"
+        stderr.contains("--allow-ddl"),
+        "refusal must point at the ddl flag: {stderr}"
     );
 
     // The table survived, proving the statement never reached the engine.
@@ -362,7 +362,7 @@ async fn destructive_ddl_is_refused_even_with_the_flag() {
     let events = audit_events(&audit_dir);
     let denied = only(&events, "cli_sql");
     assert_eq!(denied["decision"], "deny");
-    assert_eq!(denied["deny_reason"], "destructive_ddl");
+    assert_eq!(denied["deny_reason"], "ddl_flag_required");
     assert_eq!(denied["class"], "ddl");
 
     drop_table(name).await;

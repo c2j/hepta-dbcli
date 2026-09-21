@@ -94,6 +94,12 @@ struct Cli {
     #[arg(long, global = true)]
     allow_write: bool,
 
+    /// Allow CLI DDL (DROP/TRUNCATE/ALTER/CREATE/RENAME). Separate from
+    /// --allow-write so seed scripts can run TRUNCATE/CREATE without opening
+    /// data changes. GRANT/REVOKE stay refused; MCP is unaffected.
+    #[arg(long, global = true)]
+    allow_ddl: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1246,6 +1252,12 @@ async fn main() {
                 );
                 std::process::exit(2);
             }
+            if cli.allow_ddl {
+                eprintln!(
+                    "error: --allow-ddl is not valid for the MCP server; MCP execute_query stays read-only"
+                );
+                std::process::exit(2);
+            }
             if cli.url.is_some() {
                 eprintln!(
                     "error: --url is not supported by the MCP server; use delta_diff left_url/right_url tool arguments instead"
@@ -1344,6 +1356,7 @@ async fn main() {
                     no_history,
                     timeout_action,
                     allow_write: cli.allow_write,
+                    allow_ddl: cli.allow_ddl,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = interactive::run_interactive(args, &registry, &audit).await {
@@ -1364,6 +1377,7 @@ async fn main() {
                     no_history,
                     timeout_action,
                     allow_write: cli.allow_write,
+                    allow_ddl: cli.allow_ddl,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = cli::run_cli(args, &registry, &audit).await {

@@ -17,6 +17,7 @@ use crate::config::{
     read_config, resolve_env_var_connection, resolve_single_connection,
     rewrite_password_to_sentinel, store_keyring_password, TimeoutConfig,
 };
+use crate::interactive::SqlTokenizer;
 use crate::output;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub(crate) struct CliArgs {
     pub timeout_action: Option<String>,
     /// `--allow-write`: permit L2 data changes (issue #58).
     pub allow_write: bool,
+    /// `--allow-ddl`: permit DDL (DROP/TRUNCATE/ALTER/CREATE/RENAME, issue #112).
+    pub allow_ddl: bool,
 }
 
 fn value_to_compact_string(v: &Value) -> String {
@@ -135,8 +138,10 @@ pub(crate) enum StatementClass {
     DataChange,
     /// `CALL` / `EXEC` / `DO` / an anonymous block — needs `--allow-write`.
     Call,
-    /// `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `GRANT` / ... — always refused.
-    Destructive,
+    /// `DROP` / `TRUNCATE` / `ALTER` / `CREATE` / `RENAME` — needs `--allow-ddl`.
+    Ddl,
+    /// `GRANT` / `REVOKE` — never allowed from the CLI/REPL.
+    Privilege,
     /// Transaction control and anything unrecognised: unchanged behaviour.
     Other,
 }
@@ -146,15 +151,14 @@ pub(crate) enum StatementClass {
 pub(crate) enum WriteGate {
     /// Execute as-is.
     Allow,
-    /// Refused: a data change without `--allow-write`.
+    /// Refused: the statement's class is not covered by the flags that were set
+    /// (a data change without `--allow-write`, DDL without `--allow-ddl`, or a
+    /// privilege statement, which is never allowed).
     NeedsFlag(StatementClass),
-    /// Refused: destructive DDL is out of scope even with `--allow-write`.
-    Destructive,
 }
 
-const DESTRUCTIVE_KEYWORDS: &[&str] = &[
-    "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE", "RENAME",
-];
+const DDL_KEYWORDS: &[&str] = &["DROP", "TRUNCATE", "ALTER", "CREATE", "RENAME"];
+const PRIVILEGE_KEYWORDS: &[&str] = &["GRANT", "REVOKE"];
 const DATA_CHANGE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "UPSERT", "LOAD", "IMPORT",
 ];
@@ -188,8 +192,11 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .to_string();
 
-    if DESTRUCTIVE_KEYWORDS.contains(&first.as_str()) {
-        return StatementClass::Destructive;
+    if DDL_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::Ddl;
+    }
+    if PRIVILEGE_KEYWORDS.contains(&first.as_str()) {
+        return StatementClass::Privilege;
     }
     if DATA_CHANGE_KEYWORDS.contains(&first.as_str()) {
         return StatementClass::DataChange;
@@ -199,8 +206,11 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
     }
     if first == "WITH" {
         // A CTE can carry a data change (`WITH x AS (...) INSERT ...`).
-        if DESTRUCTIVE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
-            return StatementClass::Destructive;
+        if DDL_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+            return StatementClass::Ddl;
+        }
+        if PRIVILEGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
+            return StatementClass::Privilege;
         }
         if DATA_CHANGE_KEYWORDS.iter().any(|k| is_keyword(&upper, k)) {
             return StatementClass::DataChange;
@@ -225,11 +235,19 @@ pub(crate) fn classify_statement(sql: &str) -> StatementClass {
     StatementClass::Other
 }
 
-/// Apply the CLI write policy (issue #58 D4): L1 read-only and transaction
-/// control pass, L2 data changes need the flag, L3 destructive never passes.
-pub(crate) fn write_gate(sql: &str, allow_write: bool) -> WriteGate {
+/// Apply the CLI write policy (issue #58 D4, issue #112): L1 read-only and
+/// transaction control pass, L2 data changes need `--allow-write`, DDL needs
+/// `--allow-ddl`, and GRANT/REVOKE never pass.
+pub(crate) fn write_gate(sql: &str, allow_write: bool, allow_ddl: bool) -> WriteGate {
     match classify_statement(sql) {
-        StatementClass::Destructive => WriteGate::Destructive,
+        StatementClass::Privilege => WriteGate::NeedsFlag(StatementClass::Privilege),
+        StatementClass::Ddl => {
+            if allow_ddl {
+                WriteGate::Allow
+            } else {
+                WriteGate::NeedsFlag(StatementClass::Ddl)
+            }
+        }
         class @ (StatementClass::DataChange | StatementClass::Call) => {
             if allow_write {
                 WriteGate::Allow
@@ -400,7 +418,8 @@ pub(crate) fn action_class(class: StatementClass) -> ActionClass {
         StatementClass::ReadOnly | StatementClass::Other => ActionClass::Dql,
         StatementClass::DataChange => ActionClass::Dml,
         StatementClass::Call => ActionClass::Call,
-        StatementClass::Destructive => ActionClass::Ddl,
+        StatementClass::Ddl => ActionClass::Ddl,
+        StatementClass::Privilege => ActionClass::Dcl,
     }
 }
 
@@ -409,9 +428,10 @@ pub(crate) fn action_class(class: StatementClass) -> ActionClass {
 /// never reached the engine (issue #57 §5 "deny_reason").
 pub(crate) fn write_gate_reason(gate: WriteGate) -> &'static str {
     match gate {
-        WriteGate::Destructive => "destructive_ddl",
-        WriteGate::NeedsFlag(_) => "write_flag_required",
         WriteGate::Allow => "",
+        WriteGate::NeedsFlag(StatementClass::Ddl) => "ddl_flag_required",
+        WriteGate::NeedsFlag(StatementClass::Privilege) => "privilege_refused",
+        WriteGate::NeedsFlag(_) => "write_flag_required",
     }
 }
 
@@ -419,9 +439,13 @@ pub(crate) fn write_gate_reason(gate: WriteGate) -> &'static str {
 pub(crate) fn write_gate_message(gate: WriteGate) -> String {
     match gate {
         WriteGate::Allow => String::new(),
-        WriteGate::Destructive => {
-            "refusing destructive DDL: --allow-write covers INSERT/UPDATE/DELETE \
-and CALL, not DROP/TRUNCATE/ALTER/CREATE/GRANT"
+        WriteGate::NeedsFlag(StatementClass::Ddl) => {
+            "DDL requires --allow-ddl (DROP/TRUNCATE/ALTER/CREATE/RENAME); \
+--allow-write only covers INSERT/UPDATE/DELETE and CALL"
+                .to_string()
+        }
+        WriteGate::NeedsFlag(StatementClass::Privilege) => {
+            "refusing GRANT/REVOKE: privilege changes are never allowed from the CLI/REPL"
                 .to_string()
         }
         WriteGate::NeedsFlag(StatementClass::Call) => {
@@ -445,6 +469,8 @@ pub(crate) struct StmtAudit<'a> {
     pub source: Option<&'a str>,
     pub class: StatementClass,
     pub allow_write: bool,
+    /// Whether `--allow-ddl` put the session in write mode (issue #112).
+    pub allow_ddl: bool,
 }
 
 impl<'a> StmtAudit<'a> {
@@ -465,6 +491,7 @@ impl<'a> StmtAudit<'a> {
             source: Some(source),
             class,
             allow_write,
+            allow_ddl: false,
         }
     }
 
@@ -484,7 +511,14 @@ impl<'a> StmtAudit<'a> {
             source: None,
             class,
             allow_write,
+            allow_ddl: false,
         }
+    }
+
+    /// Record that the session also ran with `--allow-ddl` (issue #112).
+    pub(crate) fn with_allow_ddl(mut self, allow_ddl: bool) -> Self {
+        self.allow_ddl = allow_ddl;
+        self
     }
 }
 
@@ -496,7 +530,7 @@ pub(crate) fn stmt_event(ctx: &StmtAudit<'_>, decision: Decision) -> DraftEvent 
         ConnectionInfo::from_url(
             ctx.conn_name,
             ctx.url,
-            read_only_session_for(ctx.url) && !ctx.allow_write,
+            read_only_session_for(ctx.url) && !ctx.allow_write && !ctx.allow_ddl,
         ),
         ctx.action,
         action_class(ctx.class),
@@ -536,19 +570,32 @@ pub(crate) fn stmt_error_event(
     stmt_event(ctx, Decision::Error).with_outcome(outcome)
 }
 
-/// Emitted once when a CLI/REPL session is opened with `--allow-write`, before
-/// any statement runs (issue #58 CLI contract).
-pub(crate) fn session_mode_event(conn_name: &str, url: &str, allow_write: bool) -> DraftEvent {
+/// Emitted once when a CLI/REPL session is opened with `--allow-write` and/or
+/// `--allow-ddl`, before any statement runs (issue #58 CLI contract, #112).
+pub(crate) fn session_mode_event(
+    conn_name: &str,
+    url: &str,
+    allow_write: bool,
+    allow_ddl: bool,
+) -> DraftEvent {
+    let mode = match (allow_write, allow_ddl) {
+        (false, false) => "read_only",
+        (true, false) => "allow_write",
+        (false, true) => "allow_ddl",
+        (true, true) => "allow_write+ddl",
+    };
     DraftEvent::new(
         Channel::Cli,
-        ConnectionInfo::from_url(conn_name, url, read_only_session_for(url) && !allow_write),
+        ConnectionInfo::from_url(
+            conn_name,
+            url,
+            read_only_session_for(url) && !allow_write && !allow_ddl,
+        ),
         "session_mode",
         ActionClass::Admin,
         Decision::Allow,
     )
-    .with_detail(serde_json::json!({
-        "mode": if allow_write { "allow_write" } else { "read_only" }
-    }))
+    .with_detail(serde_json::json!({ "mode": mode }))
 }
 
 /// Event for an action that is not a SQL statement (connect, check,
@@ -600,6 +647,54 @@ pub(crate) fn resolve_cli_target(
             raw.config_path.clone(),
             raw.base_timeout.as_ref(),
         )
+    }
+}
+
+/// Tokenizer quoting rules for a URL scheme. MySQL uses backticks and `#`
+/// comments; GaussDB/Oracle/DuckDB use ANSI double quotes and dollar-quoted
+/// bodies (issue #112).
+pub(crate) fn statement_split_params(scheme: &str) -> (char, bool, bool) {
+    match scheme {
+        "mysql" => ('`', true, false),
+        _ => ('"', false, true),
+    }
+}
+
+/// True when a split fragment carries an actual statement (not blank and not
+/// only comments), so comment-only tails do not reach the engine.
+fn has_statement(fragment: &str) -> bool {
+    !strip_leading_comments(fragment.trim()).trim().is_empty()
+}
+
+/// Split a `-f`/stdin SQL script into individual statements, dropping blank and
+/// comment-only fragments. Reuses the REPL tokenizer so quoting, comments and
+/// dollar-quoted bodies behave identically (issue #112).
+pub(crate) fn split_cli_statements(sql: &str, scheme: &str) -> Vec<String> {
+    let (id_quote, hash_comment, dollar_quote) = statement_split_params(scheme);
+    let split = SqlTokenizer::split_statements(sql, id_quote, hash_comment, dollar_quote);
+    split
+        .complete
+        .into_iter()
+        .chain(std::iter::once(split.remainder))
+        .map(|s| s.trim().to_string())
+        .filter(|s| has_statement(s))
+        .collect()
+}
+
+/// Statements to execute for one CLI invocation. A single `--sql` statement is
+/// passed through untouched (exact pre-#112 behaviour); a `-f`/stdin script is
+/// split so multi-statement files stop being sent as one prepared statement.
+pub(crate) fn cli_statements(sql: &str, scheme: &str, from_argv: bool) -> Vec<String> {
+    if from_argv {
+        return vec![sql.to_string()];
+    }
+    let split = split_cli_statements(sql, scheme);
+    if split.is_empty() {
+        // Only comments/blank lines: keep the original so the empty-statement
+        // error surface is unchanged.
+        vec![sql.to_string()]
+    } else {
+        split
     }
 }
 
@@ -666,7 +761,10 @@ pub(crate) async fn run_cli(
             scheme,
             &target.connection_url,
             Some(&effective_timeout),
-            args.allow_write,
+            // GaussDB opens a read-only session unless told otherwise, and a
+            // read-only session refuses DDL server-side — so `--allow-ddl`
+            // must put the pool in write mode too (issue #112).
+            args.allow_write || args.allow_ddl,
         )
         .await
         .map_err(|e| {
@@ -706,80 +804,103 @@ pub(crate) async fn run_cli(
     }
 
     let source_label = cli_source_label(args.sql.as_deref(), args.file.as_deref());
-    let statement_class = classify_statement(&sql);
-    let ctx = StmtAudit::cli(
-        &target.name,
-        &target.connection_url,
-        &sql,
-        &source_label,
-        statement_class,
-        args.allow_write,
-    );
-
-    // Refuse before touching the engine (issue #58 acceptance 4). A refusal is
-    // still an auditable fact: it answers "who tried to write" (issue #57 §5).
-    let gate = write_gate(&sql, args.allow_write);
-    if gate != WriteGate::Allow {
-        audit.record_best_effort(
-            stmt_event(&ctx, Decision::Deny).with_deny_reason(write_gate_reason(gate)),
-        );
-        return Err(write_gate_message(gate));
-    }
-    // Reject MySQL-only syntax (e.g. LIMIT on Oracle) before it reaches the
-    // server, where it would kill the connection instead of reporting why.
-    if let Some(hint) = conn.dialect().statement_syntax_hint(&sql) {
-        return Err(hint);
-    }
-    let is_write = matches!(
-        statement_class,
-        StatementClass::DataChange | StatementClass::Call
-    );
+    let statements = cli_statements(&sql, scheme, args.sql.is_some());
+    let total = statements.len();
 
     // One marker per session, so the ledger states whether it could write
-    // (issue #57 CLI contract: read_only -> allow_write).
+    // (issue #57 CLI contract: read_only -> allow_write; #112 adds ddl).
     audit.record_best_effort(session_mode_event(
         &target.name,
         &target.connection_url,
         args.allow_write,
+        args.allow_ddl,
     ));
 
-    // Writes are fail-closed (issue #58): the intent must be on disk before the
-    // statement reaches the engine, otherwise a mutation would be unaudited.
-    if is_write {
-        if let Err(e) = audit.record(stmt_event(&ctx, Decision::Allow)) {
-            return Err(format!(
-                "refusing to execute a data change without an audit record: {e}"
-            ));
+    for (idx, stmt) in statements.iter().enumerate() {
+        // Prefix only when a script carries several statements, so a single
+        // statement keeps the exact pre-#112 error surface.
+        let label = if total > 1 {
+            Some(format!("statement {}/{}", idx + 1, total))
+        } else {
+            None
+        };
+        let fail = |msg: String| -> String {
+            match &label {
+                Some(l) => format!("{} failed: {}", l, msg),
+                None => msg,
+            }
+        };
+
+        let statement_class = classify_statement(stmt);
+        let ctx = StmtAudit::cli(
+            &target.name,
+            &target.connection_url,
+            stmt,
+            &source_label,
+            statement_class,
+            args.allow_write,
+        )
+        .with_allow_ddl(args.allow_ddl);
+
+        // Refuse before touching the engine (issue #58 acceptance 4). A refusal
+        // is still an auditable fact: it answers "who tried to write"
+        // (issue #57 §5).
+        let gate = write_gate(stmt, args.allow_write, args.allow_ddl);
+        if gate != WriteGate::Allow {
+            audit.record_best_effort(
+                stmt_event(&ctx, Decision::Deny).with_deny_reason(write_gate_reason(gate)),
+            );
+            return Err(fail(write_gate_message(gate)));
         }
-    }
+        // Reject MySQL-only syntax (e.g. LIMIT on Oracle) before it reaches the
+        // server, where it would kill the connection instead of reporting why.
+        if let Some(hint) = conn.dialect().statement_syntax_hint(stmt) {
+            return Err(fail(hint));
+        }
+        let is_write = matches!(
+            statement_class,
+            StatementClass::DataChange | StatementClass::Call | StatementClass::Ddl
+        );
 
-    let start = Instant::now();
-    let result: Result<QueryResult, crate::backend::DbError> = if is_write {
-        conn.execute_write(&sql).await
-    } else {
-        execute_query_typed(&mut *conn, &sql).await
-    };
-    let duration_ms = start.elapsed().as_millis() as u64;
+        // Writes are fail-closed (issue #58): the intent must be on disk before
+        // the statement reaches the engine, otherwise a mutation would be
+        // unaudited.
+        if is_write {
+            if let Err(e) = audit.record(stmt_event(&ctx, Decision::Allow)) {
+                return Err(fail(format!(
+                    "refusing to execute a data change without an audit record: {e}"
+                )));
+            }
+        }
 
-    match &result {
-        Ok(qr) => audit.record_best_effort(stmt_ok_event(
-            &ctx,
-            duration_ms,
-            qr.rows_affected.unwrap_or(qr.row_count as u64),
-            is_write,
-        )),
-        Err(e) => {
-            let (error_kind, sqlstate) = classify_query_error(e);
-            audit.record_best_effort(stmt_error_event(
+        let start = Instant::now();
+        let result: Result<QueryResult, crate::backend::DbError> = if is_write {
+            conn.execute_write(stmt).await
+        } else {
+            execute_query_typed(&mut *conn, stmt).await
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(qr) => audit.record_best_effort(stmt_ok_event(
                 &ctx,
                 duration_ms,
-                &error_kind,
-                sqlstate.as_deref(),
-            ))
+                qr.rows_affected.unwrap_or(qr.row_count as u64),
+                is_write,
+            )),
+            Err(e) => {
+                let (error_kind, sqlstate) = classify_query_error(e);
+                audit.record_best_effort(stmt_error_event(
+                    &ctx,
+                    duration_ms,
+                    &error_kind,
+                    sqlstate.as_deref(),
+                ))
+            }
         }
+        let result = result.map_err(|e| fail(format!("Query failed: {}", e)))?;
+        render_result(&result, &mut std::io::stdout(), args.format).map_err(fail)?;
     }
-    let result = result.map_err(|e| format!("Query failed: {}", e))?;
-    render_result(&result, &mut std::io::stdout(), args.format)?;
 
     if let Some(action) = args.timeout_action.as_deref() {
         if action == "disconnect" {
@@ -1089,14 +1210,19 @@ mod tests {
             "TRUNCATE TABLE t",
             "ALTER TABLE t ADD c INT",
             "CREATE TABLE t (id INT)",
-            "GRANT SELECT ON t TO u",
-            "REVOKE SELECT ON t FROM u",
             "RENAME TABLE a TO b",
         ] {
             assert_eq!(
                 classify_statement(sql),
-                StatementClass::Destructive,
-                "expected Destructive for {sql:?}"
+                StatementClass::Ddl,
+                "expected Ddl for {sql:?}"
+            );
+        }
+        for sql in ["GRANT SELECT ON t TO u", "REVOKE SELECT ON t FROM u"] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Privilege,
+                "expected Privilege for {sql:?}"
             );
         }
     }
@@ -1104,43 +1230,201 @@ mod tests {
     #[test]
     fn should_refuse_data_changes_without_the_flag() {
         assert_eq!(
-            write_gate("INSERT INTO t VALUES (1)", false),
+            write_gate("INSERT INTO t VALUES (1)", false, false),
             WriteGate::NeedsFlag(StatementClass::DataChange)
         );
         assert_eq!(
-            write_gate("CALL foo()", false),
+            write_gate("CALL foo()", false, false),
             WriteGate::NeedsFlag(StatementClass::Call)
         );
-        assert_eq!(write_gate("SELECT 1", false), WriteGate::Allow);
+        assert_eq!(write_gate("SELECT 1", false, false), WriteGate::Allow);
     }
 
     #[test]
     fn should_allow_data_changes_with_the_flag_but_never_destructive() {
         assert_eq!(
-            write_gate("INSERT INTO t VALUES (1)", true),
+            write_gate("INSERT INTO t VALUES (1)", true, false),
             WriteGate::Allow
         );
-        assert_eq!(write_gate("CALL foo()", true), WriteGate::Allow);
-        assert_eq!(write_gate("DROP TABLE t", true), WriteGate::Destructive);
-        assert_eq!(write_gate("TRUNCATE TABLE t", true), WriteGate::Destructive);
+        assert_eq!(write_gate("CALL foo()", true, false), WriteGate::Allow);
         assert_eq!(
-            write_gate("ALTER TABLE t ADD c INT", true),
-            WriteGate::Destructive
+            write_gate("DROP TABLE t", true, false),
+            WriteGate::NeedsFlag(StatementClass::Ddl)
+        );
+        assert_eq!(
+            write_gate("TRUNCATE TABLE t", true, false),
+            WriteGate::NeedsFlag(StatementClass::Ddl)
+        );
+        assert_eq!(
+            write_gate("ALTER TABLE t ADD c INT", true, false),
+            WriteGate::NeedsFlag(StatementClass::Ddl)
+        );
+    }
+
+    #[test]
+    fn should_classify_ddl_and_privilege_separately() {
+        for sql in [
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "CREATE TABLE t (id INT)",
+            "RENAME TABLE a TO b",
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Ddl,
+                "expected Ddl for {sql:?}"
+            );
+        }
+        for sql in ["GRANT SELECT ON t TO u", "REVOKE SELECT ON t FROM u"] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementClass::Privilege,
+                "expected Privilege for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_refuse_ddl_without_the_ddl_flag() {
+        for sql in [
+            "TRUNCATE TABLE t",
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD c INT",
+        ] {
+            assert_eq!(
+                write_gate(sql, true, false),
+                WriteGate::NeedsFlag(StatementClass::Ddl),
+                "--allow-write alone must not open DDL: {sql:?}"
+            );
+            assert_eq!(
+                write_gate(sql, false, false),
+                WriteGate::NeedsFlag(StatementClass::Ddl),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_allow_ddl_with_the_ddl_flag() {
+        for sql in [
+            "TRUNCATE TABLE t",
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "RENAME TABLE a TO b",
+        ] {
+            assert_eq!(
+                write_gate(sql, false, true),
+                WriteGate::Allow,
+                "--allow-ddl must open DDL: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_always_refuse_privileges() {
+        for sql in ["GRANT SELECT ON t TO u", "REVOKE SELECT ON t FROM u"] {
+            assert_eq!(
+                write_gate(sql, true, true),
+                WriteGate::NeedsFlag(StatementClass::Privilege),
+                "privileges are never allowed: {sql:?}"
+            );
+            assert_eq!(
+                write_gate(sql, false, false),
+                WriteGate::NeedsFlag(StatementClass::Privilege),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_ddl_does_not_open_data_changes_without_allow_write() {
+        assert_eq!(
+            write_gate("INSERT INTO t VALUES (1)", false, true),
+            WriteGate::NeedsFlag(StatementClass::DataChange)
+        );
+        assert_eq!(
+            write_gate("CALL foo()", false, true),
+            WriteGate::NeedsFlag(StatementClass::Call)
+        );
+    }
+
+    #[test]
+    fn split_cli_statements_handles_a_gaussdb_seed_script() {
+        let sql = "SET search_path TO app;\n\
+                   INSERT INTO t VALUES (1);\n\
+                   INSERT INTO t VALUES (2);\n\
+                   DO $$ BEGIN PERFORM 1; END $$;";
+        let stmts = split_cli_statements(sql, "gaussdb");
+        assert_eq!(stmts.len(), 4, "{stmts:?}");
+        assert_eq!(stmts[0], "SET search_path TO app");
+        assert_eq!(stmts[3], "DO $$ BEGIN PERFORM 1; END $$");
+    }
+
+    #[test]
+    fn split_cli_statements_mysql_treats_backticks_as_identifiers() {
+        let stmts = split_cli_statements("SELECT `a;b` FROM t; SELECT 2;", "mysql");
+        assert_eq!(stmts, vec!["SELECT `a;b` FROM t", "SELECT 2"]);
+    }
+
+    #[test]
+    fn split_cli_statements_drops_blank_and_comment_only_fragments() {
+        let stmts = split_cli_statements("-- header\n;\n\nSELECT 1;", "gaussdb");
+        assert_eq!(stmts, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn split_cli_statements_keeps_a_single_statement_intact() {
+        let stmts = split_cli_statements("SELECT 1", "mysql");
+        assert_eq!(stmts, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn cli_statements_passes_argv_through_untouched() {
+        // A single `--sql` argument keeps its exact text (including a trailing
+        // semicolon), so the pre-#112 single-statement path is unchanged.
+        assert_eq!(
+            cli_statements("SELECT 1;", "mysql", true),
+            vec!["SELECT 1;"]
+        );
+    }
+
+    #[test]
+    fn cli_statements_splits_a_stdin_script() {
+        let stmts = cli_statements("SELECT 1; SELECT 2;", "mysql", false);
+        assert_eq!(stmts, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn cli_statements_falls_back_to_the_original_for_comment_only_input() {
+        assert_eq!(
+            cli_statements("-- just a comment", "mysql", false),
+            vec!["-- just a comment"]
         );
     }
 
     #[test]
     fn write_gate_reason_names_each_refusal() {
         assert_eq!(
-            write_gate_reason(write_gate("DROP TABLE t", true)),
-            "destructive_ddl"
+            write_gate_reason(write_gate("DROP TABLE t", true, false)),
+            "ddl_flag_required"
         );
         assert_eq!(
-            write_gate_reason(write_gate("INSERT INTO t VALUES (1)", false)),
+            write_gate_reason(write_gate("TRUNCATE TABLE t", false, false)),
+            "ddl_flag_required"
+        );
+        assert_eq!(
+            write_gate_reason(write_gate("GRANT SELECT ON t TO u", true, true)),
+            "privilege_refused"
+        );
+        assert_eq!(
+            write_gate_reason(write_gate("INSERT INTO t VALUES (1)", false, false)),
             "write_flag_required"
         );
         assert_eq!(
-            write_gate_reason(write_gate("CALL p()", false)),
+            write_gate_reason(write_gate("CALL p()", false, false)),
             "write_flag_required"
         );
     }
@@ -1152,7 +1436,7 @@ mod tests {
             "gaussdb://u:p@h:5432/db",
             "CREATE TABLE t (id INT)",
             "argv",
-            StatementClass::Destructive,
+            StatementClass::Ddl,
             true,
         );
         let ev = stmt_error_event(&ctx, 7, "QueryFailed", Some("25006"));
@@ -1230,14 +1514,22 @@ mod tests {
 
     #[test]
     fn session_mode_event_records_the_mode() {
-        let ro = session_mode_event("g", "gaussdb://u:p@h:5432/db", false);
+        let ro = session_mode_event("g", "gaussdb://u:p@h:5432/db", false, false);
         assert_eq!(ro.action, "session_mode");
         assert_eq!(ro.detail.as_ref().unwrap()["mode"], "read_only");
         assert!(ro.connection.read_only_session);
 
-        let rw = session_mode_event("g", "gaussdb://u:p@h:5432/db", true);
+        let rw = session_mode_event("g", "gaussdb://u:p@h:5432/db", true, false);
         assert_eq!(rw.detail.as_ref().unwrap()["mode"], "allow_write");
         assert!(!rw.connection.read_only_session);
+
+        let ddl = session_mode_event("g", "gaussdb://u:p@h:5432/db", false, true);
+        assert_eq!(ddl.detail.as_ref().unwrap()["mode"], "allow_ddl");
+        assert!(!ddl.connection.read_only_session);
+
+        let both = session_mode_event("g", "gaussdb://u:p@h:5432/db", true, true);
+        assert_eq!(both.detail.as_ref().unwrap()["mode"], "allow_write+ddl");
+        assert!(!both.connection.read_only_session);
     }
 
     #[test]
