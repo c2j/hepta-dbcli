@@ -230,9 +230,7 @@ async fn fetch_and_attach_keyless(
             .map(|name| {
                 ctx.left
                     .plan
-                    .norm_specs
-                    .iter()
-                    .find(|spec| spec.name.eq_ignore_ascii_case(name))
+                    .spec_for(name)
                     .map(|spec| spec.data_type.clone())
                     .unwrap_or_default()
             })
@@ -423,6 +421,7 @@ mod tests {
                     .collect(),
                 norm_specs: vec![],
                 warnings: vec![],
+                key_specs: vec![],
             },
         }
     }

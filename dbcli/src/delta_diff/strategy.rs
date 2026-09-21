@@ -193,6 +193,7 @@ mod filter_tests {
                 compare_columns: vec![],
                 norm_specs: vec![],
                 warnings: vec![],
+                key_specs: vec![],
             },
         }
     }

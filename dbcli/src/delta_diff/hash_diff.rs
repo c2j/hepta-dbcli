@@ -1178,6 +1178,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
+            key_specs: vec![],
         }
     }
 

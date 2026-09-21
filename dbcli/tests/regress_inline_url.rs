@@ -92,6 +92,97 @@ fn seed_duckdb(path: &std::path::Path, rows: &str) {
         .expect("bootstrap table");
 }
 
+/// Same shape as [`seed_duckdb`] plus a timestamp-ish column, so one column
+/// can differ while the compared ones do not (issue #109).
+fn seed_duckdb_with_etl_column(path: &std::path::Path, rows: &str) {
+    if path.exists() {
+        std::fs::remove_file(path).expect("remove stale fixture");
+    }
+    let conn = duckdb::Connection::open(path).expect("bootstrap create");
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (id INTEGER, amount INTEGER, etl_time VARCHAR); {rows}"
+    ))
+    .expect("bootstrap table");
+}
+
+/// Keyless table without an `id` column: nothing for a key-domain probe to
+/// name (the shape that broke in issue #108).
+fn seed_keyless_duckdb(path: &std::path::Path, rows: &str) {
+    if path.exists() {
+        std::fs::remove_file(path).expect("remove stale fixture");
+    }
+    let conn = duckdb::Connection::open(path).expect("bootstrap create");
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (code INTEGER, label VARCHAR); {rows}"
+    ))
+    .expect("bootstrap table");
+}
+
+/// Keyed table for the merge-order regression: an integer primary key plus a
+/// value column.
+fn seed_keyed_duckdb(path: &std::path::Path, rows: &str) {
+    if path.exists() {
+        std::fs::remove_file(path).expect("remove stale fixture");
+    }
+    let conn = duckdb::Connection::open(path).expect("bootstrap create");
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR); {rows}"
+    ))
+    .expect("bootstrap table");
+}
+
+/// `initialize` + `notifications/initialized` preamble for one stdio session.
+fn mcp_handshake() -> String {
+    format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "0"}
+            }
+        }),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+    )
+}
+
+/// One `tools/call` request (no trailing newline) for `tool` with `args`.
+fn mcp_tool_call(tool: &str, args: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": args}
+    })
+    .to_string()
+}
+
+/// Send `payload` to a fresh configless MCP server and return its stdout.
+fn mcp_call(payload: String) -> String {
+    let (mut mcp_cmd, _home) = isolated(Command::new(BIN));
+    let mut child = mcp_cmd
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write stdio");
+    let out = child.wait_with_output().expect("wait");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Reports travel as an escaped JSON string inside the tool result.
+fn unescape_report(stdout: &str) -> String {
+    stdout.replace("\\\"", "\"").replace("\\n", "\n")
+}
+
 #[test]
 fn mcp_with_broken_explicit_config_fails_closed() {
     // `--config` 指向坏文件时必须 exit 1，绝不降级为空连接表
@@ -390,5 +481,156 @@ fn mcp_configless_startup_serves_inline_url_diff_and_rejects_named() {
                 && (stdout.to_lowercase().contains("not found")
                     || stdout.contains("unknown_connection"))),
         "named connection must fail loudly without config: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_exclude_columns_hides_a_differing_column_from_the_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let left = dir.path().join("left_ex.duckdb");
+    let right = dir.path().join("right_ex.duckdb");
+    // Only `etl_time` differs between the sides.
+    seed_duckdb_with_etl_column(
+        &left,
+        "INSERT INTO t VALUES (1, 100, '2026-01-01'), (2, 200, '2026-01-02')",
+    );
+    seed_duckdb_with_etl_column(
+        &right,
+        "INSERT INTO t VALUES (1, 100, '2026-09-01'), (2, 200, '2026-09-02')",
+    );
+
+    // Control: without exclusions the differing column is reported.
+    let args = serde_json::json!({
+        "left_url": format!("duckdb://{}", left.display()),
+        "right_url": format!("duckdb://{}", right.display()),
+        "table": "t",
+        "key_columns": ["id"],
+    });
+    let stdout = mcp_call(format!(
+        "{}{}\n",
+        mcp_handshake(),
+        mcp_tool_call("delta_diff", args)
+    ));
+    assert!(
+        !stdout.contains("\"isError\":true"),
+        "control diff must not error: {stdout}"
+    );
+    assert!(
+        unescape_report(&stdout).contains("\"modified\": 2"),
+        "control run must report the differing column: {stdout}"
+    );
+
+    // With --exclude-columns the same tables compare identical.
+    let args = serde_json::json!({
+        "left_url": format!("duckdb://{}", left.display()),
+        "right_url": format!("duckdb://{}", right.display()),
+        "table": "t",
+        "key_columns": ["id"],
+        "exclude_columns": ["etl_time"],
+    });
+    let stdout = mcp_call(format!(
+        "{}{}\n",
+        mcp_handshake(),
+        mcp_tool_call("delta_diff", args)
+    ));
+    assert!(
+        !stdout.contains("\"isError\":true"),
+        "excluded diff must not error: {stdout}"
+    );
+    assert!(
+        unescape_report(&stdout).contains("\"modified\": 0"),
+        "excluded column must no longer be modified: {stdout}"
+    );
+    assert!(
+        unescape_report(&stdout).contains("excluded from comparison by --exclude-columns"),
+        "the exclusion must be reported: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_keyless_duckdb_snapshot_diff_completes_without_a_key_probe() {
+    // Issue #108: bucketdiff used to probe a hardcoded `id` key domain even
+    // for keyless tables, which aborted the snapshot transaction on
+    // PostgreSQL-family engines. DuckDB is the service-free stand-in here:
+    // a keyless table must diff successfully in the default snapshot mode.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let left = dir.path().join("left_keyless.duckdb");
+    let right = dir.path().join("right_keyless.duckdb");
+    // No PRIMARY KEY: the router picks bucketdiff with an empty key.
+    seed_keyless_duckdb(&left, "INSERT INTO t VALUES (1, 'a'), (1, 'a'), (2, 'b')");
+    seed_keyless_duckdb(&right, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (2, 'b')");
+
+    let args = serde_json::json!({
+        "left_url": format!("duckdb://{}", left.display()),
+        "right_url": format!("duckdb://{}", right.display()),
+        "table": "t",
+    });
+    let stdout = mcp_call(format!(
+        "{}{}\n",
+        mcp_handshake(),
+        mcp_tool_call("delta_diff", args)
+    ));
+
+    assert!(
+        !stdout.contains("\"isError\":true"),
+        "keyless snapshot diff must not error: {stdout}"
+    );
+    let report = unescape_report(&stdout);
+    assert!(
+        report.contains("\"strategy\": \"bucketdiff\""),
+        "keyless tables route to bucketdiff: {stdout}"
+    );
+    assert!(
+        report.contains("keyless table diff reports row-content multiset differences only"),
+        "the keyless semantics must be stated: {stdout}"
+    );
+    // Multiset semantics: id=1 twice on the left, id=2 twice on the right.
+    assert!(
+        report.contains("\"missing_left\": 1") && report.contains("\"missing_right\": 1"),
+        "one duplicated row per side must be reported: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_excluded_integer_key_merges_keys_numerically() {
+    // Keys 2 and 10 must not be ordered as text ("10" < "2") once the key is
+    // excluded from the comparison: the client-side merge walks both sides in
+    // SQL ORDER BY order (numeric), so a text comparison desynchronizes and
+    // reports false missing rows.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let left = dir.path().join("left_keymerge.duckdb");
+    let right = dir.path().join("right_keymerge.duckdb");
+    seed_keyed_duckdb(&left, "INSERT INTO t VALUES (2, 'a'), (10, 'b')");
+    seed_keyed_duckdb(&right, "INSERT INTO t VALUES (2, 'a'), (3, 'c'), (10, 'b')");
+
+    let args = serde_json::json!({
+        "left_url": format!("duckdb://{}", left.display()),
+        "right_url": format!("duckdb://{}", right.display()),
+        "table": "t",
+        "strategy": "keyeddiff",
+        "exclude_columns": ["id"],
+    });
+    let stdout = mcp_call(format!(
+        "{}{}\n",
+        mcp_handshake(),
+        mcp_tool_call("delta_diff", args)
+    ));
+
+    assert!(
+        !stdout.contains("\"isError\":true"),
+        "excluded-key diff must not error: {stdout}"
+    );
+    let report = unescape_report(&stdout);
+    assert!(
+        report.contains("\"missing_left\": 1"),
+        "only the right-only key 3 may be reported: {stdout}"
+    );
+    assert!(
+        report.contains("\"missing_right\": 0"),
+        "no left row may look missing (the merge must order keys numerically): {stdout}"
+    );
+    assert!(
+        report.contains("\"modified\": 0"),
+        "the shared keys 2 and 10 are identical: {stdout}"
     );
 }

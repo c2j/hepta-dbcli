@@ -46,6 +46,8 @@ pub(crate) struct DiffOptions {
     pub(crate) strict: bool,
     pub(crate) key: Vec<String>,
     pub(crate) columns: Vec<String>,
+    /// --exclude-columns: deny list applied after `columns` (issue #109)
+    pub(crate) exclude_columns: Vec<String>,
     pub(crate) filter: Option<String>,
     pub(crate) incremental: Option<(String, String)>,
     pub(crate) bisection_factor: usize,
@@ -101,8 +103,8 @@ pub(crate) async fn run_diff(
         &opts.columns,
         &opts.key,
         opts.strategy,
-        !opts.snapshot,
         opts.rtrim_char_columns,
+        &opts.exclude_columns,
     )
     .await?;
     let (left_key_columns, right_key_columns) = super::paired_side_keys(
@@ -182,8 +184,8 @@ pub(crate) async fn preflight(
     columns: &[String],
     key: &[String],
     strategy_hint: Option<crate::delta_diff::cmd::Strategy>,
-    _consistency_none: bool,
     rtrim_char_columns: bool,
+    exclude_columns: &[String],
 ) -> Result<Preflight, String> {
     pin_session(left.conn, "left").await?;
     pin_session(right.conn, "right").await?;
@@ -194,6 +196,7 @@ pub(crate) async fn preflight(
         columns,
         key,
         rtrim_char_columns,
+        exclude_columns,
     )
     .await
     .map_err(|e| format!("left plan: {}", e))?;
@@ -204,6 +207,7 @@ pub(crate) async fn preflight(
         columns,
         key,
         rtrim_char_columns,
+        exclude_columns,
     )
     .await
     .map_err(|e| format!("right plan: {}", e))?;
@@ -384,6 +388,7 @@ mod tests {
                 })
                 .collect(),
             warnings: Vec::new(),
+            key_specs: vec![],
         }
     }
 
@@ -554,6 +559,7 @@ mod duckdb_e2e_tests {
             strict: false,
             key: vec![],
             columns: vec![],
+            exclude_columns: vec![],
             filter: None,
             incremental: None,
             bisection_factor: 32,

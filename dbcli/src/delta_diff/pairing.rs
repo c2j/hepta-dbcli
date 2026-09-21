@@ -134,6 +134,7 @@ mod tests {
             compare_columns: compare.iter().map(|name| (*name).to_string()).collect(),
             norm_specs: Vec::new(),
             warnings: Vec::new(),
+            key_specs: vec![],
         }
     }
 

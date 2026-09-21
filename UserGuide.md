@@ -744,7 +744,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理），两者皆缺会明确报错；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`exclude_columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 
 `where_condition` 禁止包含分号。`update_column` 与 `where_condition` 互斥，同时提供会被拒绝。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
@@ -787,7 +787,19 @@ hepta_dbcli delta-diff --left mysql_dev --right ora_dev \
 # 指定比对键与列（自动发现失败时）
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
   --key id --columns id,amount,status
+
+# 排除若干列（自动发现后做减法，适合 etl_time / remark 这类噪声列）
+hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
+  --exclude-columns etl_time,remark,src_file
 ```
+
+`--exclude-columns` 语义：
+
+- 在自动发现（或 `--columns` 白名单）之后做减法，两侧同名同用；列名大小写不敏感。
+- 列名必须是该表现有列，拼错直接报错，不会静默跳过。
+- 同一列同时出现在 `--columns` 与 `--exclude-columns` 会报错（语义冲突），两者只在列名不重叠时共存。
+- 排除的是「值比较」：被排除的键列仍然用于行配对（`key_columns` 不变），报告会在 warnings 里写明；被排除的列也不会出现在 `--export` / `.sql` 补丁的列清单里。
+- 全部列都被排除时报错。
 
 ### 9.2 过滤与增量
 
@@ -826,6 +838,13 @@ DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致（含 `
 ```bash
 hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-run
 ```
+
+`bucketdiff` 有两种分桶方式，按「是否存在可用的单列整数键」自动选择：
+
+- **有单列整数键**（类型为整数/数值/decimal 等）：先探针一次 `MIN/MAX` 拿键域，再按键区间分桶，每个桶的拉取都走索引范围。
+- **无键表，或键类型不可能是整数**（VARCHAR/日期/JSON 等）：不做任何探针，直接按 `MOD(rowHash, N)` 内容分桶。
+
+探针只在能构成整数键域时才发；探针语句本身被库拒绝（例如键列不支持 `MIN()`）会直接报错并给出替代策略提示，不会静默降级。键没有单列整数形态时请改用 `--strategy naivediff` 或 `--strategy keyeddiff`。
 
 ### 9.4 一致性与复核
 

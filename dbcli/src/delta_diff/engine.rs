@@ -9,7 +9,7 @@
 use crate::config::ResolvedConnection;
 use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
 use crate::delta_diff::metadata::TablePlan;
-use crate::delta_diff::pairing::{find_unique_ci, pair_plans};
+use crate::delta_diff::pairing::pair_plans;
 use crate::delta_diff::strategy::DiffStrategy;
 use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff, naive_diff};
 
@@ -206,7 +206,8 @@ fn resolve_key(lplan: &TablePlan, rplan: &TablePlan) -> Vec<String> {
 }
 
 fn is_int_key(plan: &TablePlan, key: &str) -> bool {
-    let ty = find_unique_ci(&plan.norm_specs, key, |spec| &spec.name)
+    let ty = plan
+        .spec_for(key)
         .map(|s| s.data_type.as_str())
         .unwrap_or("");
     let base = ty.split('(').next().unwrap_or("").trim().to_lowercase();
@@ -244,8 +245,9 @@ fn non_bisectable_reason(lplan: &TablePlan, rplan: &TablePlan, key_columns: &[St
             }
         }
         [k] => {
-            let compared =
-                |p: &TablePlan| find_unique_ci(&p.norm_specs, k, |spec| &spec.name).is_some();
+            // A key known from either list is a real column; “not among the
+            // compared columns” is only for keys the plan cannot see at all.
+            let compared = |p: &TablePlan| p.spec_for(k).is_some();
             if !compared(lplan) || !compared(rplan) {
                 format!("key column '{k}' is not among the compared columns")
             } else {
@@ -309,6 +311,7 @@ mod tests {
                 })
                 .collect(),
             warnings: vec![],
+            key_specs: vec![],
         }
     }
 
@@ -565,10 +568,78 @@ mod tests {
                 rtrim_fixed_char: false,
             }],
             warnings: vec![],
+            key_specs: vec![],
         };
         assert_eq!(
             non_bisectable_reason(&excluded, &excluded, &["id".into()]),
             "key column 'id' is not among the compared columns"
+        );
+    }
+
+    #[test]
+    fn non_bisectable_reason_reports_the_type_when_the_key_is_known() {
+        // Same exclusion as above, but the plan carries the key's declared
+        // type (key_specs): the reason is about the type, not about
+        // visibility, so routing keeps the bisectable decision.
+        let typed = TablePlan {
+            url_scheme: "mysql".into(),
+            key_columns: vec!["id".to_string()],
+            compare_columns: vec!["c1".to_string()],
+            norm_specs: vec![ColumnNormSpec {
+                name: "c1".to_string(),
+                data_type: "int".to_string(),
+                nullable: false,
+                rtrim_fixed_char: false,
+            }],
+            key_specs: vec![ColumnNormSpec {
+                name: "id".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+                rtrim_fixed_char: false,
+            }],
+            warnings: vec![],
+        };
+        assert_eq!(
+            non_bisectable_reason(&typed, &typed, &["id".into()]),
+            "key column 'id' is not an integer type"
+        );
+    }
+
+    #[test]
+    fn excluded_integer_key_still_routes_as_bisectable() {
+        // --exclude-columns id: the key leaves compare_columns but keeps its
+        // declared type in key_specs, so the fast path stays available
+        // (review of #109).
+        let excluded = || TablePlan {
+            url_scheme: "mysql".into(),
+            key_columns: vec!["id".to_string()],
+            compare_columns: vec!["amt".to_string()],
+            norm_specs: vec![ColumnNormSpec {
+                name: "amt".to_string(),
+                data_type: "int".to_string(),
+                nullable: false,
+                rtrim_fixed_char: false,
+            }],
+            key_specs: vec![ColumnNormSpec {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                rtrim_fixed_char: false,
+            }],
+            warnings: vec![],
+        };
+        let routed = route_plan(
+            &excluded(),
+            &excluded(),
+            "mysql://a/t",
+            "mysql://a/t",
+            Some(Strategy::Auto),
+        )
+        .unwrap();
+        assert_eq!(
+            routed.strategy.name(),
+            "joindiff",
+            "an excluded integer key keeps the same-connection MySQL fast path"
         );
     }
 

@@ -762,6 +762,7 @@ mod tests {
                 compare_columns: specs.iter().map(|s| s.name.clone()).collect(),
                 norm_specs: specs,
                 warnings: vec![],
+                key_specs: vec![],
             }
         }
 
@@ -1200,6 +1201,7 @@ mod duckdb_e2e_tests {
                 },
             ],
             warnings: vec![],
+            key_specs: vec![],
         }
     }
 
