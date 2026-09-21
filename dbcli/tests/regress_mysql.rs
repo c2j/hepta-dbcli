@@ -182,4 +182,62 @@ mod tests {
                 .await;
         assert!(result.is_err());
     }
+
+    // Issue #101: MySQL 8 marks several information_schema string columns
+    // (DATA_TYPE, COLUMN_TYPE, ...) with the binary flag on the wire, which
+    // used to render as `0x696e74` instead of `int`. Real text must come back
+    // as text; only genuinely non-UTF-8 bytes keep the hex escape.
+    #[tokio::test]
+    async fn mysql_information_schema_strings_render_as_text_not_hex() {
+        let mut conn = connect().await;
+        let result = polar_mysql::backend::DbConn::query(
+            &mut *conn,
+            "SELECT DATA_TYPE AS data_type, COLUMN_TYPE AS column_type \
+             FROM information_schema.COLUMNS LIMIT 1",
+        )
+        .await
+        .expect("information_schema query");
+        let row = result.rows.first().expect("at least one column exists");
+        for idx in [0usize, 1] {
+            match &row[idx] {
+                Value::String(s) => {
+                    assert!(
+                        !s.starts_with("0x"),
+                        "information_schema string rendered as hex: {s}"
+                    );
+                }
+                other => panic!("expected string value, got {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_non_utf8_blob_still_renders_as_hex() {
+        let mut conn = connect().await;
+        let name = unique_name("_blob101");
+        conn.query_drop(&format!("DROP TABLE IF EXISTS {name}"))
+            .await
+            .ok();
+        conn.query_drop(&format!(
+            "CREATE TABLE {name} (id INT PRIMARY KEY, raw VARBINARY(16))"
+        ))
+        .await
+        .expect("create blob table");
+        conn.query_drop(&format!("INSERT INTO {name} VALUES (1, UNHEX('00FFFE'))"))
+            .await
+            .expect("insert binary");
+        let result =
+            polar_mysql::backend::DbConn::query(&mut *conn, &format!("SELECT raw FROM {name}"))
+                .await
+                .expect("query blob");
+        conn.query_drop(&format!("DROP TABLE {name}"))
+            .await
+            .expect("drop blob table");
+        let row = result.rows.first().expect("blob row");
+        assert_eq!(
+            row[0],
+            Value::String("0x00fffe".to_string()),
+            "invalid UTF-8 bytes keep the hex escape"
+        );
+    }
 }
