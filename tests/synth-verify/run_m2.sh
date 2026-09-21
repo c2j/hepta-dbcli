@@ -76,8 +76,16 @@ fi
 export HEPTA_DBCLI_URL="${URL}"
 
 TABLES="m1_verify_parent,m1_verify_child"
-# Measured on this fixture: ~0.74. The gate is margin, not a fidelity claim.
-GOOD_MIN_SCORE=0.7
+# Measured on this fixture with a #103 binary: PK uniqueness is enforced on
+# every export format, so `--rows 2000` extrapolates parent.id past the
+# trained 1..1000 range; the generated parent pool doubles and child.parent_id
+# follows it, shifting supports the holdout never saw. `synth report` now
+# displays but does not count pk columns (issue #103 review), yet the FK-pool
+# ripple keeps this fixture's ceiling at ~0.655. The gate is margin, not a
+# fidelity claim: clean ~0.655 passes, the degraded copy (cjje shifted) still
+# collapses cjje to 0.0 and fails its own 0.95 gate, and verify_m2.py asserts
+# the per-column drop.
+GOOD_MIN_SCORE=0.62
 DEGRADED_MIN_SCORE=0.95
 
 run() {

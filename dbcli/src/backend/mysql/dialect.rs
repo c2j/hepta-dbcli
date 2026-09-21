@@ -14,6 +14,10 @@ impl Dialect for MySqlDialect {
          @@version_comment AS version_comment"
     }
 
+    fn current_schema_sql(&self) -> Option<&str> {
+        Some("SELECT DATABASE()")
+    }
+
     fn list_tables(&self) -> &str {
         "SELECT t.TABLE_SCHEMA AS schema_name, t.TABLE_NAME AS table_name, \
          t.TABLE_TYPE AS table_type, t.ENGINE AS engine, t.TABLE_ROWS AS row_count, \
@@ -375,6 +379,14 @@ impl Dialect for MySqlDialect {
 mod tests {
     use super::*;
     use crate::backend::is_polardbx_version;
+
+    // Issue #100: MySQL has no "public" schema; the schema-less default is
+    // the connection's current database.
+    #[test]
+    fn current_schema_sql_selects_database() {
+        let sql = MySqlDialect.current_schema_sql().expect("mysql has one");
+        assert!(sql.to_ascii_lowercase().contains("database()"));
+    }
 
     #[test]
     fn foreign_keys_sql_escapes_quote_in_schema() {

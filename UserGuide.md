@@ -1062,17 +1062,16 @@ tables:
 | `pii` | 强制匿名化；`pii_provider` 省略时用识别结果，再退回 `name` |
 
 - **防泄漏**：训练为 PII 的列不写入 `profile.json` 的 `top_values`；模型里该列的字典被替换为 `__pii_level_N` 占位（保留档位/频次结构，不保留原值），数值/日期列的 min/max/格式一并清空，相关矩阵中该维归零（不参与其它列的联合采样）。
-- **键列规则**：主键（含自然键，如 `email` 主键）**会**被匿名化；`--format sql` 导出时主键唯一性会通过 provider 重抽（不再从占位字典取值）。外键列**不**匿名化——生成时它由父表键池赋值，命中识别或强制 `sdtype: pii` 都会在训练期告警/加载期报错，以免破坏引用完整性。
+- **键列规则**：主键（含自然键，如 `email` 主键）**会**被匿名化；导出时主键唯一性会通过 provider 重抽（不再从占位字典取值）。外键列**不**匿名化——生成时它由父表键池赋值，命中识别或强制 `sdtype: pii` 都会在训练期告警/加载期报错，以免破坏引用完整性。
 - **格式合法**：email 来自 `fake` 的 `SafeEmail`，name 来自 `Name`，phone / id_card 用固定模板；生成端会校验并重抽，保证 100% 通过各自格式。
 - **确定性**：假值由表名+列名+seed 派生，同 seed 同配置逐字节可复现；`stable_mapping` 时同档位映射同一假值（不同档位不碰撞）。
 - **二进制体积**：引入 `fake`（2.9，复用已有 `rand 0.8`）后 release 二进制增加约 1.9%（<15% 门禁），未做 feature gate。
 
-#### 主键唯一性（issue #82）
+#### 主键唯一性（issue #82，#103 起覆盖全部导出格式）
 
-`--format sql` 导出时，模型里记录的主键（`model.pk`，含复合主键）强制唯一，即使没有其它表引用它：否则生成的 SQL 回灌时必然 `Duplicate entry`。单列主键与父键一样做拒绝重抽；复合主键只要求**元组**唯一，单个成员可以重复。
+模型里记录的主键（`model.pk`，含复合主键）在**所有导出格式**下都强制唯一，即使没有其它表引用它：#98 的 `load` 使 CSV / JSONL / JSON 产物也能关系化回灌，重复主键在任何格式下都会 `Duplicate entry`（#82 时只有 SQL 需要这个保证，#103 把它推广到全部格式）。单列主键与父键一样做拒绝重抽；复合主键只要求**元组**唯一，单个成员可以重复。
 
 - 训练观测到的可取值足够 `--rows` 时用重抽填满；不够时（如 12 个整数主键要生成 200 行）超出部分**外推**到训练值域之外（整数主键续号、日期主键按秒推进），保证产物始终可插入。只有主键既不可外推（非数值/日期字符串）又不够行数时才报错，错误含列名与请求行数；
-- 该唯一化只发生在 SQL 导出路径。CSV / JSONL 没有键约束，仍按原边际采样，`synth report` 的分布评分因此不受影响（同 seed 下 SQL 与 CSV 的主键列可能不同）；
 - 列级 `fixed` / `values` / `fixed_range` 覆盖、relationship 的 `pk`（外键子列）与零方差列不在此检查范围内：前者是用户的显式选择，后两者由池策略/边际决定；
 - 主键列在训练集里全部为 NULL 时按 NULL 生成，不参与唯一性判定。
 
@@ -1175,7 +1174,7 @@ tables:
 - 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
 - `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
-- 质量报告（`synth report`）以 `1-KS`（数值列）/ `1-TV`（类别列）/ Pearson-Δ 与 joint-TV（`baseline` 里登记过的列对）/ FK join-rate 打分，总分是各表已打分节的均值。留出集摘要只含聚合量（分位点、频次、相关系数），泄漏敏感性与 `top_values` 同级。类别列档数超过 50 时分数照常显示但 `counted: false`，不计入均值：数百档上两个多项分布的 TV 在完美模型下也接近 1，计入只会淹没真实信号。缺 baseline（旧模型）时对应节输出 `status: skipped` 与原因、退出码仍为 0，加 `--strict` 才报错；某表的生成数据缺失同样记为 skipped 表，并同时受 `--strict`（报错）与 `--min-score`（该表无分即失败）约束
+- 质量报告（`synth report`）以 `1-KS`（数值列）/ `1-TV`（类别列）/ Pearson-Δ 与 joint-TV（`baseline` 里登记过的列对）/ FK join-rate 打分，总分是各表已打分节的均值。留出集摘要只含聚合量（分位点、频次、相关系数），泄漏敏感性与 `top_values` 同级。类别列档数超过 50 时分数照常显示但 `counted: false`，不计入均值：数百档上两个多项分布的 TV 在完美模型下也接近 1，计入只会淹没真实信号。`model.pk` 列同理 `counted: false`：#103 起主键在所有格式下强制唯一，行数超过观测键空间时会外推、KS 必然下降——那是**可装载性约束**而非保真度问题，计入只会掩盖其他列的真实信号。缺 baseline（旧模型）时对应节输出 `status: skipped` 与原因、退出码仍为 0，加 `--strict` 才报错；某表的生成数据缺失同样记为 skipped 表，并同时受 `--strict`（报错）与 `--min-score`（该表无分即失败）约束
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断。`synth train` 仅在**请求行数超过 100（`--sample` 默认 10000）且实际采样恰好 100 行**时认定被截断：向 stderr 打印 WARNING（含「分布可能失真」），并把 `{table}.model.json` 的 `provenance.truncated` 设为 `true`。`--sample 100`（或更小）是调用方自己的上限，不算截断；采样不足 100 行或非 Oracle 连接也不警告。该判定是启发式：恰好只有 100 行的表在请求更多行时仍会误报。native OCI 后端不受影响但当前无法从配置强制选择（见 `tests/benchmark/REPORT.md`）
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写。`synth train --schema S` 写入 `TableModel.schema`，`generate --format sql` **默认**输出 `INSERT INTO "S"."t"`（标识符按方言引用）；`--no-schema-qualifier` 恢复旧的无前缀语句
 - `train` 与 `rules-draft` 的 `--schema` 语义一致：显式值优先，缺省时都取连接默认 schema（`side_schema_from_conn`），不再分别回落到 `current_schema`
@@ -1225,7 +1224,7 @@ CI：`.github/workflows/synth-benchmark.yml`——每周 cron 只跑 P1-adult（
 | NULL 复现（含 pairwise-complete 相关修正） | ✅ | ✅ | ⚠️ 部分 |
 | FK 图拓扑排序 + 引用完整性 | ✅ | ✅ | ✅（固定模式） |
 | 子表基数建模（HMA-lite） | ✅ `cardinality: modeled` | ✅ HMA 全量 | ❌ |
-| 主键唯一性（SQL 导出可回灌） | ✅ 含数值外推 | ✅ 内建 id 处理 | ✅ |
+| 主键唯一性（全部格式可回灌） | ✅ 含数值外推 | ✅ 内建 id 处理 | ✅ |
 | PII 识别 + 不可逆匿名化 | ✅ email/phone/name/id_card，默认匿名、可 `keep` | ✅ AnonymizedFaker（40+ locale） | ❌（有意保留真实键值） |
 | 可逆伪匿名化 | ❌（明确不做，见 #73） | ✅ PseudoAnonymizedFaker | ❌ |
 | 差分隐私保证 | ❌（明确不做） | ⚠️ 企业版 | ❌ |
@@ -1261,7 +1260,8 @@ hepta_dbcli --allow-write load --name dev --data synth-out --format csv
 
 要点：
 
-- 每张表一个事务，失败快速回滚；多表装载时后失败的表不会回滚已完成的表（错误信息会列出 completed 集合）。
+- 每张表一个事务，失败快速回滚；多表装载时后失败的表不会回滚已完成的表（错误信息会列出 completed 集合，并附恢复 hint：用 `--tables` 只补装失败的表，或先清空已完成表再全量重跑——盲跑全量会撞已完成表的 PK）。
+- 文件只匹配**目标 schema** 下的表（#106）：显式 `--schema` 优先，否则用连接的默认 schema；文件基名在该 schema 下找不到对应表即报错（load 永不建表/建 schema）。要跨 schema 匹配裸表名时，请选一个默认 schema 为空/更宽的连接或显式传 `--schema`。
 - CSV 语义：未加引号的空字段 = NULL，`""` = 空字符串；引号内逗号/换行/转义按 RFC 4180。
 - 整数值必须落在目标列类型范围内（GaussDB 绑定溢出会报错而不是截断）。
 - 连接选择用 `--name`；不存在的连接名直接报错退出，不会静默落到默认连接。

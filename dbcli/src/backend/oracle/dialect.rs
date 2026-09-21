@@ -58,6 +58,10 @@ impl Dialect for OracleDialect {
          FROM dual"
     }
 
+    fn current_schema_sql(&self) -> Option<&str> {
+        Some("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS \"schema\" FROM dual")
+    }
+
     fn list_tables(&self) -> &str {
         "SELECT \
          t.OWNER AS \"schema_name\", \
@@ -515,6 +519,14 @@ fn oracle_number_scale(data_type_upper: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::backend::Dialect;
+
+    // Issue #100: Oracle's schema-less default is the session's current schema.
+    #[test]
+    fn current_schema_sql_selects_syscontext_current_schema() {
+        let dialect = OracleDialect::new();
+        let sql = dialect.current_schema_sql().expect("oracle has one");
+        assert!(sql.contains("CURRENT_SCHEMA"));
+    }
 
     #[test]
     fn foreign_keys_sql_escapes_quote_in_schema() {

@@ -40,9 +40,17 @@ pub(crate) fn read_generated_table(
     Ok(None)
 }
 
+/// Strip a leading UTF-8 BOM (EF BB BF, issue #105): Excel/WPS exports carry
+/// it, and it would otherwise corrupt the first column name or JSON text.
+/// Any other byte sequence is left alone.
+fn strip_utf8_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}
+
 pub(crate) fn read_jsonl(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let content = strip_utf8_bom(&content);
     let mut columns: Vec<String> = Vec::new();
     let mut rows = Vec::new();
     for (line_no, line) in content.lines().enumerate() {
@@ -67,8 +75,9 @@ pub(crate) fn read_jsonl(path: &Path) -> Result<GeneratedTable, String> {
 pub(crate) fn read_json(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let content = strip_utf8_bom(&content);
     let objects: Vec<serde_json::Map<String, Value>> =
-        serde_json::from_str(&content).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+        serde_json::from_str(content).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     let mut columns: Vec<String> = Vec::new();
     if let Some(first) = objects.first() {
         columns = first.keys().cloned().collect();
@@ -94,7 +103,8 @@ pub(crate) fn read_json(path: &Path) -> Result<GeneratedTable, String> {
 pub(crate) fn read_csv(path: &Path) -> Result<GeneratedTable, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let records = parse_csv_records(&content);
+    let content = strip_utf8_bom(&content);
+    let records = parse_csv_records(content);
     let mut records = records.into_iter();
     let columns: Vec<String> = match records.next() {
         Some(header) => header
@@ -364,6 +374,55 @@ mod tests {
 
         // CRLF files and a missing trailing newline both parse to one record.
         assert_eq!(parse_csv_records("a,b\r\n1,2").len(), 2);
+    }
+
+    // Issue #105: Excel/WPS-exported CSV carries a UTF-8 BOM (EF BB BF).
+    // The BOM must be stripped so the first column name matches, while the
+    // strict column-set rejection of genuinely malformed headers stays.
+    #[test]
+    fn read_csv_strips_utf8_bom_from_first_column_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.csv"), b"\xef\xbb\xbfx,y\n1,2\n").unwrap();
+
+        let (columns, rows) = read_generated_table(dir.path(), "b").unwrap().unwrap();
+
+        assert_eq!(
+            columns,
+            vec!["x".to_string(), "y".to_string()],
+            "BOM must not leak into the first column name"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn read_jsonl_strips_utf8_bom_before_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "{\"a\":1,\"b\":\"p\"}\n";
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        std::fs::write(dir.path().join("t.jsonl"), bytes).unwrap();
+
+        let (columns, rows) = read_generated_table(dir.path(), "t").unwrap().unwrap();
+
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::from(1));
+    }
+
+    #[test]
+    fn read_json_strips_utf8_bom_before_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[{\"a\":1,\"b\":\"p\"}]";
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        std::fs::write(dir.path().join("t.json"), bytes).unwrap();
+
+        let (columns, rows) = read_generated_table(dir.path(), "t").unwrap().unwrap();
+
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::from(1));
     }
 
     #[test]

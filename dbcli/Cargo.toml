@@ -3,6 +3,7 @@ name = "polar-mysql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "CLI and MCP server for MySQL/PolarDB-X/Oracle/GaussDB/DuckDB database introspection"
 
 [lib]

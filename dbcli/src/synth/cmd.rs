@@ -1,5 +1,5 @@
 use crate::synth::export::{export, ExportFormat};
-use crate::synth::generator::{generate, generate_unique_primary_keys, GeneratorConfig};
+use crate::synth::generator::{generate, GeneratorConfig};
 use crate::synth::marginal::{
     compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
     NormalParams,
@@ -708,11 +708,10 @@ pub fn run_generate(
         enforce_min_max_values: flags.enforce_min_max_values,
     };
 
-    let data = if format == "sql" {
-        // Unique primary keys only matter where a relational constraint will
-        // be applied; see `generate_unique_primary_keys` (issue #82).
-        generate_unique_primary_keys(&models, &rules, &config)?
-    } else {
+    let data = {
+        // Every export format round-trips through `load`, so primary-key
+        // uniqueness is enforced on all paths (issue #103; formerly the SQL
+        // branch only, see issue #82).
         generate(&models, &rules, &config)?
     };
 
@@ -1105,7 +1104,7 @@ mod tests {
                 strategy: crate::synth::rules::TableStrategy::default(),
             }],
         };
-        let data = generate(
+        let data = crate::synth::generator::generate(
             &models,
             &rules,
             &GeneratorConfig {
@@ -1874,6 +1873,71 @@ mod tests {
             vy += dy * dy;
         }
         cov / (vx * vy).sqrt()
+    }
+
+    /// Issue #102: a BOOLEAN column (DuckDB/GaussDB report `BOOLEAN`,
+    /// samples arrive as JSON booleans) must train as a two-level
+    /// Categorical and generate real true/false values, not be silently
+    /// skipped into NULL.
+    #[test]
+    fn should_train_boolean_column_as_categorical() {
+        let values: Vec<Value> = (0..100)
+            .map(|i| Value::Bool(i % 3 != 0)) // 2/3 true, 1/3 false
+            .collect();
+        let (profile, rows) = typed_profile("t1", &[("is_active", "BOOLEAN", values)]);
+        let (model, skipped) = build_model("t1", "duckdb", &profile, &rows, vec![], None)
+            .expect("boolean column must train");
+        assert!(
+            !skipped.contains(&"is_active".to_string()),
+            "boolean column must not be skipped: {skipped:?}"
+        );
+        let col = model.columns.get("is_active").expect("column in model");
+        assert!(
+            matches!(col.marginal, Marginal::Categorical(_)),
+            "expected a categorical marginal, got {:?}",
+            col.marginal
+        );
+
+        // Generation emits the dictionary as text ("true"/"false"): the
+        // export/load path coerces those literals back to BOOLEAN
+        // (tabular::coerce_bool), so text is the round-trip carrier.
+        let generated = generate_table(model, 300);
+        let mut true_count = 0usize;
+        let mut false_count = 0usize;
+        for row in &generated {
+            match row[0].as_str() {
+                Some("true") => true_count += 1,
+                Some("false") => false_count += 1,
+                other => panic!("generated non-boolean value: {other:?}"),
+            }
+        }
+        assert_eq!(
+            true_count + false_count,
+            300,
+            "column must be fully populated"
+        );
+        let true_share = true_count as f64 / 300.0;
+        assert!(
+            (0.55..=0.78).contains(&true_share),
+            "true share {true_share} should approximate the trained 2/3"
+        );
+    }
+
+    /// Issue #102: booleans that arrive as text ("true"/"false" strings,
+    /// e.g. through a driver that casts) train the same two-level model.
+    #[test]
+    fn should_train_boolean_text_column_as_categorical() {
+        let values: Vec<Value> = (0..100)
+            .map(|i| Value::from(if i % 2 == 0 { "true" } else { "false" }))
+            .collect();
+        let (profile, rows) = typed_profile("t1", &[("flag", "BOOLEAN", values)]);
+        let (model, skipped) = build_model("t1", "duckdb", &profile, &rows, vec![], None).unwrap();
+        assert!(!skipped.contains(&"flag".to_string()));
+        let generated = generate_table(model, 50);
+        for row in &generated {
+            let text = row[0].as_str().expect("string flag");
+            assert!(text == "true" || text == "false", "got {text}");
+        }
     }
 
     #[test]

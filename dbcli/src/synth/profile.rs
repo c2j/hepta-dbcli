@@ -198,6 +198,17 @@ fn is_datetime_sql_type(data_type: &str) -> bool {
         || base.starts_with("time ")
 }
 
+/// Issue #102: declared boolean columns (`BOOLEAN` in DuckDB/GaussDB/
+/// PostgreSQL, `BOOL`, `TINYINT(1)` is deliberately NOT here because MySQL
+/// uses it as a numeric alias). A two-valued column is a categorical, so the
+/// value-dictionary path trains and generates it.
+fn is_boolean_sql_type(data_type: &str) -> bool {
+    matches!(
+        sql_type_base(data_type).as_str(),
+        "boolean" | "bool" | "logical"
+    )
+}
+
 fn compact_yyyymmdd_number(s: &str) -> Option<f64> {
     let s = s.trim();
     if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -248,7 +259,9 @@ fn frequency_top_values(non_null: &[&Value], top_k: Option<usize>) -> Option<Vec
         } else if v.is_number() {
             Some(v.to_string())
         } else {
-            None
+            // Issue #102: booleans enter the value dictionary as the text
+            // literals generation emits for every backend.
+            v.as_bool().map(|b| b.to_string())
         };
         if let Some(key) = key {
             *counts.entry(key).or_insert(0) += 1;
@@ -308,6 +321,9 @@ impl ColumnProfile {
 
         let schema_datetime = data_type.map(is_datetime_sql_type).unwrap_or(false);
         let schema_numeric = data_type.map(is_numeric_sql_type).unwrap_or(false);
+        let schema_boolean = data_type.map(is_boolean_sql_type).unwrap_or(false);
+        // Drivers may hand over native JSON booleans even without DDL info.
+        let sample_boolean = !non_null.is_empty() && non_null.iter().all(|v| v.is_boolean());
 
         let all_compact_dates = !non_null.is_empty()
             && !schema_numeric
@@ -367,6 +383,11 @@ impl ColumnProfile {
             } else {
                 ("datetime".to_string(), None, None, None, None)
             }
+        } else if schema_boolean || sample_boolean {
+            // Issue #102: a boolean column is a two-level categorical. The
+            // dictionary is normalised to "true"/"false" text so generation
+            // and the SQL export path emit literals every backend accepts.
+            ("categorical".to_string(), None, None, None, None)
         } else if non_null[0].is_number() || numeric_strings.is_some() {
             let nums: Vec<f64> = if non_null[0].is_number() {
                 non_null.iter().filter_map(|v| v.as_f64()).collect()

@@ -672,14 +672,7 @@ impl DbMcp {
         &self,
         Parameters(params): Parameters<GetTableMetadataParams>,
     ) -> Result<CallToolResult, McpError> {
-        let schema = params.schema_name.as_deref().unwrap_or("public");
         let table = &params.table_name;
-        info!(
-            "tool called: get_table_metadata schema={} table={} connection={}",
-            schema,
-            table,
-            params.connection_name.as_deref().unwrap_or("(default)")
-        );
         let name = params
             .connection_name
             .as_deref()
@@ -687,6 +680,29 @@ impl DbMcp {
             .to_string();
         let (_pool, mut conn) = self.get_connection(Some(&name)).await?;
         let url = self.connection_url_of(&name).await;
+
+        // Issue #100: the schema-less default is the connection's current
+        // schema (MySQL `DATABASE()`, PG/DuckDB `current_schema()`, Oracle
+        // SYS_CONTEXT), never the PostgreSQL-ism "public", which silently
+        // returned empty metadata on every other backend. When the dialect
+        // has no such notion, resolve through list_tables when the table
+        // name is unambiguous, else fail loudly with an actionable message.
+        let schema = match params.schema_name.as_deref() {
+            Some(explicit) => explicit.to_string(),
+            None => match self.resolve_default_schema(&mut conn, table).await {
+                Ok(schema) => schema,
+                Err(e) => {
+                    self.record_meta(&name, &url, "get_table_metadata", Decision::Error);
+                    return Err(e);
+                }
+            },
+        };
+        info!(
+            "tool called: get_table_metadata schema={} table={} connection={}",
+            schema,
+            table,
+            params.connection_name.as_deref().unwrap_or("(default)")
+        );
 
         let sql = { conn.dialect().table_columns().to_string() };
         let col_result = match conn
@@ -725,6 +741,25 @@ impl DbMcp {
                 })
             })
             .collect();
+
+        // Issue #100 companion: an empty column list means the table does
+        // not exist under `schema` (or is invisible to this connection).
+        // Answering {"columns":[],"indexes":[]} with isError:false is the
+        // same silent-trap the schema-less "public" default produced, so a
+        // missing table fails loudly too.
+        if columns.is_empty() {
+            self.record_meta(&name, &url, "get_table_metadata", Decision::Error);
+            return Err(McpError::invalid_request(
+                "table_not_found",
+                Some(json!({
+                    "message": format!(
+                        "table '{}' not found in schema '{}' (or not visible to this connection)",
+                        table, schema
+                    ),
+                    "hint": "call list_tables to see the tables this connection can see",
+                })),
+            ));
+        }
 
         let idx_sql = { conn.dialect().table_indexes().to_string() };
         let idx_result = match conn
@@ -1174,6 +1209,79 @@ impl DbMcp {
         match conns.get(name) {
             Some(ConnectionState::Connected(active)) => active.url.clone(),
             _ => String::new(),
+        }
+    }
+
+    /// Resolve the schema for a schema-less `get_table_metadata` call
+    /// (issue #100). Preference order:
+    /// 1. the dialect's current schema (`DATABASE()` / `current_schema()` /
+    ///    `SYS_CONTEXT`),
+    /// 2. `list_tables()` when the table name appears under exactly one
+    ///    schema (covers schemas a session default would not see),
+    /// 3. a loud invalid_params error naming the ambiguity — never the
+    ///    PostgreSQL-ism "public", which silently returned empty metadata
+    ///    on MySQL/DuckDB.
+    async fn resolve_default_schema(
+        &self,
+        conn: &mut Box<dyn DbConn + Send>,
+        table: &str,
+    ) -> Result<String, McpError> {
+        let probe_sql = conn.dialect().current_schema_sql().map(str::to_string);
+        if let Some(sql) = probe_sql {
+            if let Ok(result) = conn.query(&sql).await {
+                if let Some(row) = result.rows.first() {
+                    if let Some(schema) = row.first().and_then(|v| v.as_str()) {
+                        if !schema.is_empty() {
+                            return Ok(schema.to_string());
+                        }
+                    }
+                }
+            }
+            // A failing current-schema probe is not fatal: fall through to
+            // the list_tables disambiguation below.
+        }
+
+        let list_sql = conn.dialect().list_tables().to_string();
+        let listed = conn.query(&list_sql).await.map_err(|e| {
+            query_error(
+                "get_table_metadata (schema resolve)",
+                &list_sql,
+                &e.to_string(),
+            )
+        })?;
+        let mut matches: Vec<String> = Vec::new();
+        for row in &listed.rows {
+            let listed_table = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            if listed_table.eq_ignore_ascii_case(table) {
+                let schema = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+                if !schema.is_empty() && !matches.contains(&schema.to_string()) {
+                    matches.push(schema.to_string());
+                }
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(McpError::invalid_request(
+                "schema_required",
+                Some(json!({
+                    "message": format!(
+                        "table '{}' was not found in any schema; pass schema_name explicitly",
+                        table
+                    ),
+                    "hint": "call list_tables first, then retry with schema_name set",
+                })),
+            )),
+            _ => Err(McpError::invalid_request(
+                "ambiguous_table",
+                Some(json!({
+                    "message": format!(
+                        "table '{}' exists under multiple schemas: {}",
+                        table,
+                        matches.join(", ")
+                    ),
+                    "hint": "pass schema_name explicitly to disambiguate",
+                })),
+            )),
         }
     }
 

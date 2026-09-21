@@ -620,6 +620,12 @@ pub fn evaluate_shapes(
             reason: "no report baseline; retrain with --holdout-ratio > 0".to_string(),
         };
     };
+    // Since #103 the generator enforces unique `model.pk` values on every
+    // export format; scaling past the observed key space extrapolates keys
+    // and their shape score drops by design. That is a loadability
+    // constraint, not a fidelity claim, so PK columns are displayed but not
+    // averaged (same mechanism as the categorical level cap).
+    let pk_columns: std::collections::HashSet<&str> = model.pk.iter().map(String::as_str).collect();
     let mut items = Vec::new();
     for name in &model.copula.column_order {
         let Some(col_idx) = first_index(columns, name) else {
@@ -653,7 +659,7 @@ pub fn evaluate_shapes(
                         },
                     ),
                     levels: None,
-                    counted: true,
+                    counted: !pk_columns.contains(name.as_str()),
                 });
             }
             ColumnBaseline::Categorical {
@@ -670,7 +676,8 @@ pub fn evaluate_shapes(
                     metric: "1-tv".to_string(),
                     score: categorical_shape_score(&generated, base_values),
                     levels: Some(base_values.len()),
-                    counted: base_values.len() <= CATEGORICAL_SCORE_LEVEL_CAP,
+                    counted: base_values.len() <= CATEGORICAL_SCORE_LEVEL_CAP
+                        && !pk_columns.contains(name.as_str()),
                 });
             }
         }
@@ -681,7 +688,8 @@ pub fn evaluate_shapes(
             reason: if items.is_empty() {
                 "baseline has no column that is also present in the generated data".to_string()
             } else {
-                "every scoreable column is high-cardinality categorical (displayed, not averaged)"
+                "every scoreable column is a primary key or high-cardinality categorical \
+                 (displayed, not averaged)"
                     .to_string()
             },
         };
@@ -1559,6 +1567,50 @@ mod tests {
             panic!("expected scored shapes");
         };
         assert!(items.iter().all(|item| item.counted));
+    }
+
+    #[test]
+    fn primary_key_shapes_are_shown_but_not_averaged() {
+        // Issue #103 enforces unique model.pk values on every export format;
+        // scaling past the observed key space extrapolates ids and their KS
+        // score drops by design. That loadability constraint is not a fidelity
+        // claim, so the PK column is displayed but excluded from the mean
+        // (same mechanism as the high-cardinality categorical cap).
+        let mut model = model_of(&[numeric_column("id"), numeric_column("amount")]);
+        model.pk = vec!["id".to_string()];
+        let rows: Vec<Vec<Value>> = (0..2_000)
+            .map(|i| {
+                // 1000 observed keys; the generator would extrapolate ids
+                // 1000..2000 past the trained range.
+                vec![Value::from(i % 1000), Value::from(i as f64 * 0.5)]
+            })
+            .collect();
+        let baseline = build_baseline("t", &model, &rows, &[0, 1], 0.2).unwrap();
+        let columns = vec!["id".to_string(), "amount".to_string()];
+
+        let shapes = evaluate_shapes(&model, Some(&baseline), &columns, &rows);
+        let Section::Scored { score, items } = &shapes else {
+            panic!("expected scored shapes, got {shapes:?}");
+        };
+        assert_eq!(items.len(), 2);
+        let id = items.iter().find(|i| i.name == "id").unwrap();
+        assert!(!id.counted, "pk column must not drive the mean: {id:?}");
+
+        // The mean is the non-key column alone, even though the pk score is
+        // visibly worse.
+        let amount = items.iter().find(|i| i.name == "amount").unwrap();
+        assert!((*score - amount.score).abs() < 1e-12, "score {score}");
+
+        // A table without a declared pk keeps both columns counted.
+        let plain = model_of(&[numeric_column("id"), numeric_column("amount")]);
+        let Section::Scored { score, items } =
+            evaluate_shapes(&plain, Some(&baseline), &columns, &rows)
+        else {
+            panic!("expected scored shapes");
+        };
+        assert!(items.iter().all(|item| item.counted));
+        let mean = items.iter().map(|i| i.score).sum::<f64>() / items.len() as f64;
+        assert!((score - mean).abs() < 1e-12, "score {score}");
     }
 
     #[test]

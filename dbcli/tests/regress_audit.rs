@@ -367,3 +367,85 @@ async fn destructive_ddl_is_refused_even_with_the_flag() {
 
     drop_table(name).await;
 }
+
+// ─── Issue #104: cross-process append atomicity ─────────────────────
+
+/// PR #99 round 5 reproduction: N real processes appending to one audit
+/// file concurrently used to tear lines. With the per-append flock the
+/// ledger must stay whole-line valid.
+#[test]
+fn concurrent_processes_keep_audit_lines_intact() {
+    const PROCESSES: usize = 8;
+    const QUERIES: usize = 12;
+    let home = tempfile::tempdir().expect("tempdir");
+    let audit_dir = home.path().join("audit");
+    // Same skip contract as every other test in this file: no MySQL, no run.
+    let Some(url) = test_url() else {
+        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
+        return;
+    };
+
+    let mut children = Vec::new();
+    for _ in 0..PROCESSES {
+        let mut cmd = Command::new(BIN);
+        cmd.env("HEPTA_DBCLI_URL", &url)
+            .env("HOME", home.path())
+            .args([
+                "--audit-dir",
+                audit_dir.to_str().unwrap(),
+                "cli",
+                "--sql",
+                "SELECT 1 AS one",
+            ])
+            .stdout(Stdio::null());
+        // Spawn without waiting so the processes truly overlap.
+        children.push(cmd.spawn().expect("spawn hepta_dbcli"));
+    }
+    // Each process runs exactly QUERIES sequential invocations before we
+    // consider it done; re-spawn per query keeps the overlap high without
+    // shell loops (macOS has no `timeout`).
+    for _ in 1..QUERIES {
+        for child in children.iter_mut() {
+            let _ = child.wait();
+        }
+        children.clear();
+        for _ in 0..PROCESSES {
+            let mut cmd = Command::new(BIN);
+            cmd.env("HEPTA_DBCLI_URL", &url)
+                .env("HOME", home.path())
+                .args([
+                    "--audit-dir",
+                    audit_dir.to_str().unwrap(),
+                    "cli",
+                    "--sql",
+                    "SELECT 1 AS one",
+                ])
+                .stdout(Stdio::null());
+            children.push(cmd.spawn().expect("spawn hepta_dbcli"));
+        }
+    }
+    for child in children.iter_mut() {
+        let status = child.wait().expect("wait hepta_dbcli");
+        assert!(status.success(), "cli run failed");
+    }
+
+    // Every line in the ledger must be a whole JSON object.
+    let files: Vec<PathBuf> = std::fs::read_dir(&audit_dir)
+        .expect("audit dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "expected one daily audit file");
+    let contents = std::fs::read_to_string(&files[0]).expect("read audit file");
+    let mut count = 0usize;
+    for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("torn audit line {line:?}: {e}"));
+        count += 1;
+    }
+    assert!(
+        count >= PROCESSES * QUERIES,
+        "expected at least {} events, found {count}",
+        PROCESSES * QUERIES
+    );
+}

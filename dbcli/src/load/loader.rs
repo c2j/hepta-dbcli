@@ -162,11 +162,26 @@ pub(crate) async fn execute(
                     "table '{}' failed: {message} (completed: {})",
                     entry.table,
                     format_completed(&completed)
-                ));
+                ) + &recovery_hint(&completed));
             }
         }
     }
     Ok(total)
+}
+
+/// Issue #107: completed tables keep their rows by design, so a failed
+/// multi-table load must point at the recovery path (retry only the failed
+/// tables, or clean first) instead of leaving the user to hit PK collisions
+/// on a blind full rerun.
+fn recovery_hint(completed: &[String]) -> String {
+    if completed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nhint: completed tables [{}] already hold data; use --tables to load only the failed table(s), or clean them first.",
+            completed.join(", ")
+        )
+    }
 }
 
 /// Load one table inside a transaction: fetch column types, read + coerce the
@@ -535,6 +550,57 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(orders.rows[0][0], json!(0));
+        }
+
+        #[tokio::test]
+        async fn execute_failure_hints_recovery_for_completed_tables() {
+            let dir = tempfile::tempdir().unwrap();
+            let users_path = write_file(
+                &dir,
+                "users.jsonl",
+                "{\"id\":1,\"name\":\"alice\",\"note\":null}\n",
+            );
+            let orders_path = write_file(
+                &dir,
+                "orders.jsonl",
+                "{\"id\":10,\"user_id\":1,\"amount\":\"1.00\"}\n{\"id\":10,\"user_id\":1,\"amount\":\"2.00\"}\n",
+            );
+            let plan = LoadPlan {
+                entries: vec![
+                    plan_entry("users", &["id", "name", "note"], &users_path, 1),
+                    plan_entry("orders", &["id", "user_id", "amount"], &orders_path, 2),
+                ],
+            };
+
+            let mut conn = memory_conn().await;
+            create_fk_schema(conn.as_mut()).await;
+
+            // Issue #107: completed tables keep their rows by design, so the
+            // error must point at the recovery path instead of leaving the
+            // user to rediscover PK collisions on a blind full rerun.
+            let audit = AuditSession::disabled();
+            let err = loader_execute(&mut *conn, &plan, &audit).await.unwrap_err();
+            assert!(
+                err.contains(
+                    "hint: completed tables [users] already hold data; use --tables to load only the failed table(s), or clean them first"
+                ),
+                "{err}"
+            );
+
+            // And when nothing completed, no hint is appended.
+            let empty_plan = LoadPlan {
+                entries: vec![plan_entry(
+                    "orders",
+                    &["id", "user_id", "amount"],
+                    &orders_path,
+                    2,
+                )],
+            };
+            let err = loader_execute(&mut *conn, &empty_plan, &audit)
+                .await
+                .unwrap_err();
+            assert!(err.contains("table 'orders' failed"), "{err}");
+            assert!(!err.contains("hint:"), "{err}");
         }
 
         #[tokio::test]

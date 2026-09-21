@@ -148,18 +148,21 @@ impl PiiPlan {
     }
 }
 
+/// Generate rows for every table in `rules`. Since #98, every export format
+/// round-trips through `load` into a relational target, so `model.pk`
+/// uniqueness is enforced on every path (issue #103): duplicated keys would
+/// fail the load with `Duplicate entry` no matter the file format.
 pub fn generate(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
     config: &GeneratorConfig,
 ) -> Result<GeneratedData, String> {
-    generate_with(models, rules, config, false)
+    generate_with(models, rules, config, true)
 }
 
-/// Like [`generate`], but forces every `model.pk` to be unique so the rows can
-/// be inserted into the source table. Only the SQL export uses this: CSV/JSONL
-/// have no key constraint, and changing their key draws would move the very
-/// distribution `synth report` scores (see UserGuide §主键唯一性).
+/// Legacy name of [`generate`] (issue #82 kept the two paths apart; #103
+/// merged them). Kept so existing callers and tests keep compiling.
+#[deprecated(since = "0.5.6", note = "use `generate` (identical since #103)")]
 pub fn generate_unique_primary_keys(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
@@ -2443,6 +2446,7 @@ fn parent_observed_capacity(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::synth::cardinality::CardinalityDist;
@@ -6984,11 +6988,16 @@ tables:
         );
     }
 
-    /// Primary-key uniqueness is a SQL-export concern (issue #82): the plain
-    /// generator used for CSV/JSONL must keep its historical draws, so the
-    /// distribution `synth report` scores does not move.
+    /// Superseded by issue #103 (was `should_keep_duplicate_primary_keys_…
+    /// on_the_non_sql_path`, PR #85): the split existed because CSV/JSONL had
+    /// no key constraint, but #98's `load` made every format a relational
+    /// round-trip, so the plain generator now enforces uniqueness too. This
+    /// test keeps pinning the former non-SQL model shape (uniform 0..=10 over
+    /// 25 rows) and asserts the merged behavior: all keys unique, surplus
+    /// extrapolated past the trained maximum — byte-for-byte the contract the
+    /// SQL path already had under the same seed.
     #[test]
-    fn should_keep_duplicate_primary_keys_on_the_non_sql_path() {
+    fn should_enforce_uniqueness_on_the_former_non_sql_shape() {
         let mut model = int_key_model("t", "id", 0.0);
         let column = model.columns.get_mut("id").unwrap();
         column.rounding = Some(0);
@@ -7008,14 +7017,62 @@ tables:
         let rows = data.tables.get("t").unwrap();
         let distinct: std::collections::HashSet<String> =
             rows.iter().map(|row| row[0].to_string()).collect();
-        assert!(
-            distinct.len() < rows.len(),
-            "the non-SQL path must keep drawing with replacement"
+        assert_eq!(
+            distinct.len(),
+            rows.len(),
+            "every export format must produce loadable (unique) primary keys"
         );
         assert!(
             rows.iter()
-                .all(|row| row[0].as_i64().is_some_and(|value| value <= 10)),
-            "the non-SQL path must not extrapolate"
+                .any(|row| row[0].as_i64().is_some_and(|value| value > 10)),
+            "keys beyond the 11 trained values must extrapolate, not wrap"
+        );
+        // The two entry points are aliases now: identical seeds must give
+        // byte-identical rows.
+        let legacy = generate_unique_primary_keys(&models, &rules, &config(&["t"], 25)).unwrap();
+        assert_eq!(
+            serde_json::to_string(rows).unwrap(),
+            serde_json::to_string(legacy.tables.get("t").unwrap()).unwrap(),
+            "generate and generate_unique_primary_keys must agree"
+        );
+    }
+
+    /// `load` made every export format a relational round-trip format: a
+    /// CSV/JSONL product reloads into the source table and hits the same
+    /// `Duplicate entry` the SQL export already guards against (issue #103).
+    /// The plain generator must therefore enforce `model.pk` uniqueness too,
+    /// with the same redraw/extrapolate contract as the former SQL-only path.
+    #[test]
+    fn should_enforce_primary_key_uniqueness_on_every_format() {
+        let mut model = int_key_model("t", "id", 0.0);
+        let column = model.columns.get_mut("id").unwrap();
+        column.rounding = Some(0);
+        column.marginal = Marginal::Uniform(UniformParams {
+            low: 0.0,
+            high: 10.0,
+        });
+        column.min = Some(0.0);
+        column.max = Some(10.0);
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+
+        let data = generate(&models, &rules, &config(&["t"], 25)).unwrap();
+        let rows = data.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 25);
+        let distinct: std::collections::HashSet<String> =
+            rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            25,
+            "the plain generator must not repeat primary keys (issue #103)"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row[0].as_i64().is_some_and(|value| value > 10)),
+            "surplus keys must extrapolate past the trained maximum, matching the SQL path"
         );
     }
 

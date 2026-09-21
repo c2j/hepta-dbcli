@@ -536,6 +536,202 @@ mod duckdb_tests {
     fn json_num(n: i64) -> serde_json::Value {
         serde_json::Value::Number(n.into())
     }
+
+    // ─── Issue #106: --schema takes part in table filtering ──────────────
+
+    #[test]
+    fn load_duckdb_nonexistent_schema_fails_with_schema_level_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        shop_workspace(root.path());
+
+        // --schema ghost: the schema holds none of the listed tables, so the
+        // error must point at the schema qualifier, not "no matching table".
+        let (status, _stdout, stderr) = run_load_jsonl(root.path(), &["--schema", "ghost"]);
+        assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+        assert!(
+            stderr.contains("schema 'ghost' has no tables"),
+            "schema-level error expected: {stderr}"
+        );
+        assert!(
+            stderr.contains("does it exist"),
+            "error must hint the schema may not exist: {stderr}"
+        );
+        assert!(
+            !stderr.contains("no matching table"),
+            "must not fall through to the table-level error: {stderr}"
+        );
+        assert_eq!(count_rows(root.path(), "users"), 0);
+        assert_eq!(count_rows(root.path(), "orders"), 0);
+
+        // The main schema still loads fine with an explicit --schema main
+        // (schema participates in matching but does not break valid loads).
+        let (status2, stdout2, stderr2) = run_load_jsonl(root.path(), &["--schema", "main"]);
+        assert!(
+            status2.success(),
+            "explicit main schema must load, stderr: {stderr2}, stdout: {stdout2}"
+        );
+        assert_eq!(count_rows(root.path(), "users"), 2);
+        assert_eq!(count_rows(root.path(), "orders"), 2);
+    }
+
+    // ─── Issue #102: BOOLEAN columns survive train → generate → load ─────
+
+    #[test]
+    fn synth_boolean_round_trip_trains_generates_and_loads() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // Shop schema plus a boolean column on users. The bootstrap creates
+        // empty tables, so insert the training rows here: train samples the
+        // live database, not the data dir.
+        bootstrap_shop_db(root.path(), false);
+        {
+            let boot = duckdb::Connection::open(root.path().join("shop.duckdb"))
+                .expect("bootstrap reopen");
+            boot.execute_batch(
+                "ALTER TABLE users ADD COLUMN is_active BOOLEAN;
+                 INSERT INTO users VALUES
+                   (1, 'alice', 1.00, NULL, '2024-01-02 03:04:05', true),
+                   (2, 'bob',   0.05, '',   '2024-06-01 12:00:00', false);",
+            )
+            .expect("seed users with booleans");
+        }
+        // Config only; the data dir is produced by synth generate, and load
+        // consumes exactly that directory (orders is not generated).
+        write_config(root.path());
+
+        // 1) Train from the live DuckDB (is_active arrives as JSON booleans).
+        let models_dir = root.path().join("models");
+        let cfg = root.path().join("cfg.toml").to_string_lossy().into_owned();
+        let db_url = format!("duckdb://{}", root.path().join("shop.duckdb").display());
+        std::fs::write(&cfg, format!("[connections.test]\nurl = \"{db_url}\"\n"))
+            .expect("write cfg");
+        let train = Command::new(BIN)
+            .env("HOME", root.path())
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "--config",
+                cfg.as_str(),
+                "--audit-dir",
+                root.path().join("audit").to_str().unwrap(),
+                "synth",
+                "train",
+                "--tables",
+                "users",
+                "--output",
+                models_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run synth train");
+        assert!(
+            train.status.success(),
+            "synth train failed: {}",
+            String::from_utf8_lossy(&train.stderr)
+        );
+
+        // The trained model must carry is_active with a categorical marginal.
+        let model_json =
+            std::fs::read_to_string(models_dir.join("users.model.json")).expect("model file");
+        assert!(
+            model_json.contains("is_active"),
+            "model must contain the boolean column"
+        );
+
+        // 2) Generate from the trained model (jsonl output, small row count).
+        let rules_path = root.path().join("rules.yaml");
+        std::fs::write(
+            &rules_path,
+            "version: \"1\"\ntables:\n  - name: users\n    rows: 20\n    relationships: []\n",
+        )
+        .expect("write rules");
+        let out_dir = root.path().join("synth-out");
+        let gen = Command::new(BIN)
+            .env("HOME", root.path())
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "--config",
+                cfg.as_str(),
+                "--audit-dir",
+                root.path().join("audit2").to_str().unwrap(),
+                "synth",
+                "generate",
+                "--models",
+                models_dir.to_str().unwrap(),
+                "--rules",
+                rules_path.to_str().unwrap(),
+                "--output",
+                out_dir.to_str().unwrap(),
+                "--rows",
+                "20",
+                "--format",
+                "jsonl",
+                "--seed",
+                "7",
+            ])
+            .output()
+            .expect("run synth generate");
+        assert!(
+            gen.status.success(),
+            "synth generate failed: {}",
+            String::from_utf8_lossy(&gen.stderr)
+        );
+
+        // Generated users.jsonl must hold real true/false for is_active.
+        let generated =
+            std::fs::read_to_string(out_dir.join("users.jsonl")).expect("generated users.jsonl");
+        let mut true_count = 0usize;
+        let mut false_count = 0usize;
+        for line in generated.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).expect("json line");
+            match v["is_active"].as_str() {
+                Some("true") => true_count += 1,
+                Some("false") => false_count += 1,
+                other => panic!(
+                    "generated is_active must be \"true\"/\"false\", got {other:?} in {line}"
+                ),
+            }
+        }
+        assert_eq!(true_count + false_count, 20, "column fully populated");
+
+        // 3) Load the generated file back into the shop DB. The generated ids
+        // overlap the seeded training rows, so remove those first (the real
+        // workflow regenerates into a cleaned table; load never upserts).
+        {
+            let boot =
+                duckdb::Connection::open(root.path().join("shop.duckdb")).expect("reopen to clean");
+            boot.execute_batch("DELETE FROM orders; DELETE FROM users;")
+                .expect("clean tables");
+        }
+        let load = run_load(
+            root.path(),
+            &[
+                "load",
+                "--data",
+                out_dir.to_str().unwrap(),
+                "--name",
+                "test",
+                "--tables",
+                "users",
+            ],
+        );
+        assert!(load.0.success(), "load failed: {} / {}", load.1, load.2);
+
+        // 4) Reopen and verify the BOOLEAN column holds real booleans.
+        let boot =
+            duckdb::Connection::open(root.path().join("shop.duckdb")).expect("reopen for verify");
+        let (loaded_true, loaded_false): (i64, i64) = boot
+            .query_row(
+                "SELECT \
+                 COUNT(*) FILTER (WHERE is_active), \
+                 COUNT(*) FILTER (WHERE NOT is_active) \
+                 FROM users",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .expect("verify query");
+        assert!(
+            loaded_true + loaded_false >= 20,
+            "synthetic rows must be loaded with real booleans: true={loaded_true} false={loaded_false}"
+        );
+    }
 }
 
 // ─── MySQL (env-gated) ──────────────────────────────────────────────────
