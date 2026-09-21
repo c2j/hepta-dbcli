@@ -637,7 +637,7 @@ impl DbMcp {
         let url = self.connection_url_of(&name).await;
 
         let sql = { conn.dialect().list_tables().to_string() };
-        let result = match conn.query(&sql).await {
+        let result = match crate::backend::query_list_tables(&mut *conn).await {
             Ok(result) => result,
             Err(e) => {
                 self.record_meta(&name, &url, "list_tables", Decision::Error);
@@ -705,15 +705,7 @@ impl DbMcp {
         );
 
         let sql = { conn.dialect().table_columns().to_string() };
-        let col_result = match conn
-            .exec(
-                &sql,
-                &[
-                    Value::String(schema.to_string()),
-                    Value::String(table.clone()),
-                ],
-            )
-            .await
+        let col_result = match crate::backend::query_table_columns(&mut *conn, &schema, table).await
         {
             Ok(result) => result,
             Err(e) => {
@@ -1242,13 +1234,15 @@ impl DbMcp {
         }
 
         let list_sql = conn.dialect().list_tables().to_string();
-        let listed = conn.query(&list_sql).await.map_err(|e| {
-            query_error(
-                "get_table_metadata (schema resolve)",
-                &list_sql,
-                &e.to_string(),
-            )
-        })?;
+        let listed = crate::backend::query_list_tables(&mut **conn)
+            .await
+            .map_err(|e| {
+                query_error(
+                    "get_table_metadata (schema resolve)",
+                    &list_sql,
+                    &e.to_string(),
+                )
+            })?;
         let mut matches: Vec<String> = Vec::new();
         for row in &listed.rows {
             let listed_table = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();

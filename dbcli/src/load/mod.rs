@@ -154,8 +154,7 @@ pub(crate) async fn run(
     // the connection default) takes part in the match so tables from other
     // schemas do not satisfy it, and a schema with no tables fails with a
     // schema-level error. Without either, matching stays by bare table name.
-    let list_sql = conn.dialect().list_tables().to_string();
-    let listed = match conn.query(&list_sql).await {
+    let listed = match crate::backend::query_list_tables(&mut *conn).await {
         Ok(result) => result,
         Err(e) => {
             eprintln!("error: list tables: {e}");
