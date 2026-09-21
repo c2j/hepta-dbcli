@@ -1,5 +1,5 @@
 use crate::synth::export::{export, ExportFormat};
-use crate::synth::generator::{generate_unique_primary_keys, GeneratorConfig};
+use crate::synth::generator::{generate, GeneratorConfig};
 use crate::synth::marginal::{
     compute_gaussian_correlation, CategoricalParams, EcdfFitter, Marginal, MarginalFitter,
     NormalParams,
@@ -711,8 +711,8 @@ pub fn run_generate(
     let data = {
         // Every export format round-trips through `load`, so primary-key
         // uniqueness is enforced on all paths (issue #103; formerly the SQL
-        // branch only, see `generate_unique_primary_keys` / issue #82).
-        generate_unique_primary_keys(&models, &rules, &config)?
+        // branch only, see issue #82).
+        generate(&models, &rules, &config)?
     };
 
     let export_format = match format {

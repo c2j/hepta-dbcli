@@ -162,6 +162,7 @@ pub fn generate(
 
 /// Legacy name of [`generate`] (issue #82 kept the two paths apart; #103
 /// merged them). Kept so existing callers and tests keep compiling.
+#[deprecated(since = "0.5.6", note = "use `generate` (identical since #103)")]
 pub fn generate_unique_primary_keys(
     models: &HashMap<String, TableModel>,
     rules: &SynthRules,
@@ -2445,6 +2446,7 @@ fn parent_observed_capacity(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::synth::cardinality::CardinalityDist;

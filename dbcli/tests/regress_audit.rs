@@ -379,7 +379,11 @@ fn concurrent_processes_keep_audit_lines_intact() {
     const QUERIES: usize = 12;
     let home = tempfile::tempdir().expect("tempdir");
     let audit_dir = home.path().join("audit");
-    let url = std::env::var("HEPTA_DBCLI_TEST_URL").expect("HEPTA_DBCLI_TEST_URL");
+    // Same skip contract as every other test in this file: no MySQL, no run.
+    let Some(url) = test_url() else {
+        eprintln!("skipping: HEPTA_DBCLI_TEST_URL not set");
+        return;
+    };
 
     let mut children = Vec::new();
     for _ in 0..PROCESSES {

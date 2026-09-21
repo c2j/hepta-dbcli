@@ -1174,7 +1174,7 @@ tables:
 - 无法推断格式的 datetime（如 Oracle `15-JAN-24`）保持旧行为（按观测值做 Categorical）并打印警告。旧模型 `logical_type: datetime` 且无 `datetime_format` 的生成路径不变
 - `YYYYMMDD` 这类紧凑日期**不**走 epoch 格式还原，在 `model.json` 中仍以整数（如 `20240515`）建模，生成值裁剪在训练 min/max 之间但不保证是合法日历日（可能得到 `20240337`）；需要严格合法日期时请勿用 synth 生成该列或改用真实 `date`/`timestamp` 类型
 - 生成值默认裁剪到训练 min/max（`--enforce-min-max-values`，默认开）。关闭该开关或 min/max 缺失时，数值列（含整数 PK）可能生成负数或越界值
-- 质量报告（`synth report`）以 `1-KS`（数值列）/ `1-TV`（类别列）/ Pearson-Δ 与 joint-TV（`baseline` 里登记过的列对）/ FK join-rate 打分，总分是各表已打分节的均值。留出集摘要只含聚合量（分位点、频次、相关系数），泄漏敏感性与 `top_values` 同级。类别列档数超过 50 时分数照常显示但 `counted: false`，不计入均值：数百档上两个多项分布的 TV 在完美模型下也接近 1，计入只会淹没真实信号。缺 baseline（旧模型）时对应节输出 `status: skipped` 与原因、退出码仍为 0，加 `--strict` 才报错；某表的生成数据缺失同样记为 skipped 表，并同时受 `--strict`（报错）与 `--min-score`（该表无分即失败）约束
+- 质量报告（`synth report`）以 `1-KS`（数值列）/ `1-TV`（类别列）/ Pearson-Δ 与 joint-TV（`baseline` 里登记过的列对）/ FK join-rate 打分，总分是各表已打分节的均值。留出集摘要只含聚合量（分位点、频次、相关系数），泄漏敏感性与 `top_values` 同级。类别列档数超过 50 时分数照常显示但 `counted: false`，不计入均值：数百档上两个多项分布的 TV 在完美模型下也接近 1，计入只会淹没真实信号。`model.pk` 列同理 `counted: false`：#103 起主键在所有格式下强制唯一，行数超过观测键空间时会外推、KS 必然下降——那是**可装载性约束**而非保真度问题，计入只会掩盖其他列的真实信号。缺 baseline（旧模型）时对应节输出 `status: skipped` 与原因、退出码仍为 0，加 `--strict` 才报错；某表的生成数据缺失同样记为 skipped 表，并同时受 `--strict`（报错）与 `--min-score`（该表无分即失败）约束
 - 纯 Rust Oracle 后端（oracle-rs 0.1.7）存在驱动缺陷：查询超过 100 行被静默截断。`synth train` 仅在**请求行数超过 100（`--sample` 默认 10000）且实际采样恰好 100 行**时认定被截断：向 stderr 打印 WARNING（含「分布可能失真」），并把 `{table}.model.json` 的 `provenance.truncated` 设为 `true`。`--sample 100`（或更小）是调用方自己的上限，不算截断；采样不足 100 行或非 Oracle 连接也不警告。该判定是启发式：恰好只有 100 行的表在请求更多行时仍会误报。native OCI 后端不受影响但当前无法从配置强制选择（见 `tests/benchmark/REPORT.md`）
 - SQL 导出携带引用标识符与列名：MySQL 反引号、Oracle 双引号并折叠为大写、GaussDB 双引号小写。`synth train --schema S` 写入 `TableModel.schema`，`generate --format sql` **默认**输出 `INSERT INTO "S"."t"`（标识符按方言引用）；`--no-schema-qualifier` 恢复旧的无前缀语句
 - `train` 与 `rules-draft` 的 `--schema` 语义一致：显式值优先，缺省时都取连接默认 schema（`side_schema_from_conn`），不再分别回落到 `current_schema`
@@ -1260,7 +1260,8 @@ hepta_dbcli --allow-write load --name dev --data synth-out --format csv
 
 要点：
 
-- 每张表一个事务，失败快速回滚；多表装载时后失败的表不会回滚已完成的表（错误信息会列出 completed 集合）。
+- 每张表一个事务，失败快速回滚；多表装载时后失败的表不会回滚已完成的表（错误信息会列出 completed 集合，并附恢复 hint：用 `--tables` 只补装失败的表，或先清空已完成表再全量重跑——盲跑全量会撞已完成表的 PK）。
+- 文件只匹配**目标 schema** 下的表（#106）：显式 `--schema` 优先，否则用连接的默认 schema；文件基名在该 schema 下找不到对应表即报错（load 永不建表/建 schema）。要跨 schema 匹配裸表名时，请选一个默认 schema 为空/更宽的连接或显式传 `--schema`。
 - CSV 语义：未加引号的空字段 = NULL，`""` = 空字符串；引号内逗号/换行/转义按 RFC 4180。
 - 整数值必须落在目标列类型范围内（GaussDB 绑定溢出会报错而不是截断）。
 - 连接选择用 `--name`；不存在的连接名直接报错退出，不会静默落到默认连接。
