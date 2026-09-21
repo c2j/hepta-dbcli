@@ -224,8 +224,9 @@ pub(crate) async fn run(
             .or_else(|| listed_schemas.get(table).cloned().flatten())
     };
 
-    // Column metadata for strict validation (order-insensitive set equality).
-    let mut db_columns: HashMap<String, Vec<String>> = HashMap::new();
+    // Column metadata for validation (issue #113 B: nullable/default flags
+    // decide which omitted columns can load as NULL).
+    let mut db_columns: HashMap<String, Vec<plan::DbColumn>> = HashMap::new();
     for entry in &plan_data.entries {
         let Some(schema) = schema_of(&entry.table) else {
             eprintln!(
@@ -251,12 +252,16 @@ pub(crate) async fn run(
                 return EXIT_ERROR;
             }
         };
-        db_columns.insert(entry.table.clone(), plan::parse_column_names(&result));
+        db_columns.insert(entry.table.clone(), plan::parse_db_columns(&result));
     }
-    if let Err(e) = plan::validate_column_sets(&plan_data, &db_columns) {
-        eprintln!("error: {e}");
-        return EXIT_ERROR;
-    }
+    let allowed_missing =
+        match plan::validate_column_sets(&plan_data, &db_columns, args.strict_columns) {
+            Ok(allowed) => allowed,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_ERROR;
+            }
+        };
 
     if args.dry_run {
         let text = plan::render_plan(&plan_data, &target.name, &scheme, &fk_schema, &skipped);
@@ -277,7 +282,7 @@ pub(crate) async fn run(
     }
     let started = std::time::Instant::now();
 
-    match loader::execute(&mut *conn, &plan_data, audit, &conn_info).await {
+    match loader::execute(&mut *conn, &plan_data, &allowed_missing, audit, &conn_info).await {
         Ok(inserted) => {
             let duration_ms = started.elapsed().as_millis() as u64;
             audit.record_best_effort(load_outcome_event(

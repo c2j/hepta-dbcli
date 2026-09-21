@@ -175,14 +175,77 @@ pub(crate) fn schema_for_fk_lookup(
     candidates.into_iter().next()
 }
 
-/// Column names from a `table_columns()` result
-/// (`[column_name, data_type, nullable, ...]`).
-pub(crate) fn parse_column_names(result: &QueryResult) -> Vec<String> {
+/// One column of an existing table, from a `table_columns()` result. Only the
+/// facts load needs: the name, whether it can hold NULL, and whether it has a
+/// default (issue #113 B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DbColumn {
+    pub name: String,
+    pub nullable: bool,
+    pub has_default: bool,
+}
+
+/// Columns from a `table_columns()` result. The `nullable` and
+/// `default_value` positions are located by column name (MySQL and GaussDB
+/// return them in different orders), never by a hardcoded index.
+///
+/// `nullable` parses from a JSON bool or the string flags `true`/`t`/`1`;
+/// anything else is conservatively treated as NOT NULL. `default_value` is a
+/// default unless it is a database NULL, the literal string `NULL`, or empty
+/// (GaussDB returns `NULL`/`''` when a column has no default).
+pub(crate) fn parse_db_columns(result: &QueryResult) -> Vec<DbColumn> {
+    let index = |wanted: &str| -> Option<usize> {
+        result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(wanted))
+    };
+    let name_col = index("column_name");
+    let nullable_col = index("nullable");
+    let default_col = index("default_value");
     result
         .rows
         .iter()
-        .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|row| {
+            let name = row.get(name_col?)?.as_str().map(str::to_string)?;
+            let nullable = row.get(nullable_col?).map(parse_nullable).unwrap_or(false);
+            let has_default = row
+                .get(default_col?)
+                .map(value_has_default)
+                .unwrap_or(false);
+            Some(DbColumn {
+                name,
+                nullable,
+                has_default,
+            })
+        })
         .collect()
+}
+
+/// Parse a `nullable` cell: JSON bool, or the string flags `true`/`t`/`1`.
+/// Anything else (including a missing/NULL cell) is conservatively `false`.
+fn parse_nullable(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "t" | "1")
+        }
+        serde_json::Value::Number(n) => n.as_i64().is_some_and(|v| v != 0),
+        _ => false,
+    }
+}
+
+/// A `default_value` cell counts as a default when it is present and not a
+/// stand-in for "none": database NULL, the literal `NULL`, or the empty string.
+fn value_has_default(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("NULL")
+        }
+        _ => true,
+    }
 }
 
 /// FK edges for the topological load order, from a
@@ -362,13 +425,21 @@ fn stable_topo_order(nodes: &[String], edges: &[(String, String)]) -> Result<Vec
     Ok(order)
 }
 
-/// Strict column-set validation: the file columns must equal the DB columns
-/// for the table (order-insensitive). Returns the per-table error naming
-/// missing and extra columns.
+/// Column-set validation. In strict mode (`--strict-columns`) the file columns
+/// must equal the DB columns (order-insensitive), matching the pre-#113
+/// behaviour. Otherwise a column the file omits is allowed when the table can
+/// absorb it (nullable, or it has a default) — it loads as NULL — and only a
+/// NOT NULL column with no default rejects. A column the file carries that the
+/// table does not is always rejected (load never creates columns).
+///
+/// On success returns, per table, the set of omitted columns that will be
+/// filled with NULL, so the loader binds them instead of failing.
 pub(crate) fn validate_column_sets(
     plan: &LoadPlan,
-    db_columns: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<(), String> {
+    db_columns: &std::collections::HashMap<String, Vec<DbColumn>>,
+    strict: bool,
+) -> Result<std::collections::HashMap<String, std::collections::HashSet<String>>, String> {
+    let mut allowed_missing = std::collections::HashMap::new();
     for entry in &plan.entries {
         let Some(db_cols) = db_columns.get(&entry.table) else {
             return Err(format!(
@@ -376,44 +447,79 @@ pub(crate) fn validate_column_sets(
                 entry.table
             ));
         };
-        let missing: Vec<&String> = db_cols
+        let missing: Vec<&DbColumn> = db_cols
             .iter()
-            .filter(|c| !entry.columns.iter().any(|fc| fc.eq_ignore_ascii_case(c)))
+            .filter(|c| {
+                !entry
+                    .columns
+                    .iter()
+                    .any(|fc| fc.eq_ignore_ascii_case(&c.name))
+            })
             .collect();
         let extra: Vec<&String> = entry
             .columns
             .iter()
-            .filter(|fc| !db_cols.iter().any(|c| c.eq_ignore_ascii_case(fc)))
+            .filter(|fc| !db_cols.iter().any(|c| c.name.eq_ignore_ascii_case(fc)))
             .collect();
-        if !missing.is_empty() || !extra.is_empty() {
+
+        // Strict mode keeps every miss a rejection; non-strict splits the
+        // misses into "can insert NULL" and "cannot".
+        let (allowed, rejected): (Vec<&DbColumn>, Vec<&DbColumn>) = if strict {
+            (Vec::new(), missing.clone())
+        } else {
+            missing
+                .iter()
+                .copied()
+                .partition(|c| c.nullable || c.has_default)
+        };
+
+        if !rejected.is_empty() || !extra.is_empty() {
             let mut message = format!(
                 "table '{}': data file columns do not match the table columns",
                 entry.table
             );
-            if !missing.is_empty() {
-                message.push_str(&format!(
-                    "\n  missing in file: {}",
-                    missing
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+            if strict {
+                if !missing.is_empty() {
+                    message.push_str(&format!(
+                        "\n  missing in file: {}",
+                        join_names(missing.iter().map(|c| c.name.as_str()))
+                    ));
+                }
+            } else {
+                if !allowed.is_empty() {
+                    message.push_str(&format!(
+                        "\n  missing in file (nullable, will insert NULL): {}",
+                        join_names(allowed.iter().map(|c| c.name.as_str()))
+                    ));
+                }
+                if !rejected.is_empty() {
+                    message.push_str(&format!(
+                        "\n  missing in file (NOT NULL without default): {}",
+                        join_names(rejected.iter().map(|c| c.name.as_str()))
+                    ));
+                }
             }
             if !extra.is_empty() {
                 message.push_str(&format!(
                     "\n  extra in file: {}",
-                    extra
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    join_names(extra.iter().map(|s| s.as_str()))
                 ));
             }
             return Err(message);
         }
+
+        if !allowed.is_empty() {
+            allowed_missing.insert(
+                entry.table.clone(),
+                allowed.iter().map(|c| c.name.clone()).collect(),
+            );
+        }
     }
-    Ok(())
+    Ok(allowed_missing)
+}
+
+fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names.collect::<Vec<_>>().join(", ")
 }
 
 // ─── Rendering ──────────────────────────────────────────────────────────
@@ -797,43 +903,187 @@ mod tests {
         assert!(read_table_file(dir.path(), "t", "auto").unwrap().is_some());
     }
 
-    #[test]
-    fn should_validate_column_sets_order_insensitively() {
-        let plan = LoadPlan {
+    /// A single-entry plan whose file exposes exactly `columns`.
+    fn plan_with_columns(columns: &[&str]) -> LoadPlan {
+        LoadPlan {
             entries: vec![PlanEntry {
                 table: "t".to_string(),
                 schema: None,
                 path: PathBuf::from("/data/t.jsonl"),
-                columns: vec!["b".to_string(), "a".to_string()],
+                columns: columns.iter().map(|s| s.to_string()).collect(),
                 row_count: 2,
             }],
-        };
+        }
+    }
+
+    fn db_col(name: &str, nullable: bool, has_default: bool) -> DbColumn {
+        DbColumn {
+            name: name.to_string(),
+            nullable,
+            has_default,
+        }
+    }
+
+    fn db_map(cols: Vec<DbColumn>) -> std::collections::HashMap<String, Vec<DbColumn>> {
         let mut db = std::collections::HashMap::new();
-        db.insert(
-            "t".to_string(),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        db.insert("t".to_string(), cols);
+        db
+    }
+
+    /// Columns from a `table_columns()` result: the nullable/default_value
+    /// positions are located by name, not index.
+    #[test]
+    fn should_parse_db_columns_nullable_and_defaults() {
+        let result = fk_result(
+            &[
+                "column_name",
+                "data_type",
+                "nullable",
+                "default_value",
+                "ordinal_position",
+                "comment",
+                "column_key",
+            ],
+            vec![
+                vec![
+                    Value::from("id"),
+                    Value::from("bigint"),
+                    Value::Bool(false),
+                    Value::Null,
+                    Value::from(1),
+                    Value::Null,
+                    Value::from("PRI"),
+                ],
+                vec![
+                    Value::from("name"),
+                    Value::from("varchar(100)"),
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::from(2),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    Value::from("status"),
+                    Value::from("varchar(20)"),
+                    Value::Bool(false),
+                    Value::from("active"),
+                    Value::from(3),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    Value::from("created"),
+                    Value::from("timestamp"),
+                    Value::Bool(false),
+                    Value::from("CURRENT_TIMESTAMP"),
+                    Value::from(4),
+                    Value::Null,
+                    Value::Null,
+                ],
+            ],
         );
-        let err = validate_column_sets(&plan, &db).unwrap_err();
+        let cols = parse_db_columns(&result);
+        assert_eq!(cols.len(), 4);
+        assert_eq!(cols[0], db_col("id", false, false));
+        assert_eq!(cols[1], db_col("name", true, false));
+        assert_eq!(cols[2], db_col("status", false, true));
+        assert_eq!(cols[3], db_col("created", false, true));
+    }
+
+    /// A database NULL, the literal string "NULL", and the empty string all
+    /// mean "no default"; nullable parses from bools and from string flags.
+    #[test]
+    fn should_treat_null_literal_empty_and_db_null_defaults_as_absent() {
+        let result = fk_result(
+            &["column_name", "nullable", "default_value"],
+            vec![
+                vec![Value::from("a"), Value::from("true"), Value::Null],
+                vec![Value::from("b"), Value::from("false"), Value::from("NULL")],
+                vec![Value::from("c"), Value::from("t"), Value::from("")],
+                vec![Value::from("d"), Value::from("1"), Value::from("0")],
+            ],
+        );
+        let cols = parse_db_columns(&result);
+        assert_eq!(cols[0], db_col("a", true, false));
+        assert_eq!(cols[1], db_col("b", false, false));
+        assert_eq!(cols[2], db_col("c", true, false));
+        assert_eq!(cols[3], db_col("d", true, true));
+    }
+
+    #[test]
+    fn should_validate_column_sets_order_insensitively() {
+        let plan = plan_with_columns(&["b", "a"]);
+        let db = db_map(vec![
+            db_col("a", true, false),
+            db_col("b", true, false),
+            db_col("c", false, false),
+        ]);
+        let err = validate_column_sets(&plan, &db, true).unwrap_err();
         assert!(err.contains("missing in file: c"), "{err}");
         assert!(!err.contains("extra in file"), "{err}");
     }
 
     #[test]
     fn should_name_extra_columns_in_validation() {
-        let plan = LoadPlan {
-            entries: vec![PlanEntry {
-                table: "t".to_string(),
-                schema: None,
-                path: PathBuf::from("/data/t.jsonl"),
-                columns: vec!["a".to_string(), "ghost".to_string()],
-                row_count: 2,
-            }],
-        };
-        let mut db = std::collections::HashMap::new();
-        db.insert("t".to_string(), vec!["a".to_string()]);
-        let err = validate_column_sets(&plan, &db).unwrap_err();
+        let plan = plan_with_columns(&["a", "ghost"]);
+        let db = db_map(vec![db_col("a", true, false)]);
+        let err = validate_column_sets(&plan, &db, true).unwrap_err();
         assert!(err.contains("extra in file: ghost"), "{err}");
         assert!(err.contains("table 't'"), "{err}");
+    }
+
+    /// Issue #113 B: a missing nullable column (or one with a default) is
+    /// allowed in non-strict mode and reported as insert-NULL in the allow set.
+    #[test]
+    fn should_allow_missing_nullable_or_defaulted_columns() {
+        let plan = plan_with_columns(&["id"]);
+        let db = db_map(vec![
+            db_col("id", false, false),
+            db_col("note", true, false),
+            db_col("status", false, true),
+        ]);
+        let allowed = validate_column_sets(&plan, &db, false).unwrap();
+        let set = allowed.get("t").expect("allow set for t");
+        assert!(set.contains("note"), "{set:?}");
+        assert!(set.contains("status"), "{set:?}");
+        assert!(!set.contains("id"), "{set:?}");
+    }
+
+    /// Issue #113 B: a NOT NULL column with no default cannot be filled, so it
+    /// still rejects; the message groups the allowed misses separately.
+    #[test]
+    fn should_reject_missing_not_null_column_without_default() {
+        let plan = plan_with_columns(&["id"]);
+        let db = db_map(vec![
+            db_col("id", false, false),
+            db_col("a", true, false),
+            db_col("b", true, false),
+            db_col("c", false, false),
+        ]);
+        let err = validate_column_sets(&plan, &db, false).unwrap_err();
+        assert!(
+            err.contains("missing in file (NOT NULL without default): c"),
+            "{err}"
+        );
+        assert!(
+            err.contains("missing in file (nullable, will insert NULL): a, b"),
+            "{err}"
+        );
+    }
+
+    /// `--strict-columns` restores the old set-equality behaviour: any missing
+    /// column rejects, even nullable ones.
+    #[test]
+    fn should_reject_any_missing_column_in_strict_mode() {
+        let plan = plan_with_columns(&["id"]);
+        let db = db_map(vec![
+            db_col("id", false, false),
+            db_col("note", true, false),
+            db_col("status", false, true),
+        ]);
+        let err = validate_column_sets(&plan, &db, true).unwrap_err();
+        assert!(err.contains("missing in file: note, status"), "{err}");
     }
 
     #[test]

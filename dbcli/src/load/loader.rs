@@ -101,6 +101,38 @@ pub(crate) fn align_types(
         .collect()
 }
 
+// ─── Row alignment ──────────────────────────────────────────────────────
+
+/// Align one file row to the plan column order, filling NULL for a column the
+/// file omits when `allowed_missing` approves it (issue #113 B: nullable or
+/// defaulted columns that synth could not train). JSONL/JSON key order can
+/// drift from the discovered column list, so every plan column is looked up by
+/// name (case-insensitive). A missing column that was NOT approved is a named
+/// error — plan validation rejects those, so reaching it here is defensive.
+pub(crate) fn align_row_with_defaults(
+    file_columns: &[String],
+    row: &[serde_json::Value],
+    plan_columns: &[String],
+    allowed_missing: &std::collections::HashSet<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut aligned = Vec::with_capacity(plan_columns.len());
+    for col in plan_columns {
+        match file_columns
+            .iter()
+            .position(|fc| fc.eq_ignore_ascii_case(col))
+        {
+            Some(pos) => aligned.push(row.get(pos).cloned().unwrap_or(serde_json::Value::Null)),
+            None if allowed_missing.iter().any(|m| m.eq_ignore_ascii_case(col)) => {
+                aligned.push(serde_json::Value::Null)
+            }
+            None => {
+                return Err(format!("data file is missing column '{col}'"));
+            }
+        }
+    }
+    Ok(aligned)
+}
+
 // ─── Executor ───────────────────────────────────────────────────────────
 
 use crate::audit::event::{ActionClass, Channel, ConnectionInfo, Decision};
@@ -112,12 +144,14 @@ use crate::audit::event::{ActionClass, Channel, ConnectionInfo, Decision};
 pub(crate) async fn execute(
     conn: &mut dyn DbConn,
     plan: &LoadPlan,
+    allowed_missing: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     audit: &crate::audit::AuditSession,
     conn_info: &ConnectionInfo,
 ) -> Result<u64, String> {
     let scheme = conn.dialect().url_scheme().to_string();
     let quote = conn.dialect().identifier_quote();
     let columns_sql = conn.dialect().table_columns().to_string();
+    let empty = std::collections::HashSet::new();
     let mut completed: Vec<String> = Vec::new();
     let mut total: u64 = 0;
 
@@ -130,7 +164,8 @@ pub(crate) async fn execute(
             table_intent_detail(&scheme, entry, entry.row_count as u64),
         ));
 
-        match load_table(conn, &scheme, quote, &columns_sql, entry).await {
+        let allowed = allowed_missing.get(&entry.table).unwrap_or(&empty);
+        match load_table(conn, &scheme, quote, &columns_sql, entry, allowed).await {
             Ok(loaded) => {
                 completed.push(entry.table.clone());
                 total += loaded as u64;
@@ -195,6 +230,7 @@ async fn load_table(
     quote: char,
     columns_sql: &str,
     entry: &super::plan::PlanEntry,
+    allowed_missing: &std::collections::HashSet<String>,
 ) -> Result<usize, (usize, String)> {
     // Oracle: oracle-rs DML hardcodes auto_commit=false and the only commit()
     // lives on its own Connection type, unreachable through the DbConn trait
@@ -241,21 +277,16 @@ async fn load_table(
     );
     for (i, row) in rows.iter().enumerate() {
         // Align the file row to the plan column order first (JSONL/JSON key
-        // order can drift from the discovered column list), then coerce with
-        // the shared per-column error formatting.
-        let mut aligned = Vec::with_capacity(entry.columns.len());
-        for col in &entry.columns {
-            match file_columns
-                .iter()
-                .position(|fc| fc.eq_ignore_ascii_case(col))
-            {
-                Some(pos) => aligned.push(row[pos].clone()),
-                None => {
-                    let message = format!("row {}: data file is missing column '{col}'", i + 1);
+        // order can drift from the discovered column list), filling NULL for
+        // any omitted column plan validation approved (#113 B).
+        let aligned =
+            match align_row_with_defaults(&file_columns, row, &entry.columns, allowed_missing) {
+                Ok(values) => values,
+                Err(reason) => {
+                    let message = format!("row {}: {reason}", i + 1);
                     return Err(rollback(conn, loaded_so_far(i), message).await);
                 }
-            }
-        }
+            };
         let coerced = match crate::tabular::coerce_row(&aligned, &types, &entry.columns) {
             Ok(values) => values,
             Err(reason) => {
@@ -627,7 +658,15 @@ mod tests {
             plan: &LoadPlan,
             audit: &AuditSession,
         ) -> Result<u64, String> {
-            crate::load::loader::execute(conn, plan, audit, &conn_info()).await
+            // These tests exercise full-column files, so no omitted columns.
+            crate::load::loader::execute(
+                conn,
+                plan,
+                &std::collections::HashMap::new(),
+                audit,
+                &conn_info(),
+            )
+            .await
         }
     }
 
@@ -677,6 +716,54 @@ mod tests {
             oracle,
             "INSERT INTO \"T\" (\"ID\", \"NAME\") VALUES (:1, :2)"
         );
+    }
+
+    #[test]
+    fn align_row_reorders_to_plan_order() {
+        let file_columns = vec!["b".to_string(), "a".to_string()];
+        let row = vec![serde_json::json!(2), serde_json::json!(1)];
+        let plan_columns = vec!["a".to_string(), "b".to_string()];
+        let aligned =
+            align_row_with_defaults(&file_columns, &row, &plan_columns, &Default::default())
+                .unwrap();
+        assert_eq!(aligned, vec![serde_json::json!(1), serde_json::json!(2)]);
+    }
+
+    /// Issue #113 B: a column the file omits but the plan (and the DB) allows
+    /// to be null is filled with NULL instead of failing the row.
+    #[test]
+    fn align_row_fills_null_for_allowed_missing_columns() {
+        let file_columns = vec!["id".to_string(), "name".to_string()];
+        let row = vec![serde_json::json!(1), serde_json::json!("alice")];
+        let plan_columns = vec!["id".to_string(), "name".to_string(), "note".to_string()];
+        let allowed: std::collections::HashSet<String> = ["note".to_string()].into_iter().collect();
+        let aligned =
+            align_row_with_defaults(&file_columns, &row, &plan_columns, &allowed).unwrap();
+        assert_eq!(
+            aligned,
+            vec![
+                serde_json::json!(1),
+                serde_json::json!("alice"),
+                serde_json::Value::Null
+            ]
+        );
+    }
+
+    /// Defensive: a missing column that plan validation did NOT approve still
+    /// errors (it should be unreachable once the plan stage rejects).
+    #[test]
+    fn align_row_rejects_missing_column_not_marked_allowed() {
+        let file_columns = vec!["id".to_string()];
+        let row = vec![serde_json::json!(1)];
+        let plan_columns = vec!["id".to_string(), "note".to_string()];
+        let err = align_row_with_defaults(
+            &file_columns,
+            &row,
+            &plan_columns,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("missing column 'note'"), "{err}");
     }
 
     #[test]
