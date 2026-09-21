@@ -558,6 +558,7 @@ mod duckdb_e2e_tests {
             strict: false,
             key: vec![],
             columns: vec![],
+            exclude_columns: vec![],
             filter: None,
             incremental: None,
             bisection_factor: 32,

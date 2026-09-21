@@ -473,13 +473,15 @@ fn mcp_exclude_columns_hides_a_differing_column_from_the_diff() {
         "table": "t",
         "key_columns": ["id"],
     });
+    // The report travels as an escaped JSON string inside the tool result.
+    let plain = |s: &str| s.replace("\\\"", "\"").replace("\\n", "\n");
     let stdout = call(diff_call(args));
     assert!(
         !stdout.contains("\"isError\":true"),
         "control diff must not error: {stdout}"
     );
     assert!(
-        stdout.contains("\"modified\":2"),
+        plain(&stdout).contains("\"modified\": 2"),
         "control run must report the differing column: {stdout}"
     );
 
@@ -497,11 +499,11 @@ fn mcp_exclude_columns_hides_a_differing_column_from_the_diff() {
         "excluded diff must not error: {stdout}"
     );
     assert!(
-        stdout.contains("\"modified\":0"),
+        plain(&stdout).contains("\"modified\": 0"),
         "excluded column must no longer be modified: {stdout}"
     );
     assert!(
-        stdout.contains("excluded from comparison by --exclude-columns"),
+        plain(&stdout).contains("excluded from comparison by --exclude-columns"),
         "the exclusion must be reported: {stdout}"
     );
 }

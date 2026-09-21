@@ -1736,7 +1736,7 @@ mod range_tests {
         rrows: &[(i64, &str)],
         lfilter: Option<&str>,
         rfilter: Option<&str>,
-    ) -> Result<BucketPlan, DbError> {
+    ) -> Result<BucketPlan, ProbeError> {
         make_table(lpool, lrows).await;
         make_table(rpool, rrows).await;
         let (mut lc, mut rc) = (
