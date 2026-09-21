@@ -15,8 +15,6 @@ pub mod fk_pool;
 #[cfg(feature = "synth")]
 pub mod generator;
 #[cfg(feature = "synth")]
-pub mod graph;
-#[cfg(feature = "synth")]
 pub mod marginal;
 #[cfg(feature = "synth")]
 pub mod mine;
@@ -1076,7 +1074,7 @@ fn draft_cycle_warning(rules: &crate::synth::rules::SynthRules) -> Option<String
             }
         }
     }
-    match crate::synth::graph::topological_sort(&nodes, &edges) {
+    match crate::graph::topological_sort(&nodes, &edges) {
         Ok(_) => None,
         Err(msg) => Some(format!(
             "draft references form a {} — `synth generate` would fail. \

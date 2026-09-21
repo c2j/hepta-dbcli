@@ -6,13 +6,16 @@ mod cli;
 mod config;
 mod connection;
 mod delta_diff;
+mod graph;
 mod interactive;
+mod load;
 mod logger;
 mod output;
 mod queries;
 mod server;
 #[cfg(feature = "synth")]
 mod synth;
+mod tabular;
 
 use clap::{Parser, Subcommand};
 use keyring::Entry;
@@ -114,6 +117,13 @@ enum Commands {
     DeltaDiff {
         #[command(flatten)]
         args: Box<delta_diff::cmd::DeltaDiffArgs>,
+    },
+
+    /// Load data files (JSONL/JSON/CSV) into an existing database; tables must
+    /// already exist with matching structure (no schema mapping, no DDL)
+    Load {
+        #[command(flatten)]
+        args: Box<load::cmd::LoadArgs>,
     },
 
     /// Synthetic data generation (train / rules-draft / generate / validate)
@@ -1267,6 +1277,18 @@ async fn main() {
             }
             let audit = audit::AuditSession::new(&audit_config);
             let code = delta_diff::run(*args, cli.config, &audit).await;
+            std::process::exit(code);
+        }
+        Some(Commands::Load { args }) => {
+            if cli.url.is_some() {
+                eprintln!(
+                    "error: --url is not supported by load; add the connection to the config file or set HEPTA_DBCLI_URL"
+                );
+                std::process::exit(2);
+            }
+            let audit = audit::AuditSession::new(&audit_config);
+            let code =
+                load::run(*args, cli.config, cli.name.clone(), cli.allow_write, &audit).await;
             std::process::exit(code);
         }
         #[cfg(feature = "synth")]

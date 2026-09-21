@@ -1,6 +1,9 @@
+//! Directed-graph algorithms (topological order, cycle finding, Tarjan SCC)
+//! shared by `synth` and the `load` command.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub fn topological_sort<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
+pub(crate) fn topological_sort<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
     nodes: &[T],
     edges: &[(T, T)],
 ) -> Result<Vec<T>, String> {
@@ -93,7 +96,7 @@ fn dfs_find_cycle<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
     None
 }
 
-pub fn tarjan_scc<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
+pub(crate) fn tarjan_scc<T: Eq + std::hash::Hash + Clone + std::fmt::Debug>(
     nodes: &[T],
     edges: &[(T, T)],
 ) -> Vec<Vec<T>> {

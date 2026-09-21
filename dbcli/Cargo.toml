@@ -34,6 +34,11 @@ path = "tests/regress_duckdb.rs"
 required-features = ["integration", "duckdb"]
 
 [[test]]
+name = "regress_load"
+path = "tests/regress_load.rs"
+required-features = ["integration"]
+
+[[test]]
 name = "regress_audit"
 path = "tests/regress_audit.rs"
 required-features = ["integration"]

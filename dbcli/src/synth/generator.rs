@@ -191,7 +191,7 @@ fn generate_with(
         .cloned()
         .collect();
 
-    let table_order = crate::synth::graph::topological_sort(
+    let table_order = crate::graph::topological_sort(
         &rules
             .tables
             .iter()

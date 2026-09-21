@@ -94,6 +94,9 @@ jobs:
       - run: cargo clippy --all --all-targets --features duckdb
       - run: cargo test --all --features duckdb
       - run: cargo test --features "duckdb,integration" --test regress_duckdb
+      # Issue #98: end-to-end load tests (drive the real binary against the
+      # embedded DuckDB file; MySQL part self-skips without its env var).
+      - run: cargo test --features "duckdb,integration" --test regress_load
       - run: cargo test --features "duckdb,integration" --test regress_inline_url
 
   test:
@@ -143,6 +146,12 @@ jobs:
       - run: cargo test --all
       - run: cargo test --all --features synth
       - run: cargo test --all --features integration
+        env:
+          HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
+      # Issue #98: load end-to-end tests. The duckdb job runs the DuckDB-file
+      # module; this job runs the MySQL module (integration-gated) against the
+      # service container.
+      - run: cargo test --features integration --test regress_load
         env:
           HEPTA_DBCLI_TEST_URL: mysql://mcp:testpass@127.0.0.1:3306/testdb
       # Real-database acceptance for the synth M1 work (#62-#65): trains on a

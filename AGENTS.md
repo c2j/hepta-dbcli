@@ -188,6 +188,8 @@ dbcli/                          # Cargo workspace root
 │       ├── server.rs           # MCP server via rmcp: DbMcp with 7 tools (multi-backend)
 │       ├── interactive.rs      # REPL mode: rustyline + SQL tokenizer (MySQL/Oracle aware)
 │       ├── output.rs           # Table formatting (type mapping moved to backend/)
+│       ├── tabular.rs          # Generated-table readers (jsonl/json/csv, NULL vs "") + target-type coercion
+│       ├── graph.rs            # Shared graph algos (lifted out of synth; used by load planning)
 │       ├── queries.rs          # Legacy: MySQL SQL strings (still used by check command)
 │       ├── connection.rs       # Legacy: MySQL connection helpers (still used by check command)
 │       ├── logger.rs           # Tracing to ~/.local/share/hepta-dbcli/hepta-dbcli.log (daily)
@@ -229,12 +231,17 @@ dbcli/                          # Cargo workspace root
 │           ├── conn.rs     # DuckDbConn (sync driver wrapped in spawn_blocking)
 │           ├── dialect.rs  # DuckDbDialect (duckdb_tables/views/indexes, information_schema)
 │           └── types.rs    # duckdb::types::ValueRef → serde_json::Value
+│       ├── load/            # `load` subcommand (#98): data files back into a DB, CLI-only
+│           ├── mod.rs      # load::run: gate → connection → discovery → plan → dry-run/execute + audit
+│           ├── cmd.rs      # clap LoadArgs (--data/--format/--tables/--schema/--dry-run)
+│           ├── plan.rs     # FK-topo plan (stable tiebreak), file discovery, STRICT column-set validation
+│           └── loader.rs   # Per-table txns, parameterized inserts, fail-fast rollback, per-table audit
 └── .github/workflows/
     ├── ci.yml                  # PR/push: fmt, clippy, test (MySQL 8 service container)
     └── release-build.yml       # Tag push: linux-x86_64, linux-arm64, windows-x86_64 (--features oracle-rs,oracle,gaussdb,synth)
 ```
 
-**Dual mode**: The binary defaults to MCP server (`hepta_dbcli` with no subcommand). Use `hepta_dbcli cli` for one-shot SQL or `hepta_dbcli cli --interactive` for REPL.
+**Dual mode**: The binary defaults to MCP server (`hepta_dbcli` with no subcommand). Use `hepta_dbcli cli` for one-shot SQL, `hepta_dbcli cli --interactive` for REPL, or `hepta_dbcli load` to load generated data files back into a database in FK-safe order.
 
 ## Key Dependencies
 
@@ -358,6 +365,7 @@ The project was renamed from `polar-mysql` to `hepta_dbcli`. All new code must u
 - Runs on **stdio** (not HTTP/WebSocket). Intended to be spawned by MCP clients (e.g., Claude, Cursor).
 - MCP tools (7): `get_database_info`, `list_tables`, `get_table_metadata`, `execute_query`, `get_execution_plan`, `list_connections`, `delta_diff`.
 - `delta_diff` is read-only: compare + csv/jsonl/json export + checkpoint + incremental. SQL patch (`--apply-to`) stays on the CLI. Each side accepts an inline URL (`left_url`/`right_url`) instead of a connection name (see "Inline URLs" above).
+- `load` (issue #98) is **CLI-only**, never an MCP tool: `--allow-write` is mandatory, the plan is FK-topological, and the audit trail uses `Channel::Load` with per-table intent/outcome events carrying row **counts only** (never row data). Oracle is refused pending a commit/rollback surface on `DbConn`.
 - All tool calls from MCP enforce **read-only**: only SELECT, EXPLAIN, SHOW, DESCRIBE, DESC are allowed (MySQL). Oracle/GaussDB only allow SELECT, EXPLAIN, WITH. DuckDB allows SELECT, EXPLAIN, WITH, SHOW, DESCRIBE, DESC, SUMMARIZE.
 - `execute_query` tool appends `LIMIT N` (MySQL) or `FETCH FIRST N ROWS ONLY` (Oracle 12c+) — dialect-specific. DuckDB appends `LIMIT N` only to SELECT/WITH-shaped statements.
 - `get_execution_plan` uses `EXPLAIN FORMAT=JSON` (MySQL) or `EXPLAIN PLAN ... DBMS_XPLAN` (Oracle).
