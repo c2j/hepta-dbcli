@@ -94,6 +94,12 @@ struct Cli {
     #[arg(long, global = true)]
     allow_write: bool,
 
+    /// Allow CLI DDL (DROP/TRUNCATE/ALTER/CREATE/RENAME). Separate from
+    /// --allow-write so seed scripts can run TRUNCATE/CREATE without opening
+    /// data changes. GRANT/REVOKE stay refused; MCP is unaffected.
+    #[arg(long, global = true)]
+    allow_ddl: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1002,7 +1008,10 @@ async fn handle_check_connection_cmd(
     };
 
     let resolved = if raw.is_env_var {
-        resolve_env_var_connection(target_conn.url.clone().unwrap())
+        resolve_env_var_connection(target_conn.url.clone().unwrap()).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        })
     } else {
         resolve_single_connection(
             target_conn,
@@ -1243,6 +1252,12 @@ async fn main() {
                 );
                 std::process::exit(2);
             }
+            if cli.allow_ddl {
+                eprintln!(
+                    "error: --allow-ddl is not valid for the MCP server; MCP execute_query stays read-only"
+                );
+                std::process::exit(2);
+            }
             if cli.url.is_some() {
                 eprintln!(
                     "error: --url is not supported by the MCP server; use delta_diff left_url/right_url tool arguments instead"
@@ -1328,6 +1343,16 @@ async fn main() {
                 )
                 .await;
             } else if interactive {
+                // The REPL has no DDL gate: it never sets allow_ddl on its
+                // session, so accepting the flag here would silently ignore
+                // it and let a user believe DDL is permitted (issue #112 PR
+                // review C6, matching the MCP server's exit 2).
+                if cli.allow_ddl {
+                    eprintln!(
+                        "error: --allow-ddl is not valid for the interactive session; the REPL runs the read-only/data-change gate only"
+                    );
+                    std::process::exit(2);
+                }
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {
                     sql,
@@ -1341,6 +1366,7 @@ async fn main() {
                     no_history,
                     timeout_action,
                     allow_write: cli.allow_write,
+                    allow_ddl: cli.allow_ddl,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = interactive::run_interactive(args, &registry, &audit).await {
@@ -1361,6 +1387,7 @@ async fn main() {
                     no_history,
                     timeout_action,
                     allow_write: cli.allow_write,
+                    allow_ddl: cli.allow_ddl,
                 };
                 let audit = audit::AuditSession::new(&audit_config);
                 if let Err(e) = cli::run_cli(args, &registry, &audit).await {

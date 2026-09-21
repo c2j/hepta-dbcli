@@ -475,14 +475,13 @@ fn generate_with(
                     .map(|c| &c.marginal)
                 {
                     if p.values.len() < row_count {
+                        let max_rows = p.values.len();
                         return Err(format!(
                             "referenced column '{}.{}' has only {} categorical level(s) \
                              but {} rows are requested; unique values are impossible — \
-                             reduce --rows or drop the table from the rules",
-                            table_name,
-                            col_name,
-                            p.values.len(),
-                            row_count
+                             set this table's rows to at most {} (rules.{}.rows) or \
+                             reduce the global --rows",
+                            table_name, col_name, max_rows, row_count, max_rows, table_name
                         ));
                     }
                 }
@@ -492,13 +491,13 @@ fn generate_with(
                     .find(|r| &r.column == col_name)
                     .expect("fk_pool_column implies a rel pool");
                 if pool.pool.distinct_len() < row_count {
+                    let max_rows = pool.pool.distinct_len();
                     return Err(format!(
                         "referenced FK column '{}.{}' draws from a pool of {} distinct \
-                         value(s) but {} rows are requested; unique values are impossible",
-                        table_name,
-                        col_name,
-                        pool.pool.distinct_len(),
-                        row_count
+                         value(s) but {} rows are requested; unique values are impossible — \
+                         set this table's rows to at most {} (rules.{}.rows) or \
+                         reduce the global --rows",
+                        table_name, col_name, max_rows, row_count, max_rows, table_name
                     ));
                 }
             }
@@ -1133,15 +1132,22 @@ fn gen_column_value(
 }
 
 fn numeric_value_or_string(value: String) -> Value {
+    // Only coerce when the number round-trips back to the exact original
+    // spelling. Code-like strings ("0510", "1.50", "1e5") parse numerically but
+    // carry significant formatting (leading zeros, trailing zeros, exponents);
+    // emitting them as numbers would silently change the data (issue #114).
     if let Ok(integer) = value.parse::<i64>() {
-        return Value::from(integer);
+        if integer.to_string() == value {
+            return Value::from(integer);
+        }
+        return Value::String(value);
     }
-    value
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-        .map(Value::Number)
-        .unwrap_or(Value::String(value))
+    match value.parse::<f64>() {
+        Ok(float) if float.to_string() == value => serde_json::Number::from_f64(float)
+            .map(Value::Number)
+            .unwrap_or(Value::String(value)),
+        _ => Value::String(value),
+    }
 }
 
 fn effective_null_rate(
@@ -7877,5 +7883,204 @@ tables:
             let value = row[0].as_str().expect("child key is a string");
             assert!(parent_set.contains(value), "orphan child key {value}");
         }
+    }
+
+    // ─── issue #114 A: keep leading-zero code strings ───
+
+    #[test]
+    fn should_preserve_code_strings_whose_numeric_form_does_not_round_trip() {
+        // A numeric-looking categorical level like "0510" must not be coerced
+        // to the number 510: the leading zero is significant. Only values whose
+        // canonical numeric form equals the original string are emitted as
+        // numbers ("42" -> 42), everything else stays a string.
+        let cases: &[(&str, Value)] = &[
+            ("0510", Value::String("0510".to_string())),
+            ("001", Value::String("001".to_string())),
+            ("1.50", Value::String("1.50".to_string())),
+            ("007.5", Value::String("007.5".to_string())),
+            // "1e5" parses to 100000.0, whose to_string ("100000") differs from
+            // the original spelling, so the string must be preserved.
+            ("1e5", Value::String("1e5".to_string())),
+            ("abc", Value::String("abc".to_string())),
+            ("42", Value::from(42_i64)),
+            ("-3", Value::from(-3_i64)),
+            ("0", Value::from(0_i64)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                numeric_value_or_string((*input).to_string()),
+                *expected,
+                "numeric_value_or_string({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn should_generate_leading_zero_categorical_levels_as_strings() {
+        // Integration: a Numerical column whose marginal is a categorical
+        // dictionary of code strings must emit the strings verbatim.
+        let model = ColumnModel {
+            logical_type: LogicalType::Numerical,
+            marginal: Marginal::Categorical(CategoricalParams {
+                values: vec!["0510".to_string(), "0511".to_string()],
+                weights: vec![0.5, 0.5],
+            }),
+            ..Default::default()
+        };
+        let first = gen_column_value(Some(&model), 0.1, true);
+        let second = gen_column_value(Some(&model), 0.9, true);
+        assert_eq!(first, Value::String("0510".to_string()));
+        assert_eq!(second, Value::String("0511".to_string()));
+        assert!(first.is_string() && second.is_string());
+    }
+
+    // ─── issue #114 C: actionable upper bound in uniqueness errors ───
+
+    #[test]
+    fn categorical_uniqueness_error_suggests_parent_row_cap() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "k".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["1".to_string(), "2".to_string(), "3".to_string()],
+                    weights: vec![1.0 / 3.0; 3],
+                }),
+                ..Default::default()
+            },
+        );
+        let parent = TableModel {
+            version: 1,
+            table: "parent".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec!["k".to_string()],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["k".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let mut models = HashMap::new();
+        models.insert("parent".to_string(), parent);
+        models.insert("child".to_string(), int_key_model("child", "k", 0.0));
+
+        let mut parent_rule = single_rule("parent", vec![]);
+        parent_rule.rows = Some(10);
+        let child_rule = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "k".to_string(),
+                references: vec!["parent.k".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+            }],
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let err = generate(&models, &rules, &GeneratorConfig::default())
+            .expect_err("impossible uniqueness must error");
+        assert!(
+            err.contains("parent.k"),
+            "error must name the column: {err}"
+        );
+        assert!(
+            err.contains("at most 3"),
+            "error must suggest the categorical-level upper bound: {err}"
+        );
+    }
+
+    #[test]
+    fn fk_pool_uniqueness_error_suggests_parent_row_cap() {
+        fn two_level_model(table: &str, column: &str) -> TableModel {
+            let mut columns = HashMap::new();
+            columns.insert(
+                column.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Numerical,
+                    rounding: Some(0),
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: vec!["1".to_string(), "2".to_string()],
+                        weights: vec![0.5, 0.5],
+                    }),
+                    ..Default::default()
+                },
+            );
+            TableModel {
+                version: 1,
+                table: table.to_string(),
+                dialect: "mysql".to_string(),
+                schema: None,
+                provenance: Provenance {
+                    source: "test".to_string(),
+                    converter_version: None,
+                    sdv_version: None,
+                    truncated: false,
+                    trained_rows: None,
+                },
+                pk: vec![column.to_string()],
+                columns,
+                copula: CopulaInfo {
+                    column_order: vec![column.to_string()],
+                    correlation: vec![vec![1.0]],
+                },
+                fk_cardinality: Default::default(),
+            }
+        }
+
+        let mut models = HashMap::new();
+        models.insert("a".to_string(), two_level_model("a", "id"));
+        models.insert("b".to_string(), two_level_model("b", "a_id"));
+        models.insert("c".to_string(), int_key_model("c", "b_a_id", 0.0));
+
+        let mut a_rule = single_rule("a", vec![]);
+        a_rule.rows = Some(2);
+        let mut b_rule = single_rule(
+            "b",
+            vec![Relationship {
+                pk: "a_id".to_string(),
+                references: vec!["a.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+            }],
+        );
+        b_rule.rows = Some(5);
+        let c_rule = single_rule(
+            "c",
+            vec![Relationship {
+                pk: "b_a_id".to_string(),
+                references: vec!["b.a_id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+            }],
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![a_rule, b_rule, c_rule],
+        };
+
+        let err = generate(&models, &rules, &GeneratorConfig::default())
+            .expect_err("pool smaller than row count must error");
+        assert!(err.contains("b.a_id"), "error must name the column: {err}");
+        assert!(
+            err.contains("at most 2"),
+            "error must suggest the FK pool upper bound: {err}"
+        );
     }
 }

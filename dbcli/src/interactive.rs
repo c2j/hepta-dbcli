@@ -585,10 +585,12 @@ pub(crate) async fn run_interactive(
     )
     .await?;
     // One marker per session, so the ledger states whether it could write.
+    // The REPL has no --allow-ddl flag (issue #112), so it stays false.
     audit.record_best_effort(session_mode_event(
         &target.name,
         &target.connection_url,
         args.allow_write,
+        false,
     ));
 
     let mut rl = Editor::<SqlHelper, DefaultHistory>::new()
@@ -743,7 +745,8 @@ pub(crate) async fn run_interactive(
                 args.allow_write,
             );
 
-            let gate = write_gate(stmt, args.allow_write);
+            // The REPL has no --allow-ddl flag (issue #112): DDL stays refused.
+            let gate = write_gate(stmt, args.allow_write, false);
             if gate != WriteGate::Allow {
                 eprintln!("error: {}", write_gate_message(gate));
                 audit.record_best_effort(

@@ -154,8 +154,7 @@ pub(crate) async fn run(
     // the connection default) takes part in the match so tables from other
     // schemas do not satisfy it, and a schema with no tables fails with a
     // schema-level error. Without either, matching stays by bare table name.
-    let list_sql = conn.dialect().list_tables().to_string();
-    let listed = match conn.query(&list_sql).await {
+    let listed = match crate::backend::query_list_tables(&mut *conn).await {
         Ok(result) => result,
         Err(e) => {
             eprintln!("error: list tables: {e}");
@@ -225,8 +224,9 @@ pub(crate) async fn run(
             .or_else(|| listed_schemas.get(table).cloned().flatten())
     };
 
-    // Column metadata for strict validation (order-insensitive set equality).
-    let mut db_columns: HashMap<String, Vec<String>> = HashMap::new();
+    // Column metadata for validation (issue #113 B: nullable/default flags
+    // decide which omitted columns the INSERT may leave out).
+    let mut db_columns: HashMap<String, Vec<plan::DbColumn>> = HashMap::new();
     for entry in &plan_data.entries {
         let Some(schema) = schema_of(&entry.table) else {
             eprintln!(
@@ -235,29 +235,26 @@ pub(crate) async fn run(
             );
             return EXIT_ERROR;
         };
-        let sql = conn.dialect().table_columns().to_string();
-        let result = match conn
-            .exec(
-                &sql,
-                &[
-                    serde_json::Value::from(schema),
-                    serde_json::Value::from(entry.table.clone()),
-                ],
-            )
-            .await
-        {
-            Ok(result) => result,
+        // Issue #111: retry once without catalog comments when the primary
+        // column query dies on a non-UTF-8 comment (SQLSTATE 22021).
+        let result =
+            match crate::backend::query_table_columns(&mut *conn, &schema, &entry.table).await {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("error: columns of {}: {e}", entry.table);
+                    return EXIT_ERROR;
+                }
+            };
+        db_columns.insert(entry.table.clone(), plan::parse_db_columns(&result));
+    }
+    let allowed_missing =
+        match plan::validate_column_sets(&plan_data, &db_columns, args.strict_columns) {
+            Ok(allowed) => allowed,
             Err(e) => {
-                eprintln!("error: columns of {}: {e}", entry.table);
+                eprintln!("error: {e}");
                 return EXIT_ERROR;
             }
         };
-        db_columns.insert(entry.table.clone(), plan::parse_column_names(&result));
-    }
-    if let Err(e) = plan::validate_column_sets(&plan_data, &db_columns) {
-        eprintln!("error: {e}");
-        return EXIT_ERROR;
-    }
 
     if args.dry_run {
         let text = plan::render_plan(&plan_data, &target.name, &scheme, &fk_schema, &skipped);
@@ -278,7 +275,7 @@ pub(crate) async fn run(
     }
     let started = std::time::Instant::now();
 
-    match loader::execute(&mut *conn, &plan_data, audit, &conn_info).await {
+    match loader::execute(&mut *conn, &plan_data, &allowed_missing, audit, &conn_info).await {
         Ok(inserted) => {
             let duration_ms = started.elapsed().as_millis() as u64;
             audit.record_best_effort(load_outcome_event(
@@ -329,9 +326,7 @@ fn resolve_connection(
             format!("connection '{target_name}' not found\n  available: {available:?}")
         })?;
     if raw.is_env_var {
-        Ok(crate::config::resolve_env_var_connection(
-            target.url.clone().unwrap_or_default(),
-        ))
+        crate::config::resolve_env_var_connection(target.url.clone().unwrap_or_default())
     } else {
         crate::config::resolve_single_connection(
             target,

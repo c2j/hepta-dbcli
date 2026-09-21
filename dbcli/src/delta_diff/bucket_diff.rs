@@ -677,46 +677,96 @@ fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError
     }
 }
 
-/// 行数估算：复用 list_tables 统计值（§7.1，仅用于分片规划，不作一致性依据）。
+/// 行数估算：优先读方言的轻量 catalog 统计（issue #111），无可用值时降级
+/// 到精确 COUNT(*)（§7.1，仅用于分片规划，不作一致性依据）。
 async fn estimate_rows(
     conn: &mut (dyn DbConn + Send),
     ctx: &DiffContext,
     is_left: bool,
 ) -> Result<u64, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let sql = conn.dialect().list_tables().to_string();
+    let schema = side.schema.as_deref().unwrap_or("");
+    let sql = conn.dialect().estimate_table_rows_sql(schema, &side.table);
     ctx.vlog(format!("[sql] {sql}"));
-    let r = conn.query(&sql).await?;
-    let schema_idx = r.columns.iter().position(|c| c == "schema_name");
-    let table_idx = r.columns.iter().position(|c| c == "table_name");
-    let rows_idx = r.columns.iter().position(|c| c == "row_count");
-    let (Some(si), Some(ti), Some(ri)) = (schema_idx, table_idx, rows_idx) else {
-        return Ok(0);
+    // The GaussDB override binds ($1 schema, $2 table); the default fallback is
+    // the parameterless `list_tables()` scan and is matched by name below.
+    let estimate = if sql.contains("$1") {
+        conn.exec(
+            &sql,
+            &[
+                Value::String(schema.to_string()),
+                Value::String(side.table.clone()),
+            ],
+        )
+        .await
+    } else {
+        conn.query(&sql).await
     };
-    for row in &r.rows {
-        let schema_matches = match (&side.schema, row.get(si)) {
+    if let Ok(result) = estimate {
+        if let Some(rows) = parse_row_estimate(&result, side.schema.as_deref(), &side.table) {
+            return Ok(rows);
+        }
+    }
+
+    // Catalog statistics are unavailable, stale, or non-positive (openGauss
+    // never-ANALYZEd tables report reltuples = -1): fall back to an exact
+    // count. Estimates are unfiltered by design, so no side filter is applied.
+    let count_sql = filtered_count_sql(
+        conn.dialect().url_scheme(),
+        conn.dialect().identifier_quote(),
+        side.schema.as_deref(),
+        &side.table,
+        None,
+    );
+    ctx.vlog(format!("[sql] {count_sql}"));
+    let result = conn.query(&count_sql).await?;
+    parse_count_cell(&result)
+}
+
+/// Pull a positive row-count estimate out of an estimate result. Handles both
+/// the single-cell catalog estimate (`row_count`, one row) and the legacy
+/// `list_tables()` shape, where the requested table is matched by name.
+/// `None` means "no usable estimate" (absent, NULL, non-numeric, or <= 0) and
+/// the caller must fall back to an exact `COUNT(*)`.
+fn parse_row_estimate(
+    result: &crate::backend::QueryResult,
+    schema: Option<&str>,
+    table: &str,
+) -> Option<u64> {
+    let ri = result.columns.iter().position(|c| c == "row_count")?;
+    let Some(ti) = result.columns.iter().position(|c| c == "table_name") else {
+        // Single-cell catalog estimate: trust it only when positive.
+        return result
+            .rows
+            .first()
+            .and_then(|r| r.get(ri))
+            .and_then(value_as_u64)
+            .filter(|n| *n > 0);
+    };
+    let si = result.columns.iter().position(|c| c == "schema_name");
+    for row in &result.rows {
+        let schema_matches = match (schema, si.and_then(|i| row.get(i))) {
             (Some(want), Some(Value::String(got))) => want == got,
             _ => true,
         };
-        if schema_matches && row.get(ti) == Some(&Value::String(side.table.clone())) {
-            if let Some(v) = row.get(ri) {
-                match v {
-                    Value::Number(n) => return Ok(n.as_u64().unwrap_or(0)),
-                    Value::String(s) => {
-                        return Ok(s
-                            .trim()
-                            .split('.')
-                            .next()
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0));
-                    }
-                    _ => return Ok(0),
-                }
-            }
+        if schema_matches && row.get(ti) == Some(&Value::String(table.to_string())) {
+            return row.get(ri).and_then(value_as_u64).filter(|n| *n > 0);
         }
     }
-    Ok(0)
+    None
+}
+
+/// Best-effort unsigned integer from a JSON cell (numbers, or numeric strings
+/// as returned by some catalog aggregations). Non-positive values are reported
+/// as-is; callers decide whether to reject them.
+fn value_as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        Value::String(s) => s.trim().split('.').next().unwrap_or("").parse().ok(),
+        _ => None,
+    }
 }
 
 fn bucket_checksum_spec(
@@ -1018,6 +1068,55 @@ mod tests {
         let l = vec![vec![Value::from("aaa"), Value::from(2)]];
         let r = vec![vec![Value::from("aaa"), Value::from(2)]];
         assert!(multiset_diff(l, r).is_empty());
+    }
+
+    fn estimate_result(columns: &[&str], rows: Vec<Vec<Value>>) -> crate::backend::QueryResult {
+        crate::backend::QueryResult {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            row_count: rows.len(),
+            rows,
+            rows_affected: None,
+        }
+    }
+
+    #[test]
+    fn row_estimate_reads_single_cell_catalog_stat() {
+        let r = estimate_result(&["row_count"], vec![vec![Value::from(42)]]);
+        assert_eq!(parse_row_estimate(&r, Some("public"), "orders"), Some(42));
+        let r = estimate_result(&["row_count"], vec![vec![Value::String("123".into())]]);
+        assert_eq!(parse_row_estimate(&r, None, "orders"), Some(123));
+    }
+
+    #[test]
+    fn row_estimate_signals_fallback_when_unusable() {
+        for rows in [
+            vec![],
+            vec![vec![Value::from(0)]],
+            vec![vec![Value::from(-1)]],
+            vec![vec![Value::Null]],
+            vec![vec![Value::String("stale".into())]],
+        ] {
+            let r = estimate_result(&["row_count"], rows);
+            assert_eq!(
+                parse_row_estimate(&r, None, "orders"),
+                None,
+                "unusable estimate must fall back to COUNT(*)"
+            );
+        }
+    }
+
+    #[test]
+    fn row_estimate_matches_named_table_in_list_shape() {
+        let r = estimate_result(
+            &["schema_name", "table_name", "row_count"],
+            vec![
+                vec![Value::from("other"), Value::from("t"), Value::from(99)],
+                vec![Value::from("s"), Value::from("t"), Value::from(7)],
+            ],
+        );
+        assert_eq!(parse_row_estimate(&r, Some("s"), "t"), Some(7));
+        assert_eq!(parse_row_estimate(&r, None, "missing"), None);
+        assert_eq!(parse_row_estimate(&r, Some("nope"), "t"), None);
     }
 }
 

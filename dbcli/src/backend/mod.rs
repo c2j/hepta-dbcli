@@ -125,6 +125,29 @@ pub trait Dialect: Send + Sync {
     /// Query returning [schema_name, table_name, table_type, engine, row_count, total_size, comment]
     fn list_tables(&self) -> &str;
 
+    /// Lightweight, table-scoped row-count estimate from catalog statistics
+    /// (issue #111), parameterized by ($1 schema, $2 table) where the dialect
+    /// supports bindings. The default falls back to the full `list_tables()`
+    /// scan, so backends without a cheap catalog estimate keep working; their
+    /// callers match the requested table by name in the returned rows.
+    fn estimate_table_rows_sql(&self, _schema: &str, _table: &str) -> String {
+        self.list_tables().to_string()
+    }
+
+    /// Retry-safe variant of `list_tables()` that omits catalog-comment
+    /// columns. On SQL_ASCII instances a non-UTF-8 comment makes the primary
+    /// query fail with SQLSTATE 22021; this degraded form keeps every other
+    /// column. `None` when the dialect has no comment-free variant (issue #111).
+    fn list_tables_without_comments(&self) -> Option<String> {
+        None
+    }
+
+    /// Retry-safe variant of `table_columns()` with the same caveat as
+    /// `list_tables_without_comments()` (issue #111).
+    fn table_columns_without_comments(&self) -> Option<String> {
+        None
+    }
+
     /// Parameterized query (schema_name, table_name) returning
     /// [column_name, data_type, nullable, default_value, ordinal_position, comment, column_key]
     fn table_columns(&self) -> &str;
@@ -500,6 +523,93 @@ pub(crate) fn escape_sql_string(s: &str, backslash_escape: bool) -> String {
         s.to_string()
     };
     s.replace('\'', "''")
+}
+
+/// True when an error is (probably) the SQL_ASCII catalog-comment encoding
+/// failure that the comment-free retry exists for (#111): SQLSTATE 22021 or
+/// an "invalid byte sequence" message. Any other failure (permissions,
+/// timeouts, catalog drift) returns immediately — a retry that happens to
+/// survive an unrelated error would silently degrade the result and hide the
+/// real cause (#111 PR review).
+fn is_catalog_comment_encoding_error(err: &DbError) -> bool {
+    let text = err.to_string();
+    text.contains("22021") || text.contains("invalid byte sequence")
+}
+
+/// Run `list_tables()`, retrying once with the dialect's comment-free variant
+/// when the primary query fails with a catalog-comment encoding error
+/// (issue #111: a non-UTF-8 catalog comment on a SQL_ASCII instance raises
+/// SQLSTATE 22021 and would otherwise take down the whole introspection
+/// path). The retry only wins when it succeeds; otherwise the original error
+/// is returned. Degradation warns once on stderr.
+pub(crate) async fn query_list_tables(
+    conn: &mut (dyn DbConn + Send),
+) -> Result<QueryResult, DbError> {
+    let sql = conn.dialect().list_tables().to_string();
+    match conn.query(&sql).await {
+        Ok(result) => Ok(result),
+        Err(primary) => {
+            if !is_catalog_comment_encoding_error(&primary) {
+                return Err(primary);
+            }
+            let Some(fallback) = conn.dialect().list_tables_without_comments() else {
+                return Err(primary);
+            };
+            match conn.query(&fallback).await {
+                Ok(result) => {
+                    eprintln!(
+                        "warning: list_tables failed ({primary}); retried without catalog comments"
+                    );
+                    Ok(result)
+                }
+                Err(fallback_err) => {
+                    eprintln!(
+                        "warning: comment-free list_tables retry also failed: {fallback_err}"
+                    );
+                    Err(primary)
+                }
+            }
+        }
+    }
+}
+
+/// Parameterized `table_columns()` with the same comment-free retry as
+/// `query_list_tables()` (issue #111).
+pub(crate) async fn query_table_columns(
+    conn: &mut (dyn DbConn + Send),
+    schema: &str,
+    table: &str,
+) -> Result<QueryResult, DbError> {
+    let sql = conn.dialect().table_columns().to_string();
+    let params = [
+        Value::String(schema.to_string()),
+        Value::String(table.to_string()),
+    ];
+    match conn.exec(&sql, &params).await {
+        Ok(result) => Ok(result),
+        Err(primary) => {
+            if !is_catalog_comment_encoding_error(&primary) {
+                return Err(primary);
+            }
+            let Some(fallback) = conn.dialect().table_columns_without_comments() else {
+                return Err(primary);
+            };
+            match conn.exec(&fallback, &params).await {
+                Ok(result) => {
+                    eprintln!(
+                        "warning: table_columns failed ({primary}); retried without catalog comments"
+                    );
+                    Ok(result)
+                }
+                Err(fallback_err) => {
+                    eprintln!(
+                        "warning: comment-free table_columns retry also failed: {fallback_err}"
+                    );
+                    Err(primary)
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
@@ -958,5 +1068,218 @@ mod tests {
     fn mysql_dialect_has_no_oracle_limit_hint() {
         let d = crate::backend::mysql::dialect::MySqlDialect;
         assert!(d.statement_syntax_hint("SELECT * FROM t LIMIT 1").is_none());
+    }
+
+    // Issue #111: backends without a cheap catalog estimate keep the legacy
+    // full-list fallback, and offer no comment-free retry.
+    #[test]
+    fn default_estimate_table_rows_sql_falls_back_to_list_tables() {
+        let d = crate::backend::mysql::dialect::MySqlDialect;
+        assert_eq!(d.estimate_table_rows_sql("s", "t"), d.list_tables());
+        assert!(d.list_tables_without_comments().is_none());
+    }
+
+    /// Fake GaussDB connection: the primary `list_tables()` (which projects
+    /// `obj_description`) fails with the SQLSTATE 22021 shape a SQL_ASCII
+    /// instance produces; any comment-free retry succeeds.
+    #[cfg(feature = "gaussdb")]
+    struct EncodingFailingConn {
+        dialect: crate::backend::gaussdb::GaussdbDialect,
+        fallback_fails: bool,
+        /// When true the primary failure is a non-encoding error (permission
+        /// denied), which must NOT trigger the comment-free retry.
+        non_encoding_primary: bool,
+        /// Number of fallback (comment-free) SQL executions, so tests can
+        /// assert the retry never ran.
+        fallback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "gaussdb")]
+    impl EncodingFailingConn {
+        fn encoding(fallback_fails: bool) -> Self {
+            Self {
+                dialect: crate::backend::gaussdb::GaussdbDialect,
+                fallback_fails,
+                non_encoding_primary: false,
+                fallback_attempts: Default::default(),
+            }
+        }
+
+        fn non_encoding() -> Self {
+            Self {
+                dialect: crate::backend::gaussdb::GaussdbDialect,
+                fallback_fails: false,
+                non_encoding_primary: true,
+                fallback_attempts: Default::default(),
+            }
+        }
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[async_trait::async_trait]
+    impl DbConn for EncodingFailingConn {
+        async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            if sql.contains("obj_description") {
+                return Err(if self.non_encoding_primary {
+                    DbError::query(
+                        "GaussDB query failed: [SQLSTATE 42501] permission denied for table orders",
+                    )
+                } else {
+                    DbError::query("SQLSTATE 22021: invalid byte sequence for encoding")
+                });
+            }
+            if sql.contains("NULL AS comment") || sql.contains("NULL::text AS comment") {
+                self.fallback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fallback_fails {
+                    return Err(DbError::query("fallback also failed"));
+                }
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    "schema_name".into(),
+                    "table_name".into(),
+                    "row_count".into(),
+                ],
+                rows: vec![vec![
+                    Value::from("public"),
+                    Value::from("orders"),
+                    Value::from(5),
+                ]],
+                row_count: 1,
+                rows_affected: None,
+            })
+        }
+
+        async fn exec(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            if sql.contains("col_description") {
+                return Err(if self.non_encoding_primary {
+                    DbError::query(
+                        "GaussDB query failed: [SQLSTATE 42501] permission denied for table orders",
+                    )
+                } else {
+                    DbError::query("SQLSTATE 22021: invalid byte sequence for encoding")
+                });
+            }
+            if sql.contains("NULL::text AS comment") {
+                self.fallback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fallback_fails {
+                    return Err(DbError::query("fallback also failed"));
+                }
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "nullable".into(),
+                    "default_value".into(),
+                ],
+                rows: vec![vec![
+                    Value::from("id"),
+                    Value::from("bigint"),
+                    Value::from(false),
+                    Value::Null,
+                ]],
+                row_count: 1,
+                rows_affected: None,
+            })
+        }
+
+        async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn dialect(&self) -> &dyn Dialect {
+            &self.dialect
+        }
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_list_tables_does_not_retry_on_non_encoding_error() {
+        let mut conn = EncodingFailingConn::non_encoding();
+        let err = query_list_tables(&mut conn)
+            .await
+            .expect_err("permission errors are not encoding-related");
+        assert!(
+            err.to_string().contains("42501"),
+            "the primary error must be returned untouched: {err}"
+        );
+        assert_eq!(
+            conn.fallback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the comment-free retry must not run for non-encoding errors"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_does_not_retry_on_non_encoding_error() {
+        let mut conn = EncodingFailingConn::non_encoding();
+        let err = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect_err("permission errors are not encoding-related");
+        assert!(
+            err.to_string().contains("42501"),
+            "the primary error must be returned untouched: {err}"
+        );
+        assert_eq!(
+            conn.fallback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the comment-free retry must not run for non-encoding errors"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_list_tables_retries_without_comments_on_encoding_error() {
+        let mut conn = EncodingFailingConn::encoding(false);
+        let result = query_list_tables(&mut conn)
+            .await
+            .expect("comment-free retry must succeed");
+        assert_eq!(result.rows.len(), 1, "fallback rows are returned as-is");
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_retries_without_comments_on_encoding_error() {
+        let mut conn = EncodingFailingConn::encoding(false);
+        let result = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect("comment-free column retry must succeed");
+        assert_eq!(
+            result.rows[0][0],
+            Value::from("id"),
+            "fallback column rows are returned as-is"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_propagates_primary_error_when_fallback_fails() {
+        let mut conn = EncodingFailingConn::encoding(true);
+        let err = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect_err("both queries failed");
+        assert!(
+            err.to_string().contains("22021"),
+            "the original encoding error must survive: {err}"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_list_tables_propagates_primary_error_when_fallback_fails() {
+        let mut conn = EncodingFailingConn::encoding(true);
+        let err = query_list_tables(&mut conn)
+            .await
+            .expect_err("both queries failed");
+        assert!(
+            err.to_string().contains("22021"),
+            "the original encoding error must survive: {err}"
+        );
     }
 }

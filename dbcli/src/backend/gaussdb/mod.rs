@@ -73,6 +73,33 @@ impl Dialect for GaussdbDialect {
         "SELECT a.attname::text AS column_name, pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS data_type, NOT a.attnotnull AS nullable, pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text AS default_value, a.attnum::int4 AS ordinal_position, col_description(a.attrelid, a.attnum)::text AS comment, ic.relname::text AS column_key FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum) LEFT JOIN (pg_catalog.pg_index ix JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid AND ix.indisprimary) ON (ix.indrelid = a.attrelid AND a.attnum = ANY(ix.indkey)) WHERE a.attrelid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1) AND NOT a.attisdropped AND attnum > 0 ORDER BY a.attnum"
     }
 
+    // Issue #111: `list_tables()` projects `obj_description`, which fails with
+    // SQLSTATE 22021 on SQL_ASCII instances holding non-UTF-8 comments. This
+    // degraded form keeps the projected shape with a NULL comment.
+    fn list_tables_without_comments(&self) -> Option<String> {
+        Some(
+            "SELECT n.nspname AS schema_name, c.relname AS table_name, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' WHEN 'f' THEN 'foreign_table' WHEN 'p' THEN 'partitioned_table' END AS table_type, NULL AS engine, c.reltuples::bigint AS row_count, pg_total_relation_size(c.oid) AS total_size, NULL::text AS comment FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','v','m','f','p') AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY n.nspname, c.relname"
+                .to_string(),
+        )
+    }
+
+    // Issue #111 companion: `col_description` has the same SQLSTATE 22021 risk
+    // for `get_table_metadata`.
+    fn table_columns_without_comments(&self) -> Option<String> {
+        Some(self.table_columns().replace(
+            "col_description(a.attrelid, a.attnum)::text AS comment",
+            "NULL::text AS comment",
+        ))
+    }
+
+    // Issue #111: a table-scoped catalog estimate for delta-diff bucket sizing.
+    // `reltuples` is -1 on never-ANALYZEd openGauss tables, so GREATEST pins
+    // the floor at 0; the caller then falls back to an exact COUNT(*).
+    fn estimate_table_rows_sql(&self, _schema: &str, _table: &str) -> String {
+        "SELECT GREATEST(c.reltuples::bigint, 0) AS row_count FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1"
+            .to_string()
+    }
+
     fn table_indexes(&self) -> &str {
         "SELECT i.relname::text AS index_name, ix.indisunique AS is_unique, ix.indisprimary AS is_primary, pg_catalog.pg_get_indexdef(ix.indexrelid)::text AS columns, am.amname::text AS index_type FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE t.oid = (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE LOWER(c.relname) = LOWER($2) AND LOWER(n.nspname) = LOWER($1) ORDER BY (c.relname = $2) DESC, (n.nspname = $1) DESC, c.oid LIMIT 1) ORDER BY i.relname"
     }
@@ -464,6 +491,40 @@ mod tests {
         assert!(sql.contains("LOWER(n.nspname) = LOWER($1)"));
         assert!(sql.contains("ORDER BY (c.relname = $2) DESC"));
         assert!(sql.contains("LIMIT 1"));
+    }
+
+    // Issue #111: the row-count estimate must be a lightweight, table-scoped
+    // catalog read that never touches (possibly non-UTF-8) catalog comments.
+    #[test]
+    fn estimate_table_rows_sql_is_a_lightweight_catalog_estimate() {
+        let sql = GaussdbDialect.estimate_table_rows_sql("public", "orders");
+        assert!(
+            sql.contains("GREATEST(c.reltuples::bigint, 0) AS row_count"),
+            "{sql}"
+        );
+        assert!(sql.contains("LOWER(c.relname) = LOWER($2)"), "{sql}");
+        assert!(sql.contains("LOWER(n.nspname) = LOWER($1)"), "{sql}");
+        assert!(sql.contains("LIMIT 1"), "{sql}");
+        assert!(!sql.contains("obj_description"), "{sql}");
+        assert!(!sql.contains("pg_total_relation_size"), "{sql}");
+    }
+
+    // Issue #111: the degraded list_tables variant keeps the projected shape
+    // but substitutes NULL for the comment column.
+    #[test]
+    fn list_tables_without_comments_drops_obj_description() {
+        let d = GaussdbDialect;
+        let sql = d
+            .list_tables_without_comments()
+            .expect("gaussdb has a comment-free fallback");
+        assert!(sql.contains("NULL::text AS comment"), "{sql}");
+        assert!(!sql.contains("obj_description"), "{sql}");
+        assert!(sql.contains("c.relname AS table_name"), "{sql}");
+        assert!(sql.contains("c.reltuples::bigint AS row_count"), "{sql}");
+        assert!(
+            sql.contains("n.nspname NOT IN ('pg_catalog','information_schema')"),
+            "{sql}"
+        );
     }
 
     #[test]
