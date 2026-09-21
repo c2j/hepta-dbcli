@@ -1343,6 +1343,16 @@ async fn main() {
                 )
                 .await;
             } else if interactive {
+                // The REPL has no DDL gate: it never sets allow_ddl on its
+                // session, so accepting the flag here would silently ignore
+                // it and let a user believe DDL is permitted (issue #112 PR
+                // review C6, matching the MCP server's exit 2).
+                if cli.allow_ddl {
+                    eprintln!(
+                        "error: --allow-ddl is not valid for the interactive session; the REPL runs the read-only/data-change gate only"
+                    );
+                    std::process::exit(2);
+                }
                 let fmt: cli::OutputFormat = format.parse().unwrap_or(cli::OutputFormat::Table);
                 let args = cli::CliArgs {
                     sql,
