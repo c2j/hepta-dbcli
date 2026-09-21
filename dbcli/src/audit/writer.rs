@@ -74,9 +74,24 @@ impl AuditWriter {
     pub(crate) fn append(&mut self, line: &str) -> std::io::Result<()> {
         let fsync = self.fsync;
         let file = self.current_file()?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
+        // Issue #104: other processes append to the same daily file, so the
+        // line and its newline must reach disk as one unit. Take an exclusive
+        // advisory flock around a single buffered write: readers see either
+        // the whole line or nothing, never a torn interleaving. std's
+        // `File::lock` (flock on Unix, LockFileEx on Windows) holds until
+        // `unlock` or file close; the guard is released before `fsync` so the
+        // durability step never runs under the lock.
+        file.lock()?;
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        let mut write = || -> std::io::Result<()> {
+            file.write_all(buf.as_bytes())?;
+            file.flush()
+        };
+        let result = write();
+        file.unlock()?;
+        result?;
         if fsync {
             file.sync_all()?;
         }
@@ -238,6 +253,51 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let v: serde_json::Value = serde_json::from_str(line).expect("valid json line");
             assert_eq!(v["seq"], i as u64 + 1);
+        }
+    }
+
+    /// Issue #104: multiple processes append to the same daily file. Each
+    /// `AuditWriter` instance is one process; their `write_all` calls must
+    /// interleave at line granularity so every reader sees whole JSON lines.
+    #[test]
+    fn should_keep_lines_intact_when_multiple_writers_append_concurrently() {
+        const WRITERS: usize = 8;
+        const EVENTS: usize = 200;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let thread_dir = dir_path.clone();
+                std::thread::spawn(move || {
+                    let mut writer =
+                        AuditWriter::open(&thread_dir, false).expect("open per-writer");
+                    for i in 0..EVENTS {
+                        // Long padded payload makes partial writes easy to spot.
+                        let line = format!(
+                            "{{\"writer\":{w},\"i\":{i},\"payload\":\"{}\"}}",
+                            "x".repeat(200)
+                        );
+                        writer.append(&line).expect("append");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let contents = read_all(dir_path.as_path());
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            WRITERS * EVENTS,
+            "every line must survive whole"
+        );
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("torn or malformed line {line:?}: {e}"));
+            assert!(v["writer"].is_u64(), "expected writer tag in {line:?}");
         }
     }
 
