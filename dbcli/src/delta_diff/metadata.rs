@@ -66,7 +66,11 @@ impl TablePlan {
         columns
             .iter()
             .map(|column| {
-                find_unique_ci(&self.norm_specs, column, |spec| &spec.name)
+                // `spec_for` consults the key list first: an excluded key still
+                // has to compare numerically, otherwise the client-side merge
+                // orders keys as text ("10" < "2") while SQL ORDER BY is
+                // numeric and the walk desynchronizes.
+                self.spec_for(column)
                     .map(|spec| Self::is_numeric_type(&spec.data_type))
                     .unwrap_or(false)
             })
@@ -1346,6 +1350,21 @@ mod tests {
             plan.string_key_flags(),
             vec![true],
             "keyset paging needs the string flag even when the key is not compared"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_integer_key_still_flags_as_numeric() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude = vec!["id".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plan.numeric_value_flags_for(&["id".to_string(), "c_int".to_string()]),
+            vec![true, true],
+            "the client-side merge must order an excluded integer key numerically"
         );
     }
 

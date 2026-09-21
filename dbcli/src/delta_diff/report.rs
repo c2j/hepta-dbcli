@@ -158,9 +158,7 @@ pub(crate) fn stamp_columns_from_plan(
         .row_columns()
         .iter()
         .map(|name| {
-            plan.norm_specs
-                .iter()
-                .find(|spec| spec.name.eq_ignore_ascii_case(name))
+            plan.spec_for(name)
                 .map(|spec| spec.data_type.clone())
                 .unwrap_or_default()
         })
@@ -455,5 +453,67 @@ mod tests {
         let legacy: DiffReport =
             serde_json::from_value(json).expect("legacy report should deserialize");
         assert!(legacy.modified_columns.is_none());
+    }
+
+    #[test]
+    fn stamp_columns_from_plan_types_an_excluded_key_from_key_specs() {
+        let plan = crate::delta_diff::metadata::TablePlan {
+            url_scheme: "gaussdb".into(),
+            key_columns: vec!["id".into()],
+            compare_columns: vec!["v".into()],
+            norm_specs: vec![crate::backend::ColumnNormSpec {
+                name: "v".into(),
+                data_type: "character varying(16)".into(),
+                nullable: true,
+                rtrim_fixed_char: false,
+            }],
+            key_specs: vec![crate::backend::ColumnNormSpec {
+                name: "id".into(),
+                data_type: "integer".into(),
+                nullable: false,
+                rtrim_fixed_char: false,
+            }],
+            warnings: vec![],
+        };
+        let mut report = DiffReport {
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            left: TableRef {
+                connection: "a".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            right: TableRef {
+                connection: "b".into(),
+                schema: None,
+                table: "t".into(),
+            },
+            strategy: "keyeddiff".into(),
+            consistency: "none".into(),
+            hash_algorithm: "md5".into(),
+            summary: DiffSummary::default(),
+            perf: PerfMetrics::default(),
+            shards: vec![],
+            sample_diffs: vec![],
+            warnings: vec![],
+            row_payload: RowPayload::Columns,
+            key_columns: vec![],
+            value_columns: vec![],
+            column_data_types: vec![],
+            ident_quote: '"',
+            ident_scheme: String::new(),
+            backslash_escape: false,
+            modified_columns: None,
+        };
+
+        stamp_columns_from_plan(&mut report, &plan);
+
+        assert_eq!(report.key_columns, vec!["id"]);
+        assert_eq!(report.value_columns, vec!["v"]);
+        assert_eq!(
+            report.column_data_types,
+            vec!["integer", "character varying(16)"],
+            "an excluded key must not lose its declared type in the report"
+        );
     }
 }

@@ -118,6 +118,19 @@ fn seed_keyless_duckdb(path: &std::path::Path, rows: &str) {
     .expect("bootstrap table");
 }
 
+/// Keyed table for the merge-order regression: an integer primary key plus a
+/// value column.
+fn seed_keyed_duckdb(path: &std::path::Path, rows: &str) {
+    if path.exists() {
+        std::fs::remove_file(path).expect("remove stale fixture");
+    }
+    let conn = duckdb::Connection::open(path).expect("bootstrap create");
+    conn.execute_batch(&format!(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR); {rows}"
+    ))
+    .expect("bootstrap table");
+}
+
 /// `initialize` + `notifications/initialized` preamble for one stdio session.
 fn mcp_handshake() -> String {
     format!(
@@ -575,5 +588,49 @@ fn mcp_keyless_duckdb_snapshot_diff_completes_without_a_key_probe() {
     assert!(
         report.contains("\"missing_left\": 1") && report.contains("\"missing_right\": 1"),
         "one duplicated row per side must be reported: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_excluded_integer_key_merges_keys_numerically() {
+    // Keys 2 and 10 must not be ordered as text ("10" < "2") once the key is
+    // excluded from the comparison: the client-side merge walks both sides in
+    // SQL ORDER BY order (numeric), so a text comparison desynchronizes and
+    // reports false missing rows.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let left = dir.path().join("left_keymerge.duckdb");
+    let right = dir.path().join("right_keymerge.duckdb");
+    seed_keyed_duckdb(&left, "INSERT INTO t VALUES (2, 'a'), (10, 'b')");
+    seed_keyed_duckdb(&right, "INSERT INTO t VALUES (2, 'a'), (3, 'c'), (10, 'b')");
+
+    let args = serde_json::json!({
+        "left_url": format!("duckdb://{}", left.display()),
+        "right_url": format!("duckdb://{}", right.display()),
+        "table": "t",
+        "strategy": "keyeddiff",
+        "exclude_columns": ["id"],
+    });
+    let stdout = mcp_call(format!(
+        "{}{}\n",
+        mcp_handshake(),
+        mcp_tool_call("delta_diff", args)
+    ));
+
+    assert!(
+        !stdout.contains("\"isError\":true"),
+        "excluded-key diff must not error: {stdout}"
+    );
+    let report = unescape_report(&stdout);
+    assert!(
+        report.contains("\"missing_left\": 1"),
+        "only the right-only key 3 may be reported: {stdout}"
+    );
+    assert!(
+        report.contains("\"missing_right\": 0"),
+        "no left row may look missing (the merge must order keys numerically): {stdout}"
+    );
+    assert!(
+        report.contains("\"modified\": 0"),
+        "the shared keys 2 and 10 are identical: {stdout}"
     );
 }
