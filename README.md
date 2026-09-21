@@ -449,7 +449,7 @@ When running as MCP server, the following tools are available:
 | `list_connections` | List all configured connections and their status |
 | `delta_diff` | Cross-DB table compare (read-only). Supports incremental (`update_column`/`update_since`), `checkpoint`, and csv/jsonl/json `export`. SQL patch `--apply-to` stays on the CLI. |
 
-`delta_diff` parameters: `left_connection` or `left_url`, `right_connection` or `right_url` (exactly one per side), `table` (required). `left_url` / `right_url` connect without any config entry (e.g. local DuckDB files); in reports and the audit ledger such a side shows up as `inline-<scheme>`. Optional: `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `where_condition`, `update_column` / `update_since`, `checkpoint`, `export`, `export_format` (csv/jsonl/json), `export_rows`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
+`delta_diff` parameters: `left_connection` or `left_url`, `right_connection` or `right_url` (exactly one per side), `table` (required). `left_url` / `right_url` connect without any config entry (e.g. local DuckDB files); in reports and the audit ledger such a side shows up as `inline-<scheme>`. Optional: `left_table` / `right_table`, `schema` / `left_schema` / `right_schema`, `key_columns`, `columns`, `exclude_columns`, `where_condition`, `update_column` / `update_since`, `checkpoint`, `export`, `export_format` (csv/jsonl/json), `export_rows`, `strategy`, `consistency`, `recheck`, `sample_limit` (default 1000), `summary_only`.
 
 ## Development
 

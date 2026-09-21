@@ -159,7 +159,8 @@ impl TablePlan {
 
 /// Fetch table metadata through the connection's dialect and build the
 /// comparison plan. `explicit_columns`/`explicit_key` are the user's
-/// --columns/--key overrides (empty = auto).
+/// --columns/--key overrides (empty = auto); `exclude_columns` is the
+/// --exclude-columns deny list, applied on top of the resulting compare set.
 pub(crate) async fn build_table_plan(
     conn: &mut dyn DbConn,
     schema: &str,
@@ -167,6 +168,7 @@ pub(crate) async fn build_table_plan(
     explicit_columns: &[String],
     explicit_key: &[String],
     rtrim_char_columns: bool,
+    exclude_columns: &[String],
 ) -> Result<TablePlan, DbError> {
     let (col_sql, idx_sql) = {
         let d = conn.dialect();
@@ -237,6 +239,62 @@ pub(crate) async fn build_table_plan(
             conn.dialect().normalize_expr(&spec)?;
             compare_columns.push(col.name.clone());
             norm_specs.push(spec);
+        }
+    }
+
+    // --exclude-columns (issue #109): a deny list applied on top of the
+    // discovered/--columns set. Names resolve against the table's real
+    // columns (case-insensitive) so typos fail loudly instead of silently
+    // comparing a column the user meant to skip.
+    let mut excluded: Vec<String> = Vec::new();
+    for name in exclude_columns {
+        let col = find_column_ci(&columns, name).ok_or_else(|| {
+            DbError::config(format!(
+                "delta-diff: --exclude-columns column '{name}' not found in '{schema}.{table}'"
+            ))
+        })?;
+        if explicit_columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&col.name))
+        {
+            return Err(DbError::config(format!(
+                "delta-diff: column '{}' is listed in both --columns and --exclude-columns",
+                col.name
+            )));
+        }
+        if !excluded.contains(&col.name) {
+            excluded.push(col.name.clone());
+        }
+    }
+    if !excluded.is_empty() {
+        let mut kept_columns = Vec::with_capacity(compare_columns.len());
+        let mut kept_specs = Vec::with_capacity(norm_specs.len());
+        for (name, spec) in compare_columns.into_iter().zip(norm_specs) {
+            if excluded.contains(&name) {
+                continue;
+            }
+            kept_columns.push(name);
+            kept_specs.push(spec);
+        }
+        compare_columns = kept_columns;
+        norm_specs = kept_specs;
+        warnings.push(format!(
+            "column(s) excluded from comparison by --exclude-columns: {}",
+            excluded.join(", ")
+        ));
+        for key in &key_columns {
+            if excluded.contains(key) {
+                warnings.push(format!(
+                    "column '{schema}.{table}.{key}' is part of the row key: it still \
+                     identifies rows, only its value comparison was excluded"
+                ));
+            }
+        }
+        if compare_columns.is_empty() {
+            return Err(DbError::config(format!(
+                "delta-diff: no columns left to compare in '{schema}.{table}' after \
+                 --exclude-columns"
+            )));
         }
     }
 
@@ -696,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn plan_from_mysql_metadata() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -715,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn composite_primary_key_csv_parsed() {
         let mut conn = mock(verify_columns(), primary_index("id, c_int"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id", "c_int"]);
@@ -733,7 +791,7 @@ mod tests {
         ]);
         idx.row_count += 1;
         let mut conn = mock(verify_columns(), idx);
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -742,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn no_primary_index_yields_empty_key() {
         let mut conn = mock(verify_columns(), as_result(vec![]));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert!(plan.key_columns.is_empty());
@@ -754,7 +812,7 @@ mod tests {
         cols.rows.push(col_row("doc", "text", true, ""));
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert!(!plan.compare_columns.contains(&"doc".to_string()));
@@ -770,7 +828,7 @@ mod tests {
         cols.row_count += 1;
         let mut conn = mock(cols, primary_index("id"));
         let explicit = vec!["id".to_string(), "doc".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("doc"), "{err}");
@@ -780,7 +838,7 @@ mod tests {
     async fn explicit_columns_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["id".to_string(), "nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -796,6 +854,7 @@ mod tests {
             &[],
             &["c_int".into()],
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -816,6 +875,7 @@ mod tests {
             &[],
             &["c_dt".into()],
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -836,6 +896,7 @@ mod tests {
             &[],
             &["c_vc".into()],
             false,
+            &[],
         )
         .await
         .unwrap();
@@ -851,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn primary_key_has_no_uniqueness_warning() {
         let mut conn = mock(verify_columns(), primary_index("id"));
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
             .await
             .unwrap();
         assert!(
@@ -867,7 +928,7 @@ mod tests {
     async fn explicit_key_overrides_discovery() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["c_int".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["c_int"]);
@@ -877,7 +938,7 @@ mod tests {
     async fn explicit_key_unknown_column_errors() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["nope".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -889,7 +950,7 @@ mod tests {
         // to the catalog's case, since downstream SQL double-quotes the key.
         let mut conn = mock(verify_columns(), primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["id"]);
@@ -899,7 +960,7 @@ mod tests {
     async fn explicit_columns_case_insensitive_matches() {
         let mut conn = mock(verify_columns(), primary_index("id"));
         let explicit = vec!["ID".to_string(), "C_INT".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &explicit, &[], false, &[])
             .await
             .unwrap();
         assert_eq!(plan.compare_columns, vec!["id", "c_int"]);
@@ -913,7 +974,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("id"));
         let key = vec!["ID".to_string()];
-        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["ID"]);
@@ -927,7 +988,7 @@ mod tests {
         ]);
         let mut conn = mock(cols, primary_index("ID"));
         let key = vec!["id".to_string()];
-        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false)
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &key, false, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("id"), "{err}");
@@ -936,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn missing_table_errors() {
         let mut conn = mock(as_result(vec![]), as_result(vec![]));
-        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[], false)
+        let err = build_table_plan(&mut conn, "verify", "nope", &[], &[], false, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
@@ -1021,7 +1082,7 @@ mod tests {
         let def = "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (xwdm, security_id) \
              LOCAL(PARTITION part_202401_xwdm_security_id, PARTITION part_202402_xwdm_security_id)";
         let mut conn = mock(cols, primary_index(def));
-        let plan = build_table_plan(&mut conn, "public", "t", &[], &[], false)
+        let plan = build_table_plan(&mut conn, "public", "t", &[], &[], false, &[])
             .await
             .unwrap();
         assert_eq!(plan.key_columns, vec!["xwdm", "security_id"]);
@@ -1073,5 +1134,142 @@ mod tests {
         assert!(!out.contains("$2"));
         assert!(out.contains("'bigfund'"));
         assert!(out.contains("'dat_fund_cjqs'"));
+    }
+
+    // ── --exclude-columns (issue #109) ──
+
+    #[tokio::test]
+    async fn exclude_columns_drops_them_from_the_compare_set() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude = vec!["c_vc".to_string(), "c_dt".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.compare_columns,
+            vec!["id", "c_int", "c_dec", "c_bool", "c_null"]
+        );
+        assert_eq!(plan.norm_specs.len(), plan.compare_columns.len());
+        assert_eq!(
+            plan.norm_specs
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "c_int", "c_dec", "c_bool", "c_null"]
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("exclude-columns") && w.contains("c_dt") && w.contains("c_vc")),
+            "warnings must name the excluded columns: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn exclude_columns_matches_case_insensitively() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude = vec!["C_VC".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+        assert!(!plan.compare_columns.contains(&"c_vc".to_string()));
+        assert_eq!(plan.compare_columns.len(), 6);
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("c_vc")),
+            "the physical name is reported: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_exclude_column_is_rejected() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude = vec!["nope".to_string()];
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--exclude-columns"), "{err}");
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn excluding_a_key_column_keeps_the_key_and_warns() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude = vec!["id".to_string()];
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap();
+        assert_eq!(plan.key_columns, vec!["id"]);
+        assert!(!plan.compare_columns.contains(&"id".to_string()));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("row key") && w.contains("id")),
+            "excluding a key column must be reported: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn excluding_every_column_leaves_nothing_to_compare() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let exclude: Vec<String> = ["id", "c_int", "c_dec", "c_dt", "c_vc", "c_bool", "c_null"]
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        let err = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &exclude)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no columns left"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exclude_column_also_listed_in_columns_is_rejected() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let explicit = vec!["id".to_string(), "c_int".to_string()];
+        let exclude = vec!["C_INT".to_string()];
+        let err = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &explicit,
+            &[],
+            false,
+            &exclude,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("both --columns"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exclude_columns_outside_an_explicit_list_is_a_no_op() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        // Overlap with --columns is rejected, so a legal --columns +
+        // --exclude-columns pair can only name columns that were not going to
+        // be compared anyway: the compare set stays as --columns left it.
+        let explicit = vec!["id".to_string(), "c_int".to_string()];
+        let exclude = vec!["c_dec".to_string()];
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &explicit,
+            &[],
+            false,
+            &exclude,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.compare_columns, vec!["id", "c_int"]);
+        assert_eq!(plan.norm_specs.len(), 2);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("exclude-columns") && w.contains("c_dec")),
+            "{:?}",
+            plan.warnings
+        );
     }
 }

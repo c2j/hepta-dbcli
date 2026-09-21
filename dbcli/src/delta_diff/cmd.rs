@@ -129,6 +129,10 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub columns: Option<String>,
 
+    /// 不参与比对的列，逗号分隔（在发现/--columns 之后做减法；两侧同名）
+    #[arg(long)]
+    pub exclude_columns: Option<String>,
+
     /// WHERE 条件（两侧同时应用；禁止分号）
     #[arg(
         long = "where",
@@ -275,6 +279,10 @@ impl DeltaDiffArgs {
 
     pub(crate) fn columns_list(&self) -> Vec<String> {
         split_csv(self.columns.as_deref())
+    }
+
+    pub(crate) fn exclude_columns_list(&self) -> Vec<String> {
+        split_csv(self.exclude_columns.as_deref())
     }
 
     pub(crate) fn recheck_effective(&self) -> bool {
@@ -757,6 +765,41 @@ mod tests {
         .unwrap();
         assert!(args.key_list().is_empty());
         assert!(args.columns_list().is_empty());
+    }
+
+    #[test]
+    fn exclude_columns_flag_splits_csv() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "dev",
+            "--right",
+            "prod",
+            "--table",
+            "orders",
+            "--columns",
+            "id,amount,status",
+            "--exclude-columns",
+            "etl_time, remark ",
+        ])
+        .unwrap();
+        assert_eq!(args.exclude_columns_list(), vec!["etl_time", "remark"]);
+        assert_eq!(args.columns_list(), vec!["id", "amount", "status"]);
+    }
+
+    #[test]
+    fn exclude_columns_defaults_empty() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "dev",
+            "--right",
+            "prod",
+            "--table",
+            "orders",
+        ])
+        .unwrap();
+        assert!(args.exclude_columns_list().is_empty());
     }
 
     #[test]

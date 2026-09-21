@@ -542,9 +542,10 @@ mod integration_tests {
     async fn setup(scheme: &str, env: &str) -> Option<Side> {
         let mut conn = connect(env, scheme).await?;
         let schema = current_schema(&mut *conn).await;
-        let plan = metadata::build_table_plan(&mut *conn, &schema, "verify_t", &[], &[], false)
-            .await
-            .expect("build_table_plan failed");
+        let plan =
+            metadata::build_table_plan(&mut *conn, &schema, "verify_t", &[], &[], false, &[])
+                .await
+                .expect("build_table_plan failed");
         assert_eq!(plan.key_columns, vec!["id".to_string()]);
         assert_eq!(
             plan.compare_columns.len(),

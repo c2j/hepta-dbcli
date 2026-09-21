@@ -255,6 +255,7 @@ async fn dry_run_inner(
         &args.columns_list(),
         &args.key_list(),
         args.rtrim_char_columns,
+        &args.exclude_columns_list(),
     )
     .await
     .map_err(|e| format!("left plan: {}", e))?;
@@ -265,6 +266,7 @@ async fn dry_run_inner(
         &args.columns_list(),
         &args.key_list(),
         args.rtrim_char_columns,
+        &args.exclude_columns_list(),
     )
     .await
     .map_err(|e| format!("right plan: {}", e))?;
@@ -455,8 +457,8 @@ async fn execute_diff_inner(
         &args.columns_list(),
         &args.key_list(),
         Some(args.strategy),
-        matches!(args.consistency, cmd::ConsistencyMode::None),
         args.rtrim_char_columns,
+        &args.exclude_columns_list(),
     )
     .await?;
     let (left_key_columns, right_key_columns) = paired_side_keys(

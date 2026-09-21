@@ -162,6 +162,8 @@ pub struct DeltaDiffParams {
     pub key_columns: Option<Vec<String>>,
     /// 要比对的列（默认全部可比列）
     pub columns: Option<Vec<String>>,
+    /// 不参与比对的列（在发现/columns 之后做减法；两侧同名）
+    pub exclude_columns: Option<Vec<String>>,
     /// WHERE 条件（两侧同时应用；禁止分号）
     pub where_condition: Option<String>,
     /// 策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
@@ -1450,6 +1452,7 @@ fn build_mcp_diff_options(
         strategy,
         key: params.key_columns.clone().unwrap_or_default(),
         columns: params.columns.clone().unwrap_or_default(),
+        exclude_columns: params.exclude_columns.clone().unwrap_or_default(),
         filter,
         incremental,
         bisection_factor: 32,
@@ -1482,6 +1485,7 @@ mod delta_diff_url_side_tests {
             right_schema: None,
             key_columns: None,
             columns: None,
+            exclude_columns: None,
             where_condition: None,
             strategy: None,
             consistency: None,
@@ -1623,6 +1627,7 @@ mod delta_diff_mcp_plan_tests {
             right_schema: None,
             key_columns: None,
             columns: None,
+            exclude_columns: None,
             where_condition: None,
             strategy: None,
             consistency: None,
@@ -1686,6 +1691,16 @@ mod delta_diff_mcp_plan_tests {
         p.checkpoint = Some("/tmp/dd.ckpt".into());
         let opts = build_mcp_diff_options(&p).unwrap();
         assert_eq!(opts.checkpoint.as_deref(), Some("/tmp/dd.ckpt"));
+    }
+
+    #[test]
+    fn exclude_columns_are_passed_through() {
+        let mut p = base_params();
+        p.columns = Some(vec!["id".into(), "amount".into()]);
+        p.exclude_columns = Some(vec!["etl_time".into()]);
+        let opts = build_mcp_diff_options(&p).unwrap();
+        assert_eq!(opts.exclude_columns, vec!["etl_time"]);
+        assert_eq!(opts.columns, vec!["id", "amount"]);
     }
 
     #[test]
