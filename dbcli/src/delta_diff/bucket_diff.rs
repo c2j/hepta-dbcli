@@ -47,6 +47,30 @@ pub(crate) struct ProbeSpec {
     pub(crate) max_buckets: u64,
 }
 
+/// Why the key-domain probe produced no `RangePlan` (issue #108).
+///
+/// `Domain` is a data condition the probe itself proved (no rows, all-NULL
+/// keys, disjoint ranges): bucketdiff keeps MOD(rowHash, N) bucketing.
+/// `Db` is the engine rejecting the probe statement: that must not be
+/// papered over, because inside a snapshot transaction it aborts the
+/// session (every later statement then fails with SQLSTATE 25P02) and in
+/// `--consistency none` it silently downgrades the whole table to a MOD
+/// scan.
+#[derive(Debug)]
+pub(crate) enum ProbeError {
+    Domain(String),
+    Db(DbError),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Domain(reason) => write!(f, "{reason}"),
+            ProbeError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 impl BucketPlan {
     /// Probe the overlapping integer key domain and split it into at most
     /// `spec.max_buckets` contiguous PK ranges (WP2, issue #77). Fails closed
@@ -57,12 +81,16 @@ impl BucketPlan {
         spec: &ProbeSpec,
         ctx: &DiffContext,
         queries: &mut u64,
-    ) -> Result<Self, DbError> {
+    ) -> Result<Self, ProbeError> {
         let key_column = spec.key_column.as_str();
+        let (lkey, rkey) = (
+            side_range_key(ctx, true, key_column),
+            side_range_key(ctx, false, key_column),
+        );
         let (lt, rt) = (&spec.left, &spec.right);
         let lp = Self::probe_side(
             left,
-            key_column,
+            &lkey,
             &lt.table.schema,
             &lt.table.table,
             lt.filter.as_deref(),
@@ -70,7 +98,7 @@ impl BucketPlan {
         );
         let rp = Self::probe_side(
             right,
-            key_column,
+            &rkey,
             &rt.table.schema,
             &rt.table.table,
             rt.filter.as_deref(),
@@ -87,9 +115,10 @@ impl BucketPlan {
         let min = lmin.min(rmin);
         let max = lmax.max(rmax);
         if min > max {
-            return Err(DbError::query(
+            return Err(ProbeError::Domain(
                 "key domain unresolved: sides' key ranges do not overlap \
-                 (bucketdiff falls back to MOD(rowHash, N) bucketing)",
+                 (bucketdiff falls back to MOD(rowHash, N) bucketing)"
+                    .to_string(),
             ));
         }
         Ok(Self {
@@ -107,37 +136,43 @@ impl BucketPlan {
         table: &str,
         filter: Option<&str>,
         ctx: &DiffContext,
-    ) -> Result<((i64, i64), u64), DbError> {
+    ) -> Result<((i64, i64), u64), ProbeError> {
         let scheme = conn.dialect().url_scheme().to_owned();
         let quote = conn.dialect().identifier_quote();
+        // Each side's own physical column, quoted like every other key
+        // reference (hash_diff::key_range does the same): an unquoted shared
+        // name misresolves on case-sensitive identifiers.
+        let key = conn.dialect().quote_ident(key_column);
         let mut sql = format!(
-            "SELECT MIN({key_column}) AS mn, MAX({key_column}) AS mx, \
-             SUM(CASE WHEN {key_column} IS NULL THEN 1 ELSE 0 END) AS nulls FROM {}",
+            "SELECT MIN({key}) AS mn, MAX({key}) AS mx, \
+             SUM(CASE WHEN {key} IS NULL THEN 1 ELSE 0 END) AS nulls FROM {}",
             crate::backend::quote_table_scheme(&scheme, quote, schema.as_deref(), table)
         );
         if let Some(f) = filter {
             sql.push_str(&format!(" WHERE ({f})"));
         }
         ctx.vlog(format!("[sql] {sql}"));
-        let r = conn.query(&sql).await?;
+        let r = conn.query(&sql).await.map_err(ProbeError::Db)?;
         let used = 1u64;
         let row = r.rows.first().ok_or_else(|| {
-            DbError::query(format!("key domain probe returned no rows for {table}"))
+            ProbeError::Domain(format!("key domain probe returned no rows for {table}"))
         })?;
-        let parse = |v: Option<&Value>| -> Result<Option<i64>, DbError> {
+        let parse = |v: Option<&Value>| -> Result<Option<i64>, ProbeError> {
             match v {
                 None | Some(Value::Null) => Ok(None),
                 Some(Value::Number(n)) => n
                     .as_i64()
                     .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()))
                     .map(Some)
-                    .ok_or_else(|| DbError::query(format!("non-integer key domain: {n}"))),
+                    .ok_or_else(|| ProbeError::Domain(format!("non-integer key domain: {n}"))),
                 Some(Value::String(s)) => s
                     .trim()
                     .parse::<i64>()
                     .map(Some)
-                    .map_err(|_| DbError::query(format!("non-integer key domain: {s}"))),
-                Some(other) => Err(DbError::query(format!("non-integer key domain: {other}"))),
+                    .map_err(|_| ProbeError::Domain(format!("non-integer key domain: {s}"))),
+                Some(other) => Err(ProbeError::Domain(format!(
+                    "non-integer key domain: {other}"
+                ))),
             }
         };
         let cols: Vec<Option<&Value>> = (0..2).map(|i| row.get(i)).collect();
@@ -156,7 +191,7 @@ impl BucketPlan {
             })
             .unwrap_or(0);
         if nulls > 0 {
-            return Err(DbError::query(format!(
+            return Err(ProbeError::Domain(format!(
                 "key domain probe found {nulls} NULL {key_column} values in {table} \
                  (range bucketing cannot see NULL keys; bucketdiff falls back \
                  to MOD(rowHash, N) bucketing)"
@@ -164,7 +199,7 @@ impl BucketPlan {
         }
         match (mn, mx) {
             (Some(a), Some(b)) if a <= b => Ok(((a, b), used)),
-            _ => Err(DbError::query(format!(
+            _ => Err(ProbeError::Domain(format!(
                 "key domain unresolved for {table}: no non-NULL {key_column} values \
                  (bucketdiff falls back to MOD(rowHash, N) bucketing)"
             ))),
@@ -261,11 +296,15 @@ impl RangePlan {
     /// SQL predicate selecting this bucket's keys, spliced into checksum
     /// pulls: `(k >= a AND k <= b)` — sargable, PK-index-friendly.
     pub(crate) fn range_predicate(&self, b: u64) -> String {
+        self.range_predicate_for(&self.key_column, b)
+    }
+
+    /// Same predicate with an explicit (already quoted) key name: the two
+    /// sides may spell the same logical key differently, so each side's pull
+    /// must name its own column.
+    pub(crate) fn range_predicate_for(&self, key: &str, b: u64) -> String {
         let (lo, hi) = self.range(b);
-        format!(
-            "({} >= {lo} AND {} <= {hi})",
-            self.key_column, self.key_column
-        )
+        format!("({key} >= {lo} AND {key} <= {hi})")
     }
 }
 
@@ -328,7 +367,7 @@ impl BucketDiffer {
         queries: &mut u64,
     ) -> Result<(Vec<ShardResult>, Vec<DiffRow>, u64), DbError> {
         let n = self.bucket_count(left, right, ctx, queries).await?;
-        let range_plan = self.probe_key_domain(left, right, ctx, n, queries).await;
+        let range_plan = self.probe_key_domain(left, right, ctx, n, queries).await?;
         let t0 = Instant::now();
 
         // WP2 (issue #77): with a usable integer key domain, per-bucket
@@ -474,7 +513,9 @@ impl BucketDiffer {
     /// both sides. Returns `None` (with a stderr note) when the table exposes
     /// no usable integer key, when either side has no rows, all-NULL keys,
     /// non-integer keys, or the ranges are disjoint; bucketdiff then keeps
-    /// the legacy MOD(rowHash, N) bucketing.
+    /// the legacy MOD(rowHash, N) bucketing. An engine rejection of the probe
+    /// statement itself is fatal (issue #108): it aborts a snapshot session
+    /// and silently downgrades `--consistency none` runs.
     async fn probe_key_domain(
         &self,
         left: &mut (dyn DbConn + Send),
@@ -482,16 +523,16 @@ impl BucketDiffer {
         ctx: &DiffContext,
         n: u64,
         queries: &mut u64,
-    ) -> Option<RangePlan> {
+    ) -> Result<Option<RangePlan>, DbError> {
         let Some(key_column) = range_probe_key(ctx) else {
             ctx.vlog(
                 "[delta-diff] bucketdiff key-domain probe skipped: no single integer \
                  comparison key; keeping MOD(rowHash, N) bucketing",
             );
-            return None;
+            return Ok(None);
         };
         let spec = ProbeSpec {
-            key_column,
+            key_column: key_column.clone(),
             left: KeySide {
                 table: table_ref(&ctx.left),
                 filter: side_filter(ctx, left.dialect().url_scheme()),
@@ -509,15 +550,20 @@ impl BucketDiffer {
                     "[delta-diff] bucketdiff PK-range plan: {} in [{}..={}], {} buckets",
                     plan.key_column, plan.min, plan.max, plan.n
                 ));
-                Some(plan)
+                Ok(Some(plan))
             }
-            Err(e) => {
+            Err(ProbeError::Domain(reason)) => {
                 ctx.vlog(format!(
-                    "[delta-diff] bucketdiff key-domain probe unavailable ({e}); \
+                    "[delta-diff] bucketdiff key-domain probe unavailable ({reason}); \
                      keeping MOD(rowHash, N) bucketing"
                 ));
-                None
+                Ok(None)
             }
+            Err(ProbeError::Db(e)) => Err(DbError::query(format!(
+                "bucketdiff key-domain probe failed on key '{key_column}': {e} \
+                 (the PK-range path needs a MIN/MAX-able key on both sides; \
+                 re-run with --strategy naivediff or --strategy keyeddiff to skip it)"
+            ))),
         }
     }
 }
@@ -549,12 +595,8 @@ async fn run_range_checksum_maps(
     let mut rmap = std::collections::BTreeMap::new();
     for b in 0..plan.n {
         let (lo, hi) = plan.range(b);
-        let mut lspec = bucket_checksum_spec(ctx, true, 1, 0, left.dialect())?;
-        lspec.key_column = Some(plan.key_column.clone());
-        lspec.range = Some((lo, hi + 1));
-        let mut rspec = bucket_checksum_spec(ctx, false, 1, 0, right.dialect())?;
-        rspec.key_column = Some(plan.key_column.clone());
-        rspec.range = Some((lo, hi + 1));
+        let lspec = range_checksum_spec(ctx, true, plan, b, left.dialect())?;
+        let rspec = range_checksum_spec(ctx, false, plan, b, right.dialect())?;
         ctx.vlog(format!(
             "[delta-diff] bucketdiff checksum slice {b}: [{lo}..={hi}]"
         ));
@@ -597,11 +639,38 @@ fn range_pull_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<ChecksumSqlSpec, DbError> {
     let mut spec = bucket_checksum_spec(ctx, is_left, 1, 0, dialect)?;
+    let key = dialect.quote_ident(&side_range_key(ctx, is_left, &plan.key_column));
+    let predicate = plan.range_predicate_for(&key, bucket);
     spec.filter = match spec.filter {
-        Some(f) => Some(format!("({f}) AND {}", plan.range_predicate(bucket))),
-        None => Some(plan.range_predicate(bucket)),
+        Some(f) => Some(format!("({f}) AND {predicate}")),
+        None => Some(predicate),
     };
     Ok(spec)
+}
+
+/// One range-path checksum spec for bucket `b`: the bucket's key range
+/// selects the rows, the side's own key column carries the predicate.
+fn range_checksum_spec(
+    ctx: &DiffContext,
+    is_left: bool,
+    plan: &RangePlan,
+    b: u64,
+    dialect: &dyn crate::backend::Dialect,
+) -> Result<ChecksumSqlSpec, DbError> {
+    let mut spec = bucket_checksum_spec(ctx, is_left, 1, 0, dialect)?;
+    spec.key_column = Some(side_range_key(ctx, is_left, &plan.key_column));
+    let (lo, hi) = plan.range(b);
+    spec.range = Some((lo, hi + 1));
+    Ok(spec)
+}
+
+/// This side's physical key column for the range path, falling back to the
+/// plan's display name when the pairing produced no per-side key.
+fn side_range_key(ctx: &DiffContext, is_left: bool, fallback: &str) -> String {
+    ctx.side_key_columns(is_left)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn table_ref(side: &crate::delta_diff::strategy::SideCtx) -> TableRef {
@@ -1307,7 +1376,8 @@ mod tests {
 
         let plan = BucketDiffer
             .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
-            .await;
+            .await
+            .expect("gating must not fail the diff");
 
         assert!(plan.is_none(), "keyless tables keep MOD(rowHash, N)");
         assert!(
@@ -1328,7 +1398,8 @@ mod tests {
 
         let plan = BucketDiffer
             .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
-            .await;
+            .await
+            .expect("gating must not fail the diff");
 
         assert!(plan.is_none());
         assert!(
@@ -1354,7 +1425,8 @@ mod tests {
 
         let plan = BucketDiffer
             .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
-            .await;
+            .await
+            .expect("integer key probe must succeed");
 
         let plan = plan.expect("integer key keeps the PK-range path");
         assert_eq!(plan.key_column, "id");
@@ -1368,6 +1440,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_statement_failure_is_fatal_not_silently_downgraded() {
+        let ctx = probe_ctx(Some(("id", "bigint")));
+        let (mut left, _lseen) =
+            RecordingConn::recording(ProbeReply::Fail("column \"id\" does not exist"));
+        let (mut right, _rseen) = RecordingConn::recording(ProbeReply::MinMax(min_max_result(
+            Value::from(1),
+            Value::from(9),
+            0,
+        )));
+        let mut queries = 0;
+
+        let err = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await
+            .expect_err("a failed probe statement must surface");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") && msg.contains("key 'id'"),
+            "engine error and failing key must both be reported: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn unusable_key_domain_still_falls_back_to_mod_bucketing() {
         let ctx = probe_ctx(Some(("id", "bigint")));
         let reply = || ProbeReply::MinMax(min_max_result(Value::Null, Value::Null, 3));
@@ -1377,12 +1473,72 @@ mod tests {
 
         let plan = BucketDiffer
             .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
-            .await;
+            .await
+            .expect("a data condition must not fail the diff");
 
         assert!(
             plan.is_none(),
             "all-NULL keys are a data condition, not a probe failure"
         );
+    }
+
+    // ── per-side physical key names on the range path (issue #108) ──
+
+    /// Same logical key spelled differently on each side, as GaussDB/Oracle
+    /// casing produces (left `ID`, right `rid`) — the paired per-side key
+    /// names, not the shared logical name, must reach every statement.
+    fn probe_ctx_with_side_keys(left_key: &str, right_key: &str) -> DiffContext {
+        let mut ctx = probe_ctx(Some(("id", "bigint")));
+        ctx.left_key_columns = vec![left_key.to_string()];
+        ctx.right_key_columns = vec![right_key.to_string()];
+        ctx
+    }
+
+    #[tokio::test]
+    async fn key_domain_probe_names_each_side_key_column() {
+        let ctx = probe_ctx_with_side_keys("ID", "rid");
+        let reply = || ProbeReply::MinMax(min_max_result(Value::from(0), Value::from(10), 0));
+        let (mut left, lseen) = RecordingConn::recording(reply());
+        let (mut right, rseen) = RecordingConn::recording(reply());
+        let mut queries = 0;
+
+        BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await
+            .expect("probe");
+
+        let lsql = lseen.lock().expect("lock").join(";");
+        let rsql = rseen.lock().expect("lock").join(";");
+        assert!(lsql.contains("MIN(`ID`)"), "left probe SQL: {lsql}");
+        assert!(rsql.contains("MIN(`rid`)"), "right probe SQL: {rsql}");
+    }
+
+    #[test]
+    fn range_checksum_spec_names_each_side_key_column() {
+        let ctx = probe_ctx_with_side_keys("ID", "rid");
+        let plan = RangePlan::new("ID", 0, 10, 2);
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+
+        let ls = range_checksum_spec(&ctx, true, &plan, 0, &dialect).expect("left spec");
+        let rs = range_checksum_spec(&ctx, false, &plan, 0, &dialect).expect("right spec");
+
+        assert_eq!(ls.key_column.as_deref(), Some("ID"));
+        assert_eq!(ls.range, Some((0, 6)));
+        assert_eq!(rs.key_column.as_deref(), Some("rid"));
+        assert_eq!(rs.range, Some((0, 6)));
+    }
+
+    #[test]
+    fn range_pull_spec_filters_on_each_side_key_column() {
+        let ctx = probe_ctx_with_side_keys("ID", "rid");
+        let plan = RangePlan::new("ID", 0, 10, 2);
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+
+        let lp = range_pull_spec(&ctx, true, &plan, 1, &dialect).expect("left pull");
+        let rp = range_pull_spec(&ctx, false, &plan, 1, &dialect).expect("right pull");
+
+        assert_eq!(lp.filter.as_deref(), Some("(`ID` >= 6 AND `ID` <= 10)"));
+        assert_eq!(rp.filter.as_deref(), Some("(`rid` >= 6 AND `rid` <= 10)"));
     }
 }
 
