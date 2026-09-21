@@ -150,7 +150,6 @@ pub(crate) async fn execute(
 ) -> Result<u64, String> {
     let scheme = conn.dialect().url_scheme().to_string();
     let quote = conn.dialect().identifier_quote();
-    let columns_sql = conn.dialect().table_columns().to_string();
     let empty = std::collections::HashSet::new();
     let mut completed: Vec<String> = Vec::new();
     let mut total: u64 = 0;
@@ -165,7 +164,7 @@ pub(crate) async fn execute(
         ));
 
         let allowed = allowed_missing.get(&entry.table).unwrap_or(&empty);
-        match load_table(conn, &scheme, quote, &columns_sql, entry, allowed).await {
+        match load_table(conn, &scheme, quote, entry, allowed).await {
             Ok(loaded) => {
                 completed.push(entry.table.clone());
                 total += loaded as u64;
@@ -228,7 +227,6 @@ async fn load_table(
     conn: &mut dyn DbConn,
     scheme: &str,
     quote: char,
-    columns_sql: &str,
     entry: &super::plan::PlanEntry,
     allowed_missing: &std::collections::HashSet<String>,
 ) -> Result<usize, (usize, String)> {
@@ -248,14 +246,7 @@ async fn load_table(
         .schema
         .clone()
         .unwrap_or_else(|| default_schema_for_scheme(scheme));
-    let columns_result = conn
-        .exec(
-            columns_sql,
-            &[
-                serde_json::Value::from(schema_param),
-                serde_json::Value::from(entry.table.clone()),
-            ],
-        )
+    let columns_result = crate::backend::query_table_columns(conn, &schema_param, &entry.table)
         .await
         .map_err(|e| (0, format!("column types: {e}")))?;
     let types = align_types(&entry.columns, &columns_result.rows)

@@ -1088,8 +1088,31 @@ mod tests {
             })
         }
 
-        async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
-            Err(DbError::unsupported("exec"))
+        async fn exec(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            if sql.contains("col_description") {
+                return Err(DbError::query(
+                    "SQLSTATE 22021: invalid byte sequence for encoding",
+                ));
+            }
+            if self.fallback_fails {
+                return Err(DbError::query("fallback also failed"));
+            }
+            Ok(QueryResult {
+                columns: vec![
+                    "column_name".into(),
+                    "data_type".into(),
+                    "nullable".into(),
+                    "default_value".into(),
+                ],
+                rows: vec![vec![
+                    Value::from("id"),
+                    Value::from("bigint"),
+                    Value::from(false),
+                    Value::Null,
+                ]],
+                row_count: 1,
+                rows_affected: None,
+            })
         }
 
         async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
@@ -1112,6 +1135,39 @@ mod tests {
             .await
             .expect("comment-free retry must succeed");
         assert_eq!(result.rows.len(), 1, "fallback rows are returned as-is");
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_retries_without_comments_on_encoding_error() {
+        let mut conn = EncodingFailingConn {
+            dialect: crate::backend::gaussdb::GaussdbDialect,
+            fallback_fails: false,
+        };
+        let result = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect("comment-free column retry must succeed");
+        assert_eq!(
+            result.rows[0][0],
+            Value::from("id"),
+            "fallback column rows are returned as-is"
+        );
+    }
+
+    #[cfg(feature = "gaussdb")]
+    #[tokio::test]
+    async fn query_table_columns_propagates_primary_error_when_fallback_fails() {
+        let mut conn = EncodingFailingConn {
+            dialect: crate::backend::gaussdb::GaussdbDialect,
+            fallback_fails: true,
+        };
+        let err = query_table_columns(&mut conn, "public", "orders")
+            .await
+            .expect_err("both queries failed");
+        assert!(
+            err.to_string().contains("22021"),
+            "the original encoding error must survive: {err}"
+        );
     }
 
     #[cfg(feature = "gaussdb")]

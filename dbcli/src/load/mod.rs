@@ -235,23 +235,16 @@ pub(crate) async fn run(
             );
             return EXIT_ERROR;
         };
-        let sql = conn.dialect().table_columns().to_string();
-        let result = match conn
-            .exec(
-                &sql,
-                &[
-                    serde_json::Value::from(schema),
-                    serde_json::Value::from(entry.table.clone()),
-                ],
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("error: columns of {}: {e}", entry.table);
-                return EXIT_ERROR;
-            }
-        };
+        // Issue #111: retry once without catalog comments when the primary
+        // column query dies on a non-UTF-8 comment (SQLSTATE 22021).
+        let result =
+            match crate::backend::query_table_columns(&mut *conn, &schema, &entry.table).await {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("error: columns of {}: {e}", entry.table);
+                    return EXIT_ERROR;
+                }
+            };
         db_columns.insert(entry.table.clone(), plan::parse_db_columns(&result));
     }
     let allowed_missing =
