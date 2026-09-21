@@ -3,7 +3,7 @@ resolver = "2"
 members = ["dbcli"]
 
 [workspace.package]
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 # std::os::fd / std File::lock (audit flock, issue #104) need 1.89+.
