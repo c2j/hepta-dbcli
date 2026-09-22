@@ -842,20 +842,12 @@ pub fn compute_gaussian_correlation(
         }
     }
 
-    // Ensure PSD by adding small epsilon to diagonal if needed
-    for (i, row) in corr.iter_mut().enumerate() {
-        let row_sum: f64 = row
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, &v)| v.abs())
-            .sum();
-        if row[i] < row_sum {
-            row[i] = row_sum + 1e-6;
-        }
-    }
-
-    corr
+    // PSD projection without touching the diagonal (issue #89 S2a). The old
+    // diagonal-dominance hack stored diag > 1 in the model whenever columns
+    // correlate strongly, and the copula then shrank every generated
+    // correlation by that factor. The projection clips eigenvalues instead
+    // and leaves an honest correlation matrix.
+    crate::synth::copula::project_to_correlation(corr)
 }
 
 /// DECIMAL/NUMBER values are often serialized as JSON strings by drivers;
@@ -1321,6 +1313,46 @@ mod tests {
         assert!(
             corr[0][1].abs() < 0.2,
             "alternating column must be ~uncorrelated, got {}",
+            corr[0][1]
+        );
+    }
+
+    #[test]
+    fn correlation_matrix_keeps_unit_diagonal_for_strongly_correlated_columns() {
+        // Issue #89 S2a: the old PSD "fix" raised each diagonal entry to
+        // sum(|off-diagonal|) + eps, so two perfectly correlated columns
+        // (corr[0][1] ~ 1) produced diag = 2 + eps. That matrix was stored in
+        // the model and inflated the copula's sampling variance 2x, shrinking
+        // every generated correlation by half. The correlation matrix is a
+        // correlation matrix: its diagonal must stay exactly 1.0 no matter
+        // how strong the off-diagonal structure is.
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i),
+                    serde_json::Value::from(3 * i),
+                    serde_json::Value::from(7 * i),
+                ]
+            })
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(73.5, 45.0)),
+            ("c".to_string(), normal_column_model(171.5, 105.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        for (i, row) in corr.iter().enumerate() {
+            assert!(
+                (row[i] - 1.0).abs() < 1e-9,
+                "diagonal must be exactly 1.0, got corr[{i}][{i}] = {}",
+                row[i]
+            );
+        }
+        assert!(
+            corr[0][1] > 0.99 && corr[0][2] > 0.99 && corr[1][2] > 0.99,
+            "linear columns must keep their strong correlation, got {}",
             corr[0][1]
         );
     }

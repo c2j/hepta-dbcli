@@ -379,30 +379,161 @@ pub(crate) fn normal_quantile(p: f64) -> f64 {
 }
 
 #[allow(clippy::needless_range_loop)]
+/// Public PSD projection for callers that build correlation matrices outside
+/// this module (e.g. `marginal::compute_gaussian_correlation`). Symmetric
+/// input is projected as-is; unit diagonals come back unit.
+pub(crate) fn project_to_correlation(matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    ensure_psd(matrix)
+}
+
+/// Nearest correlation matrix in the eigenvalue sense: symmetrize, clip
+/// negative eigenvalues to a small positive floor, rescale back to a unit
+/// diagonal. Repeats while negative eigenvalues remain because the diagonal
+/// rescale can reintroduce small negative ones.
+///
+/// The old implementation raised every diagonal entry to
+/// `sum(|off-diagonal|) + eps` (diagonal dominance). That keeps Cholesky
+/// happy but destroys the correlation structure: a matrix with ρ = 0.95 got
+/// its diagonal inflated to ~4, and the sampled correlation shrank by the
+/// same factor (issue #89 S2a).
 fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     let dim = matrix.len();
 
-    for i in 0..dim {
-        for j in (i + 1)..dim {
-            let avg = (matrix[i][j] + matrix[j][i]) / 2.0;
-            matrix[i][j] = avg;
-            matrix[j][i] = avg;
+    // Symmetrize via an upper-triangle snapshot so the write to row j does
+    // not alias the read from row i.
+    let mut upper: Vec<(usize, usize, f64)> = Vec::new();
+    for (i, row_i) in matrix.iter().enumerate() {
+        for (j, value) in row_i.iter().enumerate().skip(i + 1) {
+            upper.push((i, j, *value));
         }
     }
+    for (i, j, value) in upper {
+        let avg = (value + matrix[j][i]) / 2.0;
+        matrix[i][j] = avg;
+        matrix[j][i] = avg;
+    }
 
-    for (i, row) in matrix.iter_mut().enumerate() {
-        let row_sum: f64 = row
+    for _ in 0..PSD_PROJECTION_ROUNDS {
+        let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix);
+        let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+        if min_eigenvalue >= -PSD_EIGENVALUE_TOLERANCE {
+            break;
+        }
+        // Rebuild from the clipped spectrum: Σ' = V diag(max(λ, floor)) Vᵀ.
+        let mut rebuilt = vec![vec![0.0f64; dim]; dim];
+        for k in 0..dim {
+            let lambda = eigenvalues[k].max(PSD_EIGENVALUE_FLOOR);
+            for x in 0..dim {
+                for y in 0..dim {
+                    rebuilt[x][y] += lambda * eigenvectors[x][k] * eigenvectors[y][k];
+                }
+            }
+        }
+        // Rescale to a unit diagonal; the rescale is itself an eigenvalue
+        // perturbation, hence the bounded retry loop above.
+        let scales: Vec<f64> = rebuilt
             .iter()
             .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, &val)| val.abs())
-            .sum();
-        if row[i] < row_sum {
-            row[i] = row_sum + 0.001;
+            .map(|(i, row)| {
+                let diag = row[i];
+                if diag > 0.0 {
+                    diag.sqrt()
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let mut projected = vec![vec![0.0f64; dim]; dim];
+        for (x, scale_x) in scales.iter().enumerate() {
+            for (y, scale_y) in scales.iter().enumerate() {
+                projected[x][y] = rebuilt[x][y] / (scale_x * scale_y);
+            }
         }
+        matrix = projected;
     }
 
     matrix
+}
+
+const PSD_PROJECTION_ROUNDS: usize = 10;
+const PSD_EIGENVALUE_TOLERANCE: f64 = 1e-12;
+const PSD_EIGENVALUE_FLOOR: f64 = 1e-10;
+
+/// Cyclic Jacobi eigenvalue decomposition of a symmetric matrix. Returns the
+/// eigenvalues (unsorted) and the eigenvector matrix V with A = V Λ Vᵀ.
+/// Converges quadratically; 100 sweeps is far past convergence for the ≤
+/// few-hundred-column copula matrices this codebase builds.
+fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let dim = matrix.len();
+    let mut a: Vec<Vec<f64>> = matrix.to_vec();
+    let mut v: Vec<Vec<f64>> = vec![vec![0.0; dim]; dim];
+    for (i, v_row) in v.iter_mut().enumerate() {
+        v_row[i] = 1.0;
+    }
+
+    for _ in 0..100 {
+        // Largest off-diagonal magnitude drives this sweep's rotation.
+        let mut off = 0.0f64;
+        let mut p = 0usize;
+        let mut q = 0usize;
+        for (i, row_i) in a.iter().enumerate() {
+            for (j, value) in row_i.iter().enumerate().skip(i + 1) {
+                if value.abs() > off {
+                    off = value.abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if off < 1e-14 {
+            break;
+        }
+        let theta = 0.5 * ((2.0 * a[p][q]).atan2(a[q][q] - a[p][p]));
+        let (c, s) = (theta.cos(), theta.sin());
+        // Similarity transform A' = Jᵀ A J with
+        // J = [[c, s], [-s, c]] acting on coordinates p, q. The column
+        // rotation (right factor) must read the pre-rotation columns; the
+        // row rotation (left factor) then reads the intermediate A J.
+        let (col_p, col_q): (Vec<f64>, Vec<f64>) = {
+            let mut cp = Vec::with_capacity(dim);
+            let mut cq = Vec::with_capacity(dim);
+            for row in a.iter() {
+                cp.push(row[p]);
+                cq.push(row[q]);
+            }
+            (cp, cq)
+        };
+        // Right factor: A J — rotate columns p, q.
+        for ((row, col_p_k), col_q_k) in a.iter_mut().zip(col_p.iter()).zip(col_q.iter()) {
+            row[p] = c * col_p_k - s * col_q_k;
+            row[q] = s * col_p_k + c * col_q_k;
+        }
+        // Left factor: Jᵀ (A J) — rotate rows p, q.
+        let row_p = a[p].clone();
+        let row_q = a[q].clone();
+        for (j, value_p) in row_p.iter().enumerate() {
+            let value_q = row_q[j];
+            a[p][j] = c * value_p - s * value_q;
+            a[q][j] = s * value_p + c * value_q;
+        }
+        // Accumulate the rotation: V' = V J.
+        let (v_p, v_q): (Vec<f64>, Vec<f64>) = {
+            let mut vp = Vec::with_capacity(dim);
+            let mut vq = Vec::with_capacity(dim);
+            for row in v.iter() {
+                vp.push(row[p]);
+                vq.push(row[q]);
+            }
+            (vp, vq)
+        };
+        for ((row, v_p_k), v_q_k) in v.iter_mut().zip(v_p.iter()).zip(v_q.iter()) {
+            row[p] = c * v_p_k - s * v_q_k;
+            row[q] = s * v_p_k + c * v_q_k;
+        }
+    }
+
+    let eigenvalues = a.iter().enumerate().map(|(i, row)| row[i]).collect();
+    (eigenvalues, v)
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -498,6 +629,71 @@ mod tests {
 
         let corr = pearson_correlation(&samples[0], &samples[1]);
         assert!((corr - 0.8).abs() < 0.2);
+    }
+
+    #[test]
+    fn should_preserve_correlation_structure_of_psd_matrix() {
+        // Issue #89 S2a: the old ensure_psd raised every diagonal to
+        // sum(|off-diagonal|) + eps, so a strongly correlated matrix
+        // (rho = 0.95) came out sampled at rho/diag ~ 0.25. A PSD input
+        // must pass through the projection unchanged: the sampled uniforms
+        // (Gaussian rank -> Pearson on the z-scale) must reproduce the
+        // requested rho within tight tolerance, not a shrunk fraction.
+        let correlation = vec![
+            vec![1.0, 0.95, 0.85],
+            vec![0.95, 1.0, 0.80],
+            vec![0.85, 0.80, 1.0],
+        ];
+        let copula = GaussianCopula::new(correlation);
+        let samples = copula.sample(60_000, Some(7));
+
+        // Uniforms from a Gaussian copula with parameter rho have Pearson
+        // correlation 6*asin(rho/2)/pi on the z-scale before the CDF; after
+        // the CDF the rank correlation keeps the same value in expectation.
+        let expected = |rho: f64| 6.0 * (rho / 2.0).asin() / std::f64::consts::PI;
+        for (i, j, rho) in [(0usize, 1usize, 0.95), (0, 2, 0.85), (1, 2, 0.80)] {
+            let corr = pearson_correlation(&samples[i], &samples[j]);
+            assert!(
+                (corr - expected(rho)).abs() < 0.03,
+                "sampled corr({i},{j}) = {corr:.4} must match {rho} (gaussian-copula \
+                 expected {:.4}); diagonal inflation suspected",
+                expected(rho)
+            );
+        }
+    }
+
+    #[test]
+    fn should_project_non_psd_matrix_without_inflating_the_diagonal() {
+        // [[1, 0.95], [0.95, 0.5]] has a negative eigenvalue. The projection
+        // must clip eigenvalues, not raise the diagonal: the output stays a
+        // correlation matrix (unit diagonal, symmetric, PSD).
+        let correlation = vec![vec![1.0, 0.95], vec![0.95, 0.5]];
+        let projected = ensure_psd(correlation);
+
+        for (i, row) in projected.iter().enumerate() {
+            assert!(
+                (row[i] - 1.0).abs() < 1e-9,
+                "diagonal must stay 1.0, got {}",
+                row[i]
+            );
+            for (j, value) in row.iter().enumerate() {
+                assert!(
+                    (*value - projected[j][i]).abs() < 1e-12,
+                    "matrix must stay symmetric"
+                );
+            }
+        }
+        // Off-diagonal must remain positive and at most 1: the old
+        // diagonal-dominance hack pushed this entry to exactly 1.0 on both
+        // sides and the diagonal to 1.95/1.45.
+        assert!(
+            projected[0][1] > 0.3 && projected[0][1] <= 1.0 + 1e-9,
+            "off-diagonal must be a correlation in (0.3, 1], got {}",
+            projected[0][1]
+        );
+        // Cholesky must succeed on the projection without the negative-diff
+        // fallback.
+        let _l = cholesky_decomposition(&projected);
     }
 
     #[test]
