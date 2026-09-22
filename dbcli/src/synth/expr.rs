@@ -421,6 +421,62 @@ enum Node {
     Compare(CmpOp, Box<Node>, Box<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
+    /// Whitelisted function call. The name was validated against the
+    /// function table at parse time; arity is checked there too.
+    Call(&'static str, Vec<Node>),
+}
+
+/// Known functions, keyed by the literal source name. `arity` is `None` for
+/// variadic forms; otherwise exactly that many arguments are required.
+struct FunctionSpec {
+    name: &'static str,
+    arity: Option<usize>,
+}
+
+const KNOWN_FUNCTIONS: &[FunctionSpec] = &[FunctionSpec {
+    name: "if",
+    arity: Some(3),
+}];
+
+fn known_function_names() -> Vec<&'static str> {
+    KNOWN_FUNCTIONS.iter().map(|spec| spec.name).collect()
+}
+
+/// Static result type of an expression, computed without row data. `Unknown`
+/// means the type depends on column values (or a NULL propagation path), not
+/// that the expression is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Number,
+    String,
+    Bool,
+    Unknown,
+}
+
+/// Static type inference. Literals, arithmetic, comparisons and logic are
+/// exact; columns are `Unknown` without model context. `if()` follows its
+/// branches (both must agree, which the parser already enforces for literals
+/// and for branch expressions that are themselves statically typed).
+fn infer_type(node: &Node) -> Ty {
+    match node {
+        Node::Number(_) => Ty::Number,
+        Node::Str(_) => Ty::String,
+        Node::Column(_) => Ty::Unknown,
+        Node::Negate(_) => Ty::Number,
+        Node::Arith(..) => Ty::Number,
+        Node::Compare(..) | Node::And(..) | Node::Or(..) => Ty::Bool,
+        Node::Call(name, args) => {
+            debug_assert_eq!(*name, "if", "parser whitelist is if-only for now");
+            let Some([_, then, otherwise]) = args.get(0..3) else {
+                return Ty::Unknown;
+            };
+            match (infer_type(then), infer_type(otherwise)) {
+                (Ty::Number, Ty::Number) => Ty::Number,
+                (Ty::String, Ty::String) => Ty::String,
+                _ => Ty::Unknown,
+            }
+        }
+    }
 }
 
 // ─── Parser ───
@@ -489,6 +545,62 @@ impl Parser {
             construct,
             detail: base.to_string(),
         })
+    }
+
+    /// Parse a whitelisted function call: `name(arg, ...)`. Unknown names are
+    /// rejected with the list of known functions; known names must receive
+    /// exactly their declared arity.
+    fn parse_call(&mut self, name: &str) -> Result<Node, ExprError> {
+        let Some(spec) = KNOWN_FUNCTIONS.iter().find(|spec| spec.name == name) else {
+            return Err(syntax(
+                format!(
+                    "function `{name}` is not permitted; known functions: {}",
+                    known_function_names().join(", ")
+                ),
+                self.position(),
+            ));
+        };
+        self.pos += 1; // consume LParen (peeked by the caller)
+        let mut args = Vec::new();
+        if !self.eat(&Token::RParen) {
+            loop {
+                args.push(self.parse_or()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                self.expect(&Token::RParen, "`)` to close the argument list")?;
+                break;
+            }
+        }
+        if let Some(arity) = spec.arity {
+            if args.len() != arity {
+                return Err(syntax(
+                    format!(
+                        "function `{name}` expects {arity} argument(s), got {}",
+                        args.len()
+                    ),
+                    self.position(),
+                ));
+            }
+        }
+        if name == "if" {
+            // Fail fast when the two branches are *statically* different
+            // types (e.g. `if(c, 10, 'x')`). Branches whose type depends on
+            // columns stay legal; the runtime check still rejects mixed
+            // results.
+            let (then_ty, else_ty) = (infer_type(&args[1]), infer_type(&args[2]));
+            if then_ty != Ty::Unknown && else_ty != Ty::Unknown && then_ty != else_ty {
+                return Err(syntax(
+                    format!(
+                        "function `{name}` branches have different types: {then_ty:?} vs {else_ty:?}"
+                    ),
+                    self.position(),
+                ));
+            }
+        }
+        // `spec.name` is `&'static str`, so the node carries no borrow of the
+        // source text.
+        Ok(Node::Call(spec.name, args))
     }
 
     fn parse_or(&mut self) -> Result<Node, ExprError> {
@@ -567,6 +679,9 @@ impl Parser {
             Token::Number(value) => Ok(Node::Number(value)),
             Token::Str(value) => Ok(Node::Str(value)),
             Token::Ident(name) => {
+                if self.peek() == Some(&Token::LParen) {
+                    return self.parse_call(&name);
+                }
                 // Issue #117: `parent.<col>` is the one allowed qualified
                 // reference (cross-table derive). Any other `x.y` — including
                 // a second dot, `parent.a.b` — stays a rejected attribute
@@ -759,6 +874,34 @@ fn eval(node: &Node, lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value
                 found: other.kind(),
             }),
         },
+        Node::Call(name, args) => eval_call(name, args, lookup),
+    }
+}
+
+/// `if(cond, then, else)`: the condition must be boolean; only the selected
+/// branch is evaluated (lazy), so a division by zero in the untaken branch
+/// never fires.
+fn eval_call(
+    name: &str,
+    args: &[Node],
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Value, ExprError> {
+    debug_assert_eq!(name, "if", "parser whitelist is if-only for now");
+    let [cond, then, otherwise] = args else {
+        return Err(syntax(
+            format!(
+                "function `{name}` expects 3 argument(s), got {}",
+                args.len()
+            ),
+            0,
+        ));
+    };
+    match eval(cond, lookup)? {
+        Value::Bool(true) => eval(then, lookup),
+        Value::Bool(false) => eval(otherwise, lookup),
+        other => Err(ExprError::NonBooleanPredicate {
+            found: other.kind(),
+        }),
     }
 }
 
@@ -849,6 +992,11 @@ fn collect_columns(node: &Node, out: &mut BTreeSet<String>) {
             collect_columns(left, out);
             collect_columns(right, out);
         }
+        Node::Call(_, args) => {
+            for arg in args {
+                collect_columns(arg, out);
+            }
+        }
         Node::Number(_) | Node::Str(_) => {}
     }
 }
@@ -866,6 +1014,12 @@ impl Expr {
     /// [`Expr::check_columns`] for the load-time existence check.
     pub fn parse(src: &str) -> Result<Expr, ExprError> {
         parse_node(src).map(|root| Expr { root })
+    }
+
+    /// Static result type computed at load time (no row data). `Ty::Unknown`
+    /// means the type depends on column values.
+    pub fn infer_type(&self) -> Ty {
+        infer_type(&self.root)
     }
 
     /// Fail-fast load-time validation: every referenced column must be declared
@@ -967,16 +1121,117 @@ mod tests {
     }
 
     #[test]
+    fn should_lazy_evaluate_untaken_branch() {
+        // x == 0 takes the `1` branch: `10 / x` must never be evaluated.
+        assert_eq!(
+            eval_decimal("if(x == 0, 1, 10 / x)", &[("x", json!(0))]).expect("eval"),
+            dec("1")
+        );
+        // x != 0 takes the division branch and it must work.
+        assert_eq!(
+            eval_decimal("if(x == 0, 1, 10 / x)", &[("x", json!(4))]).expect("eval"),
+            dec("2.5")
+        );
+    }
+
+    #[test]
+    fn should_reject_if_with_non_boolean_condition() {
+        let err = eval_decimal("if(x + 1, 1, 2)", &[("x", json!(3))]).expect_err("must reject");
+        assert!(
+            matches!(err, ExprError::NonBooleanPredicate { found: "number" }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_if_branch_type_conflict() {
+        // Static check at parse time: `then` number vs `else` string.
+        let err = Expr::parse("if(x == 1, 10, 'other')").expect_err("must reject");
+        assert!(
+            err.to_string().contains("if"),
+            "error must name the function: {err}"
+        );
+    }
+
+    #[test]
+    fn should_evaluate_if_with_boolean_condition() {
+        assert_eq!(
+            eval_decimal(
+                "if(active == 1 && store_id > 0, 10, 20)",
+                &[("active", json!(1)), ("store_id", json!(5)),]
+            )
+            .expect("eval"),
+            dec("10")
+        );
+        assert_eq!(
+            eval_decimal(
+                "if(active == 1 && store_id > 0, 10, 20)",
+                &[("active", json!(0)), ("store_id", json!(5)),]
+            )
+            .expect("eval"),
+            dec("20")
+        );
+    }
+
+    #[test]
+    fn should_infer_expression_result_type() {
+        use Ty;
+        assert_eq!(Expr::parse("a == b").unwrap().infer_type(), Ty::Bool);
+        assert_eq!(
+            Expr::parse("a > 1 && b < 2").unwrap().infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(Expr::parse("a || b").unwrap().infer_type(), Ty::Bool);
+        assert_eq!(Expr::parse("a + b").unwrap().infer_type(), Ty::Number);
+        assert_eq!(Expr::parse("-a").unwrap().infer_type(), Ty::Number);
+        assert_eq!(Expr::parse("'text'").unwrap().infer_type(), Ty::String);
+        // A column's static type is unknown without model context.
+        assert_eq!(Expr::parse("a").unwrap().infer_type(), Ty::Unknown);
+        // if() infers from its branches.
+        assert_eq!(
+            Expr::parse("if(a == 1, 10, 20)").unwrap().infer_type(),
+            Ty::Number
+        );
+    }
+
+    #[test]
+    fn should_reject_unknown_function_with_known_list() {
+        let err = Expr::parse("coalesce(a, b)").expect_err("must reject");
+        let message = err.to_string();
+        assert!(
+            message.contains("coalesce") && message.contains("not permitted"),
+            "error must name the function: {message}"
+        );
+        assert!(
+            message.contains("if"),
+            "error must list known functions: {message}"
+        );
+        // Wrong arity on a known name fails too.
+        let err = Expr::parse("if(a == 1, 2)").expect_err("must reject");
+        let message = err.to_string();
+        assert!(
+            message.contains("expects 3 argument"),
+            "error must state arity: {message}"
+        );
+    }
+
+    // #94 decision (user-approved): unknown function names are still
+    // rejected fail-fast, but the error classification moved from
+    // `Disallowed { construct: "function call" }` to a syntax error that
+    // lists the known functions. `min` is not whitelisted, so this stays a
+    // rejection; only the error shape changed.
+    #[test]
     fn should_reject_function_call_node() {
         let err = Expr::parse("min(price, qty)").expect_err("must reject");
-        match &err {
-            ExprError::Disallowed { construct, detail } => {
-                assert_eq!(*construct, "function call");
-                assert_eq!(detail, "min");
-            }
-            other => panic!("expected disallowed node, got {other:?}"),
-        }
-        assert!(err.to_string().contains("min"), "message: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("`min`") && message.contains("not permitted"),
+            "error must name the function: {message}"
+        );
+        assert!(
+            message.contains("known functions") && message.contains("if"),
+            "error must list the known functions: {message}"
+        );
     }
 
     #[test]
