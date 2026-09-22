@@ -1062,6 +1062,7 @@ mod tests {
                         null_rate: None,
                         marginal: marginal.clone(),
                         pii: None,
+                        pii_phone_style: None,
                     },
                 )
             })

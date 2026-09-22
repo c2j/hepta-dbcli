@@ -12,6 +12,7 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::synth::marginal::{Marginal, UniformParams};
 use crate::synth::model::ColumnModel;
@@ -69,6 +70,146 @@ impl PiiProvider {
                     && chars[..17].iter().all(char::is_ascii_digit)
                     && (chars[17].is_ascii_digit() || chars[17] == 'X' || chars[17] == 'x')
             }
+        }
+    }
+}
+
+/// Region style a phone column should imitate (issue #95).
+///
+/// Inference is a **style hint only**: the 3-digit mobile prefix is kept
+/// because the issue explicitly trades that bit of structure for locality.
+/// No observed value ever survives inference; the random tail is drawn fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "style", rename_all = "snake_case")]
+pub enum PhoneStyle {
+    /// Legacy behavior: `+1-XXX-XXX-XXXX`.
+    UsDefault,
+    /// Mainland mobile: `+86-1{prefix}-{8 digits}` with the trained prefix.
+    CnMobile {
+        /// Observed `1XY` prefix digits, e.g. `[1, 3, 8]` for `138...`.
+        prefix: [u8; 3],
+    },
+}
+
+/// Reject a `CnMobile` prefix that no mainland mobile can have. Corrupted or
+/// hand-edited models must fail loading instead of silently emitting numbers
+/// outside the trained locale.
+pub fn validate_phone_style(style: &PhoneStyle) -> Result<(), String> {
+    match style {
+        PhoneStyle::UsDefault => Ok(()),
+        PhoneStyle::CnMobile { prefix } => {
+            if prefix[0] != 1 || !(3..=9).contains(&prefix[1]) || prefix[2] > 9 {
+                return Err(format!(
+                    "pii_phone_style cn_mobile prefix {:?} is not a mainland mobile prefix \
+                     (expected [1, 3-9, 0-9])",
+                    prefix
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Digit characters plus the separators the phone format check accepts.
+fn is_phone_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')')
+}
+
+/// Strip separators, then drop a leading country code: `+86` / `86` for CN.
+/// A `+` with any other country code returns `None`: that sample is not CN
+/// evidence and must not become an 11-digit false positive.
+fn normalize_cn_candidate(value: &str) -> Option<String> {
+    if !value.chars().all(is_phone_char) {
+        return None;
+    }
+    let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+    if value.starts_with('+') {
+        if let Some(rest) = digits.strip_prefix("86") {
+            return Some(rest.to_string());
+        }
+        return None;
+    }
+    if let Some(rest) = digits.strip_prefix("86") {
+        // Bare `86` + 11 digits could itself be a landline-style run; only
+        // accept the strip when what remains is CN-mobile shaped.
+        if is_cn_mobile_digits(rest) {
+            return Some(rest.to_string());
+        }
+        return Some(digits);
+    }
+    Some(digits)
+}
+
+/// CN mobile shape: `1[3-9]` followed by 9 more digits (11 total).
+fn is_cn_mobile_digits(digits: &str) -> bool {
+    let bytes = digits.as_bytes();
+    bytes.len() == 11
+        && bytes[0] == b'1'
+        && (b'3'..=b'9').contains(&bytes[1])
+        && bytes.iter().all(u8::is_ascii_digit)
+}
+
+/// Infer the region style of an already-detected phone column from its
+/// training samples. At least 80% of the samples must normalize to the CN
+/// mobile shape for [`PhoneStyle::CnMobile`] to win; the prefix is the mode
+/// of the observed first three digits. Anything else stays `UsDefault`.
+pub fn infer_phone_style(samples: &[Value]) -> PhoneStyle {
+    let strings: Vec<&str> = samples.iter().filter_map(|v| v.as_str()).collect();
+    if strings.is_empty() {
+        return PhoneStyle::UsDefault;
+    }
+    let mut prefixes: HashMap<[u8; 3], usize> = HashMap::new();
+    let mut cn_votes = 0usize;
+    for sample in &strings {
+        let Some(digits) = normalize_cn_candidate(sample) else {
+            continue;
+        };
+        if !is_cn_mobile_digits(&digits) {
+            continue;
+        }
+        cn_votes += 1;
+        let prefix = [
+            digits.as_bytes()[0] - b'0',
+            digits.as_bytes()[1] - b'0',
+            digits.as_bytes()[2] - b'0',
+        ];
+        *prefixes.entry(prefix).or_insert(0) += 1;
+    }
+    if cn_votes * 5 >= strings.len() * 4 {
+        let (prefix, _) = prefixes
+            .iter()
+            .max_by_key(|(digits, count)| (**count, std::cmp::Reverse(**digits)))
+            .expect("cn_votes > 0 implies a recorded prefix");
+        return PhoneStyle::CnMobile { prefix: *prefix };
+    }
+    PhoneStyle::UsDefault
+}
+
+/// [`infer_phone_style`] plus the `eprintln`-ready fallback notice (issue
+/// #95): a phone column that stays `UsDefault` despite being detected as PII
+/// phone explains itself once, so a `138...`-style training set that fails
+/// the 80% vote is not silently re-rendered as `+1-...`.
+///
+/// `qualified_column` is `"table.column"`; the caller deduplicates emission.
+pub fn infer_phone_style_with_warning(
+    samples: &[Value],
+    qualified_column: &str,
+) -> (PhoneStyle, Option<String>) {
+    let style = infer_phone_style(samples);
+    match style {
+        PhoneStyle::CnMobile { .. } => (style, None),
+        PhoneStyle::UsDefault => {
+            let (table, column) = match qualified_column.split_once('.') {
+                Some((table, column)) => (table, column),
+                None => ("?", qualified_column),
+            };
+            (
+                style,
+                Some(format!(
+                    "warning: table '{table}': column '{column}' has phone values that do not \
+                     look like mainland-CN mobiles; generating +1-XXX-XXX-XXXX (US format)"
+                )),
+            )
         }
     }
 }
@@ -302,17 +443,37 @@ pub fn detect(column: &str, samples: &[Value], data_type: Option<&str>) -> Optio
 /// Produce one format-valid fake value, redrawing up to a bounded number of
 /// times so the emitted value always satisfies [`PiiProvider::matches_format`].
 pub fn generate_value(provider: PiiProvider, rng: &mut StdRng) -> String {
+    generate_value_with_style(provider, PhoneStyle::UsDefault, rng)
+}
+
+/// [`generate_value`] with an explicit region style (issue #95).
+///
+/// [`PhoneStyle::CnMobile`] renders `+86-1{prefix}-{8 random digits}` so the
+/// generated column matches the trained locale; the tail is drawn fresh and
+/// never reproduces a trained value (the prefix is the only retained hint).
+pub fn generate_value_with_style(
+    provider: PiiProvider,
+    style: PhoneStyle,
+    rng: &mut StdRng,
+) -> String {
     for _ in 0..64 {
-        let candidate = match provider {
-            PiiProvider::Email => SafeEmail().fake_with_rng::<String, _>(rng),
-            PiiProvider::Name => Name().fake_with_rng::<String, _>(rng),
-            PiiProvider::Phone => format!(
+        let candidate = match (provider, style) {
+            (PiiProvider::Email, _) => SafeEmail().fake_with_rng::<String, _>(rng),
+            (PiiProvider::Name, _) => Name().fake_with_rng::<String, _>(rng),
+            (PiiProvider::Phone, PhoneStyle::CnMobile { prefix }) => format!(
+                "+86-{}{}{}-{:08}",
+                prefix[0],
+                prefix[1],
+                prefix[2],
+                rng.gen_range(0..100_000_000u32)
+            ),
+            (PiiProvider::Phone, PhoneStyle::UsDefault) => format!(
                 "+1-{:03}-{:03}-{:04}",
                 rng.gen_range(200..1000),
                 rng.gen_range(200..1000),
                 rng.gen_range(0..10_000)
             ),
-            PiiProvider::IdCard => {
+            (PiiProvider::IdCard, _) => {
                 let mut out = String::with_capacity(18);
                 for _ in 0..17 {
                     out.push(char::from(b'0' + rng.gen_range(0..10)));
@@ -326,11 +487,14 @@ pub fn generate_value(provider: PiiProvider, rng: &mut StdRng) -> String {
         }
     }
     // The templates above always match; this is a last-resort guard.
-    match provider {
-        PiiProvider::Email => "anon@example.com".to_string(),
-        PiiProvider::Name => "Anonymous".to_string(),
-        PiiProvider::Phone => "+1-000-000-0000".to_string(),
-        PiiProvider::IdCard => "000000000000000000".to_string(),
+    match (provider, style) {
+        (PiiProvider::Email, _) => "anon@example.com".to_string(),
+        (PiiProvider::Name, _) => "Anonymous".to_string(),
+        (PiiProvider::Phone, PhoneStyle::CnMobile { prefix }) => {
+            format!("+86-{}{}{}-00000000", prefix[0], prefix[1], prefix[2])
+        }
+        (PiiProvider::Phone, PhoneStyle::UsDefault) => "+1-000-000-0000".to_string(),
+        (PiiProvider::IdCard, _) => "000000000000000000".to_string(),
     }
 }
 
@@ -476,6 +640,154 @@ mod tests {
         assert!(PiiProvider::IdCard.matches_format("11010119900307123X"));
         assert!(!PiiProvider::IdCard.matches_format("1101011990030712"));
     }
+    #[test]
+    fn should_infer_cn_mobile_style_from_samples() {
+        // Bare 11-digit mobiles, +86-prefixed and delimited forms all vote CN;
+        // the prefix is the mode of the observed first three digits.
+        let mixed = strings(&[
+            "13812345678",
+            "+8613987654321",
+            "186-1234-5678",
+            "138 0000 0000",
+        ]);
+        assert_eq!(
+            infer_phone_style(&mixed),
+            PhoneStyle::CnMobile { prefix: [1, 3, 8] }
+        );
+
+        // A pure +86 sample keeps its own prefix mode.
+        let plus86 = strings(&["+86-159-1234-5678", "+86-159-8888-6666"]);
+        assert_eq!(
+            infer_phone_style(&plus86),
+            PhoneStyle::CnMobile { prefix: [1, 5, 9] }
+        );
+    }
+
+    #[test]
+    fn should_infer_us_style_from_american_samples() {
+        assert_eq!(
+            infer_phone_style(&strings(&[
+                "+1-800-555-0199",
+                "+1-800-555-0100",
+                "+1-212-664-7665"
+            ])),
+            PhoneStyle::UsDefault
+        );
+    }
+
+    #[test]
+    fn should_not_count_non_86_prefixed_samples_as_cn_evidence() {
+        // A +44 sample is not CN evidence. 3 CN votes in 4 samples (75%) stay
+        // below the 80% line, so the column keeps the US default.
+        let diluted = strings(&[
+            "13812345678",
+            "13987654321",
+            "15012345678",
+            "+44-20-7183-8750",
+        ]);
+        assert_eq!(infer_phone_style(&diluted), PhoneStyle::UsDefault);
+
+        // The same +44 sample inside a 5-sample column (80%) does not flip it.
+        let at_threshold = strings(&[
+            "13812345678",
+            "13987654321",
+            "15012345678",
+            "15887654321",
+            "+44-20-7183-8750",
+        ]);
+        assert_eq!(
+            infer_phone_style(&at_threshold),
+            PhoneStyle::CnMobile { prefix: [1, 3, 8] }
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_us_when_samples_are_not_cn_mobiles() {
+        // Short/odd digit runs never look like CN mobiles.
+        assert_eq!(
+            infer_phone_style(&strings(&["12345", "00-8000"])),
+            PhoneStyle::UsDefault
+        );
+        assert_eq!(infer_phone_style(&[]), PhoneStyle::UsDefault);
+    }
+
+    /// CN-local 11-digit shape (country code stripped) used to compare
+    /// generated values against trained values and to assert the `1`+prefix
+    /// structure.
+    fn cn_local_digits(value: &str) -> String {
+        normalize_cn_candidate(value).expect("phone-shaped test value")
+    }
+
+    #[test]
+    fn should_generate_cn_format_preserving_prefix() {
+        let style = PhoneStyle::CnMobile { prefix: [1, 3, 8] };
+        let mut rng = StdRng::seed_from_u64(11);
+        let trained = [
+            "13812345678".to_string(),
+            "+86-138-0000-0000".to_string(),
+            "138 8765 4321".to_string(),
+        ];
+        let trained_locals: std::collections::HashSet<String> =
+            trained.iter().map(|v| cn_local_digits(v)).collect();
+        for _ in 0..50 {
+            let value = generate_value_with_style(PiiProvider::Phone, style, &mut rng);
+            assert!(
+                PiiProvider::Phone.matches_format(&value),
+                "generated value {value:?} fails the phone format check"
+            );
+            assert!(
+                value.starts_with("+86-138-"),
+                "expected +86-138- prefix, got {value:?}"
+            );
+            let local = cn_local_digits(&value);
+            assert_eq!(local.len(), 11, "expected 11 local digits, got {value:?}");
+            assert_eq!(
+                &local[1..3],
+                "38",
+                "prefix digits after the leading 1 must be 38"
+            );
+            assert!(
+                !trained_locals.contains(&local),
+                "generated value {value:?} reproduces a trained value"
+            );
+        }
+    }
+
+    #[test]
+    fn should_generate_deterministically_with_style_for_the_same_seed() {
+        let style = PhoneStyle::CnMobile { prefix: [1, 8, 6] };
+        let mut left = StdRng::seed_from_u64(42);
+        let mut right = StdRng::seed_from_u64(42);
+        assert_eq!(
+            generate_value_with_style(PiiProvider::Phone, style, &mut left),
+            generate_value_with_style(PiiProvider::Phone, style, &mut right)
+        );
+    }
+
+    #[test]
+    fn should_report_us_fallback_when_cn_is_not_recognized() {
+        // Inference below the 80% line must tell the user why the output
+        // stays in the US format.
+        let (style, warn) = infer_phone_style_with_warning(
+            &strings(&["13812345678", "+1-800-555-0199"]),
+            "users.phone",
+        );
+        assert_eq!(style, PhoneStyle::UsDefault);
+        assert_eq!(
+            warn.unwrap(),
+            "warning: table 'users': column 'phone' has phone values that do not look like \
+             mainland-CN mobiles; generating +1-XXX-XXX-XXXX (US format)"
+        );
+    }
+
+    #[test]
+    fn should_not_warn_when_cn_style_is_inferred() {
+        let (style, warn) =
+            infer_phone_style_with_warning(&strings(&["13812345678", "13987654321"]), "u.p");
+        assert_eq!(style, PhoneStyle::CnMobile { prefix: [1, 3, 8] });
+        assert!(warn.is_none());
+    }
+
     #[test]
     fn should_erase_observed_values_when_anonymizing_a_model_column() {
         use crate::synth::marginal::CategoricalParams;

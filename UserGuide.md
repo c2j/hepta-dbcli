@@ -1059,7 +1059,7 @@ tables:
 
 #### PII 识别与匿名化（`sdtype`，issue #71）
 
-`synth train` 默认识别 PII 列并**匿名化**：列名模式（`email/mail/phone/mobile/tel/name/real_name/id_card/ssn/nickname` 等，含中文）与内容正则（email、电话、18 位证件号）投票，命中的列在生成时用格式合法的假值替换，**不复现任何训练值**。识别结果写入模型列元数据（`pii: email|phone|name|id_card`）。
+`synth train` 默认识别 PII 列并**匿名化**：列名模式（`email/mail/phone/mobile/tel/name/real_name/id_card/ssn/nickname` 等，含中文）与内容正则（email、电话、18 位证件号）投票，命中的列在生成时用格式合法的假值替换，**不复现任何训练值**。识别结果写入模型列元数据（`pii: email|phone|name|id_card`）。phone 列还会按训练值推断地域样式（#95）：大陆手机号样本（≥80% 匹配 `1[3-9]\d{9}`，含 `+86`/`86` 前缀与分隔符写法）生成 `+86-1{号段}-{8 位随机}`（号段取训练众数、值全新），识别不出则回退 `+1-` 美式格式并打一次 warning（详见 §10.5 已知限制 7）。
 
 ```yaml
 tables:
@@ -1208,7 +1208,7 @@ tables:
 4. **`--mine` 默认跳过 PII 列**：挖掘器在「档数 ≤ 50 且非标识符」之外还会用 PII 识别过滤列（被跳过的列名打在 stderr），低基数的 email/phone 列不会再把**训练原值**写进 YAML 注释与 `--emit-candidates` 文件。确知数据是假 PII 形状时可加 `--keep-pii-columns` 恢复旧行为。
 5. **父键 `unique: true` 受父池大小约束**：生成开始前预检——需求唯一值数超过父表**已生成**行数即报错并给出两条线索：父池当前大小、父列训练时观测到的 distinct 容量。容量足够时提示增大父表 rules 行数，容量不足时提示增大 train `--sample` 重新训练；也可以改 `unique: false` 或给父键配 `values` 池。例：users rules 只生成 3 行、orders `unique: true` 请求 300 行会直接报 `unique FK 'user_id' requests 300 unique value(s) but its parent pool 'users.id' holds only 3 generated value(s)`。
 6. **`derive` 目标列不能是布尔表达式**：比较运算（`==`、`>` 等）产生布尔值，与目标列的数值/字符串求值不兼容，`derive: expr: "active == 1 && store_id > 0"` 会报 `operator \`decimal result\` cannot be applied to boolean`。比较+逻辑组合只能用于 `branches[].predicate`；`derive` 也没有 `if/then/else` 或条件函数（白名单只有字面量、列引用、算术、比较、`&& ||`）。
-7. **PII phone provider 固定美式格式**：始终生成 `+1-XXX-XXX-XXXX`，不随训练值地域变化（训练值 `13812345678` 这类中文手机号在生成结果中为 0% 格式匹配）。需要本地格式时可 `sdtype: keep`（保留值域，注意泄漏面）或导出后自行变换。
+7. **PII phone 地域样式靠训练值推断（#95 起支持中文手机号）**：识别为 PII phone 的列在训练时会从采样值推断地域样式——归一化（剥分隔符与 `+86`/`86` 前缀）后 ≥80% 匹配大陆手机号形状 `1[3-9]\d{9}` 即记为 CN 样式（模型存 `pii_phone_style`，只存 3 位号段众数，不存原值）；生成时出 `+86-1{号段}-{8 位随机}`，号段与训练一致、值全新。无法识别时回退美式 `+1-XXX-XXX-XXXX` 并打一次 warning 说明原因。训练值全美式的列行为不变。需要保留原值域仍可 `sdtype: keep`（注意泄漏面）。
 8. **Oracle（oracle-rs 驱动）**：表不存在时报 `Oracle closed the connection without an error packet…`，语义误导（实为对象不存在被驱动吞掉）；采样超 100 行会被驱动静默截断（见上文截断告警逻辑）。
 9. **DuckDB**：连接串指向的数据库文件必须已存在，CLI 不自动创建（报 `DuckDB database file not found`）；DuckDB 引擎不支持 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`，外键必须在建表 DDL 中内联，`rules-draft` 才能扫到。
 10. **synth 全部子命令写审计日志**：channel=`synth`、class=`meta`，detail 记录子命令名与 models/rules 路径，不含任何生成数据行（见 §4.5）。

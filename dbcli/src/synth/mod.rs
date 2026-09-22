@@ -627,6 +627,31 @@ async fn run_train(
             if let Some(profile_column) = profile.columns.get_mut(&column) {
                 profile_column.top_values = None;
             }
+            // Issue #95: remember the trained phone locale so generation
+            // reproduces it. The prefix is a style hint only; no observed
+            // value survives (anonymize above already erased the dictionary).
+            if provider == crate::synth::pii::PiiProvider::Phone {
+                let index = result.columns.iter().position(|name| name == &column);
+                let samples: Vec<serde_json::Value> = index
+                    .map(|i| {
+                        result
+                            .rows
+                            .iter()
+                            .filter_map(|row| row.get(i).cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (style, warning) = crate::synth::pii::infer_phone_style_with_warning(
+                    &samples,
+                    &format!("{table}.{column}"),
+                );
+                if let Some(warning) = warning {
+                    eprintln!("{warning}");
+                }
+                if let Some(model_column) = model.columns.get_mut(&column) {
+                    model_column.pii_phone_style = Some(style);
+                }
+            }
         }
 
         if sample_may_be_truncated(&scheme, result.row_count, sample) {
@@ -1851,6 +1876,7 @@ mod tests {
                 scale: 10.0,
             }),
             pii: None,
+            pii_phone_style: None,
         };
         let categorical = ColumnModel {
             logical_type: LogicalType::Categorical,
@@ -1866,6 +1892,7 @@ mod tests {
                 weights: vec![0.5, 0.5],
             }),
             pii: None,
+            pii_phone_style: None,
         };
         TableModel {
             version: 1,
@@ -2139,6 +2166,7 @@ mod tests {
                             weights: vec![1.0 / values.len() as f64; values.len()],
                         }),
                         pii: None,
+                        pii_phone_style: None,
                     },
                 )
             })
@@ -2382,6 +2410,37 @@ mod tests {
         let out = detect_pii_columns(&columns, &rows, &types, Some(&forced));
         assert_eq!(out.get("status"), Some(&PiiProvider::Name));
         assert_eq!(out.get("email"), Some(&PiiProvider::Email));
+    }
+
+    #[test]
+    fn should_store_cn_phone_style_for_a_detected_phone_column() {
+        // The training loop (run_train) infers the phone style from the same
+        // samples it fed to detect(); this locks the combined decision the
+        // loop performs: detected phone + CN samples -> CnMobile on the model
+        // column, US samples -> UsDefault (plus a one-shot warning there).
+        use crate::synth::pii::PhoneStyle;
+        use crate::synth::pii::PiiProvider;
+
+        let columns = vec!["phone".to_string()];
+        let rows = vec![
+            vec![serde_json::Value::from("13812345678")],
+            vec![serde_json::Value::from("+8613987654321")],
+            vec![serde_json::Value::from("18612345678")],
+            vec![serde_json::Value::from("13987654321")],
+            vec![serde_json::Value::from("15012345678")],
+        ];
+        let types = HashMap::from([("phone".to_string(), "varchar(24)".to_string())]);
+
+        let detected = detect_pii_columns(&columns, &rows, &types, None);
+        assert_eq!(detected.get("phone"), Some(&PiiProvider::Phone));
+
+        let (style, warning) = crate::synth::pii::infer_phone_style_with_warning(
+            &rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            "users.phone",
+        );
+        // 139 is the mode: it appears both bare and under a +86 prefix.
+        assert_eq!(style, PhoneStyle::CnMobile { prefix: [1, 3, 9] });
+        assert!(warning.is_none());
     }
     #[test]
     fn should_reserve_only_foreign_keys_from_pii_anonymization() {

@@ -1204,6 +1204,7 @@ mod tests {
             null_rate: None,
             marginal: Marginal::Normal(NormalParams { loc, scale }),
             pii: None,
+            pii_phone_style: None,
         }
     }
 
@@ -1250,6 +1251,7 @@ mod tests {
                     weights: vec![1.0 / 3.0; 3],
                 }),
                 pii: None,
+                pii_phone_style: None,
             }
         }
 
@@ -1743,6 +1745,7 @@ mod tests {
             null_rate: None,
             marginal,
             pii: None,
+            pii_phone_style: None,
         }
     }
 
