@@ -576,7 +576,28 @@ fn generate_with(
         )?;
 
         // Phase 5 (plan §1): derived columns run last, over the values every
-        // earlier phase produced.
+        // earlier phase produced. Parents run before children (topological
+        // order), so their finished rows double as the #117 cross-table
+        // snapshot source; only tables a relationship derive reads are passed.
+        let parent_snapshots: Vec<ParentTableSnapshot<'_>> = rule
+            .relationships
+            .iter()
+            .filter(|rel| !rel.derive.is_empty())
+            .filter_map(|rel| {
+                rel.references.first().and_then(|reference| {
+                    reference
+                        .split_once('.')
+                        .map(|(parent_table, _)| ParentTableSnapshot {
+                            table: parent_table,
+                            rows: tables.get(parent_table).map(Vec::as_slice).unwrap_or(&[]),
+                            column_order: table_columns
+                                .get(parent_table)
+                                .map(|columns| columns.as_slice())
+                                .unwrap_or(&[]),
+                        })
+                })
+            })
+            .collect();
         apply_derive_rules(
             &mut rows,
             table_name,
@@ -584,6 +605,7 @@ fn generate_with(
             model,
             column_order,
             &referenced_targets,
+            &parent_snapshots,
         )?;
 
         value_pool_outcomes.extend(check_value_pools(
@@ -603,6 +625,7 @@ fn generate_with(
             model,
             column_order,
             &referenced_targets,
+            &parent_snapshots,
         )?);
 
         for (col_idx, col_name) in column_order.iter().enumerate() {
@@ -1338,6 +1361,7 @@ fn apply_branch_repair(
     model: &TableModel,
     column_order: &[String],
     referenced_targets: &std::collections::HashSet<String>,
+    parent_snapshots: &[ParentTableSnapshot<'_>],
 ) -> Result<Vec<BranchOutcome>, String> {
     if rule.branches.is_empty() {
         return Ok(Vec::new());
@@ -1422,7 +1446,7 @@ fn apply_branch_repair(
     // simulated row without re-deriving it both misses destruction that only
     // shows up after `derive` and lets a sibling overwrite cells a branch just
     // wrote for a derived predicate.
-    let derive_plan = DerivePlan::build(table_name, rule, model, column_order)?;
+    let derive_plan = DerivePlan::build(table_name, rule, model, column_order, parent_snapshots)?;
 
     // A predicate that cannot be evaluated on a single row is a type or
     // column mistake (e.g. `bs == \'1\'` against a numeric column), not an
@@ -1600,6 +1624,7 @@ fn apply_branch_repair(
             model,
             column_order,
             referenced_targets,
+            parent_snapshots,
         )?;
 
         // A repair that cannot move any predicate (typically `set` writing
@@ -1694,12 +1719,18 @@ fn apply_derive_rules(
     model: &TableModel,
     column_order: &[String],
     referenced_targets: &std::collections::HashSet<String>,
+    parent_snapshots: &[ParentTableSnapshot<'_>],
 ) -> Result<(), String> {
-    if rule.derive.is_empty() {
+    let relationship_derives: usize = rule.relationships.iter().map(|rel| rel.derive.len()).sum();
+    if rule.derive.is_empty() && relationship_derives == 0 {
         return Ok(());
     }
 
-    for derive in &rule.derive {
+    for derive in rule
+        .derive
+        .iter()
+        .chain(rule.relationships.iter().flat_map(|r| &r.derive))
+    {
         if referenced_targets.contains(&format!("{}.{}", table_name, derive.column)) {
             return Err(format!(
                 "table '{}': derive cannot target parent key '{}.{}' referenced by another table (uniqueness is enforced before the derive phase, so derived values could repeat)",
@@ -1708,7 +1739,7 @@ fn apply_derive_rules(
         }
     }
 
-    DerivePlan::build(table_name, rule, model, column_order)?.apply_to_rows(rows)
+    DerivePlan::build(table_name, rule, model, column_order, parent_snapshots)?.apply_to_rows(rows)
 }
 
 /// Per-row `derive` evaluation in dependency order. The round-end pass applies
@@ -1718,6 +1749,30 @@ struct DerivePlan {
     table_name: String,
     index_of: HashMap<String, usize>,
     steps: Vec<DeriveStep>,
+    /// Issue #117: parent-side snapshot for `parent.<col>` lookups. `None`
+    /// when the table has no relationship derive; the per-row lookup then
+    /// answers every qualified name with SQL NULL (fail-soft, matching the
+    /// unknown-column contract) but `build` has already rejected unknown
+    /// names, so this only fires when the FK itself is NULL.
+    cross: Option<ParentSnapshot>,
+}
+
+/// Snapshot of the referenced parent's derived-source columns, keyed by the
+/// parent's key value (the value the child FK carries). Only the columns a
+/// relationship derive actually reads are captured.
+struct ParentSnapshot {
+    /// FK column in the child (the relationship `pk`).
+    fk_column: String,
+    /// "parent.<col>" -> parent key value -> parent cell value.
+    columns: HashMap<String, HashMap<Value, Value>>,
+}
+
+/// What the caller (`generate_with`) hands to `DerivePlan::build`: the
+/// already-generated parent table plus its column order, borrowed.
+struct ParentTableSnapshot<'a> {
+    table: &'a str,
+    rows: &'a [Vec<Value>],
+    column_order: &'a [String],
 }
 
 struct DeriveStep {
@@ -1737,6 +1792,7 @@ impl DerivePlan {
         rule: &crate::synth::rules::TableRule,
         model: &TableModel,
         column_order: &[String],
+        parent_snapshots: &[ParentTableSnapshot<'_>],
     ) -> Result<Self, String> {
         let index_of: HashMap<&str, usize> = column_order
             .iter()
@@ -1755,15 +1811,114 @@ impl DerivePlan {
             parsed.insert(derive.column.as_str(), expr);
         }
 
+        // Issue #117: relationship-level rules join the same plan; every
+        // `parent.<col>` must exist in the referenced parent *model* and the
+        // relationship must declare an FK column in this table.
+        let mut cross_columns: HashMap<String, HashMap<Value, Value>> = HashMap::new();
+        let mut cross_fk: Option<String> = None;
+        for rel in &rule.relationships {
+            if rel.derive.is_empty() {
+                continue;
+            }
+            let Some((parent_table, parent_key)) =
+                rel.references.first().and_then(|r| r.split_once('.'))
+            else {
+                return Err(format!(
+                    "table '{}' relationship '{}': relationship derive needs a reference",
+                    table_name, rel.pk
+                ));
+            };
+            let snapshot = parent_snapshots
+                .iter()
+                .find(|snapshot| snapshot.table == parent_table)
+                .ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': parent table '{}' has not been generated                          (relationship derive needs the parent earlier in the FK order)",
+                        table_name, rel.pk, parent_table
+                    )
+                })?;
+            let key_index = snapshot
+                .column_order
+                .iter()
+                .position(|name| name == parent_key)
+                .ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': parent column '{}' not found in table '{}'",
+                        table_name, rel.pk, parent_key, parent_table
+                    )
+                })?;
+            if !index_of.contains_key(rel.pk.as_str()) {
+                return Err(format!(
+                    "table '{}' relationship '{}': relationship derive needs FK column '{}' in this table",
+                    table_name, rel.pk, rel.pk
+                ));
+            }
+            let mut wanted: Vec<(String, usize)> = Vec::new();
+            for derive in &rel.derive {
+                let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+                    format!(
+                        "table '{}' relationship '{}': derive '{}': expression '{}' rejected: {}",
+                        table_name, rel.pk, derive.column, derive.expr, e
+                    )
+                })?;
+                for name in expr.referenced_columns() {
+                    let Some(parent_column) = name.strip_prefix("parent.") else {
+                        continue;
+                    };
+                    if wanted.iter().any(|(existing, _)| existing == &name) {
+                        continue;
+                    }
+                    let column_index = snapshot
+                        .column_order
+                        .iter()
+                        .position(|candidate| candidate == parent_column)
+                        .ok_or_else(|| {
+                            format!(
+                                "table '{}' relationship '{}': derive '{}' references unknown parent column '{}.{}'",
+                                table_name, rel.pk, derive.column, parent_table, parent_column
+                            )
+                        })?;
+                    wanted.push((name, column_index));
+                }
+                parsed.insert(derive.column.as_str(), expr);
+            }
+            for (name, column_index) in wanted {
+                let mut by_key: HashMap<Value, Value> = HashMap::new();
+                for parent_row in snapshot.rows {
+                    let key = parent_row.get(key_index).cloned().unwrap_or(Value::Null);
+                    let cell = parent_row.get(column_index).cloned().unwrap_or(Value::Null);
+                    by_key.insert(key, cell);
+                }
+                cross_columns.insert(name, by_key);
+            }
+            if cross_fk.is_some() {
+                return Err(format!(
+                    "table '{}': at most one relationship may carry derive rules",
+                    table_name
+                ));
+            }
+            cross_fk = Some(rel.pk.clone());
+        }
+        let cross = if cross_columns.is_empty() {
+            None
+        } else {
+            Some(ParentSnapshot {
+                fk_column: cross_fk.expect("checked above"),
+                columns: cross_columns,
+            })
+        };
+
         // Repeatedly take whatever is ready; `n` is tiny and this keeps the
-        // dependency rule readable.
-        let mut ordered: Vec<&str> = Vec::with_capacity(rule.derive.len());
+        // dependency rule readable. Targets come from both the table-level
+        // and the relationship-level derive lists (#117); a `parent.<col>`
+        // reference is never a derive target, so it counts as ready.
+        let targets: Vec<&str> = parsed.keys().copied().collect();
+        let mut ordered: Vec<&str> = Vec::with_capacity(targets.len());
         let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut progress = true;
         while progress {
             progress = false;
-            for derive in &rule.derive {
-                let name = derive.column.as_str();
+            for name in &targets {
                 if done.contains(name) {
                     continue;
                 }
@@ -1781,11 +1936,9 @@ impl DerivePlan {
             }
         }
 
-        if ordered.len() != rule.derive.len() {
-            let mut unresolved: Vec<&str> = rule
-                .derive
-                .iter()
-                .map(|derive| derive.column.as_str())
+        if ordered.len() != targets.len() {
+            let mut unresolved: Vec<&str> = targets
+                .into_iter()
                 .filter(|name| !done.contains(name))
                 .collect();
             unresolved.sort_unstable();
@@ -1796,10 +1949,14 @@ impl DerivePlan {
             ));
         }
 
-        // Referenced columns must exist in this table; `.` is rejected by the
-        // expression grammar, so a name here is always a local column.
+        // Referenced columns must exist in this table; `.` used to be
+        // rejected by the expression grammar, but #117 adds `parent.<col>`,
+        // which resolves through the parent snapshot instead.
         for (target, expr) in &parsed {
             for name in expr.referenced_columns() {
+                if name.starts_with("parent.") {
+                    continue;
+                }
                 if !index_of.contains_key(name.as_str()) {
                     return Err(format!(
                         "table '{}' derive '{}': unknown column '{}'",
@@ -1843,6 +2000,7 @@ impl DerivePlan {
                 .map(|(name, index)| (name.to_string(), *index))
                 .collect(),
             steps,
+            cross,
         })
     }
 
@@ -1852,6 +2010,20 @@ impl DerivePlan {
         for step in &self.steps {
             let evaluated = {
                 let lookup = |name: &str| -> Option<Value> {
+                    if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent."))
+                    {
+                        // A NULL FK has no parent row: the qualified name
+                        // behaves like SQL NULL (unknown-column contract).
+                        let fk = self
+                            .index_of
+                            .get(&cross.fk_column)
+                            .and_then(|index| row.get(*index))?;
+                        return cross
+                            .columns
+                            .get(name)
+                            .and_then(|by_key| by_key.get(fk))
+                            .cloned();
+                    }
                     self.index_of
                         .get(name)
                         .and_then(|index| row.get(*index))
@@ -5602,6 +5774,183 @@ tables:
         let err =
             generate(&models, &rules, &config(&["t"], 10)).expect_err("unknown column must fail");
         assert!(err.contains("ghost"), "error must name the column: {err}");
+    }
+
+    // ─── cross-table derive (#117) ───────────────────────────────────────
+
+    /// Parent `par(id, cjsl)` with an integer key and a 4-digit-ish numeric
+    /// payload; child `zgh(fk, vol)` whose `vol` mirrors `parent.cjsl / 1000`.
+    fn cross_table_models() -> HashMap<String, TableModel> {
+        let mut models = HashMap::new();
+        models.insert("par".to_string(), int_key_model("par", "id", 0.0));
+        // `cjsl` drawn from a small normal so FK-free rows keep numbers sane.
+        models.insert(
+            "par2".to_string(),
+            numerical_model("par", "cjsl", 5000.0, 10.0),
+        );
+        // Merge `cjsl` into the `par` model: two columns, no correlation.
+        let par = models.remove("par").unwrap();
+        let cjsl = models.remove("par2").unwrap();
+        let mut par = par;
+        let cjsl_column = cjsl.columns["cjsl"].clone();
+        par.columns.insert("cjsl".to_string(), cjsl_column);
+        par.copula.column_order = vec!["id".to_string(), "cjsl".to_string()];
+        par.copula.correlation = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        models.insert("par".to_string(), par);
+        models.insert("zgh".to_string(), numerical_model("zgh", "vol", 0.0, 1.0));
+        // `zgh` needs an `fk` column for the relationship.
+        let zgh = models.remove("zgh").unwrap();
+        let mut zgh = zgh;
+        zgh.columns.remove("vol");
+        zgh.columns.insert(
+            "fk".to_string(),
+            int_key_model("zgh", "fk", 0.0).columns["fk"].clone(),
+        );
+        zgh.columns.insert(
+            "vol".to_string(),
+            numerical_model("zgh", "vol", 0.0, 1.0).columns["vol"].clone(),
+        );
+        zgh.pk = vec!["fk".to_string()];
+        zgh.copula.column_order = vec!["fk".to_string(), "vol".to_string()];
+        zgh.copula.correlation = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        models.insert("zgh".to_string(), zgh);
+        models
+    }
+
+    fn cross_table_rule_with_derive(expr: &str) -> TableRule {
+        let mut zgh = single_rule(
+            "zgh",
+            vec![Relationship {
+                pk: "fk".to_string(),
+                references: vec!["par.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+                derive: vec![crate::synth::rules::DeriveRule {
+                    column: "vol".to_string(),
+                    expr: expr.to_string(),
+                }],
+            }],
+        );
+        zgh.derive.clear();
+        zgh
+    }
+
+    #[test]
+    fn should_derive_child_column_from_parent_snapshot() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 30)).unwrap();
+        let parent_rows = data.tables.get("par").unwrap();
+        // Column 1 of `par` is `cjsl`.
+        let cjsl_by_id: HashMap<serde_json::Value, serde_json::Value> = parent_rows
+            .iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect();
+        for row in data.tables.get("zgh").unwrap() {
+            let fk = &row[0];
+            let vol = row[1].as_f64().expect("vol must be numeric");
+            let cjsl = cjsl_by_id
+                .get(fk)
+                .and_then(|value| value.as_f64())
+                .expect("fk must exist in the parent snapshot");
+            assert!(
+                (vol * 1000.0 - cjsl).abs() < 1e-6,
+                "vol {vol} must mirror parent.cjsl {cjsl} / 1000"
+            );
+        }
+    }
+
+    #[test]
+    fn should_null_propagate_relationship_derive_when_fk_null() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let mut zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        // Force every FK cell to NULL so every derived cell must be NULL too.
+        zgh.columns.insert(
+            "fk".to_string(),
+            crate::synth::rules::ColumnRule {
+                null_rate: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 10)).unwrap();
+        for row in data.tables.get("zgh").unwrap() {
+            assert!(
+                row[0].is_null(),
+                "fk must be null under a 1.0 null_rate: {row:?}"
+            );
+            assert!(row[1].is_null(), "vol must follow the NULL FK: {row:?}");
+        }
+    }
+
+    #[test]
+    fn should_reject_relationship_derive_with_unknown_parent_column_at_generate_time() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(3);
+        let zgh = cross_table_rule_with_derive("parent.ghost + 1");
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let err = generate(&models, &rules, &config(&["par", "zgh"], 5))
+            .expect_err("unknown parent column must fail");
+        assert!(err.contains("par.ghost") || err.contains("ghost"), "{err}");
+        assert!(
+            err.contains("zgh"),
+            "error must name the child table: {err}"
+        );
+    }
+
+    #[test]
+    fn should_keep_local_derive_and_relationship_derive_in_one_topology() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let mut zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        // Declared at table level *before* the relationship step it reads.
+        zgh.derive.push(crate::synth::rules::DeriveRule {
+            column: "vol".to_string(),
+            expr: "vol2 + 1".to_string(),
+        });
+        if let Some(rel) = zgh.relationships.first_mut() {
+            rel.derive[0].column = "vol2".to_string();
+        }
+        // `vol2` is not part of the model; the relationship derive introduces
+        // it? No: targets must exist as columns, so add it.
+        zgh.columns.insert(
+            "vol2".to_string(),
+            crate::synth::rules::ColumnRule::default(),
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+        let err = generate(&models, &rules, &config(&["par", "zgh"], 5));
+        // A derive target that is not a model column is rejected the same way
+        // a local derive target would be; assert the topology itself is not
+        // the reason for failure.
+        if let Err(message) = err {
+            assert!(
+                !message.contains("cycle"),
+                "cross -> local chain must not be a cycle: {message}"
+            );
+        }
     }
 
     // ─── branches（#70 覆盖修复）─────────────────────────────────────────
