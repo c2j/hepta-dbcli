@@ -2522,7 +2522,7 @@ fn build_rel_pools(
             .first()
             .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
 
-        let (pool, unique) = match &rel.pool_strategy {
+        let (pool, rel_strategy, unique) = match &rel.pool_strategy {
             PoolStrategy::Fixed { values } => {
                 let raw: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
                 let pool = if strategy == SelectionStrategy::Weighted {
@@ -2530,7 +2530,7 @@ fn build_rel_pools(
                 } else {
                     FkPool::new(raw)
                 };
-                (pool, false)
+                (pool, strategy, false)
             }
             PoolStrategy::Projection { unique } | PoolStrategy::Generated { unique } => {
                 let values = column_pools.get(ref_str).ok_or_else(|| {
@@ -2548,7 +2548,29 @@ fn build_rel_pools(
                 } else {
                     FkPool::new(values.clone())
                 };
-                (pool, *unique)
+                (pool, strategy, *unique)
+            }
+            PoolStrategy::Density => {
+                // Issue #89 S2b: weight each parent-pool value by the child
+                // table's own trained marginal for the FK column. Boundary
+                // midpoint masses turn the continuous (or empirical) CDF into
+                // per-pool-value weights; out-of-window values collapse to the
+                // floor and all-floor vectors fall back to uniform draws.
+                // The pool carries Weighted itself: a density FK must sample
+                // by weight even under a Uniform/Zipf table strategy.
+                let values = column_pools.get(ref_str).ok_or_else(|| {
+                    format!(
+                        "table '{}' references '{}' but that table.column was not generated \
+                         first; add a rule and model for it",
+                        table_name, ref_str
+                    )
+                })?;
+                let weights = density_weights(models, table_name, &rel.pk, values);
+                (
+                    FkPool::from_weighted_values(values.clone(), weights),
+                    SelectionStrategy::Weighted,
+                    false,
+                )
             }
         };
 
@@ -2598,12 +2620,91 @@ fn build_rel_pools(
         rel_pools.push(RelPool {
             column: rel.pk.clone(),
             pool,
-            strategy,
+            strategy: rel_strategy,
             unique,
             pool_size,
         });
     }
     Ok(rel_pools)
+}
+
+/// Per-value weights for `pool_strategy: !density` (issue #89 S2b). Each
+/// parent-pool value gets the child FK column's trained probability mass in
+/// the boundary-midpoint cell around it:
+///
+/// ```text
+/// mass_i = CDF((v_i + v_{i+1}) / 2) - CDF((v_{i-1} + v_i) / 2)
+/// ```
+///
+/// with the outer boundaries at ±0.5 around the first/last pool value. This
+/// turns any continuous or empirical marginal into discrete pool weights, so
+/// FK draws track the child's observed parent distribution. Values outside
+/// the child's training window (CDF differences under the floor) collapse to
+/// the floor weight; an all-floor vector lets `weighted_index` fall back to
+/// uniform, which keeps a child that never observed the parent's range
+/// drawable.
+fn density_weights(
+    models: &HashMap<String, TableModel>,
+    child_table: &str,
+    fk_column: &str,
+    pool_values: &[Value],
+) -> Vec<f64> {
+    const WEIGHT_FLOOR: f64 = 1e-9;
+
+    let marginal = models
+        .get(child_table)
+        .and_then(|m| m.columns.get(fk_column))
+        .map(|c| &c.marginal);
+
+    // Numeric axis of the pool values; a non-numeric pool falls back to
+    // uniform (all-floor) rather than guessing an ordering.
+    let mut sorted: Vec<f64> = pool_values.iter().filter_map(value_as_f64).collect();
+    if sorted.is_empty() {
+        return vec![WEIGHT_FLOOR; pool_values.len()];
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.dedup();
+
+    let cdf = |x: f64| match marginal {
+        Some(m) => m.cdf(x),
+        None => 0.0,
+    };
+    let cdf_left = |x: f64| match marginal {
+        Some(m) => m.cdf_left(x),
+        None => 0.0,
+    };
+
+    let weights: Vec<f64> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let lower = if i == 0 {
+                cdf_left(v - 0.5)
+            } else {
+                cdf((v + sorted[i - 1]) / 2.0)
+            };
+            let upper = if i + 1 == sorted.len() {
+                cdf(v + 0.5)
+            } else {
+                cdf((v + sorted[i + 1]) / 2.0)
+            };
+            (upper - lower).max(WEIGHT_FLOOR)
+        })
+        .collect();
+
+    // Map weights back to the pool's original (unsorted) order.
+    let mut weight_by_key: HashMap<String, f64> = HashMap::with_capacity(sorted.len());
+    for (i, &v) in sorted.iter().enumerate() {
+        weight_by_key.insert(format!("{v}"), weights[i]);
+    }
+    pool_values
+        .iter()
+        .map(|v| {
+            value_as_f64(v)
+                .and_then(|x| weight_by_key.get(&format!("{x}")).copied())
+                .unwrap_or(WEIGHT_FLOOR)
+        })
+        .collect()
 }
 
 /// Observed distinct-value capacity of a parent key column at train time:
@@ -2628,7 +2729,9 @@ fn parent_observed_capacity(
 mod tests {
     use super::*;
     use crate::synth::cardinality::CardinalityDist;
-    use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
+    use crate::synth::marginal::{
+        CategoricalParams, EcdfParams, Marginal, NormalParams, UniformParams,
+    };
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
     use crate::synth::pii::PiiProvider;
     use crate::synth::rules::{CardinalityMode, ColumnRule, Relationship, TableRule, ValuePool};
@@ -2960,6 +3063,142 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn density_pool_strategy_tracks_child_trained_fk_distribution() {
+        // Issue #89 S2b: `pool_strategy: !density` weights the parent pool
+        // by the child's own trained marginal for the FK column. Fixture:
+        // the child trained on parent ids concentrated in 1..100 (Ecdf
+        // knots 1..100 uniform); the parent generates keys 1..200 uniformly.
+        // A uniform pool draw would land near 100 on average; the density
+        // draw must track the child's range and stay well below that.
+        let mut parent_columns = HashMap::new();
+        parent_columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Uniform(UniformParams {
+                    low: 1.0,
+                    high: 201.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let parent = TableModel {
+            version: 1,
+            table: "parent".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec!["id".to_string()],
+            columns: parent_columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+
+        // Child trained with parent_id mass on 1..100 only.
+        let child_knots: Vec<f64> = (1..=100).map(f64::from).collect();
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "parent_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Ecdf(EcdfParams { knots: child_knots }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec!["parent_id".to_string()],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["parent_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+
+        let mut models = HashMap::new();
+        models.insert("parent".to_string(), parent);
+        models.insert("child".to_string(), child);
+
+        let mut parent_rule = single_rule("parent", vec![]);
+        parent_rule.rows = Some(200);
+        let mut child_rule = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "parent_id".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Density,
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+                derive: Vec::new(),
+            }],
+        );
+        child_rule.rows = Some(2_000);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let result = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
+
+        let fk_values: Vec<f64> = result.tables["child"]
+            .iter()
+            .map(|r| r[0].as_f64().unwrap())
+            .collect();
+        assert_eq!(fk_values.len(), 2_000);
+
+        // FK integrity: every draw stays in the parent's generated pool.
+        let parent_keys: std::collections::HashSet<String> = result.tables["parent"]
+            .iter()
+            .map(|r| r[0].to_string())
+            .collect();
+        for v in &fk_values {
+            assert!(
+                parent_keys.contains(&format!("{}", *v as i64))
+                    || parent_keys.contains(&v.to_string()),
+                "FK value {v} must be a generated parent key"
+            );
+        }
+
+        // Density: the mean must sit near the child's trained midpoint (~50),
+        // far below the pool midpoint (~100). A uniform pool draw averages
+        // ~100 with tiny variance at n = 2000, so 80 is a safe separator.
+        let mean: f64 = fk_values.iter().sum::<f64>() / fk_values.len() as f64;
+        assert!(
+            mean < 80.0,
+            "density draw mean {mean:.1} must track the child-trained range \
+             (midpoint ~50), not the pool midpoint (~100)"
+        );
     }
 
     #[test]

@@ -302,12 +302,17 @@ impl CardinalityMode {
     }
 }
 
+/// Pool sampling strategies for a relationship FK column. `Density` (issue
+/// #89 S2b) weights the parent pool by the child table's own trained
+/// marginal for the FK column, so FK value frequency tracks the child's
+/// observed parent distribution instead of the pool's uniform spread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolStrategy {
     Projection { unique: bool },
     Generated { unique: bool },
     Fixed { values: Vec<String> },
+    Density,
 }
 
 impl Default for PoolStrategy {
@@ -1455,6 +1460,32 @@ tables:
         } else {
             panic!("expected Generated pool strategy");
         }
+    }
+
+    #[test]
+    fn density_pool_strategy_parses() {
+        // Issue #89 S2b: `!density` weights the parent pool by the child's
+        // own trained marginal for the FK column, so the generated FK value
+        // distribution matches what the child observed in training instead
+        // of a uniform draw over the parent pool.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: t
+    relationships:
+      - pk: id
+        references: [other.id]
+        pool_strategy: !density
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            matches!(
+                rules.tables[0].relationships[0].pool_strategy,
+                PoolStrategy::Density
+            ),
+            "expected Density pool strategy, got {:?}",
+            rules.tables[0].relationships[0].pool_strategy
+        );
     }
 
     #[test]
