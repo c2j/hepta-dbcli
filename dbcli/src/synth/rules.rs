@@ -1049,6 +1049,10 @@ tables:
         assert!(err.contains("paid"), "error must name the branch: {err}");
     }
 
+    // #94 decision (user-approved): unknown function names are still
+    // rejected fail-fast at load time; the error text changed from the
+    // generic "function call" category to naming the function and listing
+    // the known whitelist. Table and column attribution is unchanged.
     #[test]
     fn should_reject_derive_with_a_disallowed_expression_node() {
         let yaml = r#"
@@ -1064,8 +1068,12 @@ tables:
         assert!(err.contains("orders"), "error must name the table: {err}");
         assert!(err.contains("total"), "error must name the target: {err}");
         assert!(
-            err.contains("function call"),
-            "error must name the offending node: {err}"
+            err.contains("`min`") && err.contains("not permitted"),
+            "error must name the offending function: {err}"
+        );
+        assert!(
+            err.contains("known functions"),
+            "error must list the known functions: {err}"
         );
     }
 
