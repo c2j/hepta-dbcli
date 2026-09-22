@@ -1123,13 +1123,32 @@ tables:
         expr: "price * qty * 2 + 0.01"
 ```
 
-- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**函数调用、属性访问、下标一律拒绝**（加载期报错并指出违规节点）。
+- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**函数调用、下标一律拒绝，属性访问仅放行 `parent.<col>`（跨表派生，见下节）**（加载期报错并指出违规节点）。
 - 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，溢出报错而不是 panic。
 - **NULL 传播（三值逻辑）**：`derive` 无条件重算目标列，源列为 NULL 时结果也是 NULL（`total = price * qty` 在 `price` 为 NULL 的那一行把 `total` 写成 NULL），**不会**中断整张表的生成。目标列若在库里是 `NOT NULL`，会在写入时报数据库错误。除零/类型错误仍是硬错误：那是配置写错，不是 NULL 输入。
 - 时机：**所有列生成（含 copula、FK、NULL、`fixed`/`values`/`fixed_range`）之后统一求值**，因此表达式读到的是最终值；`derive` 之间按依赖顺序求值（`c = b + 1`、`b = price * 2` 可以声明为任意顺序），成环在加载期报错。
 - 输出按目标列的类型量化：整数列取整为 i64；带 `decimal_scale` 的列量化到该标度（避免 `110.16999999999999` 这类二进制尾差写入 CSV/SQL）。
 - 冲突校验（**加载期**，错误含表名+列名）：目标列同时有 `fixed`/`values`/`fixed_range`、目标是 relationship 的 `pk`、目标是被其他表 `references` 的父键、目标重复、derive 成环。**未知列在生成期报错**：`table.columns` 只记录覆盖项，列的存在性要拿模型才判得出来（`table 'orders' derive 'amount': unknown column 'x'`）。
 - 不含 `derive` 的 rules 输出与之前逐字节一致。
+
+#### 跨表派生列（relationship `derive`，issue #117）
+
+```yaml
+tables:
+  - name: zgh
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol
+            expr: "parent.cjsl / 1000"   # 子表列 = 父表列的函数
+```
+
+- `parent.<col>` 是表达式文法里**唯一**合法的限定引用（issue #70 白名单的纯增量）；其余 `x.y` 形式（含 `parent.a.b`）照旧以 `attribute access` 拒绝。表级 `derive` 里写 `parent.` 会被拒绝：只有 relationship 有父表快照可解析（错误信息指向 relationship 的 derive 列表）。
+- 求值语义：按 FK 拓扑序生成时，父表先于子表完成，relationship `derive` 从**父表生成结果**按「父键值 → 被引用列值」快照取数；`parent.<col>` 查的是**子行自己的 FK 单元格**对应的父行。子行 FK 为 NULL（`null_rate`）时父引用取 NULL 并按三值逻辑传播为 NULL，与既有语义一致。
+- 与表级 `derive` 同一拓扑：relationship 的目标列与表级目标列共享命名空间（重复声明在加载期报错），`parent.` 引用视为已就绪输入，因此「relationship derive 先写 `vol2`、表级 derive 再写 `vol = vol2 + 1`」不是环，反向成环会报 `derive rules form a cycle`。`branches.repair` 的 `linked_derive_recompute` 复用同一合并计划。
+- 校验（加载期 + 生成期）：relationship `derive` 目标列同样不得是 `fixed`/`values`/`fixed_range` 覆盖列、relationship `pk` 或被引用父键；`parent.<col>` 的列必须在父表**模型**里存在，未知时生成期报错并点名子表、relationship 与父表列（`table 'zgh' relationship 'fk': derive 'vol' references unknown parent column 'par.ghost'`）；每个带 `derive` 的 relationship 需有非空 `references`，且子表须有对应 FK 列。
+- 快照只捕获被 `derive` 表达式实际引用的父列（内存可控）；每表最多一条 relationship 带 `derive`。
 
 #### 分支覆盖率（`branches`，issue #70）
 
