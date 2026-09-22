@@ -1033,6 +1033,14 @@ tables:
 |------|------|
 | `!projection { unique }` / `!generated { unique }` | 从父表已生成的引用列取值；`unique: true` 无放回 |
 | `!fixed { values: [...] }` | 只从给定字面量集合中取值 |
+| `!density` | 按本表 FK 列自己训练到的边际给父池逐值加权（issue #89）；父池中超出本表训练范围的值权重趋近 0，本表从未观察到父池范围时自动回退均匀采样 |
+
+`!density` 适合「子表只引用父表键的一个子集/偏斜分布」的场景（例如父表
+2000 个 id，子表只集中在低段）：均匀抽样会生成大量训练数据里不存在的
+FK 组合，`!density` 让 FK 取值频率贴合子表自己的经验分布。基线夹具实测
+可将 FK 列 1-ks 从 0.33 提升到 0.93+（docs/plans/2026-09-22-issue-89-s2b-density-pools.md）。
+`!density` 与 `cardinality: modeled` 修的维度不同：`!density` 管「抽哪个
+父键」（FK 值分布），`modeled` 管「每个父键抽几个」（子行数分布），可按需叠加。
 
 #### 子表基数建模（`cardinality`，issue #72）
 
