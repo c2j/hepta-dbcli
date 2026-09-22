@@ -386,7 +386,11 @@ fn scan_spec(
             .collect::<Result<Vec<_>, _>>()?;
         (columns, Vec::new())
     } else {
-        let mut columns: Vec<String> = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
+        // Catalog-physical names: quote without re-folding (issue #116).
+        let mut columns: Vec<String> = side_keys
+            .iter()
+            .map(|c| dialect.quote_catalog_ident(c))
+            .collect();
         for spec in side
             .plan
             .norm_specs
@@ -395,7 +399,10 @@ fn scan_spec(
         {
             columns.push(dialect.normalize_expr(spec)?);
         }
-        let order_by = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
+        let order_by = side_keys
+            .iter()
+            .map(|c| dialect.quote_catalog_ident(c))
+            .collect();
         (columns, order_by)
     };
     Ok(ScanSqlSpec {

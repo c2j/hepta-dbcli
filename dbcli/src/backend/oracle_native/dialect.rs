@@ -219,6 +219,12 @@ impl Dialect for OracleDialect {
         oracle_ident(name)
     }
 
+    fn quote_catalog_ident(&self, name: &str) -> String {
+        // Catalog names are the authoritative physical case; quoting them
+        // must not re-apply the unquoted-name fold (issue #116).
+        crate::backend::quote_ident(self.identifier_quote(), name)
+    }
+
     fn supports_hash_comment(&self) -> bool {
         false
     }
@@ -232,7 +238,8 @@ impl Dialect for OracleDialect {
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
-        let q = oracle_ident(&col.name);
+        // Catalog-physical name: quote as-is, no unquoted-name fold (#116).
+        let q = self.quote_catalog_ident(&col.name);
         let base = col.data_type.trim().to_uppercase();
         let type_name = base.split('(').next().unwrap_or(&base).trim();
         let inner = match type_name {
@@ -287,7 +294,8 @@ impl Dialect for OracleDialect {
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            let k = oracle_ident(key);
+            // spec.key_column comes from catalog-resolved key_columns (#116).
+            let k = self.quote_catalog_ident(key);
             conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some((modulus, bucket)) = spec.bucket {
@@ -327,7 +335,8 @@ impl Dialect for OracleDialect {
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            let k = oracle_ident(key);
+            // spec.key_column comes from catalog-resolved key_columns (#116).
+            let k = self.quote_catalog_ident(key);
             conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some(f) = &spec.filter {

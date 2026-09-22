@@ -92,7 +92,7 @@ pub(crate) fn render_hash_in_sql(p: &HashInSql<'_>) -> String {
     } else {
         p.columns
             .iter()
-            .map(|c| crate::backend::quote_ident(p.quote, c))
+            .map(|c| crate::backend::quote_ident_catalog(p.scheme, p.quote, c))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -348,11 +348,11 @@ async fn pull_raw_side(
 ) -> Result<(), String> {
     let dialect = conn.dialect();
     let side = if is_left { &ctx.left } else { &ctx.right };
-    let q = dialect.identifier_quote();
     let side_keys = ctx.side_key_columns(is_left);
+    // Catalog-physical names: quote without re-folding (issue #116).
     let mut columns: Vec<String> = side_keys
         .iter()
-        .map(|c| crate::backend::quote_ident(q, c))
+        .map(|c| dialect.quote_catalog_ident(c))
         .collect();
     for spec in side
         .plan
@@ -360,7 +360,7 @@ async fn pull_raw_side(
         .iter()
         .filter(|s| !side_keys.iter().any(|k| k == &s.name))
     {
-        columns.push(crate::backend::quote_ident(q, &spec.name));
+        columns.push(dialect.quote_catalog_ident(&spec.name));
     }
     let spec = crate::backend::KeysetPageSpec {
         schema: side.schema.clone(),

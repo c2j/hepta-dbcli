@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::backend::{quote_ident_scheme, quote_table_scheme, sql_literal};
+use crate::backend::{quote_ident_catalog, quote_table_scheme, sql_literal};
 use crate::delta_diff::cmd::ApplyTo;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
 
@@ -186,9 +186,10 @@ fn render_insert(
     table: &str,
 ) -> String {
     let names = all_col_names(report);
+    // Catalog-physical names: quote without re-folding (issue #116).
     let cols = names
         .iter()
-        .map(|n| quote_ident_scheme(opts.scheme, opts.quote, n))
+        .map(|n| quote_ident_catalog(opts.scheme, opts.quote, n))
         .collect::<Vec<_>>()
         .join(", ");
     let vals = names
@@ -230,7 +231,8 @@ fn render_update(
         let new_v = if src_is_right { r } else { l }.unwrap_or(&Value::Null);
         sets.push(format!(
             "{} = {}",
-            quote_ident_scheme(opts.scheme, opts.quote, name),
+            // Catalog-physical name: quote without re-folding (issue #116).
+            quote_ident_catalog(opts.scheme, opts.quote, name),
             sql_literal(new_v, opts.backslash_escape)
         ));
     }
@@ -248,7 +250,8 @@ fn render_update(
 }
 
 fn key_eq(name: &str, v: &Value, opts: &SqlPatchOpts<'_>) -> String {
-    let col = quote_ident_scheme(opts.scheme, opts.quote, name);
+    // Catalog-physical name: quote without re-folding (issue #116).
+    let col = quote_ident_catalog(opts.scheme, opts.quote, name);
     if v.is_null() {
         format!("{col} IS NULL")
     } else {

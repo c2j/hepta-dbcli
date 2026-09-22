@@ -367,7 +367,9 @@ async fn min_max(
     key: &str,
 ) -> Result<(i64, i64), String> {
     let d = conn.dialect();
-    let k = d.quote_ident(key);
+    // `key` arrives from paired_side_keys as the side's catalog-physical
+    // name: quote without re-folding (issue #116).
+    let k = d.quote_catalog_ident(key);
     let t = d.quote_table(Some(schema), table);
     let sql = format!("SELECT MIN({k}), MAX({k}) FROM {t}");
     let r = conn.query(&sql).await.map_err(|e| e.to_string())?;

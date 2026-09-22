@@ -167,8 +167,9 @@ impl BucketPlan {
         let quote = conn.dialect().identifier_quote();
         // Each side's own physical column, quoted like every other key
         // reference (hash_diff::key_range does the same): an unquoted shared
-        // name misresolves on case-sensitive identifiers.
-        let key = conn.dialect().quote_ident(key_column);
+        // name misresolves on case-sensitive identifiers. Catalog name,
+        // so no re-folding (issue #116).
+        let key = conn.dialect().quote_catalog_ident(key_column);
         let mut sql = format!(
             "SELECT MIN({key}) AS mn, MAX({key}) AS mx, \
              SUM(CASE WHEN {key} IS NULL THEN 1 ELSE 0 END) AS nulls FROM {}",
@@ -664,7 +665,8 @@ fn range_pull_spec(
     dialect: &dyn crate::backend::Dialect,
 ) -> Result<ChecksumSqlSpec, DbError> {
     let mut spec = bucket_checksum_spec(ctx, is_left, 1, 0, dialect)?;
-    let key = dialect.quote_ident(&side_range_key(ctx, is_left, &plan.key_column));
+    // Catalog-physical name: quote without re-folding (issue #116).
+    let key = dialect.quote_catalog_ident(&side_range_key(ctx, is_left, &plan.key_column));
     let predicate = plan.range_predicate_for(&key, bucket);
     spec.filter = match spec.filter {
         Some(f) => Some(format!("({f}) AND {predicate}")),
@@ -1201,9 +1203,10 @@ mod tests {
     // ── key-domain probe gating (issue #108) ──
 
     /// Records every SQL it is asked to run and answers with a canned reply,
-    /// so probe gating can be asserted without a database.
+    /// so probe gating can be asserted without a database. The dialect is
+    /// injectable so Oracle-side SQL rendering can be asserted too.
     struct RecordingConn {
-        dialect: crate::backend::mysql::dialect::MySqlDialect,
+        dialect: Box<dyn crate::backend::Dialect>,
         seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         reply: ProbeReply,
     }
@@ -1217,10 +1220,20 @@ mod tests {
 
     impl RecordingConn {
         fn recording(reply: ProbeReply) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            Self::with_dialect(
+                Box::new(crate::backend::mysql::dialect::MySqlDialect),
+                reply,
+            )
+        }
+
+        fn with_dialect(
+            dialect: Box<dyn crate::backend::Dialect>,
+            reply: ProbeReply,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             (
                 Self {
-                    dialect: crate::backend::mysql::dialect::MySqlDialect,
+                    dialect,
                     seen: std::sync::Arc::clone(&seen),
                     reply,
                 },
@@ -1248,7 +1261,7 @@ mod tests {
         }
 
         fn dialect(&self) -> &dyn crate::backend::Dialect {
-            &self.dialect
+            self.dialect.as_ref()
         }
     }
 
@@ -1501,6 +1514,41 @@ mod tests {
             lseen.lock().expect("lock").len(),
             1,
             "exactly one probe statement per side"
+        );
+    }
+
+    /// Issue #116: the probe must reference the key as the catalog spelled it.
+    /// Oracle folds unquoted identifiers, so a quoted mixed-case catalog name
+    /// rendered through the user-input path becomes `MIN("MYKEY")` and fails
+    /// with ORA-00904; the catalog path must keep `"MyKey"` verbatim.
+    #[tokio::test]
+    async fn oracle_probe_keeps_catalog_case_of_key_column() {
+        let ctx = probe_ctx(Some(("MyKey", "number(10)")));
+        let (mut left, lseen) = RecordingConn::with_dialect(
+            Box::new(crate::backend::oracle::dialect::OracleDialect::new()),
+            ProbeReply::MinMax(min_max_result(Value::from(1), Value::from(9), 0)),
+        );
+        let (mut right, _rseen) = RecordingConn::with_dialect(
+            Box::new(crate::backend::oracle::dialect::OracleDialect::new()),
+            ProbeReply::MinMax(min_max_result(Value::from(1), Value::from(9), 0)),
+        );
+        let mut queries = 0;
+
+        let plan = BucketDiffer
+            .probe_key_domain(&mut left, &mut right, &ctx, 4, &mut queries)
+            .await
+            .expect("oracle integer key probe must succeed");
+        let plan = plan.expect("integer key keeps the PK-range path");
+        assert_eq!(plan.key_column, "MyKey");
+
+        let sql = &lseen.lock().expect("lock")[0];
+        assert!(
+            sql.contains("MIN(\"MyKey\")") && sql.contains("MAX(\"MyKey\")"),
+            "probe SQL must keep the catalog case: {sql}"
+        );
+        assert!(
+            !sql.contains("MYKEY"),
+            "probe SQL must not fold the catalog name: {sql}"
         );
     }
 

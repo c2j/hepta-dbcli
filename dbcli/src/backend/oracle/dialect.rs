@@ -219,6 +219,12 @@ impl Dialect for OracleDialect {
         oracle_ident(name)
     }
 
+    fn quote_catalog_ident(&self, name: &str) -> String {
+        // Catalog names are the authoritative physical case; quoting them
+        // must not re-apply the unquoted-name fold (issue #116).
+        crate::backend::quote_ident(self.identifier_quote(), name)
+    }
+
     fn supports_hash_comment(&self) -> bool {
         false
     }
@@ -232,7 +238,8 @@ impl Dialect for OracleDialect {
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
-        let q = oracle_ident(&col.name);
+        // Catalog-physical name: quote as-is, no unquoted-name fold (#116).
+        let q = self.quote_catalog_ident(&col.name);
         let base = col.data_type.trim().to_uppercase();
         let type_name = base.split('(').next().unwrap_or(&base).trim();
         let inner = match type_name {
@@ -287,7 +294,8 @@ impl Dialect for OracleDialect {
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            let k = oracle_ident(key);
+            // spec.key_column comes from catalog-resolved key_columns (#116).
+            let k = self.quote_catalog_ident(key);
             conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some((modulus, bucket)) = spec.bucket {
@@ -327,7 +335,8 @@ impl Dialect for OracleDialect {
         }
         let mut conds: Vec<String> = Vec::new();
         if let (Some(key), Some((lo, hi))) = (&spec.key_column, spec.range) {
-            let k = oracle_ident(key);
+            // spec.key_column comes from catalog-resolved key_columns (#116).
+            let k = self.quote_catalog_ident(key);
             conds.push(format!("{k} >= {lo} AND {k} < {hi}"));
         }
         if let Some(f) = &spec.filter {
@@ -635,6 +644,39 @@ mod tests {
         );
     }
 
+    /// Issue #116: catalog-returned physical names are already authoritative
+    /// case; `quote_catalog_ident` must quote them as-is while the user-input
+    /// path (`quote_ident`) keeps the unquoted-name folding.
+    #[test]
+    fn should_quote_catalog_ident_without_folding() {
+        let d = OracleDialect::new();
+        assert_eq!(d.quote_catalog_ident("MyKey"), "\"MyKey\"");
+        // User-input path keeps folding (both directions asserted so a
+        // wrong-way refactor cannot pass).
+        assert_eq!(d.quote_ident("MyKey"), "\"MYKEY\"");
+        assert_eq!(d.quote_ident("dat_fund_cjqs"), "\"DAT_FUND_CJQS\"");
+        assert_eq!(d.quote_catalog_ident("DAT_FUND_CJQS"), "\"DAT_FUND_CJQS\"");
+    }
+
+    /// Issue #116: normalize_expr renders the column as the catalog gave it,
+    /// not folded to uppercase (ORA-00904 on `MIN("MYKEY")` otherwise).
+    #[test]
+    fn should_render_normalize_expr_with_catalog_case() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::ColumnNormSpec {
+            name: "MyKey".to_string(),
+            data_type: "NUMBER(10)".to_string(),
+            nullable: false,
+            rtrim_fixed_char: false,
+        };
+        let expr = d.normalize_expr(&spec).expect("NUMBER must normalize");
+        assert!(
+            expr.contains("\"MyKey\""),
+            "expr must keep catalog case: {expr}"
+        );
+        assert!(!expr.contains("MYKEY"), "expr must not fold: {expr}");
+    }
+
     #[test]
     fn test_read_only_prefixes_no_show_describe() {
         let d = OracleDialect::new();
@@ -806,6 +848,64 @@ mod tests {
         assert!(sql.contains("MOD(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH("));
         assert!(sql.contains(", 8) = 5"));
         assert!(sql.contains("\"ID\" >= 0 AND \"ID\" < 1000"));
+    }
+
+    /// Issue #116: checksum range predicates reference the key as the catalog
+    /// spelled it (key_column in ChecksumSqlSpec is catalog-resolved); the
+    /// user-input fold must not apply.
+    #[test]
+    fn checksum_sql_keeps_catalog_case_of_key_column() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::ChecksumSqlSpec {
+            schema: None,
+            table: "T".into(),
+            key_column: Some("MyKey".into()),
+            range: Some((0, 10)),
+            bucket: None,
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["TO_CHAR(\"MyKey\")".into()],
+            key_hash_exprs: vec![],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(
+            sql.contains("\"MyKey\" >= 0 AND \"MyKey\" < 10"),
+            "range predicate must keep catalog case: {sql}"
+        );
+        assert!(!sql.contains("MYKEY"), "must not fold: {sql}");
+
+        let batch = d.render_batch_checksum_sql(&spec);
+        assert!(
+            batch.contains("\"MyKey\" >= 0 AND \"MyKey\" < 10"),
+            "batch range predicate must keep catalog case: {batch}"
+        );
+        assert!(!batch.contains("MYKEY"), "must not fold: {batch}");
+    }
+
+    /// Issue #116: keyset paging references catalog key columns as-is, while
+    /// schema/table (user input) keep the unquoted-name fold.
+    #[test]
+    fn keyset_page_sql_keeps_catalog_case_of_key_column() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::KeysetPageSpec {
+            schema: Some("scott".into()),
+            table: "orders".into(),
+            columns: vec!["MyKey".into()],
+            raw_exprs: false,
+            key_columns: vec!["MyKey".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: Some(vec![serde_json::json!(7)]),
+            page_size: 16,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(sql.contains("SELECT \"MyKey\""), "{sql}");
+        assert!(sql.contains("\"MyKey\" > 7"), "{sql}");
+        assert!(sql.contains("ORDER BY \"MyKey\""), "{sql}");
+        // User-input schema/table keep folding.
+        assert!(sql.contains("FROM \"SCOTT\".\"ORDERS\""), "{sql}");
     }
 
     #[test]

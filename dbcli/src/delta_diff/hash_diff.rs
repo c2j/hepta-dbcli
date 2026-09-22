@@ -635,7 +635,8 @@ async fn key_range(
     let side = if is_left { &ctx.left } else { &ctx.right };
     let d = conn.dialect();
     let table = d.quote_table(side.schema.as_deref(), &side.table);
-    let key = d.quote_ident(&ctx.side_key_columns(is_left)[0]);
+    // Catalog-physical name: quote without re-folding (issue #116).
+    let key = d.quote_catalog_ident(&ctx.side_key_columns(is_left)[0]);
     let where_clause = ctx
         .filter
         .as_ref()
@@ -727,7 +728,8 @@ pub(crate) fn keyset_spec(
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let side_key = &ctx.side_key_columns(is_left)[0];
-    let mut columns = vec![dialect.quote_ident(side_key)];
+    // Catalog-physical name: quote without re-folding (issue #116).
+    let mut columns = vec![dialect.quote_catalog_ident(side_key)];
     for spec in side.plan.norm_specs.iter().filter(|s| &s.name != side_key) {
         columns.push(dialect.normalize_expr(spec)?);
     }

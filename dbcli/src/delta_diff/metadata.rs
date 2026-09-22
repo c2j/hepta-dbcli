@@ -147,18 +147,18 @@ impl TablePlan {
     }
 
     pub(crate) fn key_hash_exprs(&self, dialect: &dyn Dialect) -> Result<Vec<String>, DbError> {
-        let q = dialect.identifier_quote();
         let mut exprs = Vec::new();
         for k in &self.key_columns {
             // Prefer the key's own spec; an unnormalizable key type falls back
-            // to the raw identifier, as before.
+            // to the raw identifier. Names here are catalog-physical (issue
+            // #116), so the fallback must quote without re-folding.
             if let Some(expr) = self
                 .spec_for(k)
                 .and_then(|spec| dialect.normalize_expr(spec).ok())
             {
                 exprs.push(expr);
             } else {
-                exprs.push(crate::backend::quote_ident(q, k));
+                exprs.push(dialect.quote_catalog_ident(k));
             }
         }
         Ok(exprs)
