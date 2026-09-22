@@ -1781,6 +1781,31 @@ struct DeriveStep {
     expr: crate::synth::expr::Expr,
     is_integer: bool,
     scale: Option<u8>,
+    /// Output shape decided at plan time (issue #94): a Bool expression fills
+    /// the column with the trained text literals ("true"/"false"); anything
+    /// else keeps the numeric path.
+    is_bool_output: bool,
+}
+
+/// A target column is a boolean target when its trained categorical
+/// dictionary is exactly the true/false text pair (what a real BOOLEAN
+/// column trains into, issue #102). JSON-bool samples never reach the model:
+/// `profile` normalizes them to that same text pair.
+fn is_bool_target(column_model: Option<&crate::synth::model::ColumnModel>) -> bool {
+    let Some(column) = column_model else {
+        return false;
+    };
+    match (&column.logical_type, &column.marginal) {
+        (
+            crate::synth::model::LogicalType::Categorical,
+            crate::synth::marginal::Marginal::Categorical(params),
+        ) => {
+            let mut levels = params.values.iter().map(String::as_str).collect::<Vec<_>>();
+            levels.sort_unstable();
+            levels == ["false", "true"]
+        }
+        _ => false,
+    }
 }
 
 impl DerivePlan {
@@ -1991,12 +2016,41 @@ impl DerivePlan {
                 format!("table '{}': derive '{}' was not parsed", table_name, target)
             })?;
             let column_model = model.columns.get(target);
+            let expr_ty = expr.infer_type();
+            let bool_target = is_bool_target(column_model);
+            // Issue #94 compatibility check at plan time: the expression's
+            // static type and the target's trained shape must agree. Unknown
+            // static types stay legal here; the runtime check still rejects
+            // actual mismatches.
+            match (expr_ty, bool_target) {
+                (crate::synth::expr::Ty::Bool, false) => {
+                    return Err(format!(
+                        "table '{}' derive '{}': boolean expression cannot fill a non-boolean target column; \
+                         wrap it in if(...) or derive into a boolean column",
+                        table_name, target
+                    ));
+                }
+                (crate::synth::expr::Ty::Number | crate::synth::expr::Ty::String, true) => {
+                    return Err(format!(
+                        "table '{}' derive '{}': a boolean column cannot take a {} expression; \
+                         compare it (e.g. `== 1`) or use if(...)",
+                        table_name,
+                        target,
+                        match expr_ty {
+                            crate::synth::expr::Ty::Number => "numeric",
+                            _ => "string",
+                        }
+                    ));
+                }
+                _ => {}
+            }
             steps.push(DeriveStep {
                 column: target.to_string(),
                 index,
                 expr,
                 is_integer: column_model.and_then(|column| column.rounding) == Some(0),
                 scale: column_model.and_then(|column| column.decimal_scale),
+                is_bool_output: expr_ty == crate::synth::expr::Ty::Bool,
             });
         }
 
@@ -2015,35 +2069,50 @@ impl DerivePlan {
         use rust_decimal::prelude::ToPrimitive;
 
         for step in &self.steps {
-            let evaluated = {
-                let lookup = |name: &str| -> Option<Value> {
-                    if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent."))
-                    {
-                        // A NULL FK has no parent row: the qualified name
-                        // behaves like SQL NULL (unknown-column contract).
-                        // Short-circuit before the by_key lookup so a
-                        // NULL-keyed snapshot row (if any slipped in) can
-                        // never satisfy the join.
-                        let fk = self
-                            .index_of
-                            .get(&cross.fk_column)
-                            .and_then(|index| row.get(*index))?;
-                        if fk.is_null() {
-                            return None;
-                        }
-                        return cross
-                            .columns
-                            .get(name)
-                            .and_then(|by_key| by_key.get(fk))
-                            .cloned();
+            let lookup = |name: &str| -> Option<Value> {
+                if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent."))
+                {
+                    // A NULL FK has no parent row: the qualified name
+                    // behaves like SQL NULL (unknown-column contract).
+                    // Short-circuit before the by_key lookup so a
+                    // NULL-keyed snapshot row (if any slipped in) can
+                    // never satisfy the join.
+                    let fk = self
+                        .index_of
+                        .get(&cross.fk_column)
+                        .and_then(|index| row.get(*index))?;
+                    if fk.is_null() {
+                        return None;
                     }
-                    self.index_of
+                    return cross
+                        .columns
                         .get(name)
-                        .and_then(|index| row.get(*index))
-                        .cloned()
-                };
-                step.expr.eval_decimal(&lookup)
+                        .and_then(|by_key| by_key.get(fk))
+                        .cloned();
+                }
+                self.index_of
+                    .get(name)
+                    .and_then(|index| row.get(*index))
+                    .cloned()
             };
+
+            // Issue #94: a Bool-typed expression fills a boolean target with
+            // the trained text literals ("true"/"false"), the same carrier a
+            // real BOOLEAN column uses end to end. NULL in a boolean
+            // expression evaluates to `false` (the predicate convention),
+            // which keeps the target's two-level dictionary intact.
+            if step.is_bool_output {
+                let flag = step.expr.eval_bool(&lookup).map_err(|error| {
+                    format!(
+                        "table '{}' derive '{}': {}",
+                        self.table_name, step.column, error
+                    )
+                })?;
+                row[step.index] = Value::String(flag.to_string());
+                continue;
+            }
+
+            let evaluated = step.expr.eval_decimal(&lookup);
 
             let value = match evaluated {
                 Ok(value) => value,
@@ -6225,6 +6294,104 @@ tables:
                 "row {row:?}"
             );
         }
+    }
+
+    // ─── derive bool target columns（#94）─────────────────────────────────
+
+    /// `store_id` is numerical; `active`/`flag` train as boolean-shaped
+    /// categoricals (text "true"/"false", what a real BOOLEAN column trains
+    /// into per issue #102).
+    fn bool_derive_model() -> HashMap<String, TableModel> {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "store_id".to_string(),
+            numerical_model("t", "store_id", 3.0, 1.0).columns["store_id"].clone(),
+        );
+        for name in ["active", "flag"] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Categorical,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: vec!["true".to_string(), "false".to_string()],
+                        weights: vec![0.5, 0.5],
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let order = vec![
+            "store_id".to_string(),
+            "active".to_string(),
+            "flag".to_string(),
+        ];
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: order.clone(),
+                correlation: vec![
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                ],
+            },
+            fk_cardinality: Default::default(),
+        };
+        HashMap::from([("t".to_string(), model)])
+    }
+
+    #[test]
+    fn should_derive_boolean_target_from_if_expression() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[("flag", "if(store_id > 2, 1, 0) == 1")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            assert!(
+                row[2] == Value::String("true".into()) || row[2] == Value::String("false".into()),
+                "bool target must be the trained text literal, got {row:?}"
+            );
+            let store_id = row[0].as_f64().unwrap();
+            let expected = if store_id > 2.0 { "true" } else { "false" };
+            assert_eq!(row[2].as_str(), Some(expected), "row {row:?}");
+        }
+    }
+
+    #[test]
+    fn should_reject_bool_expression_on_numeric_target() {
+        let models = bool_derive_model();
+        // Numerical target with a Bool expression must fail at plan time.
+        let rules = derive_rules(&[("store_id", "active == 'true'")]);
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("bool expression on a numeric column must fail");
+        assert!(
+            err.contains("boolean expression") && err.contains("store_id"),
+            "plan-time error must name the column and say 'boolean expression': {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_numeric_expression_on_bool_target() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[("flag", "store_id * 2")]);
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("numeric expression on a bool target must fail");
+        assert!(
+            err.contains("boolean column") && err.contains("flag"),
+            "plan-time error must name the column and say 'boolean column': {err}"
+        );
     }
 
     #[test]

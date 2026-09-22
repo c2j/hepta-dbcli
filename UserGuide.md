@@ -1131,7 +1131,7 @@ tables:
         expr: "price * qty * 2 + 0.01"
 ```
 
-- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**函数调用、下标一律拒绝，属性访问仅放行 `parent.<col>`（跨表派生，见下节）**（加载期报错并指出违规节点）。
+- 语法（**白名单**，加载期校验）：数字字面量、列引用、`+ - * / %`、一元负号、括号、比较（`== != < <= > >=`）、逻辑（`&& ||`）、单引号字符串（仅用于比较）、**函数调用 `if(cond, then, else)`**（#94 起，白名单函数；条件必须为布尔表达式，两分支静态类型一致，惰性求值）。**没有一元 `!`**：写 `status != 'A'`，孤立的 `!` 会报 `unexpected \`!\`; use \`!=\` for inequality`。**白名单外的函数调用、属性访问、下标一律拒绝；属性访问仅放行 `parent.<col>`（跨表派生，见下节）**（加载期报错；未知函数名会列出已知函数）。
 - 求值用 `rust_decimal`：`0.1 * 3` 精确等于 `0.3`；除零/取余零、与 NULL 比较（恒为 false）、字符串与数值混比都有明确错误，溢出报错而不是 panic。
 - **NULL 传播（三值逻辑）**：`derive` 无条件重算目标列，源列为 NULL 时结果也是 NULL（`total = price * qty` 在 `price` 为 NULL 的那一行把 `total` 写成 NULL），**不会**中断整张表的生成。目标列若在库里是 `NOT NULL`，会在写入时报数据库错误。除零/类型错误仍是硬错误：那是配置写错，不是 NULL 输入。
 - 时机：**所有列生成（含 copula、FK、NULL、`fixed`/`values`/`fixed_range`）之后统一求值**，因此表达式读到的是最终值；`derive` 之间按依赖顺序求值（`c = b + 1`、`b = price * 2` 可以声明为任意顺序），成环在加载期报错。
@@ -1234,7 +1234,7 @@ tables:
 3. **rules-draft 隐式推断已跳过 datetime 列**：`last_update` 这类多表同名的更新时间戳列不再被连成互指关系（推断层跳过 datetime 子列，自引用一律跳过）。若 draft 仍因其他原因成环，落盘前会打 `warning: draft references form a cycle ...`（含同一错误文案里点名的两类常见误报），此时按提示手工删除残余伪 relationship 再 `generate`。
 4. **`--mine` 默认跳过 PII 列**：挖掘器在「档数 ≤ 50 且非标识符」之外还会用 PII 识别过滤列（被跳过的列名打在 stderr），低基数的 email/phone 列不会再把**训练原值**写进 YAML 注释与 `--emit-candidates` 文件。确知数据是假 PII 形状时可加 `--keep-pii-columns` 恢复旧行为。
 5. **父键 `unique: true` 受父池大小约束**：生成开始前预检——需求唯一值数超过父表**已生成**行数即报错并给出两条线索：父池当前大小、父列训练时观测到的 distinct 容量。容量足够时提示增大父表 rules 行数，容量不足时提示增大 train `--sample` 重新训练；也可以改 `unique: false` 或给父键配 `values` 池。例：users rules 只生成 3 行、orders `unique: true` 请求 300 行会直接报 `unique FK 'user_id' requests 300 unique value(s) but its parent pool 'users.id' holds only 3 generated value(s)`。
-6. **`derive` 目标列不能是布尔表达式**：比较运算（`==`、`>` 等）产生布尔值，与目标列的数值/字符串求值不兼容，`derive: expr: "active == 1 && store_id > 0"` 会报 `operator \`decimal result\` cannot be applied to boolean`。比较+逻辑组合只能用于 `branches[].predicate`；`derive` 也没有 `if/then/else` 或条件函数（白名单只有字面量、列引用、算术、比较、`&& ||`）。
+6. **`derive` 表达式类型必须与目标列匹配**（#94 起支持条件函数与布尔目标列）：表达式白名单新增**条件函数 `if(cond, then, else)`**——`cond` 必须是布尔表达式（比较/逻辑组合），两个分支静态类型须一致（数字或字符串），**惰性求值**（未被选中的分支不参与求值，其中的除零不会触发）。比较/逻辑表达式（结果为布尔）可以直接 `derive` 进**布尔目标列**：训练后档位恰为 `true`/`false` 文本的列（即真实 BOOLEAN 列的形态）会按表达式真值生成 `"true"`/`"false"` 文本（与该列既有导出载体一致）；布尔表达式配数值目标、或数值/字符串表达式配布尔目标，都会在生成前报错并点名目标列。未知函数名仍然 fail-fast 拒绝并给出已知函数列表。函数白名单当前：`if`。
 7. **PII phone provider 固定美式格式**：始终生成 `+1-XXX-XXX-XXXX`，不随训练值地域变化（训练值 `13812345678` 这类中文手机号在生成结果中为 0% 格式匹配）。需要本地格式时可 `sdtype: keep`（保留值域，注意泄漏面）或导出后自行变换。
 8. **Oracle（oracle-rs 驱动）**：表不存在时报 `Oracle closed the connection without an error packet…`，语义误导（实为对象不存在被驱动吞掉）；采样超 100 行会被驱动静默截断（见上文截断告警逻辑）。
 9. **DuckDB**：连接串指向的数据库文件必须已存在，CLI 不自动创建（报 `DuckDB database file not found`）；DuckDB 引擎不支持 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`，外键必须在建表 DDL 中内联，`rules-draft` 才能扫到。
@@ -1426,7 +1426,8 @@ esac
 | synth ``--tables entry 'x.y' uses schema-qualified `schema.table` notation`` | `--tables` 写了 `schema.table` 点号形式（fail-fast 拒绝） | 拆开：`--tables customer --schema staging` |
 | synth `unique FK '...' requests N unique value(s) but its parent pool '...' holds only M generated value(s)` | `unique: true` 父表生成行数（或训练观测容量）< 请求行数 | 按报错里的两条线索：父表 rules 行数不够就增大行数，训练观测不够就增大 train `--sample` 重训；也可改 `unique: false` 或给父键配 `values` 池（见 §10.5 已知限制 5） |
 | synth rules-draft 报 `warning: draft references form a cycle` | 残余的隐式误报关系成环（同名时间戳已被跳过；自引用也已被跳过） | 按警告提示手工删除 draft YAML 中的伪 relationship（见 §10.5 已知限制 3） |
-| synth derive `operator decimal result cannot be applied to boolean` | derive 表达式是布尔比较，不能赋给目标列 | 改成算术表达式，或把该条件挪到 `branches[].predicate`（见 §10.5 已知限制 6） |
+| synth derive 报 `boolean expression`/`boolean column` 类型不匹配（点名表.列） | derive 表达式结果类型与目标列档位不兼容（布尔表达式配数值列，或数值/字符串表达式配 `true`/`false` 布尔列） | 按提示改成同类型表达式；布尔真值应配布尔目标列（#94 起支持），或用 `if(cond, '1', '0')` 把结果编码成目标列的类型（见 §10.5 已知限制 6） |
+| synth derive 报 `function \`xxx\` is not permitted; known functions: if` | 用了白名单外的函数 | 首批白名单仅 `if`，其余函数暂不支持（见 §10.5 已知限制 6） |
 | GaussDB synth 连接报 `unknown option currentSchema` | URL 查询参数不被 gaussdb 驱动接受 | 去掉参数，改用 `--schema` |
 | DuckDB `database file not found` | CLI 不自动创建 DuckDB 文件 | 先用任意 DuckDB 客户端建库再连接 |
 
