@@ -2709,6 +2709,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2751,6 +2752,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(30);
@@ -2762,6 +2764,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         c_rule.rows = Some(10);
@@ -2841,6 +2844,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2914,6 +2918,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(5);
@@ -2925,6 +2930,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2991,6 +2997,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -3081,6 +3088,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3178,6 +3186,7 @@ mod tests {
             pool_strategy: PoolStrategy::Projection { unique: false },
             null_label: "null".to_string(),
             cardinality: Default::default(),
+            derive: Vec::new(),
         };
         let mut a = single_rule("a", vec![]);
         a.rows = Some(3);
@@ -3230,6 +3239,7 @@ mod tests {
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
                     cardinality: Default::default(),
+                    derive: Vec::new(),
                 }],
             )],
         };
@@ -3308,6 +3318,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
             strategy: TableStrategy::Weighted,
         };
@@ -3367,6 +3378,7 @@ mod tests {
                     },
                     null_label: "null".to_string(),
                     cardinality: Default::default(),
+                    derive: Vec::new(),
                 }],
             )],
         };
@@ -3551,6 +3563,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3605,6 +3618,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3650,6 +3664,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3710,6 +3725,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                     strategy: TableStrategy::Zipf,
                 },
@@ -3867,6 +3883,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -4103,6 +4120,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -4342,6 +4360,7 @@ tables:
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -4484,6 +4503,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: true },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         child_rule.rows = Some(14);
@@ -6652,6 +6672,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         table.branches.push(crate::synth::rules::BranchRule {
@@ -6854,6 +6875,7 @@ tables:
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -7236,6 +7258,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique },
                 cardinality: CardinalityMode::Modeled,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         )
     }
@@ -7351,6 +7374,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 cardinality: CardinalityMode::ExactRows,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         );
         child.rows = Some(37);
@@ -7852,6 +7876,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 cardinality: CardinalityMode::ExactRows,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -7985,6 +8010,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -8057,6 +8083,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(5);
@@ -8068,6 +8095,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {

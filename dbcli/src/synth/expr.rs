@@ -567,6 +567,30 @@ impl Parser {
             Token::Number(value) => Ok(Node::Number(value)),
             Token::Str(value) => Ok(Node::Str(value)),
             Token::Ident(name) => {
+                // Issue #117: `parent.<col>` is the one allowed qualified
+                // reference (cross-table derive). Any other `x.y` — including
+                // a second dot, `parent.a.b` — stays a rejected attribute
+                // access, so the frozen grammar grows by a single production.
+                if name == "parent" && self.eat(&Token::Dot) {
+                    let Some(spanned_column) = self.advance() else {
+                        return Err(syntax(
+                            "unexpected end of expression; expected a column after `parent.`",
+                            self.end,
+                        ));
+                    };
+                    match spanned_column.token {
+                        Token::Ident(column) => {
+                            self.reject_suffix(&format!("parent.{column}"))?;
+                            return Ok(Node::Column(format!("parent.{column}")));
+                        }
+                        found => {
+                            return Err(syntax(
+                                format!("expected a column after `parent.`, found `{found}`"),
+                                spanned_column.position,
+                            ));
+                        }
+                    }
+                }
                 self.reject_suffix(&name)?;
                 Ok(Node::Column(name))
             }
@@ -988,6 +1012,63 @@ mod tests {
             other => panic!("expected disallowed node, got {other:?}"),
         }
         assert!(err.to_string().contains("cols"), "message: {err}");
+    }
+
+    // ─── parent-qualified references (#117) ──────────────────────────────
+
+    #[test]
+    fn should_parse_parent_qualified_reference() {
+        let expr = Expr::parse("parent.cjsl / 1000").expect("`parent.<col>` must parse");
+        assert_eq!(
+            expr.referenced_columns(),
+            cols(&["parent.cjsl"]),
+            "the qualified name must be reported as one column"
+        );
+        let value = expr
+            .eval_decimal(&|name: &str| {
+                if name == "parent.cjsl" {
+                    Some(json!(2500))
+                } else {
+                    None
+                }
+            })
+            .expect("must evaluate against a qualified lookup");
+        assert_eq!(value, dec("2.5"));
+    }
+
+    #[test]
+    fn should_propagate_null_from_a_missing_parent_reference() {
+        // The generator supplies `parent.<col>` only when the FK is set; a
+        // lookup that does not know the name behaves like SQL NULL.
+        let value = Expr::parse("parent.cjsl + 1")
+            .unwrap()
+            .eval_decimal(&|_| None)
+            .expect_err("NULL must surface as NullResult in eval_decimal");
+        assert!(matches!(value, ExprError::NullResult), "{value:?}");
+    }
+
+    #[test]
+    fn should_reject_non_parent_qualified_reference() {
+        let err = Expr::parse("par.id + 1").expect_err("only `parent.` may be qualified");
+        match &err {
+            ExprError::Disallowed { construct, detail } => {
+                assert_eq!(*construct, "attribute access");
+                assert_eq!(detail, "par");
+            }
+            other => panic!("expected disallowed node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_deeply_qualified_reference() {
+        let err = Expr::parse("parent.a.b").expect_err("only one level is allowed");
+        match &err {
+            ExprError::Disallowed { construct, detail } => {
+                assert_eq!(*construct, "attribute access");
+                assert_eq!(detail, "parent.a");
+            }
+            other => panic!("expected disallowed node, got {other:?}"),
+        }
     }
 
     #[test]
