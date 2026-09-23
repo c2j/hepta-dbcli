@@ -800,4 +800,139 @@ mod tests {
             native.render_scan_sql(&keyless)
         );
     }
+
+    // ─── Issue #116 catalog-case tests (mirrors of backend/oracle) ───────
+    // The fix was copied into this native dialect; the oracle-rs side gained
+    // four unit tests for it and this module did not. Until now the native
+    // path was verified only by "the copy looks the same".
+
+    /// Catalog-returned physical names are already authoritative case;
+    /// `quote_catalog_ident` quotes them as-is while the user-input path
+    /// (`quote_ident`) keeps the unquoted-name folding.
+    #[test]
+    fn should_quote_catalog_ident_without_folding() {
+        let d = OracleDialect::new();
+        assert_eq!(d.quote_catalog_ident("MyKey"), "\"MyKey\"");
+        // User-input path keeps folding (both directions asserted so a
+        // wrong-way refactor cannot pass).
+        assert_eq!(d.quote_ident("MyKey"), "\"MYKEY\"");
+        assert_eq!(d.quote_ident("dat_fund_cjqs"), "\"DAT_FUND_CJQS\"");
+        assert_eq!(d.quote_catalog_ident("DAT_FUND_CJQS"), "\"DAT_FUND_CJQS\"");
+    }
+
+    /// normalize_expr renders the column as the catalog gave it, not folded
+    /// to uppercase (ORA-00904 on `MIN("MYKEY")` otherwise).
+    #[test]
+    fn should_render_normalize_expr_with_catalog_case() {
+        let d = OracleDialect::new();
+        let spec = col("MyKey", "NUMBER(10)", false);
+        let expr = d.normalize_expr(&spec).expect("NUMBER must normalize");
+        assert!(
+            expr.contains("\"MyKey\""),
+            "expr must keep catalog case: {expr}"
+        );
+        assert!(!expr.contains("MYKEY"), "expr must not fold: {expr}");
+    }
+
+    /// Checksum range predicates reference the key as the catalog spelled it
+    /// (key_column in ChecksumSqlSpec is catalog-resolved).
+    #[test]
+    fn checksum_sql_keeps_catalog_case_of_key_column() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::ChecksumSqlSpec {
+            schema: None,
+            table: "T".into(),
+            key_column: Some("MyKey".into()),
+            range: Some((0, 10)),
+            bucket: None,
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["TO_CHAR(\"MyKey\")".into()],
+            key_hash_exprs: vec![],
+        };
+        let sql = d.render_checksum_sql(&spec);
+        assert!(
+            sql.contains("\"MyKey\" >= 0 AND \"MyKey\" < 10"),
+            "range predicate must keep catalog case: {sql}"
+        );
+        assert!(!sql.contains("MYKEY"), "must not fold: {sql}");
+
+        let batch = d.render_batch_checksum_sql(&spec);
+        assert!(
+            batch.contains("\"MyKey\" >= 0 AND \"MyKey\" < 10"),
+            "batch range predicate must keep catalog case: {batch}"
+        );
+        assert!(!batch.contains("MYKEY"), "must not fold: {batch}");
+    }
+
+    /// Keyset paging references catalog key columns as-is, while schema/table
+    /// (user input) keep the unquoted-name fold.
+    #[test]
+    fn keyset_page_sql_keeps_catalog_case_of_key_column() {
+        let d = OracleDialect::new();
+        let spec = crate::backend::KeysetPageSpec {
+            schema: Some("scott".into()),
+            table: "orders".into(),
+            columns: vec!["MyKey".into()],
+            raw_exprs: false,
+            key_columns: vec!["MyKey".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: Some(vec![serde_json::json!(7)]),
+            page_size: 16,
+            filter: None,
+            scn: None,
+        };
+        let sql = d.render_keyset_page_sql(&spec);
+        assert!(sql.contains("SELECT \"MyKey\""), "{sql}");
+        assert!(sql.contains("\"MyKey\" > 7"), "{sql}");
+        assert!(sql.contains("ORDER BY \"MyKey\""), "{sql}");
+        // User-input schema/table keep folding.
+        assert!(sql.contains("FROM \"SCOTT\".\"ORDERS\""), "{sql}");
+    }
+
+    /// The native dialect must render the #116 catalog-case SQL in lockstep
+    /// with the oracle-rs dialect: same spec, byte-identical checksum range
+    /// and keyset page SQL.
+    #[test]
+    fn catalog_case_sql_matches_oracle_dialect_byte_for_byte() {
+        let rs = crate::backend::oracle::dialect::OracleDialect::new();
+        let native = OracleDialect::new();
+
+        let checksum = crate::backend::ChecksumSqlSpec {
+            schema: None,
+            table: "T".into(),
+            key_column: Some("MyKey".into()),
+            range: Some((0, 10)),
+            bucket: Some((8, 5)),
+            filter: None,
+            scn: None,
+            normalized_exprs: vec!["TO_CHAR(\"MyKey\")".into()],
+            key_hash_exprs: vec![],
+        };
+        assert_eq!(
+            rs.render_checksum_sql(&checksum),
+            native.render_checksum_sql(&checksum),
+            "checksum SQL must stay in lockstep"
+        );
+
+        let keyset = crate::backend::KeysetPageSpec {
+            schema: Some("scott".into()),
+            table: "orders".into(),
+            columns: vec!["MyKey".into()],
+            raw_exprs: false,
+            key_columns: vec!["MyKey".into()],
+            string_key: vec![false],
+            range: None,
+            last_key: Some(vec![serde_json::json!(7)]),
+            page_size: 16,
+            filter: None,
+            scn: None,
+        };
+        assert_eq!(
+            rs.render_keyset_page_sql(&keyset),
+            native.render_keyset_page_sql(&keyset),
+            "keyset SQL must stay in lockstep"
+        );
+    }
 }
