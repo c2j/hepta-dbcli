@@ -400,7 +400,8 @@ fn render_iblt(
     let spec = IbltSqlSpec {
         schema: side.schema.clone(),
         table: side.table.clone(),
-        key_expr: dialect.quote_ident(&ctx.side_key_columns(is_left)[0]),
+        // Catalog-physical name: quote without re-folding (issue #116).
+        key_expr: dialect.quote_catalog_ident(&ctx.side_key_columns(is_left)[0]),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
         cells_per_subtable: m,
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
@@ -739,6 +740,8 @@ fn assemble(
         ident_scheme: String::new(),
         backslash_escape: false,
         modified_columns: None,
+        left_column_names: None,
+        right_column_names: None,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
     report
