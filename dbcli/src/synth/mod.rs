@@ -2554,4 +2554,108 @@ mod tests {
         )
         .is_none());
     }
+
+    /// S4④ (issue #89): time cardinality modeling on 100k parent keys and
+    /// anchor the round-trip behavior (learn -> sample -> total-variation
+    /// <= 0.02). `#[ignore]`d so it never slows the CI gate; run with
+    /// `cargo test --all --bin hepta_dbcli bench_100k_parent_cardinality --
+    /// --ignored --nocapture`. Evidence lands in
+    /// docs/plans/2026-09-22-issue-89-s5-acceptance.md.
+    #[test]
+    #[ignore]
+    fn bench_100k_parent_cardinality_modeling() {
+        use rand::{Rng, SeedableRng};
+
+        // 100k parent keys, long-tail fan-out: 60% zero children, 25% one,
+        // 10% two, 4% three, 1% ten.
+        const PARENTS: usize = 100_000;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut child_fk_values: Vec<serde_json::Value> = Vec::new();
+        for i in 0..PARENTS {
+            let draw: f64 = rng.gen();
+            let count = if draw < 0.60 {
+                0
+            } else if draw < 0.85 {
+                1
+            } else if draw < 0.95 {
+                2
+            } else if draw < 0.99 {
+                3
+            } else {
+                10
+            };
+            for _ in 0..count {
+                child_fk_values.push(serde_json::Value::from(i));
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let distribution =
+            crate::synth::cardinality::learn_cardinality(&child_fk_values, Some(PARENTS))
+                .expect("must learn a distribution");
+        let learn_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let per_parent_counts: Vec<u64> = (0..PARENTS)
+            .map(|_| distribution.sample_count(rng.gen()))
+            .collect();
+        let sample_elapsed = started.elapsed();
+        let empirical = crate::synth::cardinality::CardinalityDist::from_counts(
+            per_parent_counts.iter().copied(),
+            PARENTS,
+            distribution.null_share,
+        )
+        .expect("sampled distribution must be buildable");
+        let tv = distribution.total_variation(&empirical);
+        println!(
+            "cardinality bench: learned 100k-parent distribution in {learn_elapsed:?} \
+             ({} child rows); sampled 100k fan-outs in {sample_elapsed:?}; \
+             TV(learned, sampled) = {tv:.4}",
+            child_fk_values.len()
+        );
+        assert!(
+            tv <= 0.02,
+            "sampled fan-out drifted from the learned distribution (TV {tv})"
+        );
+    }
+
+    /// S4⑤ (issue #89): PII fake-value throughput per provider and a
+    /// uniqueness floor for the id-card generator. Same `#[ignore]`d bench
+    /// protocol as the cardinality one.
+    #[test]
+    #[ignore]
+    fn bench_pii_generation_throughput() {
+        use crate::synth::pii::{self, PiiProvider};
+        use rand::SeedableRng;
+
+        const N: usize = 200_000;
+        for provider in [
+            PiiProvider::Email,
+            PiiProvider::Phone,
+            PiiProvider::Name,
+            PiiProvider::IdCard,
+        ] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(pii::generate_value(provider, &mut rng));
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "pii bench: {} {N} values in {elapsed:?} ({:.0} values/s)",
+                provider.as_str(),
+                N as f64 / elapsed.as_secs_f64()
+            );
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let unique: std::collections::HashSet<String> = (0..100_000)
+            .map(|_| pii::generate_value(PiiProvider::IdCard, &mut rng))
+            .collect();
+        assert!(
+            unique.len() > 99_000,
+            "id-card generator collapsed to {} distinct values out of 100k",
+            unique.len()
+        );
+    }
 }
