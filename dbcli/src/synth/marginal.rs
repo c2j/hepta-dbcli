@@ -809,17 +809,17 @@ pub fn compute_gaussian_correlation(
     rows: &[Vec<serde_json::Value>],
     column_order: &[String],
     columns: &HashMap<String, ColumnModel>,
-) -> Vec<Vec<f64>> {
+) -> Result<Vec<Vec<f64>>, String> {
     let n_cols = column_order.len();
     let n_rows = rows.len();
     if n_rows < 2 || n_cols == 0 {
-        return (0..n_cols)
+        return Ok((0..n_cols)
             .map(|i| {
                 (0..n_cols)
                     .map(|j| if i == j { 1.0 } else { 0.0 })
                     .collect()
             })
-            .collect();
+            .collect());
     }
 
     let mut gaussian_data = vec![vec![None; n_rows]; n_cols];
@@ -842,20 +842,12 @@ pub fn compute_gaussian_correlation(
         }
     }
 
-    // Ensure PSD by adding small epsilon to diagonal if needed
-    for (i, row) in corr.iter_mut().enumerate() {
-        let row_sum: f64 = row
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, &v)| v.abs())
-            .sum();
-        if row[i] < row_sum {
-            row[i] = row_sum + 1e-6;
-        }
-    }
-
-    corr
+    // PSD projection without touching the diagonal (issue #89 S2a). The old
+    // diagonal-dominance hack stored diag > 1 in the model whenever columns
+    // correlate strongly, and the copula then shrank every generated
+    // correlation by that factor. The projection clips eigenvalues instead
+    // and leaves an honest correlation matrix.
+    crate::synth::copula::project_to_correlation(corr)
 }
 
 /// DECIMAL/NUMBER values are often serialized as JSON strings by drivers;
@@ -1219,7 +1211,8 @@ mod tests {
             ("b".to_string(), normal_column_model(73.5, 45.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "linear columns must correlate strongly, got {}",
@@ -1268,7 +1261,8 @@ mod tests {
             ("amt".to_string(), normal_column_model(20.0, 8.2)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.5,
             "numeric-categorical column must correlate with its numeric partner, got {}",
@@ -1293,7 +1287,8 @@ mod tests {
             ("b".to_string(), normal_column_model(73.5, 45.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "numeric strings must still correlate, got {}",
@@ -1317,10 +1312,52 @@ mod tests {
             ("b".to_string(), normal_column_model(50.0, 1.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1].abs() < 0.2,
             "alternating column must be ~uncorrelated, got {}",
+            corr[0][1]
+        );
+    }
+
+    #[test]
+    fn correlation_matrix_keeps_unit_diagonal_for_strongly_correlated_columns() {
+        // Issue #89 S2a: the old PSD "fix" raised each diagonal entry to
+        // sum(|off-diagonal|) + eps, so two perfectly correlated columns
+        // (corr[0][1] ~ 1) produced diag = 2 + eps. That matrix was stored in
+        // the model and inflated the copula's sampling variance 2x, shrinking
+        // every generated correlation by half. The correlation matrix is a
+        // correlation matrix: its diagonal must stay exactly 1.0 no matter
+        // how strong the off-diagonal structure is.
+        let rows: Vec<Vec<serde_json::Value>> = (0..50)
+            .map(|i| {
+                vec![
+                    serde_json::Value::from(i),
+                    serde_json::Value::from(3 * i),
+                    serde_json::Value::from(7 * i),
+                ]
+            })
+            .collect();
+        let order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let columns = std::collections::HashMap::from([
+            ("a".to_string(), normal_column_model(24.5, 15.0)),
+            ("b".to_string(), normal_column_model(73.5, 45.0)),
+            ("c".to_string(), normal_column_model(171.5, 105.0)),
+        ]);
+
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
+        for (i, row) in corr.iter().enumerate() {
+            assert!(
+                (row[i] - 1.0).abs() < 1e-9,
+                "diagonal must be exactly 1.0, got corr[{i}][{i}] = {}",
+                row[i]
+            );
+        }
+        assert!(
+            corr[0][1] > 0.99 && corr[0][2] > 0.99 && corr[1][2] > 0.99,
+            "linear columns must keep their strong correlation, got {}",
             corr[0][1]
         );
     }
@@ -1398,7 +1435,8 @@ mod tests {
             .collect();
         let fill_hand = pearson(&filled_a, &filled_b);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             (corr[0][1] - pairwise_hand).abs() < 1e-6,
             "expected pairwise-complete Pearson {pairwise_hand}, got {}",
@@ -1761,7 +1799,8 @@ mod tests {
             .map(|(&x, &y)| vec![serde_json::Value::from(x), serde_json::Value::from(y)])
             .collect();
         let order = vec!["a".to_string(), "b".to_string()];
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "monotone pair must correlate, got {}",

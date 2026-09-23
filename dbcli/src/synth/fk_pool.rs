@@ -18,7 +18,7 @@ pub struct FkPool {
     es_prepared: bool,
 }
 
-fn value_key(v: &Value) -> String {
+pub(crate) fn value_key(v: &Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())
@@ -76,6 +76,27 @@ impl FkPool {
         let harmonic: f64 = (1..=order.len()).map(|k| 1.0 / k as f64).sum();
         Self {
             values: order,
+            harmonic,
+            weights,
+            weight_sum,
+            es_prepared: false,
+        }
+    }
+
+    /// Build a pool from explicit per-value weights (issue #89 S2b). The
+    /// caller supplies one weight per value, in the same order; values must
+    /// already be distinct. All-zero (or all-negative) weights leave the
+    /// pool drawable: `weighted_index` falls back to uniform.
+    pub fn from_weighted_values(values: Vec<Value>, weights: Vec<f64>) -> Self {
+        debug_assert_eq!(
+            values.len(),
+            weights.len(),
+            "from_weighted_values requires one weight per value"
+        );
+        let weight_sum: f64 = weights.iter().copied().filter(|w| *w > 0.0).sum();
+        let harmonic: f64 = (1..=values.len()).map(|k| 1.0 / k as f64).sum();
+        Self {
+            values,
             harmonic,
             weights,
             weight_sum,
@@ -275,6 +296,47 @@ mod tests {
         }
         assert_eq!(p.len(), 3);
         assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn weighted_pool_draws_match_explicit_weights() {
+        // Issue #89 S2b: density-weighted FK pools are built from explicit
+        // per-value weights; the Weighted draw frequencies must track those
+        // weights (10:1:1 here, so value 1 must dominate).
+        let values = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let weights = vec![10.0, 1.0, 1.0];
+        let p = FkPool::from_weighted_values(values, weights);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut count_1 = 0usize;
+        let n = 12_000;
+        for _ in 0..n {
+            let drawn = p.sample_one(SelectionStrategy::Weighted, &mut rng).unwrap();
+            let first = Value::from(1);
+            if drawn == first {
+                count_1 += 1;
+            }
+        }
+        let share = count_1 as f64 / n as f64;
+        assert!(
+            (share - 10.0 / 12.0).abs() < 0.02,
+            "value-1 share {share:.4} must be near 10/12 = {:.4}",
+            10.0 / 12.0
+        );
+    }
+
+    #[test]
+    fn weighted_pool_with_all_zero_weights_falls_back_to_uniform() {
+        // A child that never observed a parent-pool value in training yields
+        // an all-floor weight vector; drawing must still work (uniform
+        // fallback), never panic or loop.
+        let values = vec![Value::from(1), Value::from(2)];
+        let weights = vec![0.0, 0.0];
+        let p = FkPool::from_weighted_values(values, weights);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        for _ in 0..50 {
+            let v = p.sample_one(SelectionStrategy::Weighted, &mut rng).unwrap();
+            assert!((1.0..=2.0).contains(&v.as_f64().unwrap()));
+        }
     }
 
     #[test]

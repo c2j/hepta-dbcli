@@ -457,4 +457,157 @@ mod tests {
         }
         drop_table_named(&mut *conn, TABLE).await;
     }
+
+    // ── Issue #116: quoted mixed-case catalog identifiers in delta-diff ──
+
+    const MC_L: &str = "DD_MC_L";
+    const MC_R: &str = "DD_MC_R";
+
+    /// Left side: quoted mixed-case PK (`"MyKey"`); right side: lowercase
+    /// `mykey` (a folded, physically distinct name). Same logical key, three
+    /// rows each: row 1 equal, row 2 modified (v 20→21), row 3/4 missing on
+    /// the opposite side.
+    async fn create_mixed_case_fixture(conn: &mut dyn DbConn) {
+        drop_table_named(conn, MC_L).await;
+        drop_table_named(conn, MC_R).await;
+        conn.query_drop(&format!(
+            "CREATE TABLE {MC_L} (\"MyKey\" NUMBER(10) PRIMARY KEY, v NUMBER(10))"
+        ))
+        .await
+        .expect("create mc_l");
+        conn.query_drop(&format!(
+            "CREATE TABLE {MC_R} (mykey NUMBER(10) PRIMARY KEY, v NUMBER(10))"
+        ))
+        .await
+        .expect("create mc_r");
+        for k in 1..=3 {
+            let v = if k == 2 { 20 } else { k * 10 };
+            conn.query_drop(&format!("INSERT INTO {MC_L} VALUES ({k}, {v})"))
+                .await
+                .expect("insert mc_l");
+        }
+        for k in 1..=4 {
+            if k == 3 {
+                continue; // key 3 exists only on the left, key 4 only on the right
+            }
+            let v = if k == 2 { 21 } else { k * 10 };
+            conn.query_drop(&format!("INSERT INTO {MC_R} VALUES ({k}, {v})"))
+                .await
+                .expect("insert mc_r");
+        }
+        // oracle-rs has no autocommit; without COMMIT the rows vanish when
+        // this session closes and the child-process diff would see 0 rows.
+        conn.query_drop("COMMIT")
+            .await
+            .expect("commit fixture rows");
+    }
+
+    async fn drop_mixed_case_fixture(conn: &mut dyn DbConn) {
+        drop_table_named(conn, MC_L).await;
+        drop_table_named(conn, MC_R).await;
+    }
+
+    fn delta_diff_command() -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_hepta_dbcli"));
+        let home = tempfile::tempdir().expect("tempdir home");
+        let home_path = home.path().to_path_buf();
+        // The dir only isolates config lookups; leaking it keeps the process
+        // tree deterministic without threading a guard through every spawn.
+        std::mem::forget(home);
+        cmd.env("HOME", home_path)
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "delta-diff",
+                "--left-url",
+                &oracle_url().expect("oracle url"),
+                "--right-url",
+                &oracle_url().expect("oracle url"),
+                "--left-table",
+                MC_L,
+                "--right-table",
+                MC_R,
+                "--key",
+                "MyKey",
+                "--consistency",
+                "none",
+            ]);
+        cmd
+    }
+
+    /// Delta-diff must reference the key with catalog case on both sides
+    /// (`"MyKey"` left, `"mykey"` right). Before #116 the fold produced
+    /// `MIN("MYKEY")` → ORA-00904 → oracle-rs killed the session without an
+    /// error packet, so every keyed strategy failed outright.
+    #[tokio::test]
+    async fn oracle_delta_diff_strategies_survive_mixed_case_keys() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        create_mixed_case_fixture(&mut *conn).await;
+
+        let cases: &[(&str, u64, u64, u64)] = &[
+            // (strategy, missing_left, missing_right, modified)
+            ("hashdiff", 1, 1, 1),
+            ("keyeddiff", 1, 1, 1),
+            ("iblt", 1, 1, 1),
+            // bucketdiff compares multisets per bucket: each side's unmatched
+            // rows land as count deltas (1 left-only, 1 right-only, and the
+            // modified row flips both buckets' checksums).
+            ("bucketdiff", 2, 2, 0),
+        ];
+        for (strategy, missing_left, missing_right, modified) in cases {
+            let out = delta_diff_command()
+                .args(["--strategy", strategy])
+                .output()
+                .expect("spawn delta-diff");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.code() == Some(1),
+                "{strategy} must exit 1 (EXIT_DIFF); stdout: {stdout}; stderr: {stderr}"
+            );
+            assert!(
+                !stderr.contains("closed the connection"),
+                "{strategy} must not lose the session: {stderr}"
+            );
+            let count = |label: &str| -> u64 {
+                let line = stdout
+                    .lines()
+                    .find(|l| l.contains(label))
+                    .unwrap_or_else(|| panic!("{strategy}: no '{label}' row in {stdout}"));
+                // Non-TTY output bolds cells as `** n **`; grab the first
+                // integer run in the line (labels contain no digits).
+                line.split(|c: char| !c.is_ascii_digit())
+                    .find(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("{strategy}: unparseable '{label}' row: {line}"))
+            };
+            assert_eq!(count("missing_left"), *missing_left, "{strategy}: {stdout}");
+            assert_eq!(
+                count("missing_right"),
+                *missing_right,
+                "{strategy}: {stdout}"
+            );
+            assert_eq!(count("modified "), *modified, "{strategy}: {stdout}");
+        }
+
+        // joindiff is MySQL-family-only: it must refuse loudly (warning) and
+        // fall back to hashdiff, which then also handles the mixed-case keys.
+        let out = delta_diff_command()
+            .args(["--strategy", "joindiff"])
+            .output()
+            .expect("spawn delta-diff joindiff");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.code() == Some(1),
+            "joindiff fallback must exit 1 (EXIT_DIFF): {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("hashdiff"),
+            "joindiff must fall back to hashdiff on Oracle: {stdout}"
+        );
+
+        drop_mixed_case_fixture(&mut *conn).await;
+    }
 }

@@ -281,6 +281,11 @@ pub struct Relationship {
     /// does not read this field; NULL injection uses per-column `null_rate`.
     #[serde(default = "default_null_label")]
     pub null_label: String,
+    /// Cross-table derivations (issue #117): each target column is a function
+    /// of the referenced parent's columns (`parent.<col>`) plus local columns.
+    /// Empty by default so existing rules files load unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derive: Vec<DeriveRule>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,12 +302,17 @@ impl CardinalityMode {
     }
 }
 
+/// Pool sampling strategies for a relationship FK column. `Density` (issue
+/// #89 S2b) weights the parent pool by the child table's own trained
+/// marginal for the FK column, so FK value frequency tracks the child's
+/// observed parent distribution instead of the pool's uniform spread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolStrategy {
     Projection { unique: bool },
     Generated { unique: bool },
     Fixed { values: Vec<String> },
+    Density,
 }
 
 impl Default for PoolStrategy {
@@ -620,8 +630,31 @@ fn validate_derive_rules(
     table: &TableRule,
     parent_keys: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
-    let mut referenced: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
+    // Issue #117: at most one relationship per table may carry derive rules
+    // (the parent snapshot is single-sourced). Enforced here at load time to
+    // match the generator's plan-time check (`DerivePlan::build`) so `train`
+    // fails before any generation work, but this version names the offending
+    // relationships instead of just the table.
+    let derive_rels: Vec<&str> = table
+        .relationships
+        .iter()
+        .filter(|rel| !rel.derive.is_empty())
+        .map(|rel| rel.pk.as_str())
+        .collect();
+    if derive_rels.len() > 1 {
+        return Err(format!(
+            "table '{}': at most one relationship may carry derive rules, but {} and {} both do",
+            table.name,
+            derive_rels[0],
+            derive_rels[1..].join(", ")
+        ));
+    }
+
+    // Issue #117: relationship-level derive rules share the target namespace
+    // and the topology with table-level derive, so everything below works on
+    // one merged list. Whether a `parent.<col>` name actually exists is a
+    // model question and is checked where the models are (`DerivePlan::build`).
+    let mut rules: Vec<(&str, &str, crate::synth::expr::Expr)> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for derive in &table.derive {
@@ -631,45 +664,95 @@ fn validate_derive_rules(
                 table.name, derive.column
             ));
         }
-
-        if let Some(column_rule) = table.columns.get(&derive.column) {
-            if column_rule.has_column_override() {
-                return Err(format!(
-                    "table '{}' column '{}': a derived column cannot also use 'fixed'/'values'/'fixed_range'",
-                    table.name, derive.column
-                ));
-            }
-        }
-
-        if table
-            .relationships
-            .iter()
-            .any(|rel| rel.pk == derive.column)
-        {
-            return Err(format!(
-                "table '{}' column '{}': a derived column cannot be a relationship pk (referential integrity)",
-                table.name, derive.column
-            ));
-        }
-
-        if parent_keys.contains(&format!("{}.{}", table.name, derive.column)) {
-            return Err(format!(
-                "table '{}' column '{}': a derived column cannot be a parent key referenced by another table (its uniqueness is enforced before the derive phase, so the derived values could repeat)",
-                table.name, derive.column
-            ));
-        }
-
         let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
             format!(
                 "table '{}' derive '{}': expression '{}' rejected: {}",
                 table.name, derive.column, derive.expr, e
             )
         })?;
-        referenced.insert(derive.column.as_str(), expr.referenced_columns());
+        // A table-level derive has no relationship to resolve `parent.` with.
+        if expr
+            .referenced_columns()
+            .iter()
+            .any(|name| name.contains('.'))
+        {
+            return Err(format!(
+                "table '{}' derive '{}': 'parent.<col>' references are only allowed in a relationship's derive list",
+                table.name, derive.column
+            ));
+        }
+        rules.push((derive.column.as_str(), "", expr));
+    }
+
+    for rel in &table.relationships {
+        let parent_tables: Vec<&str> = rel
+            .references
+            .iter()
+            .filter_map(|reference| reference.split_once('.').map(|(t, _)| t))
+            .collect();
+        for derive in &rel.derive {
+            if !seen.insert(derive.column.as_str()) {
+                return Err(format!(
+                    "table '{}': derive lists column '{}' more than once",
+                    table.name, derive.column
+                ));
+            }
+            let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+                format!(
+                    "table '{}' relationship '{}': derive '{}': expression '{}' rejected: {}",
+                    table.name, rel.pk, derive.column, derive.expr, e
+                )
+            })?;
+            for name in expr.referenced_columns() {
+                // The grammar allows exactly one qualified form, `parent.<col>`;
+                // it must resolve against a table this relationship references.
+                // Column existence is checked against the parent model at
+                // generation time (`DerivePlan::build`).
+                if name.starts_with("parent.") && parent_tables.is_empty() {
+                    return Err(format!(
+                        "table '{}' relationship '{}': derive '{}' references '{}' but the relationship has no references",
+                        table.name, rel.pk, derive.column, name
+                    ));
+                }
+            }
+            rules.push((derive.column.as_str(), rel.pk.as_str(), expr));
+        }
+    }
+
+    let mut referenced: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+
+    for (column, rel_pk, expr) in &rules {
+        if let Some(column_rule) = table.columns.get(*column) {
+            if column_rule.has_column_override() {
+                return Err(format!(
+                    "table '{}' column '{}': a derived column cannot also use 'fixed'/'values'/'fixed_range'",
+                    table.name, column
+                ));
+            }
+        }
+
+        if table.relationships.iter().any(|rel| rel.pk == *column) {
+            return Err(format!(
+                "table '{}' column '{}': a derived column cannot be a relationship pk (referential integrity)",
+                table.name, column
+            ));
+        }
+
+        if parent_keys.contains(&format!("{}.{}", table.name, column)) {
+            return Err(format!(
+                "table '{}' column '{}': a derived column cannot be a parent key referenced by another table (its uniqueness is enforced before the derive phase, so the derived values could repeat)",
+                table.name, column
+            ));
+        }
+
+        let _ = rel_pk;
+        referenced.insert(column, expr.referenced_columns());
     }
 
     // Cycle detection over derive columns only: an edge target -> referenced
-    // means "target depends on referenced".
+    // means "target depends on referenced". Cross-table (`parent.`) names are
+    // not derive targets, so they count as ready inputs.
     let mut indegree: std::collections::BTreeMap<&str, usize> =
         referenced.keys().map(|key| (*key, 0)).collect();
     let mut dependents: std::collections::BTreeMap<&str, Vec<&str>> =
@@ -1049,6 +1132,10 @@ tables:
         assert!(err.contains("paid"), "error must name the branch: {err}");
     }
 
+    // #94 decision (user-approved): unknown function names are still
+    // rejected fail-fast at load time; the error text changed from the
+    // generic "function call" category to naming the function and listing
+    // the known whitelist. Table and column attribution is unchanged.
     #[test]
     fn should_reject_derive_with_a_disallowed_expression_node() {
         let yaml = r#"
@@ -1193,6 +1280,205 @@ tables:
         validate_yaml(yaml).expect("acyclic derive chain is valid");
     }
 
+    // ─── relationship derive (#117) ──────────────────────────────────────
+
+    #[test]
+    fn should_accept_relationship_derive_referencing_the_declared_parent() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol
+            expr: "parent.cjsl / 1000"
+"#;
+        validate_yaml(yaml).expect("parent reference through the declared relationship is valid");
+    }
+
+    #[test]
+    fn should_reject_relationship_derive_using_parent_without_references() {
+        // `parent.` can only be resolved through the relationship's own
+        // references; without them the snapshot has no source.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    relationships:
+      - pk: fk
+        references: []
+        derive:
+          - column: vol
+            expr: "parent.cjsl / 1000"
+"#;
+        let err = validate_yaml(yaml).expect_err("parent reference without a parent must fail");
+        assert!(err.contains("zgh"), "error must name the table: {err}");
+        assert!(
+            err.contains("parent.cjsl"),
+            "error must name the reference: {err}"
+        );
+    }
+
+    // An unknown `parent.<col>` name is a model question (rules carry no
+    // parent column list) and is rejected by `DerivePlan::build` at generation
+    // time; see the generator tests.
+
+    // Issue #117 constraint (UserGuide: at most one relationship per table
+    // may carry derive rules). The rejection belongs at load time, together
+    // with every other derive conflict, so `train` fails before burning a
+    // generation run on rules it can never execute.
+    #[test]
+    fn should_reject_two_relationships_carrying_derive_at_load_time() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: buyer
+    relationships: []
+  - name: seller
+    relationships: []
+  - name: orders
+    relationships:
+      - pk: buyer_fk
+        references: [buyer.id]
+        derive:
+          - column: buyer_note
+            expr: "parent.id + 1"
+      - pk: seller_fk
+        references: [seller.id]
+        derive:
+          - column: seller_note
+            expr: "parent.id + 2"
+"#;
+        let err = validate_yaml(yaml)
+            .expect_err("two relationships carrying derive must fail at load time");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(
+            err.contains("buyer_fk") && err.contains("seller_fk"),
+            "error must name both relationships: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_relationship_derive_targeting_the_fk_column() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: fk
+            expr: "parent.id / 2"
+"#;
+        let err = validate_yaml(yaml).expect_err("deriving the FK column must fail");
+        assert!(err.contains("fk"), "error must name the FK column: {err}");
+        assert!(
+            err.contains("referential integrity") || err.contains("relationship pk"),
+            "error must explain the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_relationship_derive_on_a_fixed_column() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    columns:
+      vol:
+        fixed: "1"
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol
+            expr: "parent.id + 1"
+"#;
+        let err = validate_yaml(yaml).expect_err("fixed + relationship derive must conflict");
+        assert!(err.contains("vol"), "error must name the column: {err}");
+        assert!(err.contains("fixed"), "error must explain the clash: {err}");
+    }
+
+    #[test]
+    fn should_accept_relationship_derive_feeding_local_derive() {
+        // Cross-table inputs count as ready; `vol2` (parent snapshot) then
+        // `vol` (local) resolves in one topology, not a cycle.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    derive:
+      - column: vol
+        expr: "vol2 + 1"
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol2
+            expr: "parent.id + 1"
+"#;
+        validate_yaml(yaml).expect("cross -> local chain is acyclic");
+    }
+
+    #[test]
+    fn should_reject_cycle_between_relationship_and_local_derive() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    derive:
+      - column: vol
+        expr: "vol2 + 1"
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol2
+            expr: "vol * 3"
+"#;
+        let err =
+            validate_yaml(yaml).expect_err("cycle across table and relationship derive must fail");
+        assert!(err.contains("cycle"), "error must say cycle: {err}");
+    }
+
+    #[test]
+    fn should_accept_local_derive_mixing_parent_reference_in_relationship_derive() {
+        // Relationship derive may also read local columns; mixed expressions
+        // stay within one topology with the table-level derive list.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: par
+    relationships: []
+  - name: zgh
+    derive:
+      - column: half
+        expr: "vol * 2"
+    relationships:
+      - pk: fk
+        references: [par.id]
+        derive:
+          - column: vol
+            expr: "parent.cjsl / 1000"
+"#;
+        validate_yaml(yaml).expect("mixed local+cross derive chain is valid");
+    }
+
     #[test]
     fn rules_validate_catches_empty_references() {
         let rules = SynthRules {
@@ -1209,6 +1495,7 @@ tables:
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
                     cardinality: Default::default(),
+                    derive: Vec::new(),
                 }],
                 strategy: TableStrategy::Uniform,
             }],
@@ -1236,6 +1523,32 @@ tables:
         } else {
             panic!("expected Generated pool strategy");
         }
+    }
+
+    #[test]
+    fn density_pool_strategy_parses() {
+        // Issue #89 S2b: `!density` weights the parent pool by the child's
+        // own trained marginal for the FK column, so the generated FK value
+        // distribution matches what the child observed in training instead
+        // of a uniform draw over the parent pool.
+        let yaml = r#"
+version: "1"
+tables:
+  - name: t
+    relationships:
+      - pk: id
+        references: [other.id]
+        pool_strategy: !density
+"#;
+        let rules: SynthRules = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            matches!(
+                rules.tables[0].relationships[0].pool_strategy,
+                PoolStrategy::Density
+            ),
+            "expected Density pool strategy, got {:?}",
+            rules.tables[0].relationships[0].pool_strategy
+        );
     }
 
     #[test]
@@ -1923,6 +2236,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 cardinality: CardinalityMode::ExactRows,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
             strategy: TableStrategy::Uniform,
         };

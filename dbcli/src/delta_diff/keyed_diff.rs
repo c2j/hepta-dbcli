@@ -383,7 +383,11 @@ fn full_row_spec(
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let side_keys = ctx.side_key_columns(is_left);
-    let mut columns: Vec<String> = side_keys.iter().map(|c| dialect.quote_ident(c)).collect();
+    // Catalog-physical names: quote without re-folding (issue #116).
+    let mut columns: Vec<String> = side_keys
+        .iter()
+        .map(|c| dialect.quote_catalog_ident(c))
+        .collect();
     for spec in side
         .plan
         .norm_specs
@@ -539,6 +543,8 @@ fn assemble(
         ident_scheme: String::new(),
         backslash_escape: false,
         modified_columns: None,
+        left_column_names: None,
+        right_column_names: None,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
     report

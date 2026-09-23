@@ -219,6 +219,15 @@ pub trait Dialect: Send + Sync {
         quote_ident_scheme(self.url_scheme(), self.identifier_quote(), name)
     }
 
+    /// Quote an identifier that came from the **catalog** (introspection
+    /// results), not from user input (issue #116). Catalog names are the
+    /// authoritative physical case, so Oracle must not re-fold them to
+    /// uppercase; MySQL/GaussDB/DuckDB quote as-is either way. User input
+    /// (`--table`, `--key`) keeps going through [`Dialect::quote_ident`].
+    fn quote_catalog_ident(&self, name: &str) -> String {
+        self.quote_ident(name)
+    }
+
     /// Quote `schema.table` (or just `table` when schema is None).
     fn quote_table(&self, schema: Option<&str>, table: &str) -> String {
         quote_table_scheme(self.url_scheme(), self.identifier_quote(), schema, table)
@@ -498,6 +507,14 @@ pub(crate) fn quote_ident_scheme(scheme: &str, quote: char, name: &str) -> Strin
     } else {
         quote_ident(quote, name)
     }
+}
+
+/// Quote an identifier that came from the **catalog** (issue #116): the name
+/// is already in its authoritative physical case, so Oracle must not re-fold.
+/// Free-function mirror of [`Dialect::quote_catalog_ident`] for contexts that
+/// only have a scheme string (no dialect object).
+pub(crate) fn quote_ident_catalog(_scheme: &str, quote: char, name: &str) -> String {
+    quote_ident(quote, name)
 }
 
 pub(crate) fn quote_table_scheme(
