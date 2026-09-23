@@ -426,17 +426,37 @@ enum Node {
     Call(&'static str, Vec<Node>),
 }
 
-/// Known functions, keyed by the literal source name. `arity` is `None` for
-/// variadic forms; otherwise exactly that many arguments are required.
+/// Known functions, keyed by the literal source name. `min_args`/`max_args`
+/// bound the accepted argument count (`max_args: None` = unbounded).
 struct FunctionSpec {
     name: &'static str,
-    arity: Option<usize>,
+    min_args: usize,
+    max_args: Option<usize>,
 }
 
-const KNOWN_FUNCTIONS: &[FunctionSpec] = &[FunctionSpec {
-    name: "if",
-    arity: Some(3),
-}];
+const fn fixed_arity(name: &'static str, arity: usize) -> FunctionSpec {
+    FunctionSpec {
+        name,
+        min_args: arity,
+        max_args: Some(arity),
+    }
+}
+
+const KNOWN_FUNCTIONS: &[FunctionSpec] = &[
+    fixed_arity("if", 3),
+    // String functions (issue #117: trade_no = concat('T',
+    // right(parent.check_type, 3))). `concat` is fixed at 2 arguments per the
+    // fix plan; `substr` mirrors MySQL's optional length; `right`/`left` take
+    // exactly (string, count).
+    fixed_arity("concat", 2),
+    FunctionSpec {
+        name: "substr",
+        min_args: 2,
+        max_args: Some(3),
+    },
+    fixed_arity("right", 2),
+    fixed_arity("left", 2),
+];
 
 fn known_function_names() -> Vec<&'static str> {
     KNOWN_FUNCTIONS.iter().map(|spec| spec.name).collect()
@@ -465,18 +485,22 @@ fn infer_type(node: &Node) -> Ty {
         Node::Negate(_) => Ty::Number,
         Node::Arith(..) => Ty::Number,
         Node::Compare(..) | Node::And(..) | Node::Or(..) => Ty::Bool,
-        Node::Call(name, args) => {
-            debug_assert_eq!(*name, "if", "parser whitelist is if-only for now");
-            let Some([_, then, otherwise]) = args.get(0..3) else {
-                return Ty::Unknown;
-            };
-            match (infer_type(then), infer_type(otherwise)) {
-                (Ty::Number, Ty::Number) => Ty::Number,
-                (Ty::String, Ty::String) => Ty::String,
-                (Ty::Bool, Ty::Bool) => Ty::Bool,
-                _ => Ty::Unknown,
+        Node::Call(name, args) => match *name {
+            "if" => {
+                let Some([_, then, otherwise]) = args.get(0..3) else {
+                    return Ty::Unknown;
+                };
+                match (infer_type(then), infer_type(otherwise)) {
+                    (Ty::Number, Ty::Number) => Ty::Number,
+                    (Ty::String, Ty::String) => Ty::String,
+                    (Ty::Bool, Ty::Bool) => Ty::Bool,
+                    _ => Ty::Unknown,
+                }
             }
-        }
+            // concat/substr/right/left always produce strings (their argument
+            // type checks happen at runtime).
+            _ => Ty::String,
+        },
     }
 }
 
@@ -573,16 +597,19 @@ impl Parser {
                 break;
             }
         }
-        if let Some(arity) = spec.arity {
-            if args.len() != arity {
-                return Err(syntax(
-                    format!(
-                        "function `{name}` expects {arity} argument(s), got {}",
-                        args.len()
-                    ),
-                    self.position(),
-                ));
-            }
+        if args.len() < spec.min_args || spec.max_args.is_some_and(|max| args.len() > max) {
+            let expected = match (spec.min_args, spec.max_args) {
+                (n, Some(m)) if n == m => format!("{n}"),
+                (n, Some(m)) => format!("{n}-{m}"),
+                (n, None) => format!("at least {n}"),
+            };
+            return Err(syntax(
+                format!(
+                    "function `{name}` expects {expected} argument(s), got {}",
+                    args.len()
+                ),
+                self.position(),
+            ));
         }
         if name == "if" {
             // Fail fast when the two branches are *statically* different
@@ -887,13 +914,75 @@ fn eval_call(
     args: &[Node],
     lookup: &dyn Fn(&str) -> Option<JsonValue>,
 ) -> Result<Value, ExprError> {
-    debug_assert_eq!(name, "if", "parser whitelist is if-only for now");
+    match name {
+        "if" => eval_if(args, lookup),
+        "concat" => {
+            let mut out = String::new();
+            for arg in args {
+                match eval(arg, lookup)? {
+                    Value::Str(text) => out.push_str(&text),
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(ExprError::TypeMismatch {
+                            op: "concat argument",
+                            kind: other.kind(),
+                        })
+                    }
+                }
+            }
+            Ok(Value::Str(out))
+        }
+        "right" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let count = eval_count_arg(&args[1], lookup)?;
+            let (Some(text), Some(count)) = (text, count) else {
+                return Ok(Value::Null);
+            };
+            let take = count.min(text.chars().count());
+            let skip = text.chars().count() - take;
+            Ok(Value::Str(text.chars().skip(skip).collect()))
+        }
+        "left" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let count = eval_count_arg(&args[1], lookup)?;
+            let (Some(text), Some(count)) = (text, count) else {
+                return Ok(Value::Null);
+            };
+            let taken: String = text.chars().take(count).collect();
+            Ok(Value::Str(taken))
+        }
+        "substr" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let start = eval_count_arg(&args[1], lookup)?;
+            let len = match args.get(2) {
+                Some(node) => eval_count_arg(node, lookup)?,
+                None => Some(usize::MAX),
+            };
+            let (Some(text), Some(start), Some(len)) = (text, start, len) else {
+                return Ok(Value::Null);
+            };
+            // `start` is 1-based; MySQL clamps a start of 0 to 1.
+            let skip = start.saturating_sub(1);
+            let taken: String = text.chars().skip(skip).take(len).collect();
+            Ok(Value::Str(taken))
+        }
+        other => Err(syntax(
+            format!(
+                "function `{other}` is not permitted; known functions: {}",
+                known_function_names().join(", ")
+            ),
+            0,
+        )),
+    }
+}
+
+/// `if(cond, then, else)`: the condition must be boolean; only the selected
+/// branch is evaluated (lazy), so a division by zero in the untaken branch
+/// never fires.
+fn eval_if(args: &[Node], lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value, ExprError> {
     let [cond, then, otherwise] = args else {
         return Err(syntax(
-            format!(
-                "function `{name}` expects 3 argument(s), got {}",
-                args.len()
-            ),
+            format!("function `if` expects 3 argument(s), got {}", args.len()),
             0,
         ));
     };
@@ -902,6 +991,46 @@ fn eval_call(
         Value::Bool(false) => eval(otherwise, lookup),
         other => Err(ExprError::NonBooleanPredicate {
             found: other.kind(),
+        }),
+    }
+}
+
+/// Evaluate the string argument shared by `right`/`left`/`substr`. A numeric
+/// argument where a string is expected is a type error, never a coercion;
+/// NULL propagates as `None` (the caller emits `Value::Null`, matching the
+/// three-valued-logic contract where NULL only turns into `NullResult` at
+/// the `eval_decimal` boundary).
+fn eval_string_arg(
+    node: &Node,
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Option<String>, ExprError> {
+    match eval(node, lookup)? {
+        Value::Str(text) => Ok(Some(text)),
+        Value::Null => Ok(None),
+        other => Err(ExprError::TypeMismatch {
+            op: "string function argument",
+            kind: other.kind(),
+        }),
+    }
+}
+
+/// Evaluate the non-negative integer count argument shared by
+/// `right`/`left`/`substr`.
+fn eval_count_arg(
+    node: &Node,
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Option<usize>, ExprError> {
+    match eval(node, lookup)? {
+        Value::Number(n) => usize::try_from(n)
+            .map(Some)
+            .map_err(|_| ExprError::TypeMismatch {
+                op: "string function count",
+                kind: "negative number",
+            }),
+        Value::Null => Ok(None),
+        other => Err(ExprError::TypeMismatch {
+            op: "string function count",
+            kind: other.kind(),
         }),
     }
 }
@@ -1049,6 +1178,24 @@ impl Expr {
             Value::Bool(flag) => Ok(flag),
             other => Err(ExprError::NonBooleanPredicate {
                 found: other.kind(),
+            }),
+        }
+    }
+
+    /// Evaluate as text, for string-function `derive` targets (issue #117).
+    /// The result must be a string; NULL propagates as `NullResult` so the
+    /// generator can write NULL with the same three-valued-logic contract
+    /// the numeric path uses.
+    pub fn eval_str(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<JsonValue>,
+    ) -> Result<String, ExprError> {
+        match eval(&self.root, lookup)? {
+            Value::Str(text) => Ok(text),
+            Value::Null => Err(ExprError::NullResult),
+            other => Err(ExprError::TypeMismatch {
+                op: "string result",
+                kind: other.kind(),
             }),
         }
     }
@@ -1239,6 +1386,106 @@ mod tests {
         assert!(
             message.contains("expects 3 argument"),
             "error must state arity: {message}"
+        );
+    }
+
+    // ─── String functions (#117: trade_no = concat('T', right(parent.
+    // check_type, 3))) ──────────────────────────────────────────────────
+
+    /// Evaluate to a raw Value so string results can be asserted directly.
+    fn eval_value(src: &str, pairs: &[(&str, Json)]) -> Result<Value, ExprError> {
+        let expr = Expr::parse(src).expect("expression must parse");
+        eval(&expr.root, &row(pairs))
+    }
+
+    #[test]
+    fn should_evaluate_concat_substr_right_left() {
+        // concat glues its arguments (issue #117: trade_no =
+        // concat('T', right(check_type, 3)) has the last 3 chars of
+        // trade_no come from check_type).
+        assert_eq!(
+            eval_value("concat('T', right(code, 3))", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("T123".to_string())
+        );
+        // right(s, n) takes the last n characters.
+        assert_eq!(
+            eval_value("right(code, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("123".to_string())
+        );
+        // left(s, n) takes the first n characters.
+        assert_eq!(
+            eval_value("left(code, 2)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("AB".to_string())
+        );
+        // substr(s, start) is 1-based to the end (MySQL semantics).
+        assert_eq!(
+            eval_value("substr(code, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("123".to_string())
+        );
+        // substr(s, start, len) takes len characters from start.
+        assert_eq!(
+            eval_value("substr(code, 2, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("B12".to_string())
+        );
+    }
+
+    #[test]
+    fn should_enforce_string_function_arities() {
+        // concat: 2..=N? The plan fixes concat(a, b) at exactly 2.
+        let err = Expr::parse("concat('a')").expect_err("must reject wrong arity");
+        assert!(
+            err.to_string().contains("argument"),
+            "arity error must state arguments: {err}"
+        );
+        // substr requires 2 or 3 args.
+        assert!(Expr::parse("substr(code)").is_err());
+        assert!(Expr::parse("substr(code, 1, 2, 3)").is_err());
+        // right/left require exactly 2.
+        assert!(Expr::parse("right(code)").is_err());
+        assert!(Expr::parse("left(code, 1, 2)").is_err());
+    }
+
+    #[test]
+    fn should_infer_string_function_results_as_string() {
+        use Ty;
+        assert_eq!(
+            Expr::parse("concat('T', right(code, 3))")
+                .unwrap()
+                .infer_type(),
+            Ty::String
+        );
+        assert_eq!(
+            Expr::parse("substr(code, 2)").unwrap().infer_type(),
+            Ty::String
+        );
+        assert_eq!(
+            Expr::parse("left(code, 2)").unwrap().infer_type(),
+            Ty::String
+        );
+    }
+
+    #[test]
+    fn should_null_propagate_string_functions() {
+        // NULL input: SQL three-valued logic keeps the result NULL.
+        assert_eq!(
+            eval_value("concat('T', right(code, 3))", &[("code", json!(null))]).expect("eval"),
+            Value::Null
+        );
+        assert_eq!(
+            eval_value("substr(code, 2)", &[("code", json!(null))]).expect("eval"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn should_reject_string_function_on_numeric_argument() {
+        // right() over a numeric column is a type mistake: fail with a clear
+        // type error rather than coercing.
+        let err = eval_value("right(code, 3)", &[("code", json!(123))])
+            .expect_err("numeric argument must be a type error");
+        assert!(
+            err.to_string().contains("string"),
+            "error must mention the string expectation: {err}"
         );
     }
 

@@ -1783,8 +1783,13 @@ struct DeriveStep {
     scale: Option<u8>,
     /// Output shape decided at plan time (issue #94): a Bool expression fills
     /// the column with the trained text literals ("true"/"false"); anything
-    /// else keeps the numeric path.
+    /// else keeps the numeric path. Issue #117 adds a third shape: a
+    /// statically-string expression (string functions) writes text directly.
     is_bool_output: bool,
+    /// Issue #117: a string-function expression (static `Ty::String`) fills
+    /// the target with the evaluated text via `eval_str` instead of the
+    /// decimal path.
+    is_string_output: bool,
 }
 
 /// A target column is a boolean target when its trained categorical
@@ -2051,6 +2056,7 @@ impl DerivePlan {
                 is_integer: column_model.and_then(|column| column.rounding) == Some(0),
                 scale: column_model.and_then(|column| column.decimal_scale),
                 is_bool_output: expr_ty == crate::synth::expr::Ty::Bool,
+                is_string_output: expr_ty == crate::synth::expr::Ty::String,
             });
         }
 
@@ -2070,8 +2076,7 @@ impl DerivePlan {
 
         for step in &self.steps {
             let lookup = |name: &str| -> Option<Value> {
-                if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent."))
-                {
+                if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent.")) {
                     // A NULL FK has no parent row: the qualified name
                     // behaves like SQL NULL (unknown-column contract).
                     // Short-circuit before the by_key lookup so a
@@ -2109,6 +2114,29 @@ impl DerivePlan {
                     )
                 })?;
                 row[step.index] = Value::String(flag.to_string());
+                continue;
+            }
+
+            // Issue #117: string-function expressions write text directly;
+            // NULL propagates with the same three-valued-logic contract as
+            // the numeric path (stage 6 recomputes the target, so a NULL
+            // input yields a NULL output).
+            if step.is_string_output {
+                let text = step.expr.eval_str(&lookup);
+                let value = match text {
+                    Ok(value) => value,
+                    Err(crate::synth::expr::ExprError::NullResult) => {
+                        row[step.index] = Value::Null;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "table '{}' derive '{}': {}",
+                            self.table_name, step.column, error
+                        ));
+                    }
+                };
+                row[step.index] = Value::String(value);
                 continue;
             }
 
@@ -6606,7 +6634,6 @@ tables:
     #[test]
     fn should_not_join_derive_through_null_keys_on_either_side() {
         let models = cross_table_models();
-        let par = single_rule("par", vec![]);
         let zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
 
         // Parent snapshot: two real rows plus one whose key is NULL (a
@@ -6659,6 +6686,139 @@ tables:
             "unknown FK must derive NULL, got {:?}",
             row_unknown_fk[1]
         );
+    }
+
+    /// R4 (issue #117 acceptance): `trade_no = concat('T',
+    /// right(parent.check_type, 3))` — every generated row's trade_no must
+    /// end in exactly the parent check_type's last 3 characters. This pins
+    /// the string-function whitelist end to end through the cross-table
+    /// snapshot: the child's trade_no column is trained categorical (so the
+    /// derive writes text), the parent's check_type is pinned to a small
+    /// value pool so the expected suffix is knowable per FK.
+    #[test]
+    fn should_derive_trade_no_suffix_from_parent_check_type_with_string_functions() {
+        let mut models = cross_table_models();
+        // Parent gains `check_type`: categorical over a fixed dictionary.
+        let par = models.remove("par").unwrap();
+        let mut par = par;
+        par.columns.insert(
+            "check_type".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec![
+                        "ALIPAY".to_string(),
+                        "WECHAT".to_string(),
+                        "UNIONPAY".to_string(),
+                    ],
+                    weights: vec![1.0 / 3.0; 3],
+                }),
+                ..Default::default()
+            },
+        );
+        let mut column_order = par.copula.column_order.clone();
+        column_order.push("check_type".to_string());
+        par.copula.column_order = column_order;
+        let dim = par.copula.correlation.len();
+        let mut correlation = vec![vec![0.0; dim + 1]; dim + 1];
+        for (i, row) in correlation.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        par.copula.correlation = correlation;
+        models.insert("par".to_string(), par);
+
+        // Child gains `trade_no`: categorical text target for the derive.
+        let zgh = models.remove("zgh").unwrap();
+        let mut zgh = zgh;
+        zgh.columns.insert(
+            "trade_no".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["TALIPAY".to_string(), "TWECHAT".to_string()],
+                    weights: vec![0.5, 0.5],
+                }),
+                ..Default::default()
+            },
+        );
+        let mut zgh_order = zgh.copula.column_order.clone();
+        zgh_order.push("trade_no".to_string());
+        zgh.copula.column_order = zgh_order;
+        let zdim = zgh.copula.correlation.len();
+        let mut zcorr = vec![vec![0.0; zdim + 1]; zdim + 1];
+        for (i, row) in zcorr.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        zgh.copula.correlation = zcorr;
+        models.insert("zgh".to_string(), zgh);
+
+        // Rules: parent check_type over the same 3-level pool; child
+        // trade_no = concat('T', right(parent.check_type, 3)).
+        let mut par_rule = single_rule("par", vec![]);
+        par_rule.rows = Some(20);
+        par_rule.columns.insert(
+            "check_type".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Uniform(vec![
+                    "ALIPAY".to_string(),
+                    "WECHAT".to_string(),
+                    "UNIONPAY".to_string(),
+                ])),
+                ..Default::default()
+            },
+        );
+        let mut zgh_rule = cross_table_rule_with_derive("parent.cjsl / 1000");
+        if let Some(rel) = zgh_rule.relationships.first_mut() {
+            rel.derive.push(crate::synth::rules::DeriveRule {
+                column: "trade_no".to_string(),
+                expr: "concat('T', right(parent.check_type, 3))".to_string(),
+            });
+        }
+        zgh_rule.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par_rule, zgh_rule],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 60)).unwrap();
+        let check_type_by_id: HashMap<String, String> = data.tables["par"]
+            .iter()
+            .map(|row| {
+                (
+                    row[0].to_string(),
+                    row[2].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+
+        for row in data.tables.get("zgh").unwrap() {
+            let fk = &row[0];
+            let trade_no = row[2].as_str().expect("trade_no must be text");
+            let check_type = check_type_by_id
+                .get(&fk.to_string())
+                .expect("fk must exist in the parent snapshot");
+            let expected_suffix: String = check_type
+                .chars()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert!(
+                trade_no.ends_with(&expected_suffix) && trade_no.starts_with('T'),
+                "trade_no '{trade_no}' must be concat('T', right('{check_type}', 3)) = \
+                 T{expected_suffix}"
+            );
+        }
     }
 
     #[test]

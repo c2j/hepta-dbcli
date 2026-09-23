@@ -728,8 +728,8 @@ mod tests {
         // two correlated columns each, plus one clamped beyond |1| to force a
         // negative eigenvalue on top of singularity.
         let mut correlation = vec![vec![0.0f64; dim]; dim];
-        for i in 0..dim {
-            correlation[i][i] = 1.0;
+        for (i, row) in correlation.iter_mut().enumerate() {
+            row[i] = 1.0;
         }
         for block in 0..6 {
             let (a, b) = (block * 2, block * 2 + 1);
@@ -782,14 +782,19 @@ mod tests {
     #[test]
     fn jacobi_decomposition_converges_on_a_twelve_by_twelve_matrix() {
         let dim = 12usize;
-        let mut matrix = vec![vec![0.0f64; dim]; dim];
-        for i in 0..dim {
-            matrix[i][i] = 1.0;
-            for j in (i + 1)..dim {
-                let value = 0.5 - (i + j) as f64 * 0.01;
-                matrix[i][j] = value;
-                matrix[j][i] = value;
-            }
+        let mut matrix: Vec<Vec<f64>> = (0..dim)
+            .map(|i| {
+                let mut row = vec![0.0f64; dim];
+                row[i] = 1.0;
+                row
+            })
+            .collect();
+        let pairs: Vec<(usize, usize, f64)> = (0..dim)
+            .flat_map(|i| (i + 1..dim).map(move |j| (i, j, 0.5 - (i + j) as f64 * 0.01)))
+            .collect();
+        for (i, j, value) in pairs {
+            matrix[i][j] = value;
+            matrix[j][i] = value;
         }
         let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix);
 
