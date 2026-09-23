@@ -473,6 +473,7 @@ fn infer_type(node: &Node) -> Ty {
             match (infer_type(then), infer_type(otherwise)) {
                 (Ty::Number, Ty::Number) => Ty::Number,
                 (Ty::String, Ty::String) => Ty::String,
+                (Ty::Bool, Ty::Bool) => Ty::Bool,
                 _ => Ty::Unknown,
             }
         }
@@ -1191,6 +1192,32 @@ mod tests {
         assert_eq!(
             Expr::parse("if(a == 1, 10, 20)").unwrap().infer_type(),
             Ty::Number
+        );
+    }
+
+    // Issue #94 follow-up: `if()` whose branches are themselves comparisons
+    // must infer Bool, or DerivePlan::build misclassifies the expression as
+    // Unknown and the runtime fails with a misleading decimal/boolean error.
+    #[test]
+    fn should_infer_if_with_bool_branches_as_bool() {
+        use Ty;
+        assert_eq!(
+            Expr::parse("if(a == 1, b > 1, b < 2)")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(
+            Expr::parse("if(a > 1, b == 'x', c == 'y')")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(
+            Expr::parse("if(a > 1, b == 'x', c == 'y') && d > 0")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
         );
     }
 
