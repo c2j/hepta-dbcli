@@ -391,11 +391,12 @@ pub(crate) fn project_to_correlation(matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 /// diagonal. Repeats while negative eigenvalues remain because the diagonal
 /// rescale can reintroduce small negative ones.
 ///
-/// The old implementation raised every diagonal entry to
-/// `sum(|off-diagonal|) + eps` (diagonal dominance). That keeps Cholesky
-/// happy but destroys the correlation structure: a matrix with ρ = 0.95 got
-/// its diagonal inflated to ~4, and the sampled correlation shrank by the
-/// same factor (issue #89 S2a).
+/// The old implementation forced diagonal dominance: any diagonal smaller
+/// than its row's off-diagonal absolute sum was raised to that sum plus
+/// eps. On strongly correlated blocks that inflates the diagonal several
+/// fold (the M1 fixture stored a diagonal of 4.065 for ρ = 1.0 columns),
+/// and the copula then shrank every generated correlation by roughly the
+/// same factor, ρ = 1.0 sampling near 0.25 (issue #89 S2a).
 fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     let dim = matrix.len();
 
@@ -651,9 +652,11 @@ mod tests {
 
     #[test]
     fn should_preserve_correlation_structure_of_psd_matrix() {
-        // Issue #89 S2a: the old ensure_psd raised every diagonal to
-        // sum(|off-diagonal|) + eps, so a strongly correlated matrix
-        // (rho = 0.95) came out sampled at rho/diag ~ 0.25. A PSD input
+        // Issue #89 S2a: the old ensure_psd raised any diagonal below its
+        // row's off-diagonal absolute sum to that sum plus eps. For the
+        // matrix below the diagonals were inflated to 1.80/1.75/1.65, so
+        // the correlated pairs sampled at rho/diag ~ 0.53/0.49/0.46
+        // instead of their requested strengths. A PSD input
         // must pass through the projection unchanged: the sampled uniforms
         // (Gaussian rank -> Pearson on the z-scale) must reproduce the
         // requested rho within tight tolerance, not a shrunk fraction.
