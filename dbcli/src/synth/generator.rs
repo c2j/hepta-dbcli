@@ -1887,6 +1887,12 @@ impl DerivePlan {
                 let mut by_key: HashMap<Value, Value> = HashMap::new();
                 for parent_row in snapshot.rows {
                     let key = parent_row.get(key_index).cloned().unwrap_or(Value::Null);
+                    // SQL semantics: a NULL key never joins. Indexing the
+                    // NULL-keyed row would let a NULL child FK "find" this
+                    // row and derive from it.
+                    if key.is_null() {
+                        continue;
+                    }
                     let cell = parent_row.get(column_index).cloned().unwrap_or(Value::Null);
                     by_key.insert(key, cell);
                 }
@@ -2015,10 +2021,16 @@ impl DerivePlan {
                     {
                         // A NULL FK has no parent row: the qualified name
                         // behaves like SQL NULL (unknown-column contract).
+                        // Short-circuit before the by_key lookup so a
+                        // NULL-keyed snapshot row (if any slipped in) can
+                        // never satisfy the join.
                         let fk = self
                             .index_of
                             .get(&cross.fk_column)
                             .and_then(|index| row.get(*index))?;
+                        if fk.is_null() {
+                            return None;
+                        }
                         return cross
                             .columns
                             .get(name)
@@ -6386,6 +6398,71 @@ tables:
             );
             assert!(row[1].is_null(), "vol must follow the NULL FK: {row:?}");
         }
+    }
+
+    /// Re-review bug (PR #120): the parent snapshot's by_key map inserted
+    /// rows whose parent key is NULL, so a NULL child FK could "find" a
+    /// dirty row and derive a value from it. SQL semantics: a NULL key never
+    /// joins. `generate()` itself cannot produce this state (referenced
+    /// columns are forced non-NULL), but rules that pin a NULL parent key
+    /// (`!fixed null`) reach the snapshot verbatim, so the contract is
+    /// anchored at `DerivePlan` directly.
+    #[test]
+    fn should_not_join_derive_through_null_keys_on_either_side() {
+        let models = cross_table_models();
+        let par = single_rule("par", vec![]);
+        let zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+
+        // Parent snapshot: two real rows plus one whose key is NULL (a
+        // `!fixed null` pin produces exactly this payload).
+        let par_columns = vec!["id".to_string(), "cjsl".to_string()];
+        let par_rows = vec![
+            vec![Value::from(1), Value::from(10_000)],
+            vec![Value::from(2), Value::from(20_000)],
+            vec![Value::Null, Value::from(30_000)],
+        ];
+        let snapshots = vec![ParentTableSnapshot {
+            table: "par",
+            rows: &par_rows,
+            column_order: &par_columns,
+        }];
+
+        let plan = DerivePlan::build(
+            "zgh",
+            &zgh,
+            &models["zgh"],
+            &["fk".to_string(), "vol".to_string()],
+            &snapshots,
+        )
+        .expect("plan must build");
+
+        // NULL FK cell: the derivation must stay NULL even though the
+        // snapshot holds a NULL-keyed row that a naive by_key lookup hits.
+        let mut row_null_fk = vec![Value::Null, Value::from(0.0)];
+        plan.apply_to_row(&mut row_null_fk).unwrap();
+        assert!(
+            row_null_fk[1].is_null(),
+            "NULL FK must derive NULL, got {:?}",
+            row_null_fk[1]
+        );
+
+        // A real FK still joins through the non-NULL rows only.
+        let mut row_real_fk = vec![Value::from(2), Value::from(0.0)];
+        plan.apply_to_row(&mut row_real_fk).unwrap();
+        let got = row_real_fk[1].as_f64().expect("derived vol numeric");
+        assert!(
+            (got - 20.0).abs() < 1e-6,
+            "fk=2 must mirror parent.cjsl/1000 = 20.0, got {got}"
+        );
+
+        // Unknown (non-NULL) FK derives NULL as before.
+        let mut row_unknown_fk = vec![Value::from(7), Value::from(0.0)];
+        plan.apply_to_row(&mut row_unknown_fk).unwrap();
+        assert!(
+            row_unknown_fk[1].is_null(),
+            "unknown FK must derive NULL, got {:?}",
+            row_unknown_fk[1]
+        );
     }
 
     #[test]
