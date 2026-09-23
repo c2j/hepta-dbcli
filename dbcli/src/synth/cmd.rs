@@ -395,7 +395,7 @@ pub(crate) fn build_model_with_overrides(
                     .collect()
             })
             .collect();
-        compute_gaussian_correlation(&projected, &column_order, &columns)
+        compute_gaussian_correlation(&projected, &column_order, &columns)?
     } else {
         (0..n)
             .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
@@ -720,6 +720,9 @@ pub fn run_generate(
         // branch only, see issue #82).
         generate(&models, &rules, &config)?
     };
+    for warning in &data.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let export_format = match format {
         "csv" => ExportFormat::Csv,

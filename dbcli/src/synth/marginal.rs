@@ -809,17 +809,17 @@ pub fn compute_gaussian_correlation(
     rows: &[Vec<serde_json::Value>],
     column_order: &[String],
     columns: &HashMap<String, ColumnModel>,
-) -> Vec<Vec<f64>> {
+) -> Result<Vec<Vec<f64>>, String> {
     let n_cols = column_order.len();
     let n_rows = rows.len();
     if n_rows < 2 || n_cols == 0 {
-        return (0..n_cols)
+        return Ok((0..n_cols)
             .map(|i| {
                 (0..n_cols)
                     .map(|j| if i == j { 1.0 } else { 0.0 })
                     .collect()
             })
-            .collect();
+            .collect());
     }
 
     let mut gaussian_data = vec![vec![None; n_rows]; n_cols];
@@ -1211,7 +1211,8 @@ mod tests {
             ("b".to_string(), normal_column_model(73.5, 45.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "linear columns must correlate strongly, got {}",
@@ -1260,7 +1261,8 @@ mod tests {
             ("amt".to_string(), normal_column_model(20.0, 8.2)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.5,
             "numeric-categorical column must correlate with its numeric partner, got {}",
@@ -1285,7 +1287,8 @@ mod tests {
             ("b".to_string(), normal_column_model(73.5, 45.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "numeric strings must still correlate, got {}",
@@ -1309,7 +1312,8 @@ mod tests {
             ("b".to_string(), normal_column_model(50.0, 1.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1].abs() < 0.2,
             "alternating column must be ~uncorrelated, got {}",
@@ -1342,7 +1346,8 @@ mod tests {
             ("c".to_string(), normal_column_model(171.5, 105.0)),
         ]);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         for (i, row) in corr.iter().enumerate() {
             assert!(
                 (row[i] - 1.0).abs() < 1e-9,
@@ -1430,7 +1435,8 @@ mod tests {
             .collect();
         let fill_hand = pearson(&filled_a, &filled_b);
 
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             (corr[0][1] - pairwise_hand).abs() < 1e-6,
             "expected pairwise-complete Pearson {pairwise_hand}, got {}",
@@ -1793,7 +1799,8 @@ mod tests {
             .map(|(&x, &y)| vec![serde_json::Value::from(x), serde_json::Value::from(y)])
             .collect();
         let order = vec!["a".to_string(), "b".to_string()];
-        let corr = compute_gaussian_correlation(&rows, &order, &columns);
+        let corr = compute_gaussian_correlation(&rows, &order, &columns)
+            .expect("correlation must compute");
         assert!(
             corr[0][1] > 0.99,
             "monotone pair must correlate, got {}",

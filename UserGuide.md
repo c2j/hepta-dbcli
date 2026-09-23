@@ -1060,7 +1060,7 @@ FK 组合，`!density` 让 FK 取值频率贴合子表自己的经验分布。�
 | `modeled` | 逐父键按 `fk_cardinality` 采样子行数，**子表行数由分布求和得出**（`--rows` 对这张表不再生效，父表仍是 `--rows`）；FK 值按父键成块写入，不再逐行独立采样 |
 
 - 模型里没有对应 `fk_cardinality`（旧模型或未训练）时 `generate` 直接报错，不会静默退回固定行数；
-- `unique: true` 的 1:1 关系把每个父键的子行数截断到 0/1，保证父值不被重复引用；
+- `unique: true` 的 1:1 关系把每个父键的子行数截断到 0/1，保证父值不被重复引用；学到的分布里出现扇出 > 1 时会打**截断告警**（点名表.关系列并给出 `unique: false` 出口），不会静默丢弃行，也不会报错拒绝；
 - NULL 外键份额按训练期 `null_share` 复现，NULL 行不计入任何父键的基数；
 - 每张表最多一个 `cardinality: modeled` 关系（多个会报错）；
 - 训练分布与实际生成的基数对比见 `synth report` 的 fk 行（`cardinality tv`，越小越接近）。
@@ -1426,6 +1426,7 @@ esac
 | synth ``--tables entry 'x.y' uses schema-qualified `schema.table` notation`` | `--tables` 写了 `schema.table` 点号形式（fail-fast 拒绝） | 拆开：`--tables customer --schema staging` |
 | synth `unique FK '...' requests N unique value(s) but its parent pool '...' holds only M generated value(s)` | `unique: true` 父表生成行数（或训练观测容量）< 请求行数 | 按报错里的两条线索：父表 rules 行数不够就增大行数，训练观测不够就增大 train `--sample` 重训；也可改 `unique: false` 或给父键配 `values` 池（见 §10.5 已知限制 5） |
 | synth rules-draft 报 `warning: draft references form a cycle` | 残余的隐式误报关系成环（同名时间戳已被跳过；自引用也已被跳过） | 按警告提示手工删除 draft YAML 中的伪 relationship（见 §10.5 已知限制 3） |
+| synth generate 报 `warning: table '…' relationship '…': the learned cardinality has fan-outs up to N …` | `cardinality: modeled` + `unique: true` 的关系在训练数据里存在一个父键对应多个子行（1:>N），生成把每个父键截断到 0/1 个子行 | 数据确实 1:1 就忽略告警；要复现扇出就改 `unique: false` |
 | synth derive 报 `boolean expression`/`boolean column` 类型不匹配（点名表.列） | derive 表达式结果类型与目标列档位不兼容（布尔表达式配数值列，或数值/字符串表达式配 `true`/`false` 布尔列） | 按提示改成同类型表达式；布尔真值应配布尔目标列（#94 起支持），或用 `if(cond, '1', '0')` 把结果编码成目标列的类型（见 §10.5 已知限制 6） |
 | synth derive 报 `function \`xxx\` is not permitted; known functions: if` | 用了白名单外的函数 | 首批白名单仅 `if`，其余函数暂不支持（见 §10.5 已知限制 6） |
 | GaussDB synth 连接报 `unknown option currentSchema` | URL 查询参数不被 gaussdb 驱动接受 | 去掉参数，改用 `--schema` |

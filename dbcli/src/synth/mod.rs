@@ -815,34 +815,15 @@ fn learned_cardinality(
 /// Learn each child table's rows-per-parent distribution and store it in the
 /// child's model (issue #72). Runs after the training loop because a parent
 /// key's distinct count may come from a table trained after its child.
-/// S4③ (issue #89): a foreign-key column that is also the child's primary
-/// key promises "each parent key has exactly one child"; a learned fan-out
-/// above 1 (1:>1) breaks that promise and would make `rules-draft` infer a
-/// wrong `unique: true` projection. Returns the warning text, or `None` when
-/// the shape is consistent.
-#[cfg(feature = "synth")]
-fn unique_fanout_warning(
-    from_table: &str,
-    from_column: &str,
-    distribution: &crate::synth::cardinality::CardinalityDist,
-    model_pk: &[String],
-) -> Option<String> {
-    if !model_pk.iter().any(|key| key == from_column) {
-        return None;
-    }
-    let max_fanout = distribution.counts.keys().next_back().copied()?;
-    if max_fanout <= 1 {
-        return None;
-    }
-    Some(format!(
-        "warning: table '{}' column '{}' is a primary key but the sampled data shows \
-         a parent key with up to {} children (1:>1); rules-draft would mark this \
-         relationship unique and generate would reject the fan-out — check the data \
-         or override the rules",
-        from_table, from_column, max_fanout
-    ))
-}
-
+///
+/// PR #120 review r7: the former train-side pk-shaped-fanout warning was
+/// removed. Its premise did not hold: a fan-out above 1 makes the child
+/// column non-unique (cardinality < row_count), so rules-draft's
+/// `is_unique` — which reads exactly that cardinality — can never mark the
+/// relationship `unique: true`, and for a PK column a fan-out > 1 is
+/// impossible by definition. The real 1:>1 contradiction is warned about
+/// at generate time, where `unique: true` actually meets the learned
+/// distribution (`generator::unique_truncation_warning`).
 #[cfg(feature = "synth")]
 fn attach_fk_cardinality(
     output_dir: &Path,
@@ -882,11 +863,6 @@ fn attach_fk_cardinality(
         };
         if !model.columns.contains_key(&fk.from_column) {
             continue;
-        }
-        if let Some(warning) =
-            unique_fanout_warning(&fk.from_table, &fk.from_column, &distribution, &model.pk)
-        {
-            eprintln!("{warning}");
         }
         model
             .fk_cardinality
@@ -2507,52 +2483,52 @@ mod tests {
         );
     }
 
-    /// S4③ (issue #89): a foreign-key column that is also the child's
-    /// primary key promises "each parent key has exactly one child". When
-    /// the learned distribution shows a parent with more than one child
-    /// (1:>1), that promise is broken and `rules-draft` would infer a wrong
-    /// `unique: true` projection. Training must warn so the data owner can
-    /// fix either the key or the rules.
+    /// S4③ (issue #89), PR #120 review r7: the 1:>1 contradiction between a
+    /// `unique: true` relationship and the learned fan-out is warned about
+    /// at *generate* time (see generator::unique_truncation_warning), not
+    /// at train time. The old train-side pk-shaped warning was removed: a
+    /// fan-out > 1 makes the child column non-unique, so rules-draft's
+    /// `is_unique` (cardinality == row_count) would never have marked it
+    /// `unique: true`, and a PK column cannot have a fan-out > 1 at all.
+    /// Learning itself is unaffected: a fan-out > 1 distribution still
+    /// attaches to the model unchanged.
     #[test]
-    fn should_warn_when_a_pk_shaped_fk_column_has_fanout_greater_than_one() {
-        let distribution =
-            crate::synth::cardinality::CardinalityDist::from_counts([1, 2, 1], 3, 0.0)
-                .expect("distribution with a 2-fanout parent");
+    fn fanout_above_one_attaches_without_train_side_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = categorical_model("orders", &[("user_id", &["1", "2", "9"])]);
+        child.save(&dir.path().join("orders.model.json")).unwrap();
 
-        let warning = unique_fanout_warning(
-            "orders",
-            "order_id",
-            &distribution,
-            &["order_id".to_string()],
+        let foreign_keys = vec![crate::synth::rules_draft::ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let mut fk_values = HashMap::new();
+        fk_values.insert(
+            ("orders".to_string(), "user_id".to_string()),
+            vec![
+                serde_json::Value::from(1),
+                serde_json::Value::from(1),
+                serde_json::Value::from(2),
+            ],
         );
-        let warning = warning.expect("a PK column with fan-out > 1 must warn");
+        let mut key_distinct = HashMap::new();
+        key_distinct.insert(("users".to_string(), "id".to_string()), 3usize);
+
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, true)
+            .expect("fan-out learning must not fail");
+
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        let dist = reloaded
+            .fk_cardinality
+            .get("user_id")
+            .expect("fan-out > 1 distribution must still be learned");
         assert!(
-            warning.contains("'orders'")
-                && warning.contains("'order_id'")
-                && warning.contains("1:>1"),
-            "warning must name the column and the 1:>1 contradiction, got: {warning}"
+            dist.counts.keys().next_back().copied() >= Some(2),
+            "the learned distribution must keep its fan-out above one"
         );
-
-        // Control: the same fan-out on a non-PK FK column is a normal
-        // one-to-many relationship and must stay silent.
-        assert!(unique_fanout_warning(
-            "orders",
-            "user_id",
-            &distribution,
-            &["order_id".to_string()]
-        )
-        .is_none());
-
-        // Control: a true 1:1 PK-FK distribution never warns.
-        let one_to_one = crate::synth::cardinality::CardinalityDist::from_counts([1, 1, 1], 3, 0.0)
-            .expect("1:1 distribution");
-        assert!(unique_fanout_warning(
-            "orders",
-            "order_id",
-            &one_to_one,
-            &["order_id".to_string()]
-        )
-        .is_none());
     }
 
     /// S4④ (issue #89): time cardinality modeling on 100k parent keys and

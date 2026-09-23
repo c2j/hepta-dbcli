@@ -12,16 +12,16 @@ pub struct GaussianCopula {
 }
 
 impl GaussianCopula {
-    pub fn new(correlation: Vec<Vec<f64>>) -> Self {
+    pub fn new(correlation: Vec<Vec<f64>>) -> Result<Self, String> {
         let dim = correlation.len();
-        let matrix = ensure_psd(correlation);
+        let matrix = ensure_psd(correlation)?;
         let cholesky = cholesky_decomposition(&matrix);
 
-        Self {
+        Ok(Self {
             dimension: dim,
             matrix,
             cholesky,
-        }
+        })
     }
 
     pub fn sample(&self, n: usize, seed: Option<u64>) -> Vec<Vec<f64>> {
@@ -382,7 +382,7 @@ pub(crate) fn normal_quantile(p: f64) -> f64 {
 /// Public PSD projection for callers that build correlation matrices outside
 /// this module (e.g. `marginal::compute_gaussian_correlation`). Symmetric
 /// input is projected as-is; unit diagonals come back unit.
-pub(crate) fn project_to_correlation(matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+pub(crate) fn project_to_correlation(matrix: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     ensure_psd(matrix)
 }
 
@@ -397,7 +397,7 @@ pub(crate) fn project_to_correlation(matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 /// fold (the M1 fixture stored a diagonal of 4.065 for ρ = 1.0 columns),
 /// and the copula then shrank every generated correlation by roughly the
 /// same factor, ρ = 1.0 sampling near 0.25 (issue #89 S2a).
-fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
     let dim = matrix.len();
 
     // Symmetrize via an upper-triangle snapshot so the write to row j does
@@ -415,7 +415,7 @@ fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     }
 
     for _ in 0..PSD_PROJECTION_ROUNDS {
-        let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix);
+        let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix)?;
         let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
         if min_eigenvalue >= -PSD_EIGENVALUE_TOLERANCE {
             break;
@@ -453,10 +453,17 @@ fn ensure_psd(mut matrix: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
         matrix = projected;
     }
 
-    matrix
+    Ok(matrix)
 }
 
 const PSD_PROJECTION_ROUNDS: usize = 10;
+/// Off-diagonal convergence threshold for the Jacobi sweep loop.
+const JACOBI_SWEEP_TOLERANCE: f64 = 1e-12;
+
+/// Sweep budget for the cyclic Jacobi decomposition. Copula-scale matrices
+/// converge in a handful of sweeps; 60 leaves a wide margin.
+const MAX_JACOBI_SWEEPS: usize = 60;
+
 const PSD_EIGENVALUE_TOLERANCE: f64 = 1e-12;
 const PSD_EIGENVALUE_FLOOR: f64 = 1e-10;
 
@@ -467,10 +474,23 @@ const PSD_EIGENVALUE_FLOOR: f64 = 1e-10;
 /// rotations), not one rotation to the largest pair. Jacobi converges
 /// quadratically once the off-diagonal mass is small, so a handful of sweeps
 /// drives the largest off-diagonal entry below `JACOBI_SWEEP_TOLERANCE` for
-/// the copula-scale matrices this codebase builds; the loop keeps sweeping
-/// until that holds, and returns the actual diagonal only then.
-fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
-    const MAX_SWEEPS: usize = 60;
+/// the copula-scale matrices this codebase builds. If the sweep budget is
+/// exhausted before that holds, the diagonal is *not* a spectrum: returning
+/// it would let `ensure_psd` clip a fake spectrum and silently produce a
+/// matrix that is far from the nearest PSD projection. That case is an
+/// error instead (`max_off_diagonal` is reported so the matrix can be
+/// diagnosed).
+fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> Result<(Vec<f64>, Vec<Vec<f64>>), String> {
+    jacobi_eigen_decomposition_with(matrix, MAX_JACOBI_SWEEPS)
+}
+
+/// Injected-sweep-cap variant; the test seam that lets a Red test force
+/// non-convergence deterministically instead of relying on a huge
+/// adversarial matrix.
+fn jacobi_eigen_decomposition_with(
+    matrix: &[Vec<f64>],
+    max_sweeps: usize,
+) -> Result<(Vec<f64>, Vec<Vec<f64>>), String> {
     let dim = matrix.len();
     let mut a: Vec<Vec<f64>> = matrix.to_vec();
     let mut v: Vec<Vec<f64>> = vec![vec![0.0; dim]; dim];
@@ -479,7 +499,7 @@ fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) 
     }
 
     if dim > 1 {
-        for _ in 0..MAX_SWEEPS {
+        for _ in 0..max_sweeps {
             // Off-diagonal mass before the sweep; convergence is judged on
             // the *post-sweep* state below.
             for p in 0..dim {
@@ -545,14 +565,34 @@ fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) 
                         .map(move |(_, value)| value.abs())
                 })
                 .fold(0.0f64, f64::max);
-            if max_off_diagonal < 1e-12 {
-                break;
+            if max_off_diagonal < JACOBI_SWEEP_TOLERANCE {
+                let eigenvalues = a.iter().enumerate().map(|(i, row)| row[i]).collect();
+                return Ok((eigenvalues, v));
             }
         }
+        // Sweep budget exhausted without reaching the tolerance: the
+        // diagonal is not a spectrum. Fail loudly instead of feeding a
+        // fake spectrum to the PSD clip.
+        let max_off_diagonal = a
+            .iter()
+            .enumerate()
+            .flat_map(|(i, row)| {
+                row.iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .map(move |(_, value)| value.abs())
+            })
+            .fold(0.0f64, f64::max);
+        return Err(format!(
+            "Jacobi eigen decomposition did not converge within {max_sweeps} sweeps \
+             (max off-diagonal |entry| = {max_off_diagonal:.3e}, tolerance \
+             {JACOBI_SWEEP_TOLERANCE:.0e}); the correlation matrix is too far from PSD \
+             to project reliably"
+        ));
     }
 
     let eigenvalues = a.iter().enumerate().map(|(i, row)| row[i]).collect();
-    (eigenvalues, v)
+    Ok((eigenvalues, v))
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -628,7 +668,7 @@ mod tests {
             vec![0.0, 1.0, 0.0],
             vec![0.0, 0.0, 1.0],
         ];
-        let copula = GaussianCopula::new(correlation);
+        let copula = GaussianCopula::new(correlation).expect("copula must construct");
         let samples = copula.sample(100, Some(42));
         assert_eq!(samples.len(), 3);
         assert_eq!(samples[0].len(), 100);
@@ -637,13 +677,13 @@ mod tests {
     #[test]
     fn copula_handles_non_psd_matrix() {
         let correlation = vec![vec![1.0, 0.9], vec![0.9, 0.5]];
-        let _copula = GaussianCopula::new(correlation);
+        let _copula = GaussianCopula::new(correlation).expect("copula must construct");
     }
 
     #[test]
     fn copula_sampling_preserves_correlation() {
         let correlation = vec![vec![1.0, 0.8], vec![0.8, 1.0]];
-        let copula = GaussianCopula::new(correlation);
+        let copula = GaussianCopula::new(correlation).expect("copula must construct");
         let samples = copula.sample(10000, Some(42));
 
         let corr = pearson_correlation(&samples[0], &samples[1]);
@@ -665,7 +705,7 @@ mod tests {
             vec![0.95, 1.0, 0.80],
             vec![0.85, 0.80, 1.0],
         ];
-        let copula = GaussianCopula::new(correlation);
+        let copula = GaussianCopula::new(correlation).expect("copula must construct");
         let samples = copula.sample(60_000, Some(7));
 
         // Uniforms from a Gaussian copula with parameter rho have Pearson
@@ -689,7 +729,7 @@ mod tests {
         // must clip eigenvalues, not raise the diagonal: the output stays a
         // correlation matrix (unit diagonal, symmetric, PSD).
         let correlation = vec![vec![1.0, 0.95], vec![0.95, 0.5]];
-        let projected = ensure_psd(correlation);
+        let projected = ensure_psd(correlation).expect("projection must succeed");
 
         for (i, row) in projected.iter().enumerate() {
             assert!(
@@ -743,7 +783,7 @@ mod tests {
         correlation[0][dim - 1] = 1.2;
         correlation[dim - 1][0] = 1.2;
 
-        let projected = ensure_psd(correlation);
+        let projected = ensure_psd(correlation).expect("projection must succeed");
 
         // Unit diagonal, symmetric.
         for (i, row) in projected.iter().enumerate() {
@@ -768,7 +808,7 @@ mod tests {
         // non-negative; if Jacobi did not converge, the returned "eigen-
         // values" are the diagonal of a matrix that still has large
         // off-diagonal mass and this assertion becomes flaky-by-design.
-        let (eigenvalues, _) = jacobi_eigen_decomposition(&projected);
+        let (eigenvalues, _) = jacobi_eigen_decomposition(&projected).expect("must converge");
         let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
         assert!(
             min_eigenvalue > -1e-8,
@@ -799,7 +839,8 @@ mod tests {
             matrix[i][j] = value;
             matrix[j][i] = value;
         }
-        let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix);
+        let (eigenvalues, eigenvectors) =
+            jacobi_eigen_decomposition(&matrix).expect("must converge");
 
         // Reconstruct A' = V diag V^T and compare with the input.
         let mut rebuilt = vec![vec![0.0f64; dim]; dim];
@@ -822,6 +863,85 @@ mod tests {
         );
     }
 
+    /// PR #120 review r7 bug: when the sweep budget is exhausted without
+    /// reaching the off-diagonal tolerance, the function must fail instead
+    /// of returning the diagonal of a still-undigonalized matrix as the
+    /// spectrum (which `ensure_psd` would then clip as if it were real
+    /// eigenvalues). The sweep cap is injected so the test can force
+    /// non-convergence deterministically instead of relying on a huge
+    /// adversarial matrix.
+    #[test]
+    fn should_fail_when_the_sweep_budget_is_exhausted_without_convergence() {
+        let dim = 12usize;
+        let mut matrix: Vec<Vec<f64>> = (0..dim)
+            .map(|i| {
+                let mut row = vec![0.0f64; dim];
+                row[i] = 1.0;
+                row
+            })
+            .collect();
+        let pairs: Vec<(usize, usize, f64)> = (0..dim)
+            .flat_map(|i| (i + 1..dim).map(move |j| (i, j, 0.5 - (i + j) as f64 * 0.01)))
+            .collect();
+        for (i, j, rho) in pairs {
+            matrix[i][j] = rho;
+            matrix[j][i] = rho;
+        }
+        // Zero sweeps can never converge on an off-diagonal matrix.
+        let err = jacobi_eigen_decomposition_with(&matrix, 0)
+            .expect_err("an exhausted sweep budget must be an error, not a fake spectrum");
+        assert!(
+            err.contains("converge") || err.contains("convergence"),
+            "error must state the convergence failure: {err}"
+        );
+    }
+
+    /// The public decomposition keeps converging on the matrices this
+    /// codebase builds: the error path above must not reject honest input.
+    #[test]
+    fn should_still_converge_on_a_typical_correlation_matrix() {
+        let dim = 12usize;
+        let mut matrix: Vec<Vec<f64>> = (0..dim)
+            .map(|i| {
+                let mut row = vec![0.0f64; dim];
+                row[i] = 1.0;
+                row
+            })
+            .collect();
+        let pairs: Vec<(usize, usize, f64)> = (0..dim)
+            .flat_map(|i| (i + 1..dim).map(move |j| (i, j, 0.5 - (i + j) as f64 * 0.01)))
+            .collect();
+        for (i, j, rho) in pairs {
+            matrix[i][j] = rho;
+            matrix[j][i] = rho;
+        }
+        let (eigenvalues, eigenvectors) =
+            jacobi_eigen_decomposition(&matrix).expect("must converge");
+        let mut rebuilt = vec![vec![0.0f64; dim]; dim];
+        for k in 0..dim {
+            for x in 0..dim {
+                for y in 0..dim {
+                    rebuilt[x][y] += eigenvalues[k] * eigenvectors[x][k] * eigenvectors[y][k];
+                }
+            }
+        }
+        let max_error = rebuilt
+            .iter()
+            .zip(matrix.iter())
+            .map(|(rb_row, m_row)| {
+                rb_row
+                    .iter()
+                    .zip(m_row.iter())
+                    .map(|(rb, m)| (rb - m).abs())
+                    .fold(0.0f64, f64::max)
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_error < 1e-9,
+            "decomposition must reproduce the input, max error {max_error}"
+        );
+    }
+
     #[test]
     fn cholesky_produces_lower_triangular() {
         let matrix = vec![vec![4.0, 2.0], vec![2.0, 3.0]];
@@ -833,7 +953,8 @@ mod tests {
 
     #[test]
     fn should_pin_fixed_dimension_to_requested_z() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]])
+            .expect("copula must construct");
         let samples = copula
             .sample_with_fixed_z(8, &[(0, 0.5)], Some(42))
             .unwrap();
@@ -847,7 +968,8 @@ mod tests {
 
     #[test]
     fn should_condition_free_dimension_on_fixed_z() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.8], vec![0.8, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.8], vec![0.8, 1.0]])
+            .expect("copula must construct");
         let samples = copula
             .sample_with_fixed_z(20000, &[(0, 1.0)], Some(7))
             .unwrap();
@@ -860,7 +982,8 @@ mod tests {
 
     #[test]
     fn should_reject_fixed_dimension_out_of_range() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("copula must construct");
         let error = copula
             .sample_with_fixed_z(4, &[(5, 0.0)], Some(1))
             .unwrap_err();
@@ -869,7 +992,8 @@ mod tests {
 
     #[test]
     fn should_reject_duplicate_fixed_dimensions() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("copula must construct");
         let error = copula
             .sample_with_fixed_z(4, &[(0, 0.0), (0, 1.0)], Some(1))
             .unwrap_err();
@@ -878,7 +1002,8 @@ mod tests {
 
     #[test]
     fn should_reject_fixed_uniform_outside_open_unit_interval() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("copula must construct");
         assert!(copula
             .sample_with_fixed_uniforms(4, &[(0, 1.0)], Some(1))
             .is_err());
@@ -889,7 +1014,8 @@ mod tests {
 
     #[test]
     fn should_round_trip_fixed_uniform_through_inverse_normal() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.3], vec![0.3, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.3], vec![0.3, 1.0]])
+            .expect("copula must construct");
         let samples = copula
             .sample_with_fixed_uniforms(4, &[(1, 0.975)], Some(3))
             .unwrap();
@@ -903,7 +1029,8 @@ mod tests {
 
     #[test]
     fn should_reproduce_conditional_samples_for_same_seed() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.4], vec![0.4, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.4], vec![0.4, 1.0]])
+            .expect("copula must construct");
         let first = copula
             .sample_with_fixed_z(16, &[(0, -0.5)], Some(99))
             .unwrap();
@@ -917,7 +1044,8 @@ mod tests {
 
     #[test]
     fn should_condition_each_row_on_its_own_pinned_z() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.8], vec![0.8, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.8], vec![0.8, 1.0]])
+            .expect("copula must construct");
         let n = 8000;
         // First half pinned at z = 1, second half at z = -1.
         let mut pins: Vec<f64> = vec![1.0; n / 2];
@@ -940,7 +1068,8 @@ mod tests {
 
     #[test]
     fn should_reject_pinned_row_list_of_the_wrong_length() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("copula must construct");
         let error = copula
             .sample_with_fixed_z_rows(4, &[(0, vec![0.0, 0.0])], Some(1))
             .unwrap_err();
@@ -949,7 +1078,8 @@ mod tests {
 
     #[test]
     fn should_reproduce_row_pinned_samples_for_same_seed() {
-        let copula = GaussianCopula::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]]);
+        let copula = GaussianCopula::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]])
+            .expect("copula must construct");
         let pins = vec![0.1, -0.2, 0.3, -0.4];
         let first = copula
             .sample_with_fixed_z_rows(4, &[(1, pins.clone())], Some(5))

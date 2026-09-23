@@ -69,7 +69,7 @@ overall）不足以引入 marginal.rs 选择器行为变更的风险。留作后
 |---|---|---|---|
 | ① | `train --no-cardinality` 跳过 FK 基数学习 | `b9817a7` | `should_skip_fk_cardinality_attachment_when_learning_is_disabled`（含 learn 控制组） |
 | ② | rules-draft 追加建议注释（非 unique FK → `cardinality: modeled`；PII 列名 → `sdtype: pii`） | `b54d375` | 两个 Red：可解析性+双建议 / 无可建议时字节不变 |
-| ③ | PK 形 FK 训练期 1:>1 fan-out WARN | `c866f8c` | `unique_fanout_warning_*`（含两个控制组） |
+| ③ | PK 形 FK 训练期 1:>1 fan-out WARN（原 `c866f8c`；PR #120 复审 r7 改判：判据换成**生成期** `unique` 截断分支，训练期 pk 检查已撤，见 `generator::unique_truncation_warning`） | `c866f8c` + r7 修复 | `unique_truncation_warning_fires_for_a_non_pk_unique_relationship_with_fanout_above_one` + `generate_warns_when_unique_modeled_cardinality_truncates_fanout` |
 | ④ | 10 万父键基数建模计时 + 往返 TV 断言 | （本节下方 commit） | `bench_100k_parent_cardinality_modeling` |
 | ⑤ | 四 provider PII 吞吐 + id_card 唯一性下限 | （同上） | `bench_pii_generation_throughput` |
 

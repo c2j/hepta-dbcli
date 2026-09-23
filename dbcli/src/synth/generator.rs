@@ -36,6 +36,10 @@ pub struct GeneratedData {
     pub branches: Vec<BranchOutcome>,
     /// Sampled-vs-declared conformance of every `values` pool.
     pub value_pools: Vec<ValuePoolOutcome>,
+    /// Non-fatal diagnostics emitted during generation (e.g. the unique
+    /// truncation warning for modeled 1:1 relationships). Printed to stderr
+    /// by the CLI runner; carried on the struct so tests can assert them.
+    pub warnings: Vec<String>,
 }
 
 /// Absolute deviation allowed between a `values` pool's declared weights and
@@ -207,6 +211,7 @@ fn generate_with(
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
     let mut branch_outcomes: Vec<BranchOutcome> = Vec::new();
     let mut value_pool_outcomes: Vec<ValuePoolOutcome> = Vec::new();
+    let mut table_warnings: Vec<String> = Vec::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
@@ -283,6 +288,11 @@ fn generate_with(
                     ));
                 }
                 let unique = pool.unique;
+                if let Some(warning) = unique_truncation_warning(table_name, &rel.pk, distribution)
+                {
+                    eprintln!("warning: {warning}");
+                    table_warnings.push(warning);
+                }
                 let mut assignments: Vec<Value> = Vec::new();
                 for value in parent_values {
                     let sampled = distribution.sample_count(rng.gen::<f64>());
@@ -307,7 +317,8 @@ fn generate_with(
         }
 
         let column_order = &model.copula.column_order;
-        let copula = GaussianCopula::new(model.copula.correlation.clone());
+        let copula = GaussianCopula::new(model.copula.correlation.clone())
+            .map_err(|e| format!("table '{}': {}", table_name, e))?;
 
         // `mode: copula_conditional` replaces the plain draw: the pinned
         // columns take a fixed/range quantile and every other column is drawn
@@ -653,6 +664,7 @@ fn generate_with(
         schemas: table_schemas,
         branches: branch_outcomes,
         value_pools: value_pool_outcomes,
+        warnings: table_warnings,
     })
 }
 
@@ -2615,6 +2627,33 @@ fn parent_categorical<'a>(
         Some(crate::synth::marginal::Marginal::Categorical(p)) => Some(p),
         _ => None,
     }
+}
+
+/// Warning text for a `unique: true` modeled relationship whose learned
+/// cardinality distribution contains fan-outs above one: generation will
+/// silently truncate every such parent to a single child (issue #89/#72
+/// AC3). This is the *only* point where the 1:1 promise and the observed
+/// data meet — the child FK need not be the child's primary key, so the
+/// check deliberately ignores `model.pk` (the earlier train-side pk-only
+/// warning missed non-PK `unique: true` relationships entirely and misfired
+/// on PK-shaped FKs that rules-draft would never mark unique). Returns the
+/// text without the `warning: ` prefix, or `None` when the distribution is
+/// already 1:1-shaped.
+fn unique_truncation_warning(
+    table_name: &str,
+    column: &str,
+    distribution: &crate::synth::cardinality::CardinalityDist,
+) -> Option<String> {
+    let max_fanout = distribution.counts.keys().next_back().copied()?;
+    if max_fanout <= 1 {
+        return None;
+    }
+    Some(format!(
+        "table '{}' relationship '{}': the learned cardinality has fan-outs up to {}, \
+         but the relationship is unique; every parent is truncated to at most one child \
+         (rows are dropped, not rejected) — set unique: false to reproduce the fan-out",
+        table_name, column, max_fanout
+    ))
 }
 
 fn build_rel_pools(
@@ -8659,6 +8698,85 @@ tables:
         let data = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
         assert_eq!(data.tables.get("parent").unwrap().len(), 20);
         assert_eq!(data.tables.get("child").unwrap().len(), 37);
+    }
+
+    /// PR #120 review r7 bug: the generation-time `unique` modeled path
+    /// silently clamps every parent's sampled child count to at most one.
+    /// Issue #89/#72 AC3 requires a warning when data contradicts the 1:1
+    /// promise, and the warning must fire for *any* `unique: true`
+    /// relationship — the child FK need not be the child's primary key
+    /// (the old train-side check only looked at `model.pk`, which missed
+    /// exactly this case). The text must say the fan-out is *truncated*,
+    /// not rejected.
+    #[test]
+    fn unique_truncation_warning_fires_for_a_non_pk_unique_relationship_with_fanout_above_one() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let warning = unique_truncation_warning("child", "parent_id", &dist);
+        let warning =
+            warning.expect("a unique relationship fed a fan-out > 1 distribution must warn");
+        assert!(
+            warning.contains("'child'")
+                && warning.contains("'parent_id'")
+                && warning.contains("truncated"),
+            "warning must name the relationship and say truncated, got: {warning}"
+        );
+        // Control: a true 1:1-shaped distribution never warns.
+        let one_to_one = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.5)]),
+            null_share: 0.0,
+        };
+        assert!(unique_truncation_warning("child", "parent_id", &one_to_one).is_none());
+    }
+
+    /// End to end: generating a `unique: true` modeled relationship from a
+    /// fan-out > 1 distribution must emit the warning (to stderr) while
+    /// still clamping rows to the 1:1 shape. This locks the wiring into
+    /// the modeled-cardinality branch, not just the helper.
+    #[test]
+    fn generate_warns_when_unique_modeled_cardinality_truncates_fanout() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", true)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 60)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            child_rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            child_rows.len(),
+            "clamping itself must keep the 1:1 shape"
+        );
+        let warnings = &data.warnings;
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one truncation warning must be emitted, got: {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert!(
+            warning.contains("'child'")
+                && warning.contains("'parent_id'")
+                && warning.contains("truncated"),
+            "warning must name the relationship and say truncated, got: {warning}"
+        );
     }
 
     /// A modeled relationship without a learned distribution must fail loudly,
