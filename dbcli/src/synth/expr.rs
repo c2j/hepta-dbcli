@@ -421,6 +421,87 @@ enum Node {
     Compare(CmpOp, Box<Node>, Box<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
+    /// Whitelisted function call. The name was validated against the
+    /// function table at parse time; arity is checked there too.
+    Call(&'static str, Vec<Node>),
+}
+
+/// Known functions, keyed by the literal source name. `min_args`/`max_args`
+/// bound the accepted argument count (`max_args: None` = unbounded).
+struct FunctionSpec {
+    name: &'static str,
+    min_args: usize,
+    max_args: Option<usize>,
+}
+
+const fn fixed_arity(name: &'static str, arity: usize) -> FunctionSpec {
+    FunctionSpec {
+        name,
+        min_args: arity,
+        max_args: Some(arity),
+    }
+}
+
+const KNOWN_FUNCTIONS: &[FunctionSpec] = &[
+    fixed_arity("if", 3),
+    // String functions (issue #117: trade_no = concat('T',
+    // right(parent.check_type, 3))). `concat` is fixed at 2 arguments per the
+    // fix plan; `substr` mirrors MySQL's optional length; `right`/`left` take
+    // exactly (string, count).
+    fixed_arity("concat", 2),
+    FunctionSpec {
+        name: "substr",
+        min_args: 2,
+        max_args: Some(3),
+    },
+    fixed_arity("right", 2),
+    fixed_arity("left", 2),
+];
+
+fn known_function_names() -> Vec<&'static str> {
+    KNOWN_FUNCTIONS.iter().map(|spec| spec.name).collect()
+}
+
+/// Static result type of an expression, computed without row data. `Unknown`
+/// means the type depends on column values (or a NULL propagation path), not
+/// that the expression is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Number,
+    String,
+    Bool,
+    Unknown,
+}
+
+/// Static type inference. Literals, arithmetic, comparisons and logic are
+/// exact; columns are `Unknown` without model context. `if()` follows its
+/// branches (both must agree, which the parser already enforces for literals
+/// and for branch expressions that are themselves statically typed).
+fn infer_type(node: &Node) -> Ty {
+    match node {
+        Node::Number(_) => Ty::Number,
+        Node::Str(_) => Ty::String,
+        Node::Column(_) => Ty::Unknown,
+        Node::Negate(_) => Ty::Number,
+        Node::Arith(..) => Ty::Number,
+        Node::Compare(..) | Node::And(..) | Node::Or(..) => Ty::Bool,
+        Node::Call(name, args) => match *name {
+            "if" => {
+                let Some([_, then, otherwise]) = args.get(0..3) else {
+                    return Ty::Unknown;
+                };
+                match (infer_type(then), infer_type(otherwise)) {
+                    (Ty::Number, Ty::Number) => Ty::Number,
+                    (Ty::String, Ty::String) => Ty::String,
+                    (Ty::Bool, Ty::Bool) => Ty::Bool,
+                    _ => Ty::Unknown,
+                }
+            }
+            // concat/substr/right/left always produce strings (their argument
+            // type checks happen at runtime).
+            _ => Ty::String,
+        },
+    }
 }
 
 // ─── Parser ───
@@ -489,6 +570,65 @@ impl Parser {
             construct,
             detail: base.to_string(),
         })
+    }
+
+    /// Parse a whitelisted function call: `name(arg, ...)`. Unknown names are
+    /// rejected with the list of known functions; known names must receive
+    /// exactly their declared arity.
+    fn parse_call(&mut self, name: &str) -> Result<Node, ExprError> {
+        let Some(spec) = KNOWN_FUNCTIONS.iter().find(|spec| spec.name == name) else {
+            return Err(syntax(
+                format!(
+                    "function `{name}` is not permitted; known functions: {}",
+                    known_function_names().join(", ")
+                ),
+                self.position(),
+            ));
+        };
+        self.pos += 1; // consume LParen (peeked by the caller)
+        let mut args = Vec::new();
+        if !self.eat(&Token::RParen) {
+            loop {
+                args.push(self.parse_or()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                self.expect(&Token::RParen, "`)` to close the argument list")?;
+                break;
+            }
+        }
+        if args.len() < spec.min_args || spec.max_args.is_some_and(|max| args.len() > max) {
+            let expected = match (spec.min_args, spec.max_args) {
+                (n, Some(m)) if n == m => format!("{n}"),
+                (n, Some(m)) => format!("{n}-{m}"),
+                (n, None) => format!("at least {n}"),
+            };
+            return Err(syntax(
+                format!(
+                    "function `{name}` expects {expected} argument(s), got {}",
+                    args.len()
+                ),
+                self.position(),
+            ));
+        }
+        if name == "if" {
+            // Fail fast when the two branches are *statically* different
+            // types (e.g. `if(c, 10, 'x')`). Branches whose type depends on
+            // columns stay legal; the runtime check still rejects mixed
+            // results.
+            let (then_ty, else_ty) = (infer_type(&args[1]), infer_type(&args[2]));
+            if then_ty != Ty::Unknown && else_ty != Ty::Unknown && then_ty != else_ty {
+                return Err(syntax(
+                    format!(
+                        "function `{name}` branches have different types: {then_ty:?} vs {else_ty:?}"
+                    ),
+                    self.position(),
+                ));
+            }
+        }
+        // `spec.name` is `&'static str`, so the node carries no borrow of the
+        // source text.
+        Ok(Node::Call(spec.name, args))
     }
 
     fn parse_or(&mut self) -> Result<Node, ExprError> {
@@ -567,6 +707,33 @@ impl Parser {
             Token::Number(value) => Ok(Node::Number(value)),
             Token::Str(value) => Ok(Node::Str(value)),
             Token::Ident(name) => {
+                if self.peek() == Some(&Token::LParen) {
+                    return self.parse_call(&name);
+                }
+                // Issue #117: `parent.<col>` is the one allowed qualified
+                // reference (cross-table derive). Any other `x.y` — including
+                // a second dot, `parent.a.b` — stays a rejected attribute
+                // access, so the frozen grammar grows by a single production.
+                if name == "parent" && self.eat(&Token::Dot) {
+                    let Some(spanned_column) = self.advance() else {
+                        return Err(syntax(
+                            "unexpected end of expression; expected a column after `parent.`",
+                            self.end,
+                        ));
+                    };
+                    match spanned_column.token {
+                        Token::Ident(column) => {
+                            self.reject_suffix(&format!("parent.{column}"))?;
+                            return Ok(Node::Column(format!("parent.{column}")));
+                        }
+                        found => {
+                            return Err(syntax(
+                                format!("expected a column after `parent.`, found `{found}`"),
+                                spanned_column.position,
+                            ));
+                        }
+                    }
+                }
                 self.reject_suffix(&name)?;
                 Ok(Node::Column(name))
             }
@@ -735,6 +902,136 @@ fn eval(node: &Node, lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value
                 found: other.kind(),
             }),
         },
+        Node::Call(name, args) => eval_call(name, args, lookup),
+    }
+}
+
+/// `if(cond, then, else)`: the condition must be boolean; only the selected
+/// branch is evaluated (lazy), so a division by zero in the untaken branch
+/// never fires.
+fn eval_call(
+    name: &str,
+    args: &[Node],
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Value, ExprError> {
+    match name {
+        "if" => eval_if(args, lookup),
+        "concat" => {
+            let mut out = String::new();
+            for arg in args {
+                match eval(arg, lookup)? {
+                    Value::Str(text) => out.push_str(&text),
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(ExprError::TypeMismatch {
+                            op: "concat argument",
+                            kind: other.kind(),
+                        })
+                    }
+                }
+            }
+            Ok(Value::Str(out))
+        }
+        "right" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let count = eval_count_arg(&args[1], lookup)?;
+            let (Some(text), Some(count)) = (text, count) else {
+                return Ok(Value::Null);
+            };
+            let take = count.min(text.chars().count());
+            let skip = text.chars().count() - take;
+            Ok(Value::Str(text.chars().skip(skip).collect()))
+        }
+        "left" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let count = eval_count_arg(&args[1], lookup)?;
+            let (Some(text), Some(count)) = (text, count) else {
+                return Ok(Value::Null);
+            };
+            let taken: String = text.chars().take(count).collect();
+            Ok(Value::Str(taken))
+        }
+        "substr" => {
+            let text = eval_string_arg(&args[0], lookup)?;
+            let start = eval_count_arg(&args[1], lookup)?;
+            let len = match args.get(2) {
+                Some(node) => eval_count_arg(node, lookup)?,
+                None => Some(usize::MAX),
+            };
+            let (Some(text), Some(start), Some(len)) = (text, start, len) else {
+                return Ok(Value::Null);
+            };
+            // `start` is 1-based; MySQL clamps a start of 0 to 1.
+            let skip = start.saturating_sub(1);
+            let taken: String = text.chars().skip(skip).take(len).collect();
+            Ok(Value::Str(taken))
+        }
+        other => Err(syntax(
+            format!(
+                "function `{other}` is not permitted; known functions: {}",
+                known_function_names().join(", ")
+            ),
+            0,
+        )),
+    }
+}
+
+/// `if(cond, then, else)`: the condition must be boolean; only the selected
+/// branch is evaluated (lazy), so a division by zero in the untaken branch
+/// never fires.
+fn eval_if(args: &[Node], lookup: &dyn Fn(&str) -> Option<JsonValue>) -> Result<Value, ExprError> {
+    let [cond, then, otherwise] = args else {
+        return Err(syntax(
+            format!("function `if` expects 3 argument(s), got {}", args.len()),
+            0,
+        ));
+    };
+    match eval(cond, lookup)? {
+        Value::Bool(true) => eval(then, lookup),
+        Value::Bool(false) => eval(otherwise, lookup),
+        other => Err(ExprError::NonBooleanPredicate {
+            found: other.kind(),
+        }),
+    }
+}
+
+/// Evaluate the string argument shared by `right`/`left`/`substr`. A numeric
+/// argument where a string is expected is a type error, never a coercion;
+/// NULL propagates as `None` (the caller emits `Value::Null`, matching the
+/// three-valued-logic contract where NULL only turns into `NullResult` at
+/// the `eval_decimal` boundary).
+fn eval_string_arg(
+    node: &Node,
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Option<String>, ExprError> {
+    match eval(node, lookup)? {
+        Value::Str(text) => Ok(Some(text)),
+        Value::Null => Ok(None),
+        other => Err(ExprError::TypeMismatch {
+            op: "string function argument",
+            kind: other.kind(),
+        }),
+    }
+}
+
+/// Evaluate the non-negative integer count argument shared by
+/// `right`/`left`/`substr`.
+fn eval_count_arg(
+    node: &Node,
+    lookup: &dyn Fn(&str) -> Option<JsonValue>,
+) -> Result<Option<usize>, ExprError> {
+    match eval(node, lookup)? {
+        Value::Number(n) => usize::try_from(n)
+            .map(Some)
+            .map_err(|_| ExprError::TypeMismatch {
+                op: "string function count",
+                kind: "negative number",
+            }),
+        Value::Null => Ok(None),
+        other => Err(ExprError::TypeMismatch {
+            op: "string function count",
+            kind: other.kind(),
+        }),
     }
 }
 
@@ -825,6 +1122,11 @@ fn collect_columns(node: &Node, out: &mut BTreeSet<String>) {
             collect_columns(left, out);
             collect_columns(right, out);
         }
+        Node::Call(_, args) => {
+            for arg in args {
+                collect_columns(arg, out);
+            }
+        }
         Node::Number(_) | Node::Str(_) => {}
     }
 }
@@ -842,6 +1144,12 @@ impl Expr {
     /// [`Expr::check_columns`] for the load-time existence check.
     pub fn parse(src: &str) -> Result<Expr, ExprError> {
         parse_node(src).map(|root| Expr { root })
+    }
+
+    /// Static result type computed at load time (no row data). `Ty::Unknown`
+    /// means the type depends on column values.
+    pub fn infer_type(&self) -> Ty {
+        infer_type(&self.root)
     }
 
     /// Fail-fast load-time validation: every referenced column must be declared
@@ -870,6 +1178,24 @@ impl Expr {
             Value::Bool(flag) => Ok(flag),
             other => Err(ExprError::NonBooleanPredicate {
                 found: other.kind(),
+            }),
+        }
+    }
+
+    /// Evaluate as text, for string-function `derive` targets (issue #117).
+    /// The result must be a string; NULL propagates as `NullResult` so the
+    /// generator can write NULL with the same three-valued-logic contract
+    /// the numeric path uses.
+    pub fn eval_str(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<JsonValue>,
+    ) -> Result<String, ExprError> {
+        match eval(&self.root, lookup)? {
+            Value::Str(text) => Ok(text),
+            Value::Null => Err(ExprError::NullResult),
+            other => Err(ExprError::TypeMismatch {
+                op: "string result",
+                kind: other.kind(),
             }),
         }
     }
@@ -943,16 +1269,243 @@ mod tests {
     }
 
     #[test]
+    fn should_lazy_evaluate_untaken_branch() {
+        // x == 0 takes the `1` branch: `10 / x` must never be evaluated.
+        assert_eq!(
+            eval_decimal("if(x == 0, 1, 10 / x)", &[("x", json!(0))]).expect("eval"),
+            dec("1")
+        );
+        // x != 0 takes the division branch and it must work.
+        assert_eq!(
+            eval_decimal("if(x == 0, 1, 10 / x)", &[("x", json!(4))]).expect("eval"),
+            dec("2.5")
+        );
+    }
+
+    #[test]
+    fn should_reject_if_with_non_boolean_condition() {
+        let err = eval_decimal("if(x + 1, 1, 2)", &[("x", json!(3))]).expect_err("must reject");
+        assert!(
+            matches!(err, ExprError::NonBooleanPredicate { found: "number" }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_if_branch_type_conflict() {
+        // Static check at parse time: `then` number vs `else` string.
+        let err = Expr::parse("if(x == 1, 10, 'other')").expect_err("must reject");
+        assert!(
+            err.to_string().contains("if"),
+            "error must name the function: {err}"
+        );
+    }
+
+    #[test]
+    fn should_evaluate_if_with_boolean_condition() {
+        assert_eq!(
+            eval_decimal(
+                "if(active == 1 && store_id > 0, 10, 20)",
+                &[("active", json!(1)), ("store_id", json!(5)),]
+            )
+            .expect("eval"),
+            dec("10")
+        );
+        assert_eq!(
+            eval_decimal(
+                "if(active == 1 && store_id > 0, 10, 20)",
+                &[("active", json!(0)), ("store_id", json!(5)),]
+            )
+            .expect("eval"),
+            dec("20")
+        );
+    }
+
+    #[test]
+    fn should_infer_expression_result_type() {
+        use Ty;
+        assert_eq!(Expr::parse("a == b").unwrap().infer_type(), Ty::Bool);
+        assert_eq!(
+            Expr::parse("a > 1 && b < 2").unwrap().infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(Expr::parse("a || b").unwrap().infer_type(), Ty::Bool);
+        assert_eq!(Expr::parse("a + b").unwrap().infer_type(), Ty::Number);
+        assert_eq!(Expr::parse("-a").unwrap().infer_type(), Ty::Number);
+        assert_eq!(Expr::parse("'text'").unwrap().infer_type(), Ty::String);
+        // A column's static type is unknown without model context.
+        assert_eq!(Expr::parse("a").unwrap().infer_type(), Ty::Unknown);
+        // if() infers from its branches.
+        assert_eq!(
+            Expr::parse("if(a == 1, 10, 20)").unwrap().infer_type(),
+            Ty::Number
+        );
+    }
+
+    // Issue #94 follow-up: `if()` whose branches are themselves comparisons
+    // must infer Bool, or DerivePlan::build misclassifies the expression as
+    // Unknown and the runtime fails with a misleading decimal/boolean error.
+    #[test]
+    fn should_infer_if_with_bool_branches_as_bool() {
+        use Ty;
+        assert_eq!(
+            Expr::parse("if(a == 1, b > 1, b < 2)")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(
+            Expr::parse("if(a > 1, b == 'x', c == 'y')")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
+        );
+        assert_eq!(
+            Expr::parse("if(a > 1, b == 'x', c == 'y') && d > 0")
+                .unwrap()
+                .infer_type(),
+            Ty::Bool
+        );
+    }
+
+    #[test]
+    fn should_reject_unknown_function_with_known_list() {
+        let err = Expr::parse("coalesce(a, b)").expect_err("must reject");
+        let message = err.to_string();
+        assert!(
+            message.contains("coalesce") && message.contains("not permitted"),
+            "error must name the function: {message}"
+        );
+        assert!(
+            message.contains("if"),
+            "error must list known functions: {message}"
+        );
+        // Wrong arity on a known name fails too.
+        let err = Expr::parse("if(a == 1, 2)").expect_err("must reject");
+        let message = err.to_string();
+        assert!(
+            message.contains("expects 3 argument"),
+            "error must state arity: {message}"
+        );
+    }
+
+    // ─── String functions (#117: trade_no = concat('T', right(parent.
+    // check_type, 3))) ──────────────────────────────────────────────────
+
+    /// Evaluate to a raw Value so string results can be asserted directly.
+    fn eval_value(src: &str, pairs: &[(&str, Json)]) -> Result<Value, ExprError> {
+        let expr = Expr::parse(src).expect("expression must parse");
+        eval(&expr.root, &row(pairs))
+    }
+
+    #[test]
+    fn should_evaluate_concat_substr_right_left() {
+        // concat glues its arguments (issue #117: trade_no =
+        // concat('T', right(check_type, 3)) has the last 3 chars of
+        // trade_no come from check_type).
+        assert_eq!(
+            eval_value("concat('T', right(code, 3))", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("T123".to_string())
+        );
+        // right(s, n) takes the last n characters.
+        assert_eq!(
+            eval_value("right(code, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("123".to_string())
+        );
+        // left(s, n) takes the first n characters.
+        assert_eq!(
+            eval_value("left(code, 2)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("AB".to_string())
+        );
+        // substr(s, start) is 1-based to the end (MySQL semantics).
+        assert_eq!(
+            eval_value("substr(code, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("123".to_string())
+        );
+        // substr(s, start, len) takes len characters from start.
+        assert_eq!(
+            eval_value("substr(code, 2, 3)", &[("code", json!("AB123"))]).expect("eval"),
+            Value::Str("B12".to_string())
+        );
+    }
+
+    #[test]
+    fn should_enforce_string_function_arities() {
+        // concat: 2..=N? The plan fixes concat(a, b) at exactly 2.
+        let err = Expr::parse("concat('a')").expect_err("must reject wrong arity");
+        assert!(
+            err.to_string().contains("argument"),
+            "arity error must state arguments: {err}"
+        );
+        // substr requires 2 or 3 args.
+        assert!(Expr::parse("substr(code)").is_err());
+        assert!(Expr::parse("substr(code, 1, 2, 3)").is_err());
+        // right/left require exactly 2.
+        assert!(Expr::parse("right(code)").is_err());
+        assert!(Expr::parse("left(code, 1, 2)").is_err());
+    }
+
+    #[test]
+    fn should_infer_string_function_results_as_string() {
+        use Ty;
+        assert_eq!(
+            Expr::parse("concat('T', right(code, 3))")
+                .unwrap()
+                .infer_type(),
+            Ty::String
+        );
+        assert_eq!(
+            Expr::parse("substr(code, 2)").unwrap().infer_type(),
+            Ty::String
+        );
+        assert_eq!(
+            Expr::parse("left(code, 2)").unwrap().infer_type(),
+            Ty::String
+        );
+    }
+
+    #[test]
+    fn should_null_propagate_string_functions() {
+        // NULL input: SQL three-valued logic keeps the result NULL.
+        assert_eq!(
+            eval_value("concat('T', right(code, 3))", &[("code", json!(null))]).expect("eval"),
+            Value::Null
+        );
+        assert_eq!(
+            eval_value("substr(code, 2)", &[("code", json!(null))]).expect("eval"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn should_reject_string_function_on_numeric_argument() {
+        // right() over a numeric column is a type mistake: fail with a clear
+        // type error rather than coercing.
+        let err = eval_value("right(code, 3)", &[("code", json!(123))])
+            .expect_err("numeric argument must be a type error");
+        assert!(
+            err.to_string().contains("string"),
+            "error must mention the string expectation: {err}"
+        );
+    }
+
+    // #94 decision (user-approved): unknown function names are still
+    // rejected fail-fast, but the error classification moved from
+    // `Disallowed { construct: "function call" }` to a syntax error that
+    // lists the known functions. `min` is not whitelisted, so this stays a
+    // rejection; only the error shape changed.
+    #[test]
     fn should_reject_function_call_node() {
         let err = Expr::parse("min(price, qty)").expect_err("must reject");
-        match &err {
-            ExprError::Disallowed { construct, detail } => {
-                assert_eq!(*construct, "function call");
-                assert_eq!(detail, "min");
-            }
-            other => panic!("expected disallowed node, got {other:?}"),
-        }
-        assert!(err.to_string().contains("min"), "message: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("`min`") && message.contains("not permitted"),
+            "error must name the function: {message}"
+        );
+        assert!(
+            message.contains("known functions") && message.contains("if"),
+            "error must list the known functions: {message}"
+        );
     }
 
     #[test]
@@ -988,6 +1541,63 @@ mod tests {
             other => panic!("expected disallowed node, got {other:?}"),
         }
         assert!(err.to_string().contains("cols"), "message: {err}");
+    }
+
+    // ─── parent-qualified references (#117) ──────────────────────────────
+
+    #[test]
+    fn should_parse_parent_qualified_reference() {
+        let expr = Expr::parse("parent.cjsl / 1000").expect("`parent.<col>` must parse");
+        assert_eq!(
+            expr.referenced_columns(),
+            cols(&["parent.cjsl"]),
+            "the qualified name must be reported as one column"
+        );
+        let value = expr
+            .eval_decimal(&|name: &str| {
+                if name == "parent.cjsl" {
+                    Some(json!(2500))
+                } else {
+                    None
+                }
+            })
+            .expect("must evaluate against a qualified lookup");
+        assert_eq!(value, dec("2.5"));
+    }
+
+    #[test]
+    fn should_propagate_null_from_a_missing_parent_reference() {
+        // The generator supplies `parent.<col>` only when the FK is set; a
+        // lookup that does not know the name behaves like SQL NULL.
+        let value = Expr::parse("parent.cjsl + 1")
+            .unwrap()
+            .eval_decimal(&|_| None)
+            .expect_err("NULL must surface as NullResult in eval_decimal");
+        assert!(matches!(value, ExprError::NullResult), "{value:?}");
+    }
+
+    #[test]
+    fn should_reject_non_parent_qualified_reference() {
+        let err = Expr::parse("par.id + 1").expect_err("only `parent.` may be qualified");
+        match &err {
+            ExprError::Disallowed { construct, detail } => {
+                assert_eq!(*construct, "attribute access");
+                assert_eq!(detail, "par");
+            }
+            other => panic!("expected disallowed node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_deeply_qualified_reference() {
+        let err = Expr::parse("parent.a.b").expect_err("only one level is allowed");
+        match &err {
+            ExprError::Disallowed { construct, detail } => {
+                assert_eq!(*construct, "attribute access");
+                assert_eq!(detail, "parent.a");
+            }
+            other => panic!("expected disallowed node, got {other:?}"),
+        }
     }
 
     #[test]

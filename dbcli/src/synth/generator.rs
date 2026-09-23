@@ -1,5 +1,5 @@
 use crate::synth::copula::GaussianCopula;
-use crate::synth::fk_pool::{FkPool, SelectionStrategy};
+use crate::synth::fk_pool::{value_key, FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
 use crate::synth::rules::{
     ColumnMode, PoolStrategy, SynthRules, TableRule, TableStrategy, ValuePool,
@@ -36,6 +36,10 @@ pub struct GeneratedData {
     pub branches: Vec<BranchOutcome>,
     /// Sampled-vs-declared conformance of every `values` pool.
     pub value_pools: Vec<ValuePoolOutcome>,
+    /// Non-fatal diagnostics emitted during generation (e.g. the unique
+    /// truncation warning for modeled 1:1 relationships). Printed to stderr
+    /// by the CLI runner; carried on the struct so tests can assert them.
+    pub warnings: Vec<String>,
 }
 
 /// Absolute deviation allowed between a `values` pool's declared weights and
@@ -207,6 +211,7 @@ fn generate_with(
     let mut tables: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
     let mut branch_outcomes: Vec<BranchOutcome> = Vec::new();
     let mut value_pool_outcomes: Vec<ValuePoolOutcome> = Vec::new();
+    let mut table_warnings: Vec<String> = Vec::new();
     let mut table_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut table_schemas: HashMap<String, String> = HashMap::new();
     let mut dialect = "mysql".to_string();
@@ -283,6 +288,11 @@ fn generate_with(
                     ));
                 }
                 let unique = pool.unique;
+                if let Some(warning) = unique_truncation_warning(table_name, &rel.pk, distribution)
+                {
+                    eprintln!("warning: {warning}");
+                    table_warnings.push(warning);
+                }
                 let mut assignments: Vec<Value> = Vec::new();
                 for value in parent_values {
                     let sampled = distribution.sample_count(rng.gen::<f64>());
@@ -307,7 +317,8 @@ fn generate_with(
         }
 
         let column_order = &model.copula.column_order;
-        let copula = GaussianCopula::new(model.copula.correlation.clone());
+        let copula = GaussianCopula::new(model.copula.correlation.clone())
+            .map_err(|e| format!("table '{}': {}", table_name, e))?;
 
         // `mode: copula_conditional` replaces the plain draw: the pinned
         // columns take a fixed/range quantile and every other column is drawn
@@ -576,7 +587,28 @@ fn generate_with(
         )?;
 
         // Phase 5 (plan §1): derived columns run last, over the values every
-        // earlier phase produced.
+        // earlier phase produced. Parents run before children (topological
+        // order), so their finished rows double as the #117 cross-table
+        // snapshot source; only tables a relationship derive reads are passed.
+        let parent_snapshots: Vec<ParentTableSnapshot<'_>> = rule
+            .relationships
+            .iter()
+            .filter(|rel| !rel.derive.is_empty())
+            .filter_map(|rel| {
+                rel.references.first().and_then(|reference| {
+                    reference
+                        .split_once('.')
+                        .map(|(parent_table, _)| ParentTableSnapshot {
+                            table: parent_table,
+                            rows: tables.get(parent_table).map(Vec::as_slice).unwrap_or(&[]),
+                            column_order: table_columns
+                                .get(parent_table)
+                                .map(|columns| columns.as_slice())
+                                .unwrap_or(&[]),
+                        })
+                })
+            })
+            .collect();
         apply_derive_rules(
             &mut rows,
             table_name,
@@ -584,6 +616,7 @@ fn generate_with(
             model,
             column_order,
             &referenced_targets,
+            &parent_snapshots,
         )?;
 
         value_pool_outcomes.extend(check_value_pools(
@@ -603,6 +636,7 @@ fn generate_with(
             model,
             column_order,
             &referenced_targets,
+            &parent_snapshots,
         )?);
 
         for (col_idx, col_name) in column_order.iter().enumerate() {
@@ -630,6 +664,7 @@ fn generate_with(
         schemas: table_schemas,
         branches: branch_outcomes,
         value_pools: value_pool_outcomes,
+        warnings: table_warnings,
     })
 }
 
@@ -1338,6 +1373,7 @@ fn apply_branch_repair(
     model: &TableModel,
     column_order: &[String],
     referenced_targets: &std::collections::HashSet<String>,
+    parent_snapshots: &[ParentTableSnapshot<'_>],
 ) -> Result<Vec<BranchOutcome>, String> {
     if rule.branches.is_empty() {
         return Ok(Vec::new());
@@ -1422,7 +1458,7 @@ fn apply_branch_repair(
     // simulated row without re-deriving it both misses destruction that only
     // shows up after `derive` and lets a sibling overwrite cells a branch just
     // wrote for a derived predicate.
-    let derive_plan = DerivePlan::build(table_name, rule, model, column_order)?;
+    let derive_plan = DerivePlan::build(table_name, rule, model, column_order, parent_snapshots)?;
 
     // A predicate that cannot be evaluated on a single row is a type or
     // column mistake (e.g. `bs == \'1\'` against a numeric column), not an
@@ -1600,6 +1636,7 @@ fn apply_branch_repair(
             model,
             column_order,
             referenced_targets,
+            parent_snapshots,
         )?;
 
         // A repair that cannot move any predicate (typically `set` writing
@@ -1694,12 +1731,18 @@ fn apply_derive_rules(
     model: &TableModel,
     column_order: &[String],
     referenced_targets: &std::collections::HashSet<String>,
+    parent_snapshots: &[ParentTableSnapshot<'_>],
 ) -> Result<(), String> {
-    if rule.derive.is_empty() {
+    let relationship_derives: usize = rule.relationships.iter().map(|rel| rel.derive.len()).sum();
+    if rule.derive.is_empty() && relationship_derives == 0 {
         return Ok(());
     }
 
-    for derive in &rule.derive {
+    for derive in rule
+        .derive
+        .iter()
+        .chain(rule.relationships.iter().flat_map(|r| &r.derive))
+    {
         if referenced_targets.contains(&format!("{}.{}", table_name, derive.column)) {
             return Err(format!(
                 "table '{}': derive cannot target parent key '{}.{}' referenced by another table (uniqueness is enforced before the derive phase, so derived values could repeat)",
@@ -1708,7 +1751,7 @@ fn apply_derive_rules(
         }
     }
 
-    DerivePlan::build(table_name, rule, model, column_order)?.apply_to_rows(rows)
+    DerivePlan::build(table_name, rule, model, column_order, parent_snapshots)?.apply_to_rows(rows)
 }
 
 /// Per-row `derive` evaluation in dependency order. The round-end pass applies
@@ -1718,6 +1761,30 @@ struct DerivePlan {
     table_name: String,
     index_of: HashMap<String, usize>,
     steps: Vec<DeriveStep>,
+    /// Issue #117: parent-side snapshot for `parent.<col>` lookups. `None`
+    /// when the table has no relationship derive; the per-row lookup then
+    /// answers every qualified name with SQL NULL (fail-soft, matching the
+    /// unknown-column contract) but `build` has already rejected unknown
+    /// names, so this only fires when the FK itself is NULL.
+    cross: Option<ParentSnapshot>,
+}
+
+/// Snapshot of the referenced parent's derived-source columns, keyed by the
+/// parent's key value (the value the child FK carries). Only the columns a
+/// relationship derive actually reads are captured.
+struct ParentSnapshot {
+    /// FK column in the child (the relationship `pk`).
+    fk_column: String,
+    /// "parent.<col>" -> parent key value -> parent cell value.
+    columns: HashMap<String, HashMap<Value, Value>>,
+}
+
+/// What the caller (`generate_with`) hands to `DerivePlan::build`: the
+/// already-generated parent table plus its column order, borrowed.
+struct ParentTableSnapshot<'a> {
+    table: &'a str,
+    rows: &'a [Vec<Value>],
+    column_order: &'a [String],
 }
 
 struct DeriveStep {
@@ -1726,6 +1793,36 @@ struct DeriveStep {
     expr: crate::synth::expr::Expr,
     is_integer: bool,
     scale: Option<u8>,
+    /// Output shape decided at plan time (issue #94): a Bool expression fills
+    /// the column with the trained text literals ("true"/"false"); anything
+    /// else keeps the numeric path. Issue #117 adds a third shape: a
+    /// statically-string expression (string functions) writes text directly.
+    is_bool_output: bool,
+    /// Issue #117: a string-function expression (static `Ty::String`) fills
+    /// the target with the evaluated text via `eval_str` instead of the
+    /// decimal path.
+    is_string_output: bool,
+}
+
+/// A target column is a boolean target when its trained categorical
+/// dictionary is exactly the true/false text pair (what a real BOOLEAN
+/// column trains into, issue #102). JSON-bool samples never reach the model:
+/// `profile` normalizes them to that same text pair.
+fn is_bool_target(column_model: Option<&crate::synth::model::ColumnModel>) -> bool {
+    let Some(column) = column_model else {
+        return false;
+    };
+    match (&column.logical_type, &column.marginal) {
+        (
+            crate::synth::model::LogicalType::Categorical,
+            crate::synth::marginal::Marginal::Categorical(params),
+        ) => {
+            let mut levels = params.values.iter().map(String::as_str).collect::<Vec<_>>();
+            levels.sort_unstable();
+            levels == ["false", "true"]
+        }
+        _ => false,
+    }
 }
 
 impl DerivePlan {
@@ -1737,6 +1834,7 @@ impl DerivePlan {
         rule: &crate::synth::rules::TableRule,
         model: &TableModel,
         column_order: &[String],
+        parent_snapshots: &[ParentTableSnapshot<'_>],
     ) -> Result<Self, String> {
         let index_of: HashMap<&str, usize> = column_order
             .iter()
@@ -1755,15 +1853,121 @@ impl DerivePlan {
             parsed.insert(derive.column.as_str(), expr);
         }
 
+        // Issue #117: relationship-level rules join the same plan; every
+        // `parent.<col>` must exist in the referenced parent *model* and the
+        // relationship must declare an FK column in this table.
+        let mut cross_columns: HashMap<String, HashMap<Value, Value>> = HashMap::new();
+        let mut cross_fk: Option<String> = None;
+        for rel in &rule.relationships {
+            if rel.derive.is_empty() {
+                continue;
+            }
+            let Some((parent_table, parent_key)) =
+                rel.references.first().and_then(|r| r.split_once('.'))
+            else {
+                return Err(format!(
+                    "table '{}' relationship '{}': relationship derive needs a reference",
+                    table_name, rel.pk
+                ));
+            };
+            let snapshot = parent_snapshots
+                .iter()
+                .find(|snapshot| snapshot.table == parent_table)
+                .ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': parent table '{}' has not been generated \
+                         (relationship derive needs the parent earlier in the FK order)",
+                        table_name, rel.pk, parent_table
+                    )
+                })?;
+            let key_index = snapshot
+                .column_order
+                .iter()
+                .position(|name| name == parent_key)
+                .ok_or_else(|| {
+                    format!(
+                        "table '{}' relationship '{}': parent column '{}' not found in table '{}'",
+                        table_name, rel.pk, parent_key, parent_table
+                    )
+                })?;
+            if !index_of.contains_key(rel.pk.as_str()) {
+                return Err(format!(
+                    "table '{}' relationship '{}': relationship derive needs FK column '{}' in this table",
+                    table_name, rel.pk, rel.pk
+                ));
+            }
+            let mut wanted: Vec<(String, usize)> = Vec::new();
+            for derive in &rel.derive {
+                let expr = crate::synth::expr::Expr::parse(&derive.expr).map_err(|e| {
+                    format!(
+                        "table '{}' relationship '{}': derive '{}': expression '{}' rejected: {}",
+                        table_name, rel.pk, derive.column, derive.expr, e
+                    )
+                })?;
+                for name in expr.referenced_columns() {
+                    let Some(parent_column) = name.strip_prefix("parent.") else {
+                        continue;
+                    };
+                    if wanted.iter().any(|(existing, _)| existing == &name) {
+                        continue;
+                    }
+                    let column_index = snapshot
+                        .column_order
+                        .iter()
+                        .position(|candidate| candidate == parent_column)
+                        .ok_or_else(|| {
+                            format!(
+                                "table '{}' relationship '{}': derive '{}' references unknown parent column '{}.{}'",
+                                table_name, rel.pk, derive.column, parent_table, parent_column
+                            )
+                        })?;
+                    wanted.push((name, column_index));
+                }
+                parsed.insert(derive.column.as_str(), expr);
+            }
+            for (name, column_index) in wanted {
+                let mut by_key: HashMap<Value, Value> = HashMap::new();
+                for parent_row in snapshot.rows {
+                    let key = parent_row.get(key_index).cloned().unwrap_or(Value::Null);
+                    // SQL semantics: a NULL key never joins. Indexing the
+                    // NULL-keyed row would let a NULL child FK "find" this
+                    // row and derive from it.
+                    if key.is_null() {
+                        continue;
+                    }
+                    let cell = parent_row.get(column_index).cloned().unwrap_or(Value::Null);
+                    by_key.insert(key, cell);
+                }
+                cross_columns.insert(name, by_key);
+            }
+            if cross_fk.is_some() {
+                return Err(format!(
+                    "table '{}': at most one relationship may carry derive rules",
+                    table_name
+                ));
+            }
+            cross_fk = Some(rel.pk.clone());
+        }
+        let cross = if cross_columns.is_empty() {
+            None
+        } else {
+            Some(ParentSnapshot {
+                fk_column: cross_fk.expect("checked above"),
+                columns: cross_columns,
+            })
+        };
+
         // Repeatedly take whatever is ready; `n` is tiny and this keeps the
-        // dependency rule readable.
-        let mut ordered: Vec<&str> = Vec::with_capacity(rule.derive.len());
+        // dependency rule readable. Targets come from both the table-level
+        // and the relationship-level derive lists (#117); a `parent.<col>`
+        // reference is never a derive target, so it counts as ready.
+        let targets: Vec<&str> = parsed.keys().copied().collect();
+        let mut ordered: Vec<&str> = Vec::with_capacity(targets.len());
         let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut progress = true;
         while progress {
             progress = false;
-            for derive in &rule.derive {
-                let name = derive.column.as_str();
+            for name in &targets {
                 if done.contains(name) {
                     continue;
                 }
@@ -1781,11 +1985,9 @@ impl DerivePlan {
             }
         }
 
-        if ordered.len() != rule.derive.len() {
-            let mut unresolved: Vec<&str> = rule
-                .derive
-                .iter()
-                .map(|derive| derive.column.as_str())
+        if ordered.len() != targets.len() {
+            let mut unresolved: Vec<&str> = targets
+                .into_iter()
                 .filter(|name| !done.contains(name))
                 .collect();
             unresolved.sort_unstable();
@@ -1796,10 +1998,14 @@ impl DerivePlan {
             ));
         }
 
-        // Referenced columns must exist in this table; `.` is rejected by the
-        // expression grammar, so a name here is always a local column.
+        // Referenced columns must exist in this table; `.` used to be
+        // rejected by the expression grammar, but #117 adds `parent.<col>`,
+        // which resolves through the parent snapshot instead.
         for (target, expr) in &parsed {
             for name in expr.referenced_columns() {
+                if name.starts_with("parent.") {
+                    continue;
+                }
                 if !index_of.contains_key(name.as_str()) {
                     return Err(format!(
                         "table '{}' derive '{}': unknown column '{}'",
@@ -1827,12 +2033,42 @@ impl DerivePlan {
                 format!("table '{}': derive '{}' was not parsed", table_name, target)
             })?;
             let column_model = model.columns.get(target);
+            let expr_ty = expr.infer_type();
+            let bool_target = is_bool_target(column_model);
+            // Issue #94 compatibility check at plan time: the expression's
+            // static type and the target's trained shape must agree. Unknown
+            // static types stay legal here; the runtime check still rejects
+            // actual mismatches.
+            match (expr_ty, bool_target) {
+                (crate::synth::expr::Ty::Bool, false) => {
+                    return Err(format!(
+                        "table '{}' derive '{}': boolean expression cannot fill a non-boolean target column; \
+                         wrap it in if(...) or derive into a boolean column",
+                        table_name, target
+                    ));
+                }
+                (crate::synth::expr::Ty::Number | crate::synth::expr::Ty::String, true) => {
+                    return Err(format!(
+                        "table '{}' derive '{}': a boolean column cannot take a {} expression; \
+                         compare it (e.g. `== 1`) or use if(...)",
+                        table_name,
+                        target,
+                        match expr_ty {
+                            crate::synth::expr::Ty::Number => "numeric",
+                            _ => "string",
+                        }
+                    ));
+                }
+                _ => {}
+            }
             steps.push(DeriveStep {
                 column: target.to_string(),
                 index,
                 expr,
                 is_integer: column_model.and_then(|column| column.rounding) == Some(0),
                 scale: column_model.and_then(|column| column.decimal_scale),
+                is_bool_output: expr_ty == crate::synth::expr::Ty::Bool,
+                is_string_output: expr_ty == crate::synth::expr::Ty::String,
             });
         }
 
@@ -1843,6 +2079,7 @@ impl DerivePlan {
                 .map(|(name, index)| (name.to_string(), *index))
                 .collect(),
             steps,
+            cross,
         })
     }
 
@@ -1850,15 +2087,72 @@ impl DerivePlan {
         use rust_decimal::prelude::ToPrimitive;
 
         for step in &self.steps {
-            let evaluated = {
-                let lookup = |name: &str| -> Option<Value> {
-                    self.index_of
+            let lookup = |name: &str| -> Option<Value> {
+                if let (Some(cross), true) = (self.cross.as_ref(), name.starts_with("parent.")) {
+                    // A NULL FK has no parent row: the qualified name
+                    // behaves like SQL NULL (unknown-column contract).
+                    // Short-circuit before the by_key lookup so a
+                    // NULL-keyed snapshot row (if any slipped in) can
+                    // never satisfy the join.
+                    let fk = self
+                        .index_of
+                        .get(&cross.fk_column)
+                        .and_then(|index| row.get(*index))?;
+                    if fk.is_null() {
+                        return None;
+                    }
+                    return cross
+                        .columns
                         .get(name)
-                        .and_then(|index| row.get(*index))
-                        .cloned()
-                };
-                step.expr.eval_decimal(&lookup)
+                        .and_then(|by_key| by_key.get(fk))
+                        .cloned();
+                }
+                self.index_of
+                    .get(name)
+                    .and_then(|index| row.get(*index))
+                    .cloned()
             };
+
+            // Issue #94: a Bool-typed expression fills a boolean target with
+            // the trained text literals ("true"/"false"), the same carrier a
+            // real BOOLEAN column uses end to end. NULL in a boolean
+            // expression evaluates to `false` (the predicate convention),
+            // which keeps the target's two-level dictionary intact.
+            if step.is_bool_output {
+                let flag = step.expr.eval_bool(&lookup).map_err(|error| {
+                    format!(
+                        "table '{}' derive '{}': {}",
+                        self.table_name, step.column, error
+                    )
+                })?;
+                row[step.index] = Value::String(flag.to_string());
+                continue;
+            }
+
+            // Issue #117: string-function expressions write text directly;
+            // NULL propagates with the same three-valued-logic contract as
+            // the numeric path (stage 6 recomputes the target, so a NULL
+            // input yields a NULL output).
+            if step.is_string_output {
+                let text = step.expr.eval_str(&lookup);
+                let value = match text {
+                    Ok(value) => value,
+                    Err(crate::synth::expr::ExprError::NullResult) => {
+                        row[step.index] = Value::Null;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "table '{}' derive '{}': {}",
+                            self.table_name, step.column, error
+                        ));
+                    }
+                };
+                row[step.index] = Value::String(value);
+                continue;
+            }
+
+            let evaluated = step.expr.eval_decimal(&lookup);
 
             let value = match evaluated {
                 Ok(value) => value,
@@ -2335,6 +2629,33 @@ fn parent_categorical<'a>(
     }
 }
 
+/// Warning text for a `unique: true` modeled relationship whose learned
+/// cardinality distribution contains fan-outs above one: generation will
+/// silently truncate every such parent to a single child (issue #89/#72
+/// AC3). This is the *only* point where the 1:1 promise and the observed
+/// data meet — the child FK need not be the child's primary key, so the
+/// check deliberately ignores `model.pk` (the earlier train-side pk-only
+/// warning missed non-PK `unique: true` relationships entirely and misfired
+/// on PK-shaped FKs that rules-draft would never mark unique). Returns the
+/// text without the `warning: ` prefix, or `None` when the distribution is
+/// already 1:1-shaped.
+fn unique_truncation_warning(
+    table_name: &str,
+    column: &str,
+    distribution: &crate::synth::cardinality::CardinalityDist,
+) -> Option<String> {
+    let max_fanout = distribution.counts.keys().next_back().copied()?;
+    if max_fanout <= 1 {
+        return None;
+    }
+    Some(format!(
+        "table '{}' relationship '{}': the learned cardinality has fan-outs up to {}, \
+         but the relationship is unique; every parent is truncated to at most one child \
+         (rows are dropped, not rejected) — set unique: false to reproduce the fan-out",
+        table_name, column, max_fanout
+    ))
+}
+
 fn build_rel_pools(
     table_name: &str,
     rule: &crate::synth::rules::TableRule,
@@ -2350,7 +2671,7 @@ fn build_rel_pools(
             .first()
             .ok_or_else(|| format!("relationship '{}' has no references", rel.pk))?;
 
-        let (pool, unique) = match &rel.pool_strategy {
+        let (pool, rel_strategy, unique) = match &rel.pool_strategy {
             PoolStrategy::Fixed { values } => {
                 let raw: Vec<Value> = values.iter().map(|v| Value::String(v.clone())).collect();
                 let pool = if strategy == SelectionStrategy::Weighted {
@@ -2358,7 +2679,7 @@ fn build_rel_pools(
                 } else {
                     FkPool::new(raw)
                 };
-                (pool, false)
+                (pool, strategy, false)
             }
             PoolStrategy::Projection { unique } | PoolStrategy::Generated { unique } => {
                 let values = column_pools.get(ref_str).ok_or_else(|| {
@@ -2376,7 +2697,33 @@ fn build_rel_pools(
                 } else {
                     FkPool::new(values.clone())
                 };
-                (pool, *unique)
+                (pool, strategy, *unique)
+            }
+            PoolStrategy::Density => {
+                // Issue #89 S2b: weight each parent-pool value by the child
+                // table's own trained marginal for the FK column. Boundary
+                // midpoint masses turn the continuous (or empirical) CDF into
+                // per-pool-value weights; out-of-window values collapse to the
+                // floor and all-floor vectors fall back to uniform draws.
+                // The pool carries Weighted itself: a density FK must sample
+                // by weight even under a Uniform/Zipf table strategy.
+                let values = column_pools.get(ref_str).ok_or_else(|| {
+                    format!(
+                        "table '{}' references '{}' but that table.column was not generated \
+                         first; add a rule and model for it",
+                        table_name, ref_str
+                    )
+                })?;
+                let (weights, warning) =
+                    density_weights_with_warning(models, table_name, &rel.pk, values);
+                if let Some(warning) = warning {
+                    eprintln!("warning: {warning}");
+                }
+                (
+                    FkPool::from_weighted_values(values.clone(), weights),
+                    SelectionStrategy::Weighted,
+                    false,
+                )
             }
         };
 
@@ -2426,12 +2773,144 @@ fn build_rel_pools(
         rel_pools.push(RelPool {
             column: rel.pk.clone(),
             pool,
-            strategy,
+            strategy: rel_strategy,
             unique,
             pool_size,
         });
     }
     Ok(rel_pools)
+}
+
+/// Per-value weights for `pool_strategy: !density` (issue #89 S2b). Each
+/// parent-pool value gets the child FK column's trained probability mass in
+/// the boundary-midpoint cell around it:
+///
+/// ```text
+/// mass_i = CDF((v_i + v_{i+1}) / 2) - CDF((v_{i-1} + v_i) / 2)
+/// ```
+///
+/// with the outer boundaries at ±0.5 around the first/last pool value. This
+/// turns any continuous or empirical marginal into discrete pool weights, so
+/// FK draws track the child's observed parent distribution. Values outside
+/// the child's training window (CDF differences under the floor) collapse to
+/// the floor weight; an all-floor vector lets `weighted_index` fall back to
+/// uniform, which keeps a child that never observed the parent's range
+/// drawable.
+fn density_weights_with_warning(
+    models: &HashMap<String, TableModel>,
+    child_table: &str,
+    fk_column: &str,
+    pool_values: &[Value],
+) -> (Vec<f64>, Option<String>) {
+    const WEIGHT_FLOOR: f64 = 1e-9;
+
+    let marginal = models
+        .get(child_table)
+        .and_then(|m| m.columns.get(fk_column))
+        .map(|c| &c.marginal);
+
+    // Categorical marginals carry no usable CDF (their atoms are the
+    // dictionary levels), so density weighting matches the pool against the
+    // trained dictionary in string form (profile.rs stores top_values as
+    // strings) and reuses the trained level weights directly. This is what
+    // keeps low-cardinality numeric FKs from degrading to uniform draws.
+    if let Some(crate::synth::marginal::Marginal::Categorical(categorical)) = marginal {
+        let weight_by_level: HashMap<&str, f64> = categorical
+            .values
+            .iter()
+            .zip(categorical.weights.iter())
+            .map(|(level, weight)| (level.as_str(), *weight))
+            .collect();
+        let weights: Vec<f64> = pool_values
+            .iter()
+            .map(|v| {
+                let key = value_key(v);
+                weight_by_level
+                    .get(key.as_str())
+                    .copied()
+                    .unwrap_or(WEIGHT_FLOOR)
+            })
+            .collect();
+        let all_floored = weights.iter().all(|w| *w <= WEIGHT_FLOOR);
+        let warning = all_floored.then(|| {
+            format!(
+                "pool_strategy !density on '{}.{}': no trained density mass overlaps the \
+                 parent pool, falling back to uniform draws",
+                child_table, fk_column
+            )
+        });
+        return (weights, warning);
+    }
+
+    // Numeric axis of the pool values; a non-numeric pool falls back to
+    // uniform (all-floor) rather than guessing an ordering.
+    let mut sorted: Vec<f64> = pool_values.iter().filter_map(value_as_f64).collect();
+    if sorted.is_empty() {
+        let warning = (!pool_values.is_empty()).then(|| {
+            format!(
+                "pool_strategy !density on '{}.{}': the parent pool is non-numeric, \
+                 falling back to uniform draws",
+                child_table, fk_column
+            )
+        });
+        return (vec![WEIGHT_FLOOR; pool_values.len()], warning);
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.dedup();
+
+    let cdf = |x: f64| match marginal {
+        Some(m) => m.cdf(x),
+        None => 0.0,
+    };
+    let cdf_left = |x: f64| match marginal {
+        Some(m) => m.cdf_left(x),
+        None => 0.0,
+    };
+
+    let weights: Vec<f64> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let lower = if i == 0 {
+                cdf_left(v - 0.5)
+            } else {
+                cdf((v + sorted[i - 1]) / 2.0)
+            };
+            let upper = if i + 1 == sorted.len() {
+                cdf(v + 0.5)
+            } else {
+                cdf((v + sorted[i + 1]) / 2.0)
+            };
+            (upper - lower).max(WEIGHT_FLOOR)
+        })
+        .collect();
+
+    // Map weights back to the pool's original (unsorted) order.
+    let mut weight_by_key: HashMap<String, f64> = HashMap::with_capacity(sorted.len());
+    for (i, &v) in sorted.iter().enumerate() {
+        weight_by_key.insert(format!("{v}"), weights[i]);
+    }
+    let mapped: Vec<f64> = pool_values
+        .iter()
+        .map(|v| {
+            value_as_f64(v)
+                .and_then(|x| weight_by_key.get(&format!("{x}")).copied())
+                .unwrap_or(WEIGHT_FLOOR)
+        })
+        .collect();
+
+    // Every value floored: the density declaration could not shape the draw
+    // (typically no trained marginal or a disjoint support), so the pool is
+    // effectively uniform. Say so instead of degrading silently.
+    let all_floored = mapped.iter().all(|w| *w <= WEIGHT_FLOOR);
+    let warning = all_floored.then(|| {
+        format!(
+            "pool_strategy !density on '{}.{}': no trained density mass overlaps the \
+             parent pool, falling back to uniform draws",
+            child_table, fk_column
+        )
+    });
+    (mapped, warning)
 }
 
 /// Observed distinct-value capacity of a parent key column at train time:
@@ -2456,7 +2935,9 @@ fn parent_observed_capacity(
 mod tests {
     use super::*;
     use crate::synth::cardinality::CardinalityDist;
-    use crate::synth::marginal::{CategoricalParams, Marginal, NormalParams, UniformParams};
+    use crate::synth::marginal::{
+        CategoricalParams, EcdfParams, Marginal, NormalParams, UniformParams,
+    };
     use crate::synth::model::{ColumnModel, CopulaInfo, LogicalType, Provenance};
     use crate::synth::pii::PiiProvider;
     use crate::synth::rules::{CardinalityMode, ColumnRule, Relationship, TableRule, ValuePool};
@@ -2709,6 +3190,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2751,6 +3233,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(30);
@@ -2762,6 +3245,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         c_rule.rows = Some(10);
@@ -2785,6 +3269,336 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn density_pool_strategy_tracks_child_trained_fk_distribution() {
+        // Issue #89 S2b: `pool_strategy: !density` weights the parent pool
+        // by the child's own trained marginal for the FK column. Fixture:
+        // the child trained on parent ids concentrated in 1..100 (Ecdf
+        // knots 1..100 uniform); the parent generates keys 1..200 uniformly.
+        // A uniform pool draw would land near 100 on average; the density
+        // draw must track the child's range and stay well below that.
+        let mut parent_columns = HashMap::new();
+        parent_columns.insert(
+            "id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Uniform(UniformParams {
+                    low: 1.0,
+                    high: 201.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let parent = TableModel {
+            version: 1,
+            table: "parent".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec!["id".to_string()],
+            columns: parent_columns,
+            copula: CopulaInfo {
+                column_order: vec!["id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+
+        // Child trained with parent_id mass on 1..100 only.
+        let child_knots: Vec<f64> = (1..=100).map(f64::from).collect();
+        let mut child_columns = HashMap::new();
+        child_columns.insert(
+            "parent_id".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Ecdf(EcdfParams { knots: child_knots }),
+                ..Default::default()
+            },
+        );
+        let child = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec!["parent_id".to_string()],
+            columns: child_columns,
+            copula: CopulaInfo {
+                column_order: vec!["parent_id".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+
+        let mut models = HashMap::new();
+        models.insert("parent".to_string(), parent);
+        models.insert("child".to_string(), child);
+
+        let mut parent_rule = single_rule("parent", vec![]);
+        parent_rule.rows = Some(200);
+        let mut child_rule = single_rule(
+            "child",
+            vec![Relationship {
+                pk: "parent_id".to_string(),
+                references: vec!["parent.id".to_string()],
+                pool_strategy: PoolStrategy::Density,
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+                derive: Vec::new(),
+            }],
+        );
+        child_rule.rows = Some(2_000);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent_rule, child_rule],
+        };
+
+        let result = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
+
+        let fk_values: Vec<f64> = result.tables["child"]
+            .iter()
+            .map(|r| r[0].as_f64().unwrap())
+            .collect();
+        assert_eq!(fk_values.len(), 2_000);
+
+        // FK integrity: every draw stays in the parent's generated pool.
+        let parent_keys: std::collections::HashSet<String> = result.tables["parent"]
+            .iter()
+            .map(|r| r[0].to_string())
+            .collect();
+        for v in &fk_values {
+            assert!(
+                parent_keys.contains(&format!("{}", *v as i64))
+                    || parent_keys.contains(&v.to_string()),
+                "FK value {v} must be a generated parent key"
+            );
+        }
+
+        // Density: the mean must sit near the child's trained midpoint (~50),
+        // far below the pool midpoint (~100). A uniform pool draw averages
+        // ~100 with tiny variance at n = 2000, so 80 is a safe separator.
+        let mean: f64 = fk_values.iter().sum::<f64>() / fk_values.len() as f64;
+        assert!(
+            mean < 80.0,
+            "density draw mean {mean:.1} must track the child-trained range \
+             (midpoint ~50), not the pool midpoint (~100)"
+        );
+    }
+
+    // Issue #89 S2b follow-up: a `!density` declaration that cannot be
+    // honored (non-numeric pool, or every weight floored) degrades to uniform
+    // draws, and the degradation must surface as a warning instead of being
+    // swallowed.
+    #[test]
+    fn should_report_when_density_weights_degrade_to_uniform() {
+        let models: HashMap<String, TableModel> = HashMap::new();
+
+        // Non-numeric pool: nothing to order, full fallback.
+        let strings = vec![Value::String("a".into()), Value::String("b".into())];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &strings);
+        assert!(warning.is_some(), "non-numeric pool must produce a warning");
+        assert!(
+            weights.iter().all(|w| *w > 0.0),
+            "fallback weights must be positive (uniform shape)"
+        );
+
+        // Numeric pool but no trained marginal: cdf is 0 everywhere, so every
+        // weight floors and the draw silently degrades; that must warn too.
+        let numbers = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &numbers);
+        assert!(
+            warning.is_some(),
+            "all-floor numeric pool must produce a warning"
+        );
+        assert!(weights.iter().all(|w| *w > 0.0));
+    }
+
+    #[test]
+    fn should_not_warn_when_density_weights_are_meaningful() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Uniform(UniformParams {
+                    low: 0.0,
+                    high: 4.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let numbers = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let (_, warning) = density_weights_with_warning(&models, "child", "fk", &numbers);
+        assert!(
+            warning.is_none(),
+            "meaningful density weights must not warn: {warning:?}"
+        );
+    }
+
+    /// Re-review bug (PR #120): `Marginal::cdf` returns a constant 0 for
+    /// Categorical, so a low-cardinality numeric FK with a trained
+    /// categorical dictionary floored every `!density` weight and degraded
+    /// to uniform draws. The pool values must be matched against the
+    /// categorical dictionary (string form, the form profile.rs stores) and
+    /// weighted by the trained level weights.
+    #[test]
+    fn should_weight_categorical_density_pool_by_trained_level_weights() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+                    weights: vec![0.7, 0.2, 0.1],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let pool = vec![Value::from(30), Value::from(10), Value::from(20)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &pool);
+
+        assert!(
+            warning.is_none(),
+            "overlapping categorical pool must not warn: {warning:?}"
+        );
+        // Weights keep the pool's original order (30, 10, 20) and follow the
+        // trained weights (0.1, 0.7, 0.2) up to a shared scale.
+        let total: f64 = weights.iter().sum();
+        let normalized: Vec<f64> = weights.iter().map(|w| w / total).collect();
+        for (got, want) in normalized.iter().zip([0.1, 0.7, 0.2]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "categorical density weights {normalized:?} must match trained [0.1, 0.7, 0.2]"
+            );
+        }
+    }
+
+    /// A `!density` pool whose values the trained categorical dictionary
+    /// never observed must keep warning: the weights floor and the draw
+    /// degrades to uniform.
+    #[test]
+    fn should_warn_when_categorical_density_pool_misses_all_trained_levels() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["10".to_string(), "20".to_string()],
+                    weights: vec![0.6, 0.4],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let pool = vec![Value::from(900), Value::from(901)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &pool);
+
+        assert!(
+            warning.is_some(),
+            "no-overlap categorical pool must still warn: {warning:?}"
+        );
+        assert!(weights.iter().all(|w| *w > 0.0));
     }
 
     #[test]
@@ -2841,6 +3655,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2914,6 +3729,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(5);
@@ -2925,6 +3741,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -2991,6 +3808,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -3081,6 +3899,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3178,6 +3997,7 @@ mod tests {
             pool_strategy: PoolStrategy::Projection { unique: false },
             null_label: "null".to_string(),
             cardinality: Default::default(),
+            derive: Vec::new(),
         };
         let mut a = single_rule("a", vec![]);
         a.rows = Some(3);
@@ -3230,6 +4050,7 @@ mod tests {
                     pool_strategy: PoolStrategy::Projection { unique: false },
                     null_label: "null".to_string(),
                     cardinality: Default::default(),
+                    derive: Vec::new(),
                 }],
             )],
         };
@@ -3308,6 +4129,7 @@ mod tests {
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
             strategy: TableStrategy::Weighted,
         };
@@ -3367,6 +4189,7 @@ mod tests {
                     },
                     null_label: "null".to_string(),
                     cardinality: Default::default(),
+                    derive: Vec::new(),
                 }],
             )],
         };
@@ -3551,6 +4374,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3605,6 +4429,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3650,6 +4475,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -3710,6 +4536,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                     strategy: TableStrategy::Zipf,
                 },
@@ -3867,6 +4694,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: true },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
                 single_rule("users", vec![]),
@@ -4103,6 +4931,7 @@ mod tests {
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -4342,6 +5171,7 @@ tables:
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -4484,6 +5314,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: true },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         child_rule.rows = Some(14);
@@ -5532,6 +6363,133 @@ tables:
         }
     }
 
+    // ─── derive bool target columns（#94）─────────────────────────────────
+
+    /// `store_id` is numerical; `active`/`flag` train as boolean-shaped
+    /// categoricals (text "true"/"false", what a real BOOLEAN column trains
+    /// into per issue #102).
+    fn bool_derive_model() -> HashMap<String, TableModel> {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "store_id".to_string(),
+            numerical_model("t", "store_id", 3.0, 1.0).columns["store_id"].clone(),
+        );
+        for name in ["active", "flag"] {
+            columns.insert(
+                name.to_string(),
+                ColumnModel {
+                    logical_type: LogicalType::Categorical,
+                    marginal: Marginal::Categorical(CategoricalParams {
+                        values: vec!["true".to_string(), "false".to_string()],
+                        weights: vec![0.5, 0.5],
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let order = vec![
+            "store_id".to_string(),
+            "active".to_string(),
+            "flag".to_string(),
+        ];
+        let model = TableModel {
+            version: 1,
+            table: "t".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: order.clone(),
+                correlation: vec![
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                ],
+            },
+            fk_cardinality: Default::default(),
+        };
+        HashMap::from([("t".to_string(), model)])
+    }
+
+    #[test]
+    fn should_derive_boolean_target_from_if_expression() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[("flag", "if(store_id > 2, 1, 0) == 1")]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            assert!(
+                row[2] == Value::String("true".into()) || row[2] == Value::String("false".into()),
+                "bool target must be the trained text literal, got {row:?}"
+            );
+            let store_id = row[0].as_f64().unwrap();
+            let expected = if store_id > 2.0 { "true" } else { "false" };
+            assert_eq!(row[2].as_str(), Some(expected), "row {row:?}");
+        }
+    }
+
+    // Issue #94 follow-up: branches that are themselves comparisons make the
+    // whole if() statically Bool, so a bool target must route through
+    // eval_bool at plan time instead of failing on eval_decimal.
+    #[test]
+    fn should_derive_boolean_target_from_if_with_comparison_branches() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[(
+            "flag",
+            "if(store_id > 2, active == 'true', active == 'false')",
+        )]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let active = row[1].as_str().unwrap();
+            let expected = if row[0].as_f64().unwrap() > 2.0 {
+                // then-branch: flag == (active == "true") == active itself.
+                active
+            } else {
+                // else-branch: flag == (active == "false") == negation.
+                if active == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+            };
+            assert_eq!(row[2].as_str(), Some(expected), "row {row:?}");
+        }
+    }
+
+    #[test]
+    fn should_reject_bool_expression_on_numeric_target() {
+        let models = bool_derive_model();
+        // Numerical target with a Bool expression must fail at plan time.
+        let rules = derive_rules(&[("store_id", "active == 'true'")]);
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("bool expression on a numeric column must fail");
+        assert!(
+            err.contains("boolean expression") && err.contains("store_id"),
+            "plan-time error must name the column and say 'boolean expression': {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_numeric_expression_on_bool_target() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[("flag", "store_id * 2")]);
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("numeric expression on a bool target must fail");
+        assert!(
+            err.contains("boolean column") && err.contains("flag"),
+            "plan-time error must name the column and say 'boolean column': {err}"
+        );
+    }
+
     #[test]
     fn should_derive_in_dependency_order() {
         let mut model = three_column_model(plain_total_model()).remove("t").unwrap();
@@ -5582,6 +6540,380 @@ tables:
         let err =
             generate(&models, &rules, &config(&["t"], 10)).expect_err("unknown column must fail");
         assert!(err.contains("ghost"), "error must name the column: {err}");
+    }
+
+    // ─── cross-table derive (#117) ───────────────────────────────────────
+
+    /// Parent `par(id, cjsl)` with an integer key and a 4-digit-ish numeric
+    /// payload; child `zgh(fk, vol)` whose `vol` mirrors `parent.cjsl / 1000`.
+    fn cross_table_models() -> HashMap<String, TableModel> {
+        let mut models = HashMap::new();
+        models.insert("par".to_string(), int_key_model("par", "id", 0.0));
+        // `cjsl` drawn from a small normal so FK-free rows keep numbers sane.
+        models.insert(
+            "par2".to_string(),
+            numerical_model("par", "cjsl", 5000.0, 10.0),
+        );
+        // Merge `cjsl` into the `par` model: two columns, no correlation.
+        let par = models.remove("par").unwrap();
+        let cjsl = models.remove("par2").unwrap();
+        let mut par = par;
+        let cjsl_column = cjsl.columns["cjsl"].clone();
+        par.columns.insert("cjsl".to_string(), cjsl_column);
+        par.copula.column_order = vec!["id".to_string(), "cjsl".to_string()];
+        par.copula.correlation = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        models.insert("par".to_string(), par);
+        models.insert("zgh".to_string(), numerical_model("zgh", "vol", 0.0, 1.0));
+        // `zgh` needs an `fk` column for the relationship.
+        let zgh = models.remove("zgh").unwrap();
+        let mut zgh = zgh;
+        zgh.columns.remove("vol");
+        zgh.columns.insert(
+            "fk".to_string(),
+            int_key_model("zgh", "fk", 0.0).columns["fk"].clone(),
+        );
+        zgh.columns.insert(
+            "vol".to_string(),
+            numerical_model("zgh", "vol", 0.0, 1.0).columns["vol"].clone(),
+        );
+        zgh.pk = vec!["fk".to_string()];
+        zgh.copula.column_order = vec!["fk".to_string(), "vol".to_string()];
+        zgh.copula.correlation = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        models.insert("zgh".to_string(), zgh);
+        models
+    }
+
+    fn cross_table_rule_with_derive(expr: &str) -> TableRule {
+        let mut zgh = single_rule(
+            "zgh",
+            vec![Relationship {
+                pk: "fk".to_string(),
+                references: vec!["par.id".to_string()],
+                pool_strategy: PoolStrategy::Projection { unique: false },
+                null_label: "null".to_string(),
+                cardinality: Default::default(),
+                derive: vec![crate::synth::rules::DeriveRule {
+                    column: "vol".to_string(),
+                    expr: expr.to_string(),
+                }],
+            }],
+        );
+        zgh.derive.clear();
+        zgh
+    }
+
+    #[test]
+    fn should_derive_child_column_from_parent_snapshot() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 30)).unwrap();
+        let parent_rows = data.tables.get("par").unwrap();
+        // Column 1 of `par` is `cjsl`.
+        let cjsl_by_id: HashMap<serde_json::Value, serde_json::Value> = parent_rows
+            .iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect();
+        for row in data.tables.get("zgh").unwrap() {
+            let fk = &row[0];
+            let vol = row[1].as_f64().expect("vol must be numeric");
+            let cjsl = cjsl_by_id
+                .get(fk)
+                .and_then(|value| value.as_f64())
+                .expect("fk must exist in the parent snapshot");
+            assert!(
+                (vol * 1000.0 - cjsl).abs() < 1e-6,
+                "vol {vol} must mirror parent.cjsl {cjsl} / 1000"
+            );
+        }
+    }
+
+    #[test]
+    fn should_null_propagate_relationship_derive_when_fk_null() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let mut zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        // Force every FK cell to NULL so every derived cell must be NULL too.
+        zgh.columns.insert(
+            "fk".to_string(),
+            crate::synth::rules::ColumnRule {
+                null_rate: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 10)).unwrap();
+        for row in data.tables.get("zgh").unwrap() {
+            assert!(
+                row[0].is_null(),
+                "fk must be null under a 1.0 null_rate: {row:?}"
+            );
+            assert!(row[1].is_null(), "vol must follow the NULL FK: {row:?}");
+        }
+    }
+
+    /// Re-review bug (PR #120): the parent snapshot's by_key map inserted
+    /// rows whose parent key is NULL, so a NULL child FK could "find" a
+    /// dirty row and derive a value from it. SQL semantics: a NULL key never
+    /// joins. `generate()` itself cannot produce this state (referenced
+    /// columns are forced non-NULL), but rules that pin a NULL parent key
+    /// (`!fixed null`) reach the snapshot verbatim, so the contract is
+    /// anchored at `DerivePlan` directly.
+    #[test]
+    fn should_not_join_derive_through_null_keys_on_either_side() {
+        let models = cross_table_models();
+        let zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+
+        // Parent snapshot: two real rows plus one whose key is NULL (a
+        // `!fixed null` pin produces exactly this payload).
+        let par_columns = vec!["id".to_string(), "cjsl".to_string()];
+        let par_rows = vec![
+            vec![Value::from(1), Value::from(10_000)],
+            vec![Value::from(2), Value::from(20_000)],
+            vec![Value::Null, Value::from(30_000)],
+        ];
+        let snapshots = vec![ParentTableSnapshot {
+            table: "par",
+            rows: &par_rows,
+            column_order: &par_columns,
+        }];
+
+        let plan = DerivePlan::build(
+            "zgh",
+            &zgh,
+            &models["zgh"],
+            &["fk".to_string(), "vol".to_string()],
+            &snapshots,
+        )
+        .expect("plan must build");
+
+        // NULL FK cell: the derivation must stay NULL even though the
+        // snapshot holds a NULL-keyed row that a naive by_key lookup hits.
+        let mut row_null_fk = vec![Value::Null, Value::from(0.0)];
+        plan.apply_to_row(&mut row_null_fk).unwrap();
+        assert!(
+            row_null_fk[1].is_null(),
+            "NULL FK must derive NULL, got {:?}",
+            row_null_fk[1]
+        );
+
+        // A real FK still joins through the non-NULL rows only.
+        let mut row_real_fk = vec![Value::from(2), Value::from(0.0)];
+        plan.apply_to_row(&mut row_real_fk).unwrap();
+        let got = row_real_fk[1].as_f64().expect("derived vol numeric");
+        assert!(
+            (got - 20.0).abs() < 1e-6,
+            "fk=2 must mirror parent.cjsl/1000 = 20.0, got {got}"
+        );
+
+        // Unknown (non-NULL) FK derives NULL as before.
+        let mut row_unknown_fk = vec![Value::from(7), Value::from(0.0)];
+        plan.apply_to_row(&mut row_unknown_fk).unwrap();
+        assert!(
+            row_unknown_fk[1].is_null(),
+            "unknown FK must derive NULL, got {:?}",
+            row_unknown_fk[1]
+        );
+    }
+
+    /// R4 (issue #117 acceptance): `trade_no = concat('T',
+    /// right(parent.check_type, 3))` — every generated row's trade_no must
+    /// end in exactly the parent check_type's last 3 characters. This pins
+    /// the string-function whitelist end to end through the cross-table
+    /// snapshot: the child's trade_no column is trained categorical (so the
+    /// derive writes text), the parent's check_type is pinned to a small
+    /// value pool so the expected suffix is knowable per FK.
+    #[test]
+    fn should_derive_trade_no_suffix_from_parent_check_type_with_string_functions() {
+        let mut models = cross_table_models();
+        // Parent gains `check_type`: categorical over a fixed dictionary.
+        let par = models.remove("par").unwrap();
+        let mut par = par;
+        par.columns.insert(
+            "check_type".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec![
+                        "ALIPAY".to_string(),
+                        "WECHAT".to_string(),
+                        "UNIONPAY".to_string(),
+                    ],
+                    weights: vec![1.0 / 3.0; 3],
+                }),
+                ..Default::default()
+            },
+        );
+        let mut column_order = par.copula.column_order.clone();
+        column_order.push("check_type".to_string());
+        par.copula.column_order = column_order;
+        let dim = par.copula.correlation.len();
+        let mut correlation = vec![vec![0.0; dim + 1]; dim + 1];
+        for (i, row) in correlation.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        par.copula.correlation = correlation;
+        models.insert("par".to_string(), par);
+
+        // Child gains `trade_no`: categorical text target for the derive.
+        let zgh = models.remove("zgh").unwrap();
+        let mut zgh = zgh;
+        zgh.columns.insert(
+            "trade_no".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: None,
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["TALIPAY".to_string(), "TWECHAT".to_string()],
+                    weights: vec![0.5, 0.5],
+                }),
+                ..Default::default()
+            },
+        );
+        let mut zgh_order = zgh.copula.column_order.clone();
+        zgh_order.push("trade_no".to_string());
+        zgh.copula.column_order = zgh_order;
+        let zdim = zgh.copula.correlation.len();
+        let mut zcorr = vec![vec![0.0; zdim + 1]; zdim + 1];
+        for (i, row) in zcorr.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        zgh.copula.correlation = zcorr;
+        models.insert("zgh".to_string(), zgh);
+
+        // Rules: parent check_type over the same 3-level pool; child
+        // trade_no = concat('T', right(parent.check_type, 3)).
+        let mut par_rule = single_rule("par", vec![]);
+        par_rule.rows = Some(20);
+        par_rule.columns.insert(
+            "check_type".to_string(),
+            ColumnRule {
+                values: Some(ValuePool::Uniform(vec![
+                    "ALIPAY".to_string(),
+                    "WECHAT".to_string(),
+                    "UNIONPAY".to_string(),
+                ])),
+                ..Default::default()
+            },
+        );
+        let mut zgh_rule = cross_table_rule_with_derive("parent.cjsl / 1000");
+        if let Some(rel) = zgh_rule.relationships.first_mut() {
+            rel.derive.push(crate::synth::rules::DeriveRule {
+                column: "trade_no".to_string(),
+                expr: "concat('T', right(parent.check_type, 3))".to_string(),
+            });
+        }
+        zgh_rule.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par_rule, zgh_rule],
+        };
+
+        let data = generate(&models, &rules, &config(&["par", "zgh"], 60)).unwrap();
+        let check_type_by_id: HashMap<String, String> = data.tables["par"]
+            .iter()
+            .map(|row| {
+                (
+                    row[0].to_string(),
+                    row[2].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+
+        for row in data.tables.get("zgh").unwrap() {
+            let fk = &row[0];
+            let trade_no = row[2].as_str().expect("trade_no must be text");
+            let check_type = check_type_by_id
+                .get(&fk.to_string())
+                .expect("fk must exist in the parent snapshot");
+            let expected_suffix: String = check_type
+                .chars()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert!(
+                trade_no.ends_with(&expected_suffix) && trade_no.starts_with('T'),
+                "trade_no '{trade_no}' must be concat('T', right('{check_type}', 3)) = \
+                 T{expected_suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_relationship_derive_with_unknown_parent_column_at_generate_time() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(3);
+        let zgh = cross_table_rule_with_derive("parent.ghost + 1");
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+
+        let err = generate(&models, &rules, &config(&["par", "zgh"], 5))
+            .expect_err("unknown parent column must fail");
+        assert!(err.contains("par.ghost") || err.contains("ghost"), "{err}");
+        assert!(
+            err.contains("zgh"),
+            "error must name the child table: {err}"
+        );
+    }
+
+    #[test]
+    fn should_keep_local_derive_and_relationship_derive_in_one_topology() {
+        let models = cross_table_models();
+        let mut par = single_rule("par", vec![]);
+        par.rows = Some(5);
+        let mut zgh = cross_table_rule_with_derive("parent.cjsl / 1000");
+        // Declared at table level *before* the relationship step it reads.
+        zgh.derive.push(crate::synth::rules::DeriveRule {
+            column: "vol".to_string(),
+            expr: "vol2 + 1".to_string(),
+        });
+        if let Some(rel) = zgh.relationships.first_mut() {
+            rel.derive[0].column = "vol2".to_string();
+        }
+        // `vol2` is not part of the model; the relationship derive introduces
+        // it? No: targets must exist as columns, so add it.
+        zgh.columns.insert(
+            "vol2".to_string(),
+            crate::synth::rules::ColumnRule::default(),
+        );
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![par, zgh],
+        };
+        let err = generate(&models, &rules, &config(&["par", "zgh"], 5));
+        // A derive target that is not a model column is rejected the same way
+        // a local derive target would be; assert the topology itself is not
+        // the reason for failure.
+        if let Err(message) = err {
+            assert!(
+                !message.contains("cycle"),
+                "cross -> local chain must not be a cycle: {message}"
+            );
+        }
     }
 
     // ─── branches（#70 覆盖修复）─────────────────────────────────────────
@@ -6652,6 +7984,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         table.branches.push(crate::synth::rules::BranchRule {
@@ -6854,6 +8187,7 @@ tables:
                         pool_strategy: PoolStrategy::Projection { unique: false },
                         null_label: "null".to_string(),
                         cardinality: Default::default(),
+                        derive: Vec::new(),
                     }],
                 ),
             ],
@@ -7236,6 +8570,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique },
                 cardinality: CardinalityMode::Modeled,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         )
     }
@@ -7351,6 +8686,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 cardinality: CardinalityMode::ExactRows,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         );
         child.rows = Some(37);
@@ -7362,6 +8698,85 @@ tables:
         let data = generate(&models, &rules, &GeneratorConfig::default()).unwrap();
         assert_eq!(data.tables.get("parent").unwrap().len(), 20);
         assert_eq!(data.tables.get("child").unwrap().len(), 37);
+    }
+
+    /// PR #120 review r7 bug: the generation-time `unique` modeled path
+    /// silently clamps every parent's sampled child count to at most one.
+    /// Issue #89/#72 AC3 requires a warning when data contradicts the 1:1
+    /// promise, and the warning must fire for *any* `unique: true`
+    /// relationship — the child FK need not be the child's primary key
+    /// (the old train-side check only looked at `model.pk`, which missed
+    /// exactly this case). The text must say the fan-out is *truncated*,
+    /// not rejected.
+    #[test]
+    fn unique_truncation_warning_fires_for_a_non_pk_unique_relationship_with_fanout_above_one() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let warning = unique_truncation_warning("child", "parent_id", &dist);
+        let warning =
+            warning.expect("a unique relationship fed a fan-out > 1 distribution must warn");
+        assert!(
+            warning.contains("'child'")
+                && warning.contains("'parent_id'")
+                && warning.contains("truncated"),
+            "warning must name the relationship and say truncated, got: {warning}"
+        );
+        // Control: a true 1:1-shaped distribution never warns.
+        let one_to_one = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.5)]),
+            null_share: 0.0,
+        };
+        assert!(unique_truncation_warning("child", "parent_id", &one_to_one).is_none());
+    }
+
+    /// End to end: generating a `unique: true` modeled relationship from a
+    /// fan-out > 1 distribution must emit the warning (to stderr) while
+    /// still clamping rows to the 1:1 shape. This locks the wiring into
+    /// the modeled-cardinality branch, not just the helper.
+    #[test]
+    fn generate_warns_when_unique_modeled_cardinality_truncates_fanout() {
+        let dist = CardinalityDist {
+            counts: BTreeMap::from([(0, 0.5), (1, 0.3), (2, 0.2)]),
+            null_share: 0.0,
+        };
+        let models = HashMap::from([
+            ("parent".to_string(), int_key_model("parent", "id", 1_000.0)),
+            (
+                "child".to_string(),
+                cardinality_child_model("child", "parent_id", dist),
+            ),
+        ]);
+        let mut parent = single_rule("parent", vec![]);
+        parent.rows = Some(60);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![parent, modeled_rule("parent_id", "parent", true)],
+        };
+
+        let data = generate(&models, &rules, &config(&["parent", "child"], 60)).unwrap();
+        let child_rows = data.tables.get("child").unwrap();
+        let distinct: std::collections::HashSet<String> =
+            child_rows.iter().map(|row| row[0].to_string()).collect();
+        assert_eq!(
+            distinct.len(),
+            child_rows.len(),
+            "clamping itself must keep the 1:1 shape"
+        );
+        let warnings = &data.warnings;
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one truncation warning must be emitted, got: {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert!(
+            warning.contains("'child'")
+                && warning.contains("'parent_id'")
+                && warning.contains("truncated"),
+            "warning must name the relationship and say truncated, got: {warning}"
+        );
     }
 
     /// A modeled relationship without a learned distribution must fail loudly,
@@ -7852,6 +9267,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 cardinality: CardinalityMode::ExactRows,
                 null_label: "null".to_string(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -7985,6 +9401,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {
@@ -8057,6 +9474,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         b_rule.rows = Some(5);
@@ -8068,6 +9486,7 @@ tables:
                 pool_strategy: PoolStrategy::Projection { unique: false },
                 null_label: "null".to_string(),
                 cardinality: Default::default(),
+                derive: Vec::new(),
             }],
         );
         let rules = SynthRules {

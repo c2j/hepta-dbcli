@@ -87,6 +87,12 @@ pub enum SynthCommand {
         /// (`0` disables the baseline file)
         #[arg(long, default_value_t = 0.1)]
         holdout_ratio: f64,
+
+        /// Skip per-FK child-count distribution learning: the saved model
+        /// carries no `fk_cardinality`, so `cardinality: modeled` will refuse
+        /// at generate time (issue #89 S4①).
+        #[arg(long, default_value_t = false)]
+        no_cardinality: bool,
     },
 
     /// Draft a rules YAML from database foreign keys
@@ -389,7 +395,7 @@ pub(crate) fn build_model_with_overrides(
                     .collect()
             })
             .collect();
-        compute_gaussian_correlation(&projected, &column_order, &columns)
+        compute_gaussian_correlation(&projected, &column_order, &columns)?
     } else {
         (0..n)
             .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
@@ -714,6 +720,9 @@ pub fn run_generate(
         // branch only, see issue #82).
         generate(&models, &rules, &config)?
     };
+    for warning in &data.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let export_format = match format {
         "csv" => ExportFormat::Csv,
