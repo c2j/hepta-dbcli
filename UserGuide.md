@@ -980,7 +980,7 @@ hepta_dbcli synth validate --model .synth/users.model.json
 |--------|------|------|
 | `train` | `--name`、`--tables`、`--schema`、`--output`、`--sample`、`--categorical-top-k`、`--rules`、`--holdout-ratio`、`--no-cardinality` | `--schema` 限定表所在 schema；每表最多采样 `--sample` 行（默认 10000）；`--categorical-top-k N\|full` 控制分类列写入模型的档数（默认 50，与历史硬上限一致；`full` 不截断，模型文件超过 10 MiB 时打印警告）；`--rules` 里的 `columns.<列>.marginal` 可强制该列边际族（见 §10.4），`--holdout-ratio`（默认 0.1，`0` 关闭）决定写入 `report-baseline.json` 的留出行占比（上限 5 万行）；`--no-cardinality` 跳过外键基数分布学习（模型不含 `fk_cardinality`，之后 `cardinality: modeled` 在 generate 期报错），适合只想要固定行数生成的场景 |
 | `report` | `--models`、`--data`、`--rules`、`--against-db [连接名]`、`--rows`、`--seed`、`--output`、`--min-score`、`--strict` | 对生成数据打分：`--data` 指定 `generate` 的输出目录（`{table}.csv/jsonl/json`；CSV 空字段 = NULL、`""` = 空字符串），省略时按 `--rows`（默认 1000）与 `--seed` 现场生成；`--rules` 提供 FK 关系用于 `fk` 节；`--against-db`（可省值，裸用即默认连接）用真库键池算 join-rate，否则用**生成出的父表键**；`--min-score F` 低于阈值时退出码非 0（要求**每张表都能打分**：缺 baseline/缺生成数据导致该表无分时直接失败）；`--strict` 把缺 baseline 或缺生成数据当作错误 |
-| `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测 |
+| `rules-draft` | `--name`、`--tables`、`--schema`、`--output`、`--models` | `--schema` 指定 FK 扫描的 schema；`--models` 下的 profile 用于唯一外键检测；输出 YAML 末尾追加**建议注释**（非 1:1 外键建议 `cardinality: modeled`、列名命中 PII 识别器的建议 `sdtype: pii`，均注释形式不启用，与 `--mine` 候选同契约） |
 | `generate` | `--models`、`--rules`、`--output`、`--rows`、`--seed`、`--format`、`--no-schema-qualifier` | `--format`: csv / jsonl / json / sql；`--rows` 为全表统一覆盖值，规则 YAML 的每表 `rows:` 优先级在其下（CLI > 规则 > 缺省 100）；SQL 默认带训练 schema 限定，`--no-schema-qualifier` 恢复旧的无前缀语句 |
 | `validate` | `--model` | 校验模型 JSON 版本与结构 |
 

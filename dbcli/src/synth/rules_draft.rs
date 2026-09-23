@@ -272,6 +272,77 @@ fn table_stats_from_profiles(
         .collect()
 }
 
+/// Append the draft's advice comments (issue #89 S4②): per-relationship
+/// `cardinality: modeled` for non-unique foreign keys (train learns the
+/// rows-per-parent distribution, so a one-to-many relationship can follow
+/// it) and per-column `sdtype: pii` for columns whose name trips the PII
+/// recognizer. Comments only: the YAML stays parseable and nothing is
+/// enabled, mirroring the `--mine` candidate comments (issue #69). With
+/// neither suggestion the YAML is returned unchanged.
+pub fn render_draft_advice(
+    yaml: &str,
+    foreign_keys: &[ForeignKeyInfo],
+    profiles: &std::collections::HashMap<String, crate::synth::profile::TableProfile>,
+) -> String {
+    let table_stats = table_stats_from_profiles(profiles);
+    let mut cardinality_advice: Vec<String> = Vec::new();
+    for fk in foreign_keys {
+        // Unique FKs project one parent value per row; a fan-out
+        // distribution does not apply.
+        if is_unique(fk, &table_stats) {
+            continue;
+        }
+        cardinality_advice.push(format!(
+            "{}.{} -> {}.{}: cardinality: modeled",
+            fk.from_table, fk.from_column, fk.to_table, fk.to_column
+        ));
+    }
+
+    let mut pii_advice: Vec<String> = Vec::new();
+    for (table, profile) in profiles {
+        for column in &profile.column_order {
+            // Name-based vote only: the draft has no sampled values, and a
+            // bare digit column must never be anonymized on a guess.
+            if crate::synth::pii::detect_from_name(column).is_some() {
+                pii_advice.push(format!("{}.{}: sdtype: pii", table, column));
+            }
+        }
+        // column_order can be absent in hand-written fixtures; fall back to
+        // the columns map for stable, deterministic output.
+        if profile.column_order.is_empty() {
+            let mut rest: Vec<&String> = profile.columns.keys().collect();
+            rest.sort();
+            for column in rest {
+                if crate::synth::pii::detect_from_name(column).is_some() {
+                    pii_advice.push(format!("{}.{}: sdtype: pii", table, column));
+                }
+            }
+        }
+    }
+
+    if cardinality_advice.is_empty() && pii_advice.is_empty() {
+        return yaml.to_string();
+    }
+
+    let mut out = yaml.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("# hepta-dbcli rules-draft suggestions (comments only, NOT enabled)\n");
+    for line in &cardinality_advice {
+        out.push_str(&format!(
+            "# {line}   # child trains a rows-per-parent distribution; uncomment inside\n\
+             # the relationship to follow it instead of a fixed row count\n"
+        ));
+    }
+    for line in &pii_advice {
+        out.push_str(&format!(
+            "# {line}   # under the table's columns section to anonymize this column\n"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +383,67 @@ mod tests {
                 ((*table).to_string(), profile)
             })
             .collect()
+    }
+
+    #[test]
+    fn draft_appends_cardinality_and_pii_advice_comments() {
+        // S4② (issue #89): the draft YAML gains a comment block that
+        // suggests per-relationship `cardinality: modeled` (when the child
+        // model learned an fk_cardinality distribution) and per-column
+        // `sdtype: pii` (when the column name trips the PII recognizer).
+        // Comments only: the YAML must stay parseable with nothing enabled.
+        let table_stats = std::collections::HashMap::from([(
+            "orders".to_string(),
+            TableStats {
+                row_count: 100,
+                columns: std::collections::HashMap::from([(
+                    "user_id".to_string(),
+                    ColumnStats { cardinality: 3 },
+                )]),
+            },
+        )]);
+        let foreign_keys = vec![ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let rules = generate_rules_draft(&["orders".to_string()], &foreign_keys, &table_stats);
+        let yaml = serde_yaml::to_string(&rules).unwrap();
+
+        let profiles = profiles(&[("orders", 100, &[("user_id", 3), ("contact_phone", 90)])]);
+
+        let advised = super::render_draft_advice(&yaml, &foreign_keys, &profiles);
+
+        // Still parseable, nothing enabled.
+        let parsed: SynthRules =
+            serde_yaml::from_str(&advised).expect("advice comments keep the YAML parseable");
+        assert_eq!(parsed.tables.len(), rules.tables.len());
+
+        // Cardinality advice: user_id FK can follow the learned fan-out.
+        assert!(
+            advised.contains("cardinality: modeled"),
+            "advice must suggest cardinality: modeled for FK columns, got:\n{advised}"
+        );
+        // sdtype advice: contact_phone trips the name-based PII vote.
+        assert!(
+            advised.contains("sdtype: pii"),
+            "advice must suggest sdtype: pii for PII-looking columns, got:\n{advised}"
+        );
+        assert!(
+            advised.contains("contact_phone"),
+            "advice must name the column"
+        );
+    }
+
+    #[test]
+    fn draft_appends_no_advice_without_pii_or_modeled_cardinality() {
+        let yaml = "version: \"1\"\ntables: []\n";
+        let advised = super::render_draft_advice(yaml, &[], &std::collections::HashMap::new());
+        assert_eq!(
+            advised, yaml,
+            "no FKs and no PII columns means no advice block"
+        );
     }
 
     #[test]

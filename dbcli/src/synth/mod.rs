@@ -965,6 +965,10 @@ async fn run_rules_draft(
         yaml = crate::synth::mine::append_candidate_comments(&yaml, &mined);
     }
 
+    // Issue #89 S4②: suggestion comments for cardinality/sdtype, same
+    // comments-only contract as the mined candidates.
+    yaml = crate::synth::rules_draft::render_draft_advice(&yaml, &foreign_keys, &profiles);
+
     std::fs::write(output, yaml).map_err(|e| format!("write rules file: {}", e))?;
     println!("Rules draft saved to {}", output.display());
     Ok(())
