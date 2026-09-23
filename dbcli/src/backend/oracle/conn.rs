@@ -182,8 +182,9 @@ pub(crate) fn rewrite_oracle_error_message(message: &str) -> String {
     const GENERIC: &str = "closed the connection without providing error details";
     if message.contains(GENERIC) {
         "Oracle closed the connection without an error packet; the statement may be \
-         invalid for Oracle (check for MySQL-only syntax such as LIMIT) or the session \
-         was killed."
+         invalid for Oracle (check for MySQL-only syntax such as LIMIT), the session \
+         was killed, or a quoted identifier's case does not match the catalog \
+         (identifier case mismatch raises ORA-00904 without an error packet)."
             .to_string()
     } else {
         message.to_string()
@@ -230,6 +231,19 @@ mod tests {
         assert!(
             !rewritten.contains("insufficient privileges"),
             "misleading text must not survive: {rewritten}"
+        );
+    }
+
+    /// Issue #116: the closed-connection rewrite must surface the quoted
+    /// mixed-case identifier hypothesis (ORA-00904 for a folded catalog name
+    /// kills the session without an error packet in oracle-rs 0.1.7).
+    #[test]
+    fn rewrite_oracle_error_message_mentions_identifier_case_hypothesis() {
+        let generic = "Oracle closed the connection without providing error details.";
+        let rewritten = rewrite_oracle_error_message(generic);
+        assert!(
+            rewritten.contains("identifier case"),
+            "rewrite must mention identifier case: {rewritten}"
         );
     }
 

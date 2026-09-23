@@ -60,6 +60,92 @@ fn paired_side_keys(
     ))
 }
 
+/// Record each side's catalog-physical names for `report.row_columns()` (key
+/// columns first, then value columns). The report's own `key_columns` /
+/// `value_columns` only carry the left plan's names; the SQL-patch renderer
+/// needs the `--apply-to` side's physical casing or a right-side patch writes
+/// the left side's identifiers into the right table (issue #116 review
+/// round 2). Value columns follow the left plan's order, mapped to the right
+/// side through the pairing; a column the pairing could not match keeps the
+/// report name (the renderer quotes it as-is).
+fn stamp_side_column_names(
+    report: &mut report::DiffReport,
+    ctx: &strategy::DiffContext,
+    paired: &pairing::Pairing,
+) {
+    let row_columns = report.row_columns();
+    let key_len = report.key_columns.len();
+    let mut left_names = Vec::with_capacity(row_columns.len());
+    let mut right_names = Vec::with_capacity(row_columns.len());
+    for (i, name) in row_columns.iter().enumerate() {
+        left_names.push(side_column_name(
+            name,
+            i,
+            key_len,
+            &ctx.left.plan.compare_columns,
+            &ctx.left_key_columns,
+            paired,
+            true,
+        ));
+        right_names.push(side_column_name(
+            name,
+            i,
+            key_len,
+            &ctx.right.plan.compare_columns,
+            &ctx.right_key_columns,
+            paired,
+            false,
+        ));
+    }
+    report.left_column_names = Some(left_names);
+    report.right_column_names = Some(right_names);
+}
+
+/// Physical name of one report column on the target side. Keys resolve
+/// positionally through the side key lists; values walk the left plan's
+/// compare order and map to the other side via `right_of_left`. Falls back
+/// to a case-insensitive lookup in the side's compare columns, then to the
+/// report name itself.
+fn side_column_name(
+    report_name: &str,
+    index: usize,
+    key_len: usize,
+    target_compare_columns: &[String],
+    target_keys: &[String],
+    paired: &pairing::Pairing,
+    target_is_left: bool,
+) -> String {
+    if index < key_len {
+        // Key column: positional on this side, order matches the logical key.
+        return target_keys
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| report_name.to_string());
+    }
+    let value_index = index - key_len;
+    if target_is_left {
+        // Report value order IS the left plan's compare order.
+        return target_compare_columns
+            .get(value_index)
+            .cloned()
+            .unwrap_or_else(|| report_name.to_string());
+    }
+    // Right side: map the left plan's compare position through the pairing.
+    if let Some(right_index) = paired
+        .right_of_left
+        .get(value_index)
+        .and_then(|r| *r)
+        .and_then(|index| target_compare_columns.get(index))
+    {
+        return right_index.clone();
+    }
+    target_compare_columns
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(report_name))
+        .cloned()
+        .unwrap_or_else(|| report_name.to_string())
+}
+
 // ─── Entry Point ───────────────────────────────────────────────────────
 
 pub(crate) async fn run(
@@ -367,7 +453,9 @@ async fn min_max(
     key: &str,
 ) -> Result<(i64, i64), String> {
     let d = conn.dialect();
-    let k = d.quote_ident(key);
+    // `key` arrives from paired_side_keys as the side's catalog-physical
+    // name: quote without re-folding (issue #116).
+    let k = d.quote_catalog_ident(key);
     let t = d.quote_table(Some(schema), table);
     let sql = format!("SELECT MIN({k}), MAX({k}) FROM {t}");
     let r = conn.query(&sql).await.map_err(|e| e.to_string())?;
@@ -465,8 +553,8 @@ async fn execute_diff_inner(
         &routed.key_columns,
         &lplan.key_columns,
         &rplan.key_columns,
-        paired.left_key_columns,
-        paired.right_key_columns,
+        paired.left_key_columns.clone(),
+        paired.right_key_columns.clone(),
     )?;
 
     let (filter, incremental) = effective_filter(args);
@@ -542,6 +630,7 @@ async fn execute_diff_inner(
     report.ident_quote = qconn.dialect().identifier_quote();
     report.ident_scheme = qconn.dialect().url_scheme().to_string();
     report.backslash_escape = qconn.dialect().url_scheme() == "mysql";
+    stamp_side_column_names(&mut report, &ctx, &paired);
 
     let did_fetch =
         hydrate::post_diff_fetch(args, &mut report, &mut *lconn, &mut *rconn, &ctx).await?;
@@ -1093,6 +1182,8 @@ mod emit_tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         }
     }
 

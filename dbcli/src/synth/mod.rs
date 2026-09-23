@@ -70,6 +70,7 @@ pub async fn run(
             categorical_top_k,
             rules,
             holdout_ratio,
+            no_cardinality,
         } => {
             run_train(
                 name,
@@ -81,6 +82,7 @@ pub async fn run(
                     categorical_top_k,
                     rules_path: rules.as_deref(),
                     holdout_ratio,
+                    no_cardinality,
                 },
                 config_path,
             )
@@ -422,6 +424,9 @@ struct TrainRunOptions<'a> {
     categorical_top_k: cmd::CategoricalTopK,
     rules_path: Option<&'a str>,
     holdout_ratio: f64,
+    /// `train --no-cardinality`: skip per-FK child-count distribution
+    /// learning (issue #89 S4①).
+    no_cardinality: bool,
 }
 
 async fn run_train(
@@ -437,6 +442,7 @@ async fn run_train(
         categorical_top_k,
         rules_path,
         holdout_ratio,
+        no_cardinality,
     } = options;
     let tables = split_tables(tables);
     check_table_names(&tables)?;
@@ -710,7 +716,13 @@ async fn run_train(
         );
     }
 
-    attach_fk_cardinality(output_dir, &foreign_keys, &key_distinct, &fk_values)?;
+    attach_fk_cardinality(
+        output_dir,
+        &foreign_keys,
+        &key_distinct,
+        &fk_values,
+        !no_cardinality,
+    )?;
 
     Ok(())
 }
@@ -828,13 +840,30 @@ fn learned_cardinality(
 /// Learn each child table's rows-per-parent distribution and store it in the
 /// child's model (issue #72). Runs after the training loop because a parent
 /// key's distinct count may come from a table trained after its child.
+///
+/// PR #120 review r7: the former train-side pk-shaped-fanout warning was
+/// removed. Its premise did not hold: a fan-out above 1 makes the child
+/// column non-unique (cardinality < row_count), so rules-draft's
+/// `is_unique` — which reads exactly that cardinality — can never mark the
+/// relationship `unique: true`, and for a PK column a fan-out > 1 is
+/// impossible by definition. The real 1:>1 contradiction is warned about
+/// at generate time, where `unique: true` actually meets the learned
+/// distribution (`generator::unique_truncation_warning`).
 #[cfg(feature = "synth")]
 fn attach_fk_cardinality(
     output_dir: &Path,
     foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
     key_distinct: &HashMap<(String, String), usize>,
     fk_values: &HashMap<(String, String), Vec<serde_json::Value>>,
+    learn: bool,
 ) -> Result<(), String> {
+    // `--no-cardinality` (issue #89 S4①): skip the attachment entirely so the
+    // saved model carries no `fk_cardinality`. A later `cardinality: modeled`
+    // then fails at generate time with the documented "no cardinality
+    // learned" error instead of modeling from data train never learned.
+    if !learn {
+        return Ok(());
+    }
     // Load each child model once; a table may have several foreign keys.
     let mut loaded: HashMap<String, crate::synth::model::TableModel> = HashMap::new();
     let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -969,6 +998,10 @@ async fn run_rules_draft(
         // nothing is enabled (issue #69, AC4/A hard constraint).
         yaml = crate::synth::mine::append_candidate_comments(&yaml, &mined);
     }
+
+    // Issue #89 S4②: suggestion comments for cardinality/sdtype, same
+    // comments-only contract as the mined candidates.
+    yaml = crate::synth::rules_draft::render_draft_advice(&yaml, &foreign_keys, &profiles);
 
     std::fs::write(output, yaml).map_err(|e| format!("write rules file: {}", e))?;
     println!("Rules draft saved to {}", output.display());
@@ -1717,6 +1750,7 @@ mod tests {
                 categorical_top_k: cmd::CategoricalTopK::Limit(50),
                 rules: None,
                 holdout_ratio: 0.1,
+                no_cardinality: false,
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );
@@ -2454,5 +2488,209 @@ mod tests {
         assert!(reserved.contains("user_id"));
         assert_eq!(reserved.len(), 1, "primary keys must not be reserved");
         assert!(pii_reserved_columns(&foreign_keys, "other").is_empty());
+    }
+
+    /// S4① (issue #89 acceptance): `train --no-cardinality` skips the
+    /// fk_cardinality attachment entirely. The saved child model must carry
+    /// no `fk_cardinality` entry, so a later `cardinality: modeled` fails at
+    /// generate time with the documented "no cardinality learned" error
+    /// instead of silently modeling from a distribution train never learned.
+    #[test]
+    fn should_skip_fk_cardinality_attachment_when_learning_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = categorical_model("orders", &[("user_id", &["1", "2", "9"])]);
+        child.save(&dir.path().join("orders.model.json")).unwrap();
+
+        let foreign_keys = vec![crate::synth::rules_draft::ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let child_fk_values = vec![
+            serde_json::Value::from(1),
+            serde_json::Value::from(1),
+            serde_json::Value::from(2),
+        ];
+        let mut fk_values = HashMap::new();
+        fk_values.insert(
+            ("orders".to_string(), "user_id".to_string()),
+            child_fk_values,
+        );
+        let mut key_distinct = HashMap::new();
+        key_distinct.insert(("users".to_string(), "id".to_string()), 3usize);
+
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, false)
+            .expect("disabled cardinality must not fail");
+
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        assert!(
+            reloaded.fk_cardinality.is_empty(),
+            "--no-cardinality must leave no fk_cardinality in the model"
+        );
+
+        // Control: with learning enabled the same inputs do attach the
+        // distribution, so the assertion above fails for the right reason.
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, true)
+            .expect("enabled cardinality must not fail");
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        assert!(
+            reloaded.fk_cardinality.contains_key("user_id"),
+            "default behavior must still learn cardinality"
+        );
+    }
+
+    /// S4③ (issue #89), PR #120 review r7: the 1:>1 contradiction between a
+    /// `unique: true` relationship and the learned fan-out is warned about
+    /// at *generate* time (see generator::unique_truncation_warning), not
+    /// at train time. The old train-side pk-shaped warning was removed: a
+    /// fan-out > 1 makes the child column non-unique, so rules-draft's
+    /// `is_unique` (cardinality == row_count) would never have marked it
+    /// `unique: true`, and a PK column cannot have a fan-out > 1 at all.
+    /// Learning itself is unaffected: a fan-out > 1 distribution still
+    /// attaches to the model unchanged.
+    #[test]
+    fn fanout_above_one_attaches_without_train_side_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = categorical_model("orders", &[("user_id", &["1", "2", "9"])]);
+        child.save(&dir.path().join("orders.model.json")).unwrap();
+
+        let foreign_keys = vec![crate::synth::rules_draft::ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let mut fk_values = HashMap::new();
+        fk_values.insert(
+            ("orders".to_string(), "user_id".to_string()),
+            vec![
+                serde_json::Value::from(1),
+                serde_json::Value::from(1),
+                serde_json::Value::from(2),
+            ],
+        );
+        let mut key_distinct = HashMap::new();
+        key_distinct.insert(("users".to_string(), "id".to_string()), 3usize);
+
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, true)
+            .expect("fan-out learning must not fail");
+
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        let dist = reloaded
+            .fk_cardinality
+            .get("user_id")
+            .expect("fan-out > 1 distribution must still be learned");
+        assert!(
+            dist.counts.keys().next_back().copied() >= Some(2),
+            "the learned distribution must keep its fan-out above one"
+        );
+    }
+
+    /// S4④ (issue #89): time cardinality modeling on 100k parent keys and
+    /// anchor the round-trip behavior (learn -> sample -> total-variation
+    /// <= 0.02). `#[ignore]`d so it never slows the CI gate; run with
+    /// `cargo test --all --bin hepta_dbcli bench_100k_parent_cardinality --
+    /// --ignored --nocapture`. Evidence lands in
+    /// docs/plans/2026-09-22-issue-89-s5-acceptance.md.
+    #[test]
+    #[ignore]
+    fn bench_100k_parent_cardinality_modeling() {
+        use rand::{Rng, SeedableRng};
+
+        // 100k parent keys, long-tail fan-out: 60% zero children, 25% one,
+        // 10% two, 4% three, 1% ten.
+        const PARENTS: usize = 100_000;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut child_fk_values: Vec<serde_json::Value> = Vec::new();
+        for i in 0..PARENTS {
+            let draw: f64 = rng.gen();
+            let count = if draw < 0.60 {
+                0
+            } else if draw < 0.85 {
+                1
+            } else if draw < 0.95 {
+                2
+            } else if draw < 0.99 {
+                3
+            } else {
+                10
+            };
+            for _ in 0..count {
+                child_fk_values.push(serde_json::Value::from(i));
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let distribution =
+            crate::synth::cardinality::learn_cardinality(&child_fk_values, Some(PARENTS))
+                .expect("must learn a distribution");
+        let learn_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let per_parent_counts: Vec<u64> = (0..PARENTS)
+            .map(|_| distribution.sample_count(rng.gen()))
+            .collect();
+        let sample_elapsed = started.elapsed();
+        let empirical = crate::synth::cardinality::CardinalityDist::from_counts(
+            per_parent_counts.iter().copied(),
+            PARENTS,
+            distribution.null_share,
+        )
+        .expect("sampled distribution must be buildable");
+        let tv = distribution.total_variation(&empirical);
+        println!(
+            "cardinality bench: learned 100k-parent distribution in {learn_elapsed:?} \
+             ({} child rows); sampled 100k fan-outs in {sample_elapsed:?}; \
+             TV(learned, sampled) = {tv:.4}",
+            child_fk_values.len()
+        );
+        assert!(
+            tv <= 0.02,
+            "sampled fan-out drifted from the learned distribution (TV {tv})"
+        );
+    }
+
+    /// S4⑤ (issue #89): PII fake-value throughput per provider and a
+    /// uniqueness floor for the id-card generator. Same `#[ignore]`d bench
+    /// protocol as the cardinality one.
+    #[test]
+    #[ignore]
+    fn bench_pii_generation_throughput() {
+        use crate::synth::pii::{self, PiiProvider};
+        use rand::SeedableRng;
+
+        const N: usize = 200_000;
+        for provider in [
+            PiiProvider::Email,
+            PiiProvider::Phone,
+            PiiProvider::Name,
+            PiiProvider::IdCard,
+        ] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(pii::generate_value(provider, &mut rng));
+            }
+            let elapsed = started.elapsed();
+            println!(
+                "pii bench: {} {N} values in {elapsed:?} ({:.0} values/s)",
+                provider.as_str(),
+                N as f64 / elapsed.as_secs_f64()
+            );
+        }
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let unique: std::collections::HashSet<String> = (0..100_000)
+            .map(|_| pii::generate_value(PiiProvider::IdCard, &mut rng))
+            .collect();
+        assert!(
+            unique.len() > 99_000,
+            "id-card generator collapsed to {} distinct values out of 100k",
+            unique.len()
+        );
     }
 }

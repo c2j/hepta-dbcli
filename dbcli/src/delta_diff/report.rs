@@ -111,6 +111,15 @@ pub(crate) struct DiffReport {
     /// Modified 行按变化列计数，count 降序；None = 无 Modified 行 / keyless / 尚未计算
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) modified_columns: Option<Vec<ColumnChangeCount>>,
+    /// Per-side catalog-physical column names aligned with `row_columns()`
+    /// (key columns first, then value columns). `None` until the diff runner
+    /// stamps them; SQL-patch rendering uses the `--apply-to` side's list so
+    /// a right-side patch never writes the left side's casing (issue #116
+    /// review round 2).
+    #[serde(skip)]
+    pub(crate) left_column_names: Option<Vec<String>>,
+    #[serde(skip)]
+    pub(crate) right_column_names: Option<Vec<String>>,
     #[serde(skip)]
     pub(crate) ident_quote: char,
     #[serde(skip)]
@@ -213,6 +222,8 @@ mod tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         };
         let s = serde_json::to_string(&report).unwrap();
         let back: DiffReport = serde_json::from_str(&s).unwrap();
@@ -251,6 +262,8 @@ mod tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         };
         let mut json = serde_json::to_value(report).expect("report should serialize");
         json.as_object_mut()
@@ -295,6 +308,8 @@ mod tests {
                 ident_scheme: String::new(),
                 backslash_escape: false,
                 modified_columns: None,
+                left_column_names: None,
+                right_column_names: None,
             })
             .unwrap(),
         )
@@ -343,6 +358,8 @@ mod tests {
                 ident_scheme: String::new(),
                 backslash_escape: false,
                 modified_columns: None,
+                left_column_names: None,
+                right_column_names: None,
             })
             .unwrap(),
         )
@@ -388,6 +405,8 @@ mod tests {
                 ident_scheme: String::new(),
                 backslash_escape: false,
                 modified_columns: None,
+                left_column_names: None,
+                right_column_names: None,
             })
             .unwrap(),
         )
@@ -445,6 +464,8 @@ mod tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         };
         let mut json = serde_json::to_value(report).expect("report should serialize");
         json.as_object_mut()
@@ -504,6 +525,8 @@ mod tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         };
 
         stamp_columns_from_plan(&mut report, &plan);

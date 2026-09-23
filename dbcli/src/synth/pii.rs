@@ -358,6 +358,13 @@ fn provider_from_name(column: &str) -> Option<PiiProvider> {
     None
 }
 
+/// Name-only PII vote for callers without sampled values (the rules draft,
+/// issue #89 S4②). Same `provider_from_name` heuristics `detect` uses, so a
+/// column the draft suggests is one `train` would anonymize anyway.
+pub fn detect_from_name(column: &str) -> Option<PiiProvider> {
+    provider_from_name(column)
+}
+
 /// Text-like SQL types. Any other declared type (numeric, boolean, datetime)
 /// is never anonymized: replacing it with a string fake would break the load.
 fn is_text_sql_type(data_type: &str) -> bool {

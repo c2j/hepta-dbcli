@@ -112,7 +112,8 @@ fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbE
         |side: &crate::delta_diff::strategy::SideCtx, is_left: bool| -> Result<String, DbError> {
             let exprs = side.plan.normalized_exprs(dialect)?;
             let table = dialect.quote_table(side.schema.as_deref(), &side.table);
-            let key = dialect.quote_ident(&ctx.side_key_columns(is_left)[0]);
+            // Catalog-physical name: quote without re-folding (issue #116).
+            let key = dialect.quote_catalog_ident(&ctx.side_key_columns(is_left)[0]);
             let where_clause = ctx
                 .filter
                 .as_ref()
@@ -174,7 +175,8 @@ fn point_spec(
 ) -> Result<KeysetPageSpec, DbError> {
     let side = if is_left { &ctx.left } else { &ctx.right };
     let side_key = &ctx.side_key_columns(is_left)[0];
-    let mut columns = vec![dialect.quote_ident(side_key)];
+    // Catalog-physical name: quote without re-folding (issue #116).
+    let mut columns = vec![dialect.quote_catalog_ident(side_key)];
     for spec in side.plan.norm_specs.iter().filter(|s| &s.name != side_key) {
         columns.push(dialect.normalize_expr(spec)?);
     }
@@ -291,6 +293,8 @@ fn assemble(
         ident_scheme: String::new(),
         backslash_escape: false,
         modified_columns: None,
+        left_column_names: None,
+        right_column_names: None,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
     report

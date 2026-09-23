@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::backend::{quote_ident_scheme, quote_table_scheme, sql_literal};
+use crate::backend::{quote_ident_catalog, quote_table_scheme, sql_literal};
 use crate::delta_diff::cmd::ApplyTo;
 use crate::delta_diff::report::{DiffReport, DiffRow, DiffStatus, RowPayload};
 
@@ -179,16 +179,32 @@ fn all_col_names(report: &DiffReport) -> Vec<String> {
     c
 }
 
+/// Physical column names on the `--apply-to` target side, aligned with
+/// `row_columns()` (keys first, then values). The report's `key_columns` /
+/// `value_columns` only carry the LEFT side's catalog names, so a patch for
+/// the right table must take names from `right_column_names` instead
+/// (issue #116 review round 2). Falls back to the report names when the
+/// runner did not stamp the per-side lists (older callers, tests).
+fn target_col_names(report: &DiffReport, opts: &SqlPatchOpts<'_>) -> Vec<String> {
+    let stamped = match opts.apply_to {
+        ApplyTo::Left => report.left_column_names.as_ref(),
+        ApplyTo::Right => report.right_column_names.as_ref(),
+    };
+    stamped.cloned().unwrap_or_else(|| all_col_names(report))
+}
+
 fn render_insert(
     report: &DiffReport,
     cells: &[Value],
     opts: &SqlPatchOpts<'_>,
     table: &str,
 ) -> String {
-    let names = all_col_names(report);
+    let names = target_col_names(report, opts);
+    // Catalog-physical names on the target side: quote without re-folding
+    // (issue #116, review round 2).
     let cols = names
         .iter()
-        .map(|n| quote_ident_scheme(opts.scheme, opts.quote, n))
+        .map(|n| quote_ident_catalog(opts.scheme, opts.quote, n))
         .collect::<Vec<_>>()
         .join(", ");
     let vals = names
@@ -220,8 +236,15 @@ fn render_update(
 ) -> Result<String, String> {
     let key_len = report.key_columns.len();
     let src_is_right = matches!(opts.apply_to, ApplyTo::Left);
+    let names = target_col_names(report, opts);
     let mut sets = Vec::new();
     for (i, name) in report.value_columns.iter().enumerate() {
+        // Column identifier comes from the target side's physical name list;
+        // `name` only carries the left-plan order.
+        let col_name = names
+            .get(key_len + i)
+            .map(String::as_str)
+            .unwrap_or(name.as_str());
         let l = row.left.as_ref().and_then(|r| r.get(key_len + i));
         let r = row.right.as_ref().and_then(|r| r.get(key_len + i));
         if l == r {
@@ -230,7 +253,9 @@ fn render_update(
         let new_v = if src_is_right { r } else { l }.unwrap_or(&Value::Null);
         sets.push(format!(
             "{} = {}",
-            quote_ident_scheme(opts.scheme, opts.quote, name),
+            // Catalog-physical name on the target side: quote without
+            // re-folding (issue #116, review round 2).
+            quote_ident_catalog(opts.scheme, opts.quote, col_name),
             sql_literal(new_v, opts.backslash_escape)
         ));
     }
@@ -248,7 +273,9 @@ fn render_update(
 }
 
 fn key_eq(name: &str, v: &Value, opts: &SqlPatchOpts<'_>) -> String {
-    let col = quote_ident_scheme(opts.scheme, opts.quote, name);
+    // Catalog-physical name on the target side: quote without re-folding
+    // (issue #116, review round 2).
+    let col = quote_ident_catalog(opts.scheme, opts.quote, name);
     if v.is_null() {
         format!("{col} IS NULL")
     } else {
@@ -258,11 +285,14 @@ fn key_eq(name: &str, v: &Value, opts: &SqlPatchOpts<'_>) -> String {
 
 fn key_predicate(report: &DiffReport, row: &DiffRow, opts: &SqlPatchOpts<'_>) -> String {
     let src = row.left.as_ref().or(row.right.as_ref());
+    let names = target_col_names(report, opts);
     report
         .key_columns
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            // Key identifier from the target side's physical name list.
+            let col_name = names.get(i).map(String::as_str).unwrap_or(name.as_str());
             let v = src
                 .and_then(|r| r.get(i))
                 .or_else(|| match &row.key {
@@ -271,7 +301,7 @@ fn key_predicate(report: &DiffReport, row: &DiffRow, opts: &SqlPatchOpts<'_>) ->
                     _ => None,
                 })
                 .unwrap_or(&Value::Null);
-            key_eq(name, v, opts)
+            key_eq(col_name, v, opts)
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -348,6 +378,8 @@ mod tests {
             ident_scheme: String::new(),
             backslash_escape: false,
             modified_columns: None,
+            left_column_names: None,
+            right_column_names: None,
         }
     }
 
@@ -564,6 +596,50 @@ mod tests {
         opts.quote = '`';
         let sql = render_sql_patch(&report_keyed(), &opts).unwrap();
         assert!(sql.contains("`bigfund`.`dat_fund_cjqs`"), "{sql}");
+    }
+
+    #[test]
+    fn apply_to_right_quotes_keys_with_right_side_physical_names() {
+        // Issue #116 review round 2: report.key_columns/value_columns carry
+        // the LEFT side's catalog names (stamp_columns_from_plan(ctx.left)).
+        // A patch applied to the right table must quote the RIGHT side's
+        // physical names: left quoted "MyKey" vs right unquoted mykey whose
+        // catalog name is "MYKEY". Writing "MyKey" into the right table is
+        // ORA-00904; before the fix the scheme fold would have saved us.
+        let mut r = report_keyed();
+        r.key_columns = vec!["MyKey".into()];
+        r.value_columns = vec!["V".into()];
+        r.column_data_types = vec![];
+        // Keep only the Modified row (both sides present) so UPDATE renders;
+        // the payload carries two columns (key + value) in left-plan order,
+        // matching the per-side name lists stamped below.
+        r.sample_diffs = vec![r.sample_diffs[1].clone()];
+        for row in &mut r.sample_diffs {
+            row.key = json!(["59267"]);
+            row.left = Some(vec![Value::from("59267"), Value::from(10)]);
+            row.right = Some(vec![Value::from("59267"), Value::from(12)]);
+        }
+        r.summary.missing_left = 0;
+        r.summary.missing_right = 0;
+        r.summary.modified = 1;
+        r.left_column_names = Some(vec!["MyKey".into(), "V".into()]);
+        r.right_column_names = Some(vec!["MYKEY".into(), "V".into()]);
+        let mut opts = opts_left();
+        opts.apply_to = ApplyTo::Right;
+        opts.scheme = "oracle";
+        let sql = render_sql_patch(&r, &opts).unwrap();
+        assert!(
+            sql.contains("\"MYKEY\" = '59267'"),
+            "right-side patch must quote the right catalog name \"MYKEY\": {sql}"
+        );
+        assert!(
+            !sql.contains("\"MyKey\""),
+            "left-side name must not leak into a right-side patch: {sql}"
+        );
+        assert!(
+            sql.contains("SET \"V\" = 10"),
+            "value column must use the target-side physical name: {sql}"
+        );
     }
 
     fn report_keyless_naive() -> DiffReport {
