@@ -15,18 +15,20 @@
 //! add     := mul ( ("+" | "-") mul )*
 //! mul     := unary ( ("*" | "/" | "%") unary )*
 //! unary   := "-" unary | primary
-//! primary := number | string | column | "(" expr ")"
+//! primary := number | string | column | call | "(" expr ")"
 //! number  := decimal literal, parsed into `rust_decimal::Decimal`
 //! string  := 'single quoted'
 //! column  := identifier
+//! call    := identifier "(" expr ( "," expr )* ")"
 //! ```
 //!
-//! # Security whitelist (issue #70 AC2, §3 V10)
+//! # Security whitelist (issue #70 AC2, §3 V10; extended by #94)
 //!
 //! The parser rejects, at load time and before any evaluation, every node that
 //! is outside the grammar above. In particular:
 //!
-//! * function calls such as `min(price, qty)`,
+//! * function calls other than the whitelisted [`KNOWN_FUNCTIONS`] (currently
+//!   `if`; unknown names are rejected with the known list),
 //! * attribute access such as `price.__class__`,
 //! * subscripting such as `cols[0]`,
 //! * any character outside the quoted/unquoted forms listed above.
@@ -1218,11 +1220,6 @@ mod tests {
         );
     }
 
-    // #94 decision (user-approved): unknown function names are still
-    // rejected fail-fast, but the error classification moved from
-    // `Disallowed { construct: "function call" }` to a syntax error that
-    // lists the known functions. `min` is not whitelisted, so this stays a
-    // rejection; only the error shape changed.
     #[test]
     fn should_reject_function_call_node() {
         let err = Expr::parse("min(price, qty)").expect_err("must reject");

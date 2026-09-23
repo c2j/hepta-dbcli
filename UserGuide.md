@@ -1207,7 +1207,7 @@ tables:
 3. **rules-draft 隐式推断已跳过 datetime 列**：`last_update` 这类多表同名的更新时间戳列不再被连成互指关系（推断层跳过 datetime 子列，自引用一律跳过）。若 draft 仍因其他原因成环，落盘前会打 `warning: draft references form a cycle ...`（含同一错误文案里点名的两类常见误报），此时按提示手工删除残余伪 relationship 再 `generate`。
 4. **`--mine` 默认跳过 PII 列**：挖掘器在「档数 ≤ 50 且非标识符」之外还会用 PII 识别过滤列（被跳过的列名打在 stderr），低基数的 email/phone 列不会再把**训练原值**写进 YAML 注释与 `--emit-candidates` 文件。确知数据是假 PII 形状时可加 `--keep-pii-columns` 恢复旧行为。
 5. **父键 `unique: true` 受父池大小约束**：生成开始前预检——需求唯一值数超过父表**已生成**行数即报错并给出两条线索：父池当前大小、父列训练时观测到的 distinct 容量。容量足够时提示增大父表 rules 行数，容量不足时提示增大 train `--sample` 重新训练；也可以改 `unique: false` 或给父键配 `values` 池。例：users rules 只生成 3 行、orders `unique: true` 请求 300 行会直接报 `unique FK 'user_id' requests 300 unique value(s) but its parent pool 'users.id' holds only 3 generated value(s)`。
-6. **`derive` 表达式类型必须与目标列匹配**（#94 起支持条件函数与布尔目标列）：表达式白名单新增**条件函数 `if(cond, then, else)`**——`cond` 必须是布尔表达式（比较/逻辑组合），两个分支静态类型须一致（数字或字符串），**惰性求值**（未被选中的分支不参与求值，其中的除零不会触发）。比较/逻辑表达式（结果为布尔）可以直接 `derive` 进**布尔目标列**：训练后档位恰为 `true`/`false` 文本的列（即真实 BOOLEAN 列的形态）会按表达式真值生成 `"true"`/`"false"` 文本（与该列既有导出载体一致）；布尔表达式配数值目标、或数值/字符串表达式配布尔目标，都会在生成前报错并点名目标列。未知函数名仍然 fail-fast 拒绝并给出已知函数列表。函数白名单当前：`if`。
+6. **`derive` 表达式类型必须与目标列匹配**（#94 起支持条件函数与布尔目标列）：表达式白名单新增**条件函数 `if(cond, then, else)`**——`cond` 必须是布尔表达式（比较/逻辑组合），两个分支静态类型须一致（数字或字符串），**惰性求值**（未被选中的分支不参与求值，其中的除零不会触发）。比较/逻辑表达式（结果为布尔）可以直接 `derive` 进**布尔目标列**：训练后档位恰为 `true`/`false` 文本的列（即真实 BOOLEAN 列的形态）会按表达式真值生成 `"true"`/`"false"` 文本（与该列既有导出载体一致）；布尔表达式配数值目标、数值/字符串表达式配布尔目标，以及**字符串结果配任意非布尔目标**（字符串分支只用于比较，没有字符串写出路径），都会在生成前报错并点名目标列。未知函数名仍然 fail-fast 拒绝并给出已知函数列表。函数白名单当前：`if`。
 7. **PII phone provider 固定美式格式**：始终生成 `+1-XXX-XXX-XXXX`，不随训练值地域变化（训练值 `13812345678` 这类中文手机号在生成结果中为 0% 格式匹配）。需要本地格式时可 `sdtype: keep`（保留值域，注意泄漏面）或导出后自行变换。
 8. **Oracle（oracle-rs 驱动）**：表不存在时报 `Oracle closed the connection without an error packet…`，语义误导（实为对象不存在被驱动吞掉）；采样超 100 行会被驱动静默截断（见上文截断告警逻辑）。
 9. **DuckDB**：连接串指向的数据库文件必须已存在，CLI 不自动创建（报 `DuckDB database file not found`）；DuckDB 引擎不支持 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`，外键必须在建表 DDL 中内联，`rules-draft` 才能扫到。
@@ -1399,7 +1399,7 @@ esac
 | synth ``--tables entry 'x.y' uses schema-qualified `schema.table` notation`` | `--tables` 写了 `schema.table` 点号形式（fail-fast 拒绝） | 拆开：`--tables customer --schema staging` |
 | synth `unique FK '...' requests N unique value(s) but its parent pool '...' holds only M generated value(s)` | `unique: true` 父表生成行数（或训练观测容量）< 请求行数 | 按报错里的两条线索：父表 rules 行数不够就增大行数，训练观测不够就增大 train `--sample` 重训；也可改 `unique: false` 或给父键配 `values` 池（见 §10.5 已知限制 5） |
 | synth rules-draft 报 `warning: draft references form a cycle` | 残余的隐式误报关系成环（同名时间戳已被跳过；自引用也已被跳过） | 按警告提示手工删除 draft YAML 中的伪 relationship（见 §10.5 已知限制 3） |
-| synth derive 报 `boolean expression`/`boolean column` 类型不匹配（点名表.列） | derive 表达式结果类型与目标列档位不兼容（布尔表达式配数值列，或数值/字符串表达式配 `true`/`false` 布尔列） | 按提示改成同类型表达式；布尔真值应配布尔目标列（#94 起支持），或用 `if(cond, '1', '0')` 把结果编码成目标列的类型（见 §10.5 已知限制 6） |
+| synth derive 报 `boolean expression`/`boolean column`/`string expression` 类型不匹配（点名表.列） | derive 表达式结果类型与目标列档位不兼容（布尔/字符串表达式配数值列，或数值/字符串表达式配 `true`/`false` 布尔列） | 按提示改成同类型表达式；布尔真值应配布尔目标列（#94 起支持），或用**无引号**的 `if(cond, 1, 0)` 把结果编码成数值（带引号的 `if(cond, '1', '0')` 会被计划期拒绝——字符串分支只用于比较，见 §10.5 已知限制 6） |
 | synth derive 报 `function \`xxx\` is not permitted; known functions: if` | 用了白名单外的函数 | 首批白名单仅 `if`，其余函数暂不支持（见 §10.5 已知限制 6） |
 | GaussDB synth 连接报 `unknown option currentSchema` | URL 查询参数不被 gaussdb 驱动接受 | 去掉参数，改用 `--schema` |
 | DuckDB `database file not found` | CLI 不自动创建 DuckDB 文件 | 先用任意 DuckDB 客户端建库再连接 |

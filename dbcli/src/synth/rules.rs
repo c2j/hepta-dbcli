@@ -1049,10 +1049,6 @@ tables:
         assert!(err.contains("paid"), "error must name the branch: {err}");
     }
 
-    // #94 decision (user-approved): unknown function names are still
-    // rejected fail-fast at load time; the error text changed from the
-    // generic "function call" category to naming the function and listing
-    // the known whitelist. Table and column attribution is unchanged.
     #[test]
     fn should_reject_derive_with_a_disallowed_expression_node() {
         let yaml = r#"

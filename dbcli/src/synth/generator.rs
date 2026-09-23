@@ -1878,6 +1878,20 @@ impl DerivePlan {
                         }
                     ));
                 }
+                (crate::synth::expr::Ty::String, false) => {
+                    // No write path exists for a statically-string result:
+                    // eval_decimal only accepts numbers and string literals
+                    // are never coerced outside comparison operands, so this
+                    // would die at generation with a confusing "decimal
+                    // result cannot be applied to string". Fail here instead
+                    // (issue #94 review round 2), naming the target column.
+                    return Err(format!(
+                        "table '{}' derive '{}': a string expression cannot fill a non-boolean \
+                         target column; compare it (e.g. `if(...) == 'x'`) or use unquoted \
+                         numeric branches like if(cond, 1, 0)",
+                        table_name, target
+                    ));
+                }
                 _ => {}
             }
             steps.push(DeriveStep {
@@ -5725,6 +5739,27 @@ tables:
         assert!(
             err.contains("boolean column") && err.contains("flag"),
             "plan-time error must name the column and say 'boolean column': {err}"
+        );
+    }
+
+    // A statically-string expression on a NON-boolean target has no write
+    // path: eval_decimal only accepts numbers, and string literals are never
+    // coerced outside comparison operands. `if(cond, '1', '0')` on a numeric
+    // column previously slipped through the plan-time compat check and died
+    // at generation with "decimal result cannot be applied to string"; it
+    // must fail at plan time naming the target instead. (The unquoted
+    // `if(cond, 1, 0)` is the supported encoding; see the UserGuide
+    // troubleshooting table.)
+    #[test]
+    fn should_reject_string_expression_on_non_bool_target() {
+        // price/qty/total: derive target `total` is a plain numerical column.
+        let models = three_column_model(plain_total_model());
+        let rules = derive_rules(&[("total", "if(price > 0.5, '1', '0')")]);
+        let err = generate(&models, &rules, &config(&["t"], 10))
+            .expect_err("string expression on a numeric target must fail at plan time");
+        assert!(
+            err.contains("total") && err.contains("string expression"),
+            "plan-time error must name the target and say 'string expression': {err}"
         );
     }
 
