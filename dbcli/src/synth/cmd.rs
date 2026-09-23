@@ -87,6 +87,12 @@ pub enum SynthCommand {
         /// (`0` disables the baseline file)
         #[arg(long, default_value_t = 0.1)]
         holdout_ratio: f64,
+
+        /// Skip per-FK child-count distribution learning: the saved model
+        /// carries no `fk_cardinality`, so `cardinality: modeled` will refuse
+        /// at generate time (issue #89 S4①).
+        #[arg(long, default_value_t = false)]
+        no_cardinality: bool,
     },
 
     /// Draft a rules YAML from database foreign keys

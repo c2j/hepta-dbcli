@@ -70,6 +70,7 @@ pub async fn run(
             categorical_top_k,
             rules,
             holdout_ratio,
+            no_cardinality,
         } => {
             run_train(
                 name,
@@ -81,6 +82,7 @@ pub async fn run(
                     categorical_top_k,
                     rules_path: rules.as_deref(),
                     holdout_ratio,
+                    no_cardinality,
                 },
                 config_path,
             )
@@ -422,6 +424,9 @@ struct TrainRunOptions<'a> {
     categorical_top_k: cmd::CategoricalTopK,
     rules_path: Option<&'a str>,
     holdout_ratio: f64,
+    /// `train --no-cardinality`: skip per-FK child-count distribution
+    /// learning (issue #89 S4①).
+    no_cardinality: bool,
 }
 
 async fn run_train(
@@ -437,6 +442,7 @@ async fn run_train(
         categorical_top_k,
         rules_path,
         holdout_ratio,
+        no_cardinality,
     } = options;
     let tables = split_tables(tables);
     check_table_names(&tables)?;
@@ -685,7 +691,13 @@ async fn run_train(
         );
     }
 
-    attach_fk_cardinality(output_dir, &foreign_keys, &key_distinct, &fk_values)?;
+    attach_fk_cardinality(
+        output_dir,
+        &foreign_keys,
+        &key_distinct,
+        &fk_values,
+        !no_cardinality,
+    )?;
 
     Ok(())
 }
@@ -809,7 +821,15 @@ fn attach_fk_cardinality(
     foreign_keys: &[crate::synth::rules_draft::ForeignKeyInfo],
     key_distinct: &HashMap<(String, String), usize>,
     fk_values: &HashMap<(String, String), Vec<serde_json::Value>>,
+    learn: bool,
 ) -> Result<(), String> {
+    // `--no-cardinality` (issue #89 S4①): skip the attachment entirely so the
+    // saved model carries no `fk_cardinality`. A later `cardinality: modeled`
+    // then fails at generate time with the documented "no cardinality
+    // learned" error instead of modeling from data train never learned.
+    if !learn {
+        return Ok(());
+    }
     // Load each child model once; a table may have several foreign keys.
     let mut loaded: HashMap<String, crate::synth::model::TableModel> = HashMap::new();
     let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1692,6 +1712,7 @@ mod tests {
                 categorical_top_k: cmd::CategoricalTopK::Limit(50),
                 rules: None,
                 holdout_ratio: 0.1,
+                no_cardinality: false,
             }),
             ("train".to_string(), "tables=users,orders".to_string())
         );
@@ -2395,5 +2416,57 @@ mod tests {
         assert!(reserved.contains("user_id"));
         assert_eq!(reserved.len(), 1, "primary keys must not be reserved");
         assert!(pii_reserved_columns(&foreign_keys, "other").is_empty());
+    }
+
+    /// S4① (issue #89 acceptance): `train --no-cardinality` skips the
+    /// fk_cardinality attachment entirely. The saved child model must carry
+    /// no `fk_cardinality` entry, so a later `cardinality: modeled` fails at
+    /// generate time with the documented "no cardinality learned" error
+    /// instead of silently modeling from a distribution train never learned.
+    #[test]
+    fn should_skip_fk_cardinality_attachment_when_learning_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = categorical_model("orders", &[("user_id", &["1", "2", "9"])]);
+        child.save(&dir.path().join("orders.model.json")).unwrap();
+
+        let foreign_keys = vec![crate::synth::rules_draft::ForeignKeyInfo {
+            from_table: "orders".to_string(),
+            from_column: "user_id".to_string(),
+            to_table: "users".to_string(),
+            to_column: "id".to_string(),
+        }];
+        let child_fk_values = vec![
+            serde_json::Value::from(1),
+            serde_json::Value::from(1),
+            serde_json::Value::from(2),
+        ];
+        let mut fk_values = HashMap::new();
+        fk_values.insert(
+            ("orders".to_string(), "user_id".to_string()),
+            child_fk_values,
+        );
+        let mut key_distinct = HashMap::new();
+        key_distinct.insert(("users".to_string(), "id".to_string()), 3usize);
+
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, false)
+            .expect("disabled cardinality must not fail");
+
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        assert!(
+            reloaded.fk_cardinality.is_empty(),
+            "--no-cardinality must leave no fk_cardinality in the model"
+        );
+
+        // Control: with learning enabled the same inputs do attach the
+        // distribution, so the assertion above fails for the right reason.
+        attach_fk_cardinality(dir.path(), &foreign_keys, &key_distinct, &fk_values, true)
+            .expect("enabled cardinality must not fail");
+        let reloaded = crate::synth::model::TableModel::load(&dir.path().join("orders.model.json"))
+            .expect("model must reload");
+        assert!(
+            reloaded.fk_cardinality.contains_key("user_id"),
+            "default behavior must still learn cardinality"
+        );
     }
 }
