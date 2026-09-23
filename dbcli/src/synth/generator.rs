@@ -5674,6 +5674,35 @@ tables:
         }
     }
 
+    // Issue #94 follow-up: branches that are themselves comparisons make the
+    // whole if() statically Bool, so a bool target must route through
+    // eval_bool at plan time instead of failing on eval_decimal.
+    #[test]
+    fn should_derive_boolean_target_from_if_with_comparison_branches() {
+        let models = bool_derive_model();
+        let rules = derive_rules(&[(
+            "flag",
+            "if(store_id > 2, active == 'true', active == 'false')",
+        )]);
+
+        let data = generate(&models, &rules, &config(&["t"], 200)).unwrap();
+        for row in data.tables.get("t").unwrap() {
+            let active = row[1].as_str().unwrap();
+            let expected = if row[0].as_f64().unwrap() > 2.0 {
+                // then-branch: flag == (active == "true") == active itself.
+                active
+            } else {
+                // else-branch: flag == (active == "false") == negation.
+                if active == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+            };
+            assert_eq!(row[2].as_str(), Some(expected), "row {row:?}");
+        }
+    }
+
     #[test]
     fn should_reject_bool_expression_on_numeric_target() {
         let models = bool_derive_model();
