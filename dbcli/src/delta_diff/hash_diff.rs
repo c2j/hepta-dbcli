@@ -859,6 +859,8 @@ fn assemble_report(
         ident_scheme: String::new(),
         backslash_escape: false,
         modified_columns: None,
+        left_column_names: None,
+        right_column_names: None,
     };
     crate::delta_diff::report::stamp_columns_from_plan(&mut report, &ctx.left.plan);
     report

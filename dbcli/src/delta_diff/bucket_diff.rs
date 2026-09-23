@@ -1049,6 +1049,8 @@ fn assemble(
         ident_scheme: String::new(),
         backslash_escape: false,
         modified_columns: None,
+        left_column_names: None,
+        right_column_names: None,
     }
 }
 
