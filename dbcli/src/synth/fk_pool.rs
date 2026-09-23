@@ -18,7 +18,7 @@ pub struct FkPool {
     es_prepared: bool,
 }
 
-fn value_key(v: &Value) -> String {
+pub(crate) fn value_key(v: &Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())

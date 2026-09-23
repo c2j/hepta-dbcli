@@ -1,5 +1,5 @@
 use crate::synth::copula::GaussianCopula;
-use crate::synth::fk_pool::{FkPool, SelectionStrategy};
+use crate::synth::fk_pool::{value_key, FkPool, SelectionStrategy};
 use crate::synth::model::TableModel;
 use crate::synth::rules::{
     ColumnMode, PoolStrategy, SynthRules, TableRule, TableStrategy, ValuePool,
@@ -2661,6 +2661,39 @@ fn density_weights_with_warning(
         .and_then(|m| m.columns.get(fk_column))
         .map(|c| &c.marginal);
 
+    // Categorical marginals carry no usable CDF (their atoms are the
+    // dictionary levels), so density weighting matches the pool against the
+    // trained dictionary in string form (profile.rs stores top_values as
+    // strings) and reuses the trained level weights directly. This is what
+    // keeps low-cardinality numeric FKs from degrading to uniform draws.
+    if let Some(crate::synth::marginal::Marginal::Categorical(categorical)) = marginal {
+        let weight_by_level: HashMap<&str, f64> = categorical
+            .values
+            .iter()
+            .zip(categorical.weights.iter())
+            .map(|(level, weight)| (level.as_str(), *weight))
+            .collect();
+        let weights: Vec<f64> = pool_values
+            .iter()
+            .map(|v| {
+                let key = value_key(v);
+                weight_by_level
+                    .get(key.as_str())
+                    .copied()
+                    .unwrap_or(WEIGHT_FLOOR)
+            })
+            .collect();
+        let all_floored = weights.iter().all(|w| *w <= WEIGHT_FLOOR);
+        let warning = all_floored.then(|| {
+            format!(
+                "pool_strategy !density on '{}.{}': no trained density mass overlaps the \
+                 parent pool, falling back to uniform draws",
+                child_table, fk_column
+            )
+        });
+        return (weights, warning);
+    }
+
     // Numeric axis of the pool values; a non-numeric pool falls back to
     // uniform (all-floor) rather than guessing an ordering.
     let mut sorted: Vec<f64> = pool_values.iter().filter_map(value_as_f64).collect();
@@ -3300,6 +3333,124 @@ mod tests {
             warning.is_none(),
             "meaningful density weights must not warn: {warning:?}"
         );
+    }
+
+    /// Re-review bug (PR #120): `Marginal::cdf` returns a constant 0 for
+    /// Categorical, so a low-cardinality numeric FK with a trained
+    /// categorical dictionary floored every `!density` weight and degraded
+    /// to uniform draws. The pool values must be matched against the
+    /// categorical dictionary (string form, the form profile.rs stores) and
+    /// weighted by the trained level weights.
+    #[test]
+    fn should_weight_categorical_density_pool_by_trained_level_weights() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+                    weights: vec![0.7, 0.2, 0.1],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let pool = vec![Value::from(30), Value::from(10), Value::from(20)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &pool);
+
+        assert!(
+            warning.is_none(),
+            "overlapping categorical pool must not warn: {warning:?}"
+        );
+        // Weights keep the pool's original order (30, 10, 20) and follow the
+        // trained weights (0.1, 0.7, 0.2) up to a shared scale.
+        let total: f64 = weights.iter().sum();
+        let normalized: Vec<f64> = weights.iter().map(|w| w / total).collect();
+        for (got, want) in normalized.iter().zip([0.1, 0.7, 0.2]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "categorical density weights {normalized:?} must match trained [0.1, 0.7, 0.2]"
+            );
+        }
+    }
+
+    /// A `!density` pool whose values the trained categorical dictionary
+    /// never observed must keep warning: the weights floor and the draw
+    /// degrades to uniform.
+    #[test]
+    fn should_warn_when_categorical_density_pool_misses_all_trained_levels() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Categorical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Categorical(CategoricalParams {
+                    values: vec!["10".to_string(), "20".to_string()],
+                    weights: vec![0.6, 0.4],
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let pool = vec![Value::from(900), Value::from(901)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &pool);
+
+        assert!(
+            warning.is_some(),
+            "no-overlap categorical pool must still warn: {warning:?}"
+        );
+        assert!(weights.iter().all(|w| *w > 0.0));
     }
 
     #[test]

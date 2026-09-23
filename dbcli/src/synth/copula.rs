@@ -461,9 +461,15 @@ const PSD_EIGENVALUE_FLOOR: f64 = 1e-10;
 
 /// Cyclic Jacobi eigenvalue decomposition of a symmetric matrix. Returns the
 /// eigenvalues (unsorted) and the eigenvector matrix V with A = V Λ Vᵀ.
-/// Converges quadratically; 100 sweeps is far past convergence for the ≤
-/// few-hundred-column copula matrices this codebase builds.
+///
+/// One *sweep* applies a rotation to every upper-triangle pair (n(n-1)/2
+/// rotations), not one rotation to the largest pair. Jacobi converges
+/// quadratically once the off-diagonal mass is small, so a handful of sweeps
+/// drives the largest off-diagonal entry below `JACOBI_SWEEP_TOLERANCE` for
+/// the copula-scale matrices this codebase builds; the loop keeps sweeping
+/// until that holds, and returns the actual diagonal only then.
 fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
+    const MAX_SWEEPS: usize = 60;
     let dim = matrix.len();
     let mut a: Vec<Vec<f64>> = matrix.to_vec();
     let mut v: Vec<Vec<f64>> = vec![vec![0.0; dim]; dim];
@@ -471,64 +477,76 @@ fn jacobi_eigen_decomposition(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) 
         v_row[i] = 1.0;
     }
 
-    for _ in 0..100 {
-        // Largest off-diagonal magnitude drives this sweep's rotation.
-        let mut off = 0.0f64;
-        let mut p = 0usize;
-        let mut q = 0usize;
-        for (i, row_i) in a.iter().enumerate() {
-            for (j, value) in row_i.iter().enumerate().skip(i + 1) {
-                if value.abs() > off {
-                    off = value.abs();
-                    p = i;
-                    q = j;
+    if dim > 1 {
+        for _ in 0..MAX_SWEEPS {
+            // Off-diagonal mass before the sweep; convergence is judged on
+            // the *post-sweep* state below.
+            for p in 0..dim {
+                for q in (p + 1)..dim {
+                    let apq = a[p][q];
+                    if apq.abs() < 1e-300 {
+                        continue;
+                    }
+                    let theta = 0.5 * ((2.0 * apq).atan2(a[q][q] - a[p][p]));
+                    let (c, s) = (theta.cos(), theta.sin());
+                    // Similarity transform A' = Jᵀ A J with
+                    // J = [[c, s], [-s, c]] acting on coordinates p, q. The
+                    // column rotation (right factor) must read the
+                    // pre-rotation columns; the row rotation (left factor)
+                    // then reads the intermediate A J.
+                    let (col_p, col_q): (Vec<f64>, Vec<f64>) = {
+                        let mut cp = Vec::with_capacity(dim);
+                        let mut cq = Vec::with_capacity(dim);
+                        for row in a.iter() {
+                            cp.push(row[p]);
+                            cq.push(row[q]);
+                        }
+                        (cp, cq)
+                    };
+                    // Right factor: A J — rotate columns p, q.
+                    for ((row, col_p_k), col_q_k) in
+                        a.iter_mut().zip(col_p.iter()).zip(col_q.iter())
+                    {
+                        row[p] = c * col_p_k - s * col_q_k;
+                        row[q] = s * col_p_k + c * col_q_k;
+                    }
+                    // Left factor: Jᵀ (A J) — rotate rows p, q.
+                    let row_p = a[p].clone();
+                    let row_q = a[q].clone();
+                    for (j, value_p) in row_p.iter().enumerate() {
+                        let value_q = row_q[j];
+                        a[p][j] = c * value_p - s * value_q;
+                        a[q][j] = s * value_p + c * value_q;
+                    }
+                    // Accumulate the rotation: V' = V J.
+                    let (v_p, v_q): (Vec<f64>, Vec<f64>) = {
+                        let mut vp = Vec::with_capacity(dim);
+                        let mut vq = Vec::with_capacity(dim);
+                        for row in v.iter() {
+                            vp.push(row[p]);
+                            vq.push(row[q]);
+                        }
+                        (vp, vq)
+                    };
+                    for ((row, v_p_k), v_q_k) in v.iter_mut().zip(v_p.iter()).zip(v_q.iter()) {
+                        row[p] = c * v_p_k - s * v_q_k;
+                        row[q] = s * v_p_k + c * v_q_k;
+                    }
                 }
             }
-        }
-        if off < 1e-14 {
-            break;
-        }
-        let theta = 0.5 * ((2.0 * a[p][q]).atan2(a[q][q] - a[p][p]));
-        let (c, s) = (theta.cos(), theta.sin());
-        // Similarity transform A' = Jᵀ A J with
-        // J = [[c, s], [-s, c]] acting on coordinates p, q. The column
-        // rotation (right factor) must read the pre-rotation columns; the
-        // row rotation (left factor) then reads the intermediate A J.
-        let (col_p, col_q): (Vec<f64>, Vec<f64>) = {
-            let mut cp = Vec::with_capacity(dim);
-            let mut cq = Vec::with_capacity(dim);
-            for row in a.iter() {
-                cp.push(row[p]);
-                cq.push(row[q]);
+            let max_off_diagonal = a
+                .iter()
+                .enumerate()
+                .flat_map(|(i, row)| {
+                    row.iter()
+                        .enumerate()
+                        .skip(i + 1)
+                        .map(move |(_, value)| value.abs())
+                })
+                .fold(0.0f64, f64::max);
+            if max_off_diagonal < 1e-12 {
+                break;
             }
-            (cp, cq)
-        };
-        // Right factor: A J — rotate columns p, q.
-        for ((row, col_p_k), col_q_k) in a.iter_mut().zip(col_p.iter()).zip(col_q.iter()) {
-            row[p] = c * col_p_k - s * col_q_k;
-            row[q] = s * col_p_k + c * col_q_k;
-        }
-        // Left factor: Jᵀ (A J) — rotate rows p, q.
-        let row_p = a[p].clone();
-        let row_q = a[q].clone();
-        for (j, value_p) in row_p.iter().enumerate() {
-            let value_q = row_q[j];
-            a[p][j] = c * value_p - s * value_q;
-            a[q][j] = s * value_p + c * value_q;
-        }
-        // Accumulate the rotation: V' = V J.
-        let (v_p, v_q): (Vec<f64>, Vec<f64>) = {
-            let mut vp = Vec::with_capacity(dim);
-            let mut vq = Vec::with_capacity(dim);
-            for row in v.iter() {
-                vp.push(row[p]);
-                vq.push(row[q]);
-            }
-            (vp, vq)
-        };
-        for ((row, v_p_k), v_q_k) in v.iter_mut().zip(v_p.iter()).zip(v_q.iter()) {
-            row[p] = c * v_p_k - s * v_q_k;
-            row[q] = s * v_p_k + c * v_q_k;
         }
     }
 
@@ -694,6 +712,106 @@ mod tests {
         // Cholesky must succeed on the projection without the negative-diff
         // fallback.
         let _l = cholesky_decomposition(&projected);
+    }
+
+    /// Re-review bug (PR #120): the Jacobi loop performed 100 single
+    /// rotations, not 100 sweeps; a 12-dimension non-PSD matrix did not
+    /// converge, and `ensure_psd` then trusted the diagonal of a
+    /// non-diagonalized matrix as the spectrum. A projection on a realistic
+    /// (n >= 12) copula matrix must produce a genuinely PSD result: unit
+    /// diagonal, symmetric, and the eigenvalues of the *output* must all be
+    /// positive (which requires the decomposition itself to have converged).
+    #[test]
+    fn should_project_a_twelve_dimensional_non_psd_matrix_to_psd() {
+        let dim = 12usize;
+        // Build a rank-deficient correlation matrix: six latent factors,
+        // two correlated columns each, plus one clamped beyond |1| to force a
+        // negative eigenvalue on top of singularity.
+        let mut correlation = vec![vec![0.0f64; dim]; dim];
+        for i in 0..dim {
+            correlation[i][i] = 1.0;
+        }
+        for block in 0..6 {
+            let (a, b) = (block * 2, block * 2 + 1);
+            let rho = 0.95 - block as f64 * 0.03;
+            correlation[a][b] = rho;
+            correlation[b][a] = rho;
+        }
+        correlation[0][dim - 1] = 1.2;
+        correlation[dim - 1][0] = 1.2;
+
+        let projected = ensure_psd(correlation);
+
+        // Unit diagonal, symmetric.
+        for (i, row) in projected.iter().enumerate() {
+            assert!(
+                (row[i] - 1.0).abs() < 1e-9,
+                "diagonal must stay 1.0, got {}",
+                row[i]
+            );
+            for (j, value) in row.iter().enumerate() {
+                assert!(
+                    (*value - projected[j][i]).abs() < 1e-12,
+                    "matrix must stay symmetric at ({i},{j})"
+                );
+                assert!(
+                    value.abs() <= 1.0 + 1e-9,
+                    "entries must stay in [-1, 1], got {value} at ({i},{j})"
+                );
+            }
+        }
+        // The decisive check: run the (now converged) decomposition on the
+        // OUTPUT. If the projection did its job the output spectrum is
+        // non-negative; if Jacobi did not converge, the returned "eigen-
+        // values" are the diagonal of a matrix that still has large
+        // off-diagonal mass and this assertion becomes flaky-by-design.
+        let (eigenvalues, _) = jacobi_eigen_decomposition(&projected);
+        let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            min_eigenvalue > -1e-8,
+            "projected matrix must be PSD, min eigenvalue was {min_eigenvalue}"
+        );
+        // Cholesky must succeed without the silent 0.001 fallback.
+        let _l = cholesky_decomposition(&projected);
+    }
+
+    /// The decomposition must actually converge: after the sweep loop the
+    /// matrix must be numerically diagonal, otherwise the returned
+    /// "eigenvalues" are meaningless and the PSD clip misses real negative
+    /// eigenvalues.
+    #[test]
+    fn jacobi_decomposition_converges_on_a_twelve_by_twelve_matrix() {
+        let dim = 12usize;
+        let mut matrix = vec![vec![0.0f64; dim]; dim];
+        for i in 0..dim {
+            matrix[i][i] = 1.0;
+            for j in (i + 1)..dim {
+                let value = 0.5 - (i + j) as f64 * 0.01;
+                matrix[i][j] = value;
+                matrix[j][i] = value;
+            }
+        }
+        let (eigenvalues, eigenvectors) = jacobi_eigen_decomposition(&matrix);
+
+        // Reconstruct A' = V diag V^T and compare with the input.
+        let mut rebuilt = vec![vec![0.0f64; dim]; dim];
+        for k in 0..dim {
+            for x in 0..dim {
+                for y in 0..dim {
+                    rebuilt[x][y] += eigenvalues[k] * eigenvectors[x][k] * eigenvectors[y][k];
+                }
+            }
+        }
+        let mut max_error = 0.0f64;
+        for x in 0..dim {
+            for y in 0..dim {
+                max_error = max_error.max((rebuilt[x][y] - matrix[x][y]).abs());
+            }
+        }
+        assert!(
+            max_error < 1e-9,
+            "decomposition must reproduce the input, max error {max_error}"
+        );
     }
 
     #[test]
