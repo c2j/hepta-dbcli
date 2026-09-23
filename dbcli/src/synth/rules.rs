@@ -630,6 +630,26 @@ fn validate_derive_rules(
     table: &TableRule,
     parent_keys: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
+    // Issue #117: at most one relationship per table may carry derive rules
+    // (the parent snapshot is single-sourced). Enforced here at load time to
+    // match the generator's plan-time check (`DerivePlan::build`) so `train`
+    // fails before any generation work, but this version names the offending
+    // relationships instead of just the table.
+    let derive_rels: Vec<&str> = table
+        .relationships
+        .iter()
+        .filter(|rel| !rel.derive.is_empty())
+        .map(|rel| rel.pk.as_str())
+        .collect();
+    if derive_rels.len() > 1 {
+        return Err(format!(
+            "table '{}': at most one relationship may carry derive rules, but {} and {} both do",
+            table.name,
+            derive_rels[0],
+            derive_rels[1..].join(", ")
+        ));
+    }
+
     // Issue #117: relationship-level derive rules share the target namespace
     // and the topology with table-level derive, so everything below works on
     // one merged list. Whether a `parent.<col>` name actually exists is a
@@ -1300,6 +1320,41 @@ tables:
     // An unknown `parent.<col>` name is a model question (rules carry no
     // parent column list) and is rejected by `DerivePlan::build` at generation
     // time; see the generator tests.
+
+    // Issue #117 constraint (UserGuide: at most one relationship per table
+    // may carry derive rules). The rejection belongs at load time, together
+    // with every other derive conflict, so `train` fails before burning a
+    // generation run on rules it can never execute.
+    #[test]
+    fn should_reject_two_relationships_carrying_derive_at_load_time() {
+        let yaml = r#"
+version: "1"
+tables:
+  - name: buyer
+    relationships: []
+  - name: seller
+    relationships: []
+  - name: orders
+    relationships:
+      - pk: buyer_fk
+        references: [buyer.id]
+        derive:
+          - column: buyer_note
+            expr: "parent.id + 1"
+      - pk: seller_fk
+        references: [seller.id]
+        derive:
+          - column: seller_note
+            expr: "parent.id + 2"
+"#;
+        let err = validate_yaml(yaml)
+            .expect_err("two relationships carrying derive must fail at load time");
+        assert!(err.contains("orders"), "error must name the table: {err}");
+        assert!(
+            err.contains("buyer_fk") && err.contains("seller_fk"),
+            "error must name both relationships: {err}"
+        );
+    }
 
     #[test]
     fn should_reject_relationship_derive_targeting_the_fk_column() {

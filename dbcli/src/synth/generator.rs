@@ -1833,7 +1833,8 @@ impl DerivePlan {
                 .find(|snapshot| snapshot.table == parent_table)
                 .ok_or_else(|| {
                     format!(
-                        "table '{}' relationship '{}': parent table '{}' has not been generated                          (relationship derive needs the parent earlier in the FK order)",
+                        "table '{}' relationship '{}': parent table '{}' has not been generated \
+                         (relationship derive needs the parent earlier in the FK order)",
                         table_name, rel.pk, parent_table
                     )
                 })?;
@@ -2565,7 +2566,11 @@ fn build_rel_pools(
                         table_name, ref_str
                     )
                 })?;
-                let weights = density_weights(models, table_name, &rel.pk, values);
+                let (weights, warning) =
+                    density_weights_with_warning(models, table_name, &rel.pk, values);
+                if let Some(warning) = warning {
+                    eprintln!("warning: {warning}");
+                }
                 (
                     FkPool::from_weighted_values(values.clone(), weights),
                     SelectionStrategy::Weighted,
@@ -2643,12 +2648,12 @@ fn build_rel_pools(
 /// the floor weight; an all-floor vector lets `weighted_index` fall back to
 /// uniform, which keeps a child that never observed the parent's range
 /// drawable.
-fn density_weights(
+fn density_weights_with_warning(
     models: &HashMap<String, TableModel>,
     child_table: &str,
     fk_column: &str,
     pool_values: &[Value],
-) -> Vec<f64> {
+) -> (Vec<f64>, Option<String>) {
     const WEIGHT_FLOOR: f64 = 1e-9;
 
     let marginal = models
@@ -2660,7 +2665,14 @@ fn density_weights(
     // uniform (all-floor) rather than guessing an ordering.
     let mut sorted: Vec<f64> = pool_values.iter().filter_map(value_as_f64).collect();
     if sorted.is_empty() {
-        return vec![WEIGHT_FLOOR; pool_values.len()];
+        let warning = (!pool_values.is_empty()).then(|| {
+            format!(
+                "pool_strategy !density on '{}.{}': the parent pool is non-numeric, \
+                 falling back to uniform draws",
+                child_table, fk_column
+            )
+        });
+        return (vec![WEIGHT_FLOOR; pool_values.len()], warning);
     }
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     sorted.dedup();
@@ -2697,14 +2709,27 @@ fn density_weights(
     for (i, &v) in sorted.iter().enumerate() {
         weight_by_key.insert(format!("{v}"), weights[i]);
     }
-    pool_values
+    let mapped: Vec<f64> = pool_values
         .iter()
         .map(|v| {
             value_as_f64(v)
                 .and_then(|x| weight_by_key.get(&format!("{x}")).copied())
                 .unwrap_or(WEIGHT_FLOOR)
         })
-        .collect()
+        .collect();
+
+    // Every value floored: the density declaration could not shape the draw
+    // (typically no trained marginal or a disjoint support), so the pool is
+    // effectively uniform. Say so instead of degrading silently.
+    let all_floored = mapped.iter().all(|w| *w <= WEIGHT_FLOOR);
+    let warning = all_floored.then(|| {
+        format!(
+            "pool_strategy !density on '{}.{}': no trained density mass overlaps the \
+             parent pool, falling back to uniform draws",
+            child_table, fk_column
+        )
+    });
+    (mapped, warning)
 }
 
 /// Observed distinct-value capacity of a parent key column at train time:
@@ -3198,6 +3223,82 @@ mod tests {
             mean < 80.0,
             "density draw mean {mean:.1} must track the child-trained range \
              (midpoint ~50), not the pool midpoint (~100)"
+        );
+    }
+
+    // Issue #89 S2b follow-up: a `!density` declaration that cannot be
+    // honored (non-numeric pool, or every weight floored) degrades to uniform
+    // draws, and the degradation must surface as a warning instead of being
+    // swallowed.
+    #[test]
+    fn should_report_when_density_weights_degrade_to_uniform() {
+        let models: HashMap<String, TableModel> = HashMap::new();
+
+        // Non-numeric pool: nothing to order, full fallback.
+        let strings = vec![Value::String("a".into()), Value::String("b".into())];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &strings);
+        assert!(warning.is_some(), "non-numeric pool must produce a warning");
+        assert!(
+            weights.iter().all(|w| *w > 0.0),
+            "fallback weights must be positive (uniform shape)"
+        );
+
+        // Numeric pool but no trained marginal: cdf is 0 everywhere, so every
+        // weight floors and the draw silently degrades; that must warn too.
+        let numbers = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let (weights, warning) = density_weights_with_warning(&models, "child", "fk", &numbers);
+        assert!(
+            warning.is_some(),
+            "all-floor numeric pool must produce a warning"
+        );
+        assert!(weights.iter().all(|w| *w > 0.0));
+    }
+
+    #[test]
+    fn should_not_warn_when_density_weights_are_meaningful() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "fk".to_string(),
+            ColumnModel {
+                logical_type: LogicalType::Numerical,
+                rounding: Some(0),
+                datetime_epoch: None,
+                decimal_scale: None,
+                datetime_format: None,
+                marginal: Marginal::Uniform(UniformParams {
+                    low: 0.0,
+                    high: 4.0,
+                }),
+                ..Default::default()
+            },
+        );
+        let model = TableModel {
+            version: 1,
+            table: "child".to_string(),
+            dialect: "mysql".to_string(),
+            schema: None,
+            provenance: Provenance {
+                source: "test".to_string(),
+                converter_version: None,
+                sdv_version: None,
+                truncated: false,
+                trained_rows: None,
+            },
+            pk: vec![],
+            columns,
+            copula: CopulaInfo {
+                column_order: vec!["fk".to_string()],
+                correlation: vec![vec![1.0]],
+            },
+            fk_cardinality: Default::default(),
+        };
+        let models = HashMap::from([("child".to_string(), model)]);
+
+        let numbers = vec![Value::from(1), Value::from(2), Value::from(3)];
+        let (_, warning) = density_weights_with_warning(&models, "child", "fk", &numbers);
+        assert!(
+            warning.is_none(),
+            "meaningful density weights must not warn: {warning:?}"
         );
     }
 
