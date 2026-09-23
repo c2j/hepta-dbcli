@@ -104,6 +104,8 @@ struct RelPool {
 /// Per-column PII generation state (issue #71).
 struct PiiPlan {
     provider: crate::synth::pii::PiiProvider,
+    /// Region style for phone columns (issue #95); other providers ignore it.
+    style: crate::synth::pii::PhoneStyle,
     /// Same observed value -> same fake value (derived from the placeholder
     /// level index, so nothing about the value is stored).
     stable: bool,
@@ -131,9 +133,17 @@ impl PiiPlan {
                     ^ (level.unwrap_or(0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ attempt.wrapping_mul(0x2545_F491_4F6C_DD1D);
                 let mut level_rng = rand::rngs::StdRng::seed_from_u64(seed);
-                crate::synth::pii::generate_value(self.provider, &mut level_rng)
+                crate::synth::pii::generate_value_with_style(
+                    self.provider,
+                    self.style,
+                    &mut level_rng,
+                )
             } else {
-                crate::synth::pii::generate_value(self.provider, &mut self.rng)
+                crate::synth::pii::generate_value_with_style(
+                    self.provider,
+                    self.style,
+                    &mut self.rng,
+                )
             };
             if self.unique && !self.seen.insert(candidate.clone()) {
                 continue;
@@ -365,10 +375,14 @@ fn generate_with(
         let mut pii_plans: Vec<Option<PiiPlan>> = column_order
             .iter()
             .map(|col_name| {
-                let provider = model.columns.get(col_name).and_then(|column| column.pii)?;
+                let model_column = model.columns.get(col_name);
+                let provider = model_column.and_then(|column| column.pii)?;
                 let column_rule = rule.columns.get(col_name);
                 Some(PiiPlan {
                     provider,
+                    style: model_column
+                        .and_then(|column| column.pii_phone_style)
+                        .unwrap_or(crate::synth::pii::PhoneStyle::UsDefault),
                     stable: column_rule.is_some_and(|rule| rule.pii_stable_mapping),
                     unique: column_rule.is_some_and(|rule| rule.pii_unique),
                     rng: column_null_rng(config.seed, table_name, col_name),
@@ -528,7 +542,12 @@ fn generate_with(
                             .and_then(|r| r.pool.sample_one(r.strategy, &mut rng))
                             .unwrap_or_else(|| current.clone())
                     } else if let Some(provider) = pii_provider {
-                        Value::String(crate::synth::pii::generate_value(provider, &mut rng))
+                        let style = column_model
+                            .and_then(|c| c.pii_phone_style)
+                            .unwrap_or(crate::synth::pii::PhoneStyle::UsDefault);
+                        Value::String(crate::synth::pii::generate_value_with_style(
+                            provider, style, &mut rng,
+                        ))
                     } else {
                         gen_column_value(
                             column_model,
@@ -727,7 +746,15 @@ fn sample_uniqueness_value(
         .get(column)
         .and_then(|column| column.pii)
     {
-        return Value::String(crate::synth::pii::generate_value(provider, rng));
+        let style = guard
+            .model
+            .columns
+            .get(column)
+            .and_then(|c| c.pii_phone_style)
+            .unwrap_or(crate::synth::pii::PhoneStyle::UsDefault);
+        return Value::String(crate::synth::pii::generate_value_with_style(
+            provider, style, rng,
+        ));
     }
     gen_column_value(
         guard.model.columns.get(column),
@@ -4298,6 +4325,7 @@ mod tests {
                             weights: vec![1.0 / 19.0; 19],
                         }),
                         pii: None,
+                        pii_phone_style: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -4746,6 +4774,7 @@ mod tests {
                             scale: 50.0,
                         }),
                         pii: None,
+                        pii_phone_style: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -4808,6 +4837,7 @@ mod tests {
                             scale: 50.0,
                         }),
                         pii: None,
+                        pii_phone_style: None,
                     },
                 )]),
                 copula: CopulaInfo {
@@ -5384,6 +5414,7 @@ tables:
                     scale: 12.5,
                 }),
                 pii: None,
+                pii_phone_style: None,
             },
         );
         let model = TableModel {
@@ -5442,6 +5473,7 @@ tables:
                     scale: std_dev,
                 }),
                 pii: None,
+                pii_phone_style: None,
             },
         );
         TableModel {
@@ -5551,6 +5583,7 @@ tables:
                     scale: 10.0,
                 }),
                 pii: None,
+                pii_phone_style: None,
             },
         );
         let model = TableModel {
@@ -5608,6 +5641,7 @@ tables:
                         weights: vec![0.5, 0.5],
                     }),
                     pii: None,
+                    pii_phone_style: None,
                 },
             );
             TableModel {
@@ -5672,6 +5706,7 @@ tables:
                 high: loc,
             }),
             pii: None,
+            pii_phone_style: None,
         }
     }
 
@@ -8852,6 +8887,72 @@ tables:
         }
     }
 
+    /// Issue #95: a model carrying `pii_phone_style: cn_mobile` must fill the
+    /// phone column in the CN format with the trained prefix, without touching
+    /// non-phone PII columns.
+    #[test]
+    fn should_generate_cn_phones_from_a_stored_style_hint() {
+        let mut model = pii_model("t", "phone", PiiProvider::Phone, 4);
+        model.columns.get_mut("phone").unwrap().pii_phone_style =
+            Some(crate::synth::pii::PhoneStyle::CnMobile { prefix: [1, 3, 8] });
+        let models = HashMap::from([("t".to_string(), model)]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 80)]),
+            seed: Some(9),
+            enforce_min_max_values: true,
+        };
+
+        let out = generate(&models, &rules, &config).unwrap();
+        let rows = out.tables.get("t").unwrap();
+        assert_eq!(rows.len(), 80);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in rows {
+            let value = row[1].as_str().expect("phone value must be a string");
+            assert!(
+                value.starts_with("+86-138-"),
+                "expected CN format with the trained prefix, got {value:?}"
+            );
+            assert!(PiiProvider::Phone.matches_format(value));
+            seen.insert(value.to_string());
+        }
+        assert!(
+            seen.len() > 40,
+            "tails must vary, got {} distinct",
+            seen.len()
+        );
+    }
+
+    /// Issue #95: a model without a style hint keeps the legacy `+1` template.
+    #[test]
+    fn should_keep_us_template_when_no_style_hint_is_stored() {
+        let models = HashMap::from([(
+            "t".to_string(),
+            pii_model("t", "phone", PiiProvider::Phone, 4),
+        )]);
+        let rules = SynthRules {
+            version: "1".to_string(),
+            tables: vec![single_rule("t", vec![])],
+        };
+        let config = GeneratorConfig {
+            rows_per_table: HashMap::from([("t".to_string(), 40)]),
+            seed: Some(9),
+            enforce_min_max_values: true,
+        };
+
+        let out = generate(&models, &rules, &config).unwrap();
+        for row in out.tables.get("t").unwrap() {
+            let value = row[1].as_str().expect("phone value must be a string");
+            assert!(
+                value.starts_with("+1-"),
+                "legacy model must keep the US template, got {value:?}"
+            );
+        }
+    }
+
     /// AC1/AC2: a PII column is filled with format-valid fakes, never with the
     /// placeholder dictionary values, and the run is deterministic by seed.
     #[test]
@@ -9165,6 +9266,7 @@ tables:
     fn should_error_instead_of_duplicating_a_stable_unique_pii_value() {
         let mut plan = PiiPlan {
             provider: PiiProvider::Email,
+            style: crate::synth::pii::PhoneStyle::UsDefault,
             stable: true,
             unique: true,
             rng: rand::rngs::StdRng::seed_from_u64(1),
@@ -9194,6 +9296,7 @@ tables:
     fn should_keep_stable_unique_values_distinct() {
         let mut plan = PiiPlan {
             provider: PiiProvider::Name,
+            style: crate::synth::pii::PhoneStyle::UsDefault,
             stable: true,
             unique: true,
             rng: rand::rngs::StdRng::seed_from_u64(2),

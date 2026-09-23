@@ -73,6 +73,12 @@ pub struct ColumnModel {
     /// and dictionary are replaced, and generation fills it with fake values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pii: Option<crate::synth::pii::PiiProvider>,
+    /// Region style hint for PII phone columns (issue #95). Additive since
+    /// #95: absent on legacy models (keeps the `+1` default), omitted from
+    /// JSON when unset, and `version` stays 1. Validated on load: a `CnMobile`
+    /// prefix must start with `1` and continue `[3-9]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_phone_style: Option<crate::synth::pii::PhoneStyle>,
 }
 
 impl Default for ColumnModel {
@@ -93,6 +99,7 @@ impl Default for ColumnModel {
                 },
             ),
             pii: None,
+            pii_phone_style: None,
         }
     }
 }
@@ -115,15 +122,31 @@ impl TableModel {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("read model file: {}", e))?;
+        Self::load_str(&content)
+    }
 
+    /// Parse and validate a model from an in-memory JSON document. Every
+    /// `load` path funnels through here so tests can exercise validation
+    /// without touching the filesystem.
+    pub fn load_str(content: &str) -> Result<Self, String> {
         let model: Self =
-            serde_json::from_str(&content).map_err(|e| format!("parse model JSON: {}", e))?;
+            serde_json::from_str(content).map_err(|e| format!("parse model JSON: {}", e))?;
 
         if model.version > CURRENT_VERSION {
             return Err(format!(
                 "model version {} not supported (max {})",
                 model.version, CURRENT_VERSION
             ));
+        }
+        for (name, column) in &model.columns {
+            if let Some(style) = &column.pii_phone_style {
+                if let Err(message) = crate::synth::pii::validate_phone_style(style) {
+                    return Err(format!(
+                        "table '{}': column '{}': {}",
+                        model.table, name, message
+                    ));
+                }
+            }
         }
 
         Ok(model)
@@ -163,6 +186,7 @@ mod tests {
                     scale: 1.0,
                 }),
                 pii: None,
+                pii_phone_style: None,
             },
         );
 
@@ -282,10 +306,86 @@ mod tests {
                 weights: vec![0.5, 0.5],
             }),
             pii: None,
+            pii_phone_style: None,
         };
 
         let json = serde_json::to_string(&column).unwrap();
         assert!(json.contains("categorical"));
         assert!(json.contains("\"a\""));
+    }
+
+    #[test]
+    fn should_roundtrip_pii_phone_style_on_a_phone_column() {
+        use crate::synth::pii::{PhoneStyle, PiiProvider};
+
+        let mut column = ColumnModel {
+            logical_type: LogicalType::Categorical,
+            marginal: Marginal::Categorical(CategoricalParams {
+                values: vec!["__pii_level_0".to_string()],
+                weights: vec![1.0],
+            }),
+            pii: Some(PiiProvider::Phone),
+            pii_phone_style: Some(PhoneStyle::CnMobile { prefix: [1, 3, 8] }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&column).unwrap();
+        let loaded: ColumnModel = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.pii_phone_style,
+            Some(PhoneStyle::CnMobile { prefix: [1, 3, 8] })
+        );
+        assert_eq!(loaded.pii, Some(PiiProvider::Phone));
+
+        // Clearing the style must omit the key entirely so models stay small.
+        column.pii_phone_style = None;
+        let json = serde_json::to_string(&column).unwrap();
+        assert!(
+            !json.contains("pii_phone_style"),
+            "unset pii_phone_style must not be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn should_load_legacy_phone_column_without_pii_phone_style() {
+        // A pre-#95 model has no pii_phone_style key; it must load with the
+        // US default so existing models keep generating as before.
+        let json = r#"{
+            "logical_type": "categorical",
+            "marginal": {"name": "categorical", "values": ["__pii_level_0"], "weights": [1.0]},
+            "pii": "phone"
+        }"#;
+        let column: ColumnModel = serde_json::from_str(json).unwrap();
+        assert_eq!(column.pii, Some(crate::synth::pii::PiiProvider::Phone));
+        assert_eq!(column.pii_phone_style, None);
+    }
+
+    #[test]
+    fn should_reject_pii_phone_style_with_invalid_prefix_digits() {
+        // A prefix outside the observed [1][3-9] shape is a corrupted model,
+        // not a silent US fallback. Validation lives in the load path (and
+        // `validate_phone_style`), not in serde: the wire format accepts the
+        // JSON, `TableModel::load` refuses it.
+        let json = r#"{
+            "version": 1,
+            "table": "users",
+            "dialect": "mysql",
+            "provenance": {"source": "native", "converter_version": null, "sdv_version": null},
+            "pk": [],
+            "columns": {
+                "phone": {
+                    "logical_type": "categorical",
+                    "marginal": {"name": "categorical", "values": ["__pii_level_0"], "weights": [1.0]},
+                    "pii": "phone",
+                    "pii_phone_style": {"style": "cn_mobile", "prefix": [9, 9, 9]}
+                }
+            },
+            "copula": {"column_order": ["phone"], "correlation": [[1.0]]}
+        }"#;
+        let error = TableModel::load_str(json).unwrap_err();
+        assert!(
+            error.contains("not a mainland mobile prefix") && error.contains("phone"),
+            "unexpected error: {error}"
+        );
     }
 }

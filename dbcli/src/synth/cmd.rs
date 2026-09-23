@@ -347,6 +347,7 @@ pub(crate) fn build_model_with_overrides(
                         null_rate: Some(col_profile.null_rate),
                         marginal,
                         pii: None,
+                        pii_phone_style: None,
                     },
                 );
             }
@@ -492,6 +493,7 @@ fn fit_datetime_epoch_model(
             None => Marginal::Normal(NormalParams { loc, scale }),
         },
         pii: None,
+        pii_phone_style: None,
     }
 }
 
