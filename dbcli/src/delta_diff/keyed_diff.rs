@@ -425,27 +425,6 @@ impl KeyedDiffer {
         } else {
             right.dialect().identifier_quote()
         };
-        let mut big_hits: Vec<Vec<Value>> = Vec::new();
-        for group in small_rows.chunks(chunk) {
-            let pred = render_point_query_predicate(ctx, big_is_left, quote, group)?;
-            let spec = if big_is_left {
-                full_row_spec(ctx, true, left.dialect(), Some(&pred))?
-            } else {
-                full_row_spec(ctx, false, right.dialect(), Some(&pred))?
-            };
-            let hits = if big_is_left {
-                fetch_all_pages(left, &spec, ctx.verbose, queries).await?
-            } else {
-                fetch_all_pages(right, &spec, ctx.verbose, queries).await?
-            };
-            big_hits.extend(hits);
-        }
-        ctx.vlog(format!(
-            "[delta-diff] point-query chunks={} hits={}",
-            small_rows.len().div_ceil(chunk),
-            big_hits.len()
-        ));
-
         let left_numeric = full_row_numeric_flags(ctx, true);
         let right_numeric = full_row_numeric_flags(ctx, false);
         // 与 row_level_diff 相同的对齐守卫：列排除不对称时宁可报错，
@@ -460,6 +439,31 @@ impl KeyedDiffer {
             .zip(right_numeric.iter())
             .map(|(l, r)| *l && *r)
             .collect();
+        let mut big_hits: Vec<Vec<Value>> = Vec::new();
+        for group in small_rows.chunks(chunk) {
+            let pred = render_point_query_predicate(ctx, big_is_left, quote, group)?;
+            let spec = if big_is_left {
+                full_row_spec(ctx, true, left.dialect(), Some(&pred))?
+            } else {
+                full_row_spec(ctx, false, right.dialect(), Some(&pred))?
+            };
+            let mut hits = if big_is_left {
+                fetch_all_pages(left, &spec, ctx.verbose, queries).await?
+            } else {
+                fetch_all_pages(right, &spec, ctx.verbose, queries).await?
+            };
+            // 归并游标要求与 cmp_key 完全一致的顺序；方言 ORDER BY（如
+            // MySQL utf8mb4_bin PAD SPACE）对尾部空格兄弟值可能给出不同
+            // 相对序，这里在客户端用同一个比较器重排，SQL 排序仅作优化提示
+            sort_hits_by_key(&mut hits, arity, &numeric);
+            big_hits.extend(hits);
+        }
+        ctx.vlog(format!(
+            "[delta-diff] point-query chunks={} hits={}",
+            small_rows.len().div_ceil(chunk),
+            big_hits.len()
+        ));
+
         let merge = merge_small_vs_hits(
             &small_rows,
             &big_hits,
@@ -512,8 +516,19 @@ impl KeyedDiffer {
     }
 }
 
-/// 点查等值谓词：每行 `AND` 连接各键列等值，行间 `OR`。等值语义与 keyset
-/// 完全一致（二进制校对 + 文本字面量 + NULL 用 IS NULL），见
+/// 归并游标要求与 cmp_key 完全一致的顺序；方言 ORDER BY（如 MySQL
+/// utf8mb4_bin PAD SPACE）对尾部空格兄弟值可能给出不同相对序，这里在
+/// 客户端用同一个比较器重排，SQL 排序仅作优化提示。
+fn sort_hits_by_key(hits: &mut [Vec<Value>], arity: usize, numeric: &[bool]) {
+    hits.sort_by(|a, b| {
+        let ak = &a[..arity.min(a.len())];
+        let bk = &b[..arity.min(b.len())];
+        crate::delta_diff::rowdiff::cmp_key(ak, bk, &numeric[..arity.min(numeric.len())])
+    });
+}
+
+/// 点查等值谓词：每行 `AND` 连接各键列等值，行间 `OR`。等值语义与客户端
+/// cmp_key 一致（空格敏感逐字节 + NULL 用 IS NULL），见
 /// `render_key_equality`；谓词是 OR-of-ANDs，不受 ORA-01795 约束。
 fn render_point_query_predicate(
     ctx: &DiffContext,
@@ -541,7 +556,11 @@ fn render_point_query_predicate(
                 backslash_escape,
             ));
         }
-        terms.push(format!("({})", conds.join(" AND ")));
+        if arity == 1 {
+            terms.push(conds.remove(0));
+        } else {
+            terms.push(format!("({})", conds.join(" AND ")));
+        }
     }
     Ok(terms.join(" OR "))
 }
@@ -964,6 +983,7 @@ pub(crate) fn merge_small_vs_hits(
 
     let mut si = 0usize;
     let mut bi = 0usize;
+    let mut equal_pairs = 0u64;
     while si < small_rows.len() {
         if bi >= big_hits.len() {
             rows.push(diff_row_n(
@@ -987,12 +1007,13 @@ pub(crate) fn merge_small_vs_hits(
                 ));
                 si += 1;
             }
-            // 命中键必然来自小表键集：Greater 只能是排序失步。命中不配对，
-            // 由 unpaired_hits 让调用方报错；`COUNT − 命中` 只扣配对上的。
+            // 命中键必然来自小表键集：Greater 只能是排序失步或重复命中。
+            // 不配对、不计入 paired——由 unpaired_hits 让调用方报错。
             std::cmp::Ordering::Greater => {
                 bi += 1;
             }
             std::cmp::Ordering::Equal => {
+                equal_pairs += 1;
                 let equal = crate::delta_diff::rowdiff::row_values_equal(
                     &small_rows[si][arity..],
                     &big_hits[bi][arity..],
@@ -1018,8 +1039,7 @@ pub(crate) fn merge_small_vs_hits(
         }
     }
 
-    let paired = bi as u64;
-    let unpaired_hits = (big_hits.len() as u64).saturating_sub(paired);
+    let unpaired_hits = (big_hits.len() as u64).saturating_sub(equal_pairs);
     if unpaired_hits > 0 {
         extra_warnings.push(format!(
             "point-query: {unpaired_hits} big-side hit(s) could not be paired by key order"
@@ -1032,7 +1052,7 @@ pub(crate) fn merge_small_vs_hits(
             big_hits.len()
         ));
     }
-    let missing_big = big_total.saturating_sub(paired);
+    let missing_big = big_total.saturating_sub(equal_pairs);
     PointQueryMerge {
         rows,
         missing_big,
@@ -1205,8 +1225,8 @@ mod skew_tests {
             .any(|w| w.contains("could not be paired")));
     }
 
-    fn string_key_ctx(scheme: &str) -> DiffContext {
-        fn side(scheme: &str, key: &str) -> crate::delta_diff::strategy::SideCtx {
+    fn string_key_ctx(scheme: &str, key_type: &str) -> DiffContext {
+        fn side(scheme: &str, key: &str, key_type: &str) -> crate::delta_diff::strategy::SideCtx {
             crate::delta_diff::strategy::SideCtx {
                 connection_name: "x".into(),
                 schema: Some("s".into()),
@@ -1219,7 +1239,7 @@ mod skew_tests {
                     warnings: vec![],
                     key_specs: vec![crate::backend::ColumnNormSpec {
                         name: key.into(),
-                        data_type: "varchar(64)".into(),
+                        data_type: key_type.into(),
                         nullable: false,
                         rtrim_fixed_char: false,
                     }],
@@ -1228,8 +1248,8 @@ mod skew_tests {
             }
         }
         DiffContext {
-            left: side(scheme, "K"),
-            right: side(scheme, "k"),
+            left: side(scheme, "K", key_type),
+            right: side(scheme, "k", key_type),
             left_pool: dummy_pool(),
             right_pool: dummy_pool(),
             key_column: "K".into(),
@@ -1271,29 +1291,47 @@ mod skew_tests {
     }
 
     #[test]
-    fn point_predicate_uses_binary_collation_for_mysql_string_keys() {
-        let ctx = string_key_ctx("mysql");
-        let sql = render_point_query_predicate(&ctx, true, '`', &[vec![json!("ABC"), json!("v1")]])
-            .unwrap();
-        assert!(
-            sql.contains("`K` COLLATE utf8mb4_bin = 'ABC'"),
-            "must pin binary collation: {sql}"
+    fn point_predicate_is_space_sensitive_for_mysql_string_keys() {
+        let ctx = string_key_ctx("mysql", "varchar(64)");
+        let exact =
+            render_point_query_predicate(&ctx, true, '`', &[vec![json!("ABC"), json!("v1")]])
+                .unwrap();
+        let padded =
+            render_point_query_predicate(&ctx, true, '`', &[vec![json!("ABC "), json!("v1")]])
+                .unwrap();
+        // utf8mb4_bin 是 PAD SPACE，'ABC' = 'ABC ' 会误命中尾部空格兄弟值；
+        // 必须双侧 CAST AS BINARY 才是 cmp_key 同款的空格敏感逐字节比较
+        assert_eq!(
+            exact, "CAST(`K` AS BINARY) = CAST('ABC' AS BINARY)",
+            "{exact}"
         );
-        assert!(!sql.contains("= NULL"), "{sql}");
+        assert_eq!(
+            padded, "CAST(`K` AS BINARY) = CAST('ABC ' AS BINARY)",
+            "{padded}"
+        );
     }
 
     #[test]
-    fn point_predicate_uses_binary_collation_for_gaussdb_string_keys() {
-        let ctx = string_key_ctx("gaussdb");
+    fn point_predicate_strips_bpchar_padding_for_gaussdb() {
+        // character(n) 的 SQL 比较忽略尾部填充；::text 剥掉填充后按 "C" 逐字节
+        let ctx = string_key_ctx("gaussdb", "character(10)");
         let sql =
             render_point_query_predicate(&ctx, false, '"', &[vec![json!("ABC"), json!("v1")]])
                 .unwrap();
-        assert!(sql.contains("\"k\" COLLATE \"C\" = 'ABC'"), "{sql}");
+        assert_eq!(sql, "\"k\"::text COLLATE \"C\" = 'ABC'", "{sql}");
+    }
+
+    #[test]
+    fn point_predicate_keeps_numeric_keys_bare() {
+        let ctx = string_key_ctx("mysql", "bigint");
+        let sql =
+            render_point_query_predicate(&ctx, true, '`', &[vec![json!(5), json!("v1")]]).unwrap();
+        assert_eq!(sql, "`K` = 5", "{sql}");
     }
 
     #[test]
     fn point_predicate_wraps_oracle_string_keys_in_nlssort() {
-        let ctx = string_key_ctx("oracle");
+        let ctx = string_key_ctx("oracle", "varchar(64)");
         let sql = render_point_query_predicate(&ctx, true, '"', &[vec![json!("ABC"), json!("v1")]])
             .unwrap();
         assert!(
@@ -1304,11 +1342,48 @@ mod skew_tests {
 
     #[test]
     fn point_predicate_renders_is_null_for_null_key_values() {
-        let ctx = string_key_ctx("mysql");
+        let ctx = string_key_ctx("mysql", "varchar(64)");
         let sql = render_point_query_predicate(&ctx, true, '`', &[vec![json!(null), json!("v1")]])
             .unwrap();
-        assert!(sql.contains("`K` COLLATE utf8mb4_bin IS NULL"), "{sql}");
+        assert_eq!(sql, "`K` IS NULL", "{sql}");
         assert!(!sql.contains("= NULL"), "{sql}");
+        assert!(!sql.contains("CAST"), "IS NULL 不需要包 CAST: {sql}");
+    }
+
+    #[test]
+    fn merge_counts_greater_skipped_hits_as_unpaired() {
+        // 尾部空格兄弟值：cmp_key 把 "ABC " 排在 "ABC" 之后、"ZZZ" 之前。
+        // Less 记缺失，Greater 吞掉 "ABC "，Equal 配上 "ZZZ" —— 被吞的命中
+        // 必须计入 unpaired，missing_big 只扣 Equal 那一对。
+        let small = vec![
+            row(&[json!("ABC"), json!("v1")]),
+            row(&[json!("ZZZ"), json!("v2")]),
+        ];
+        let hits = vec![
+            row(&[json!("ABC "), json!("w1")]),
+            row(&[json!("ZZZ"), json!("v2")]),
+        ];
+        let out = merge_small_vs_hits(&small, &hits, 1, &[false, false], true, 10);
+        assert_eq!(out.unpaired_hits, 1);
+        assert_eq!(out.missing_big, 9);
+        assert!(out
+            .extra_warnings
+            .iter()
+            .any(|w| w.contains("could not be paired")));
+    }
+
+    #[test]
+    fn merge_counts_duplicate_interleaved_hits_as_unpaired() {
+        // 小键 [1, 2]，命中 [1, 1, 2]：夹在中间的重复命中走 Greater，不得计入 paired
+        let small = vec![row(&[json!(1), json!("a")]), row(&[json!(2), json!("b")])];
+        let hits = vec![
+            row(&[json!(1), json!("a")]),
+            row(&[json!(1), json!("a2")]),
+            row(&[json!(2), json!("b")]),
+        ];
+        let out = merge_small_vs_hits(&small, &hits, 1, &[false, false], true, 3);
+        assert_eq!(out.unpaired_hits, 1);
+        assert_eq!(out.missing_big, 1);
     }
 
     #[test]

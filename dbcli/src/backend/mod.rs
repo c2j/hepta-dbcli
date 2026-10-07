@@ -699,10 +699,12 @@ fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool)
     }
 }
 
-/// 点查等值谓词，与 keyset 的键比较语义完全一致（issue #125 review）：
-/// 字符串键走 `key_sort_expr` 的二进制校对与 `key_cmp_rhs` 的文本字面量，
-/// 避免 MySQL `ai_ci` 大小写折叠、Oracle CHAR 空格填充与客户端 `cmp_key`
-/// 判定不一致；NULL 值必须写 `IS NULL`（`col = NULL` 永不为真）。
+/// 点查键等值谓词：与客户端 `cmp_key` 一致的**空格敏感**逐字节比较
+/// （issue #125 review 二轮）。MySQL `utf8mb4_bin` 是 PAD SPACE（
+/// `'ABC' = 'ABC '` 为真），必须双侧 `CAST … AS BINARY`；GaussDB
+/// `character`/bpchar 的比较忽略尾部填充，`::text` 剥掉后再按 `COLLATE "C"`
+/// 逐字节；Oracle `NLSSORT BINARY` 对物理填充后的 CHAR 值本就逐字节；
+/// DuckDB varchar 天然空格敏感。非字符串键维持裸列；NULL 走 `IS NULL`。
 pub(crate) fn render_key_equality(
     quote: char,
     name: &str,
@@ -711,14 +713,20 @@ pub(crate) fn render_key_equality(
     value: &Value,
     backslash_escape: bool,
 ) -> String {
-    let lhs = key_sort_expr(quote, name, is_string, scheme);
+    let q = quote_ident(quote, name);
     if value.is_null() {
-        return format!("{lhs} IS NULL");
+        return format!("{q} IS NULL");
     }
-    format!(
-        "{lhs} = {}",
-        key_cmp_rhs(value, is_string, scheme, backslash_escape)
-    )
+    if !is_string {
+        return format!("{q} = {}", sql_literal(value, backslash_escape));
+    }
+    let lit = sql_literal_as_text(value, backslash_escape);
+    match scheme {
+        "mysql" => format!("CAST({q} AS BINARY) = CAST({lit} AS BINARY)"),
+        "gaussdb" => format!("{q}::text COLLATE \"C\" = {lit}"),
+        "oracle" => format!("NLSSORT({q},'NLS_SORT=BINARY') = NLSSORT({lit},'NLS_SORT=BINARY')"),
+        _ => format!("{q} = {lit}"),
+    }
 }
 
 fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
