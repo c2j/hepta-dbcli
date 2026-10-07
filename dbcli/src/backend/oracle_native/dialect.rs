@@ -382,6 +382,36 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String {
+        let concat = exprs.join(" || '#' || ");
+        let row_hash = self.md5_hash(&concat);
+        // ORA-01795: IN 列表上限 1000 表达式，超限拆为多段 OR
+        let disjuncts: Vec<String> = buckets
+            .chunks(1000)
+            .map(|chunk| {
+                let list = chunk
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), \
+                     {modulus}) IN ({list})"
+                )
+            })
+            .collect();
+        if disjuncts.len() == 1 {
+            disjuncts.into_iter().next().unwrap_or_default()
+        } else {
+            format!("({})", disjuncts.join(" OR "))
+        }
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()

@@ -280,6 +280,23 @@ impl Dialect for DuckDbDialect {
         bucket_cond(&self.row_hash_expr(exprs), modulus, bucket)
     }
 
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String {
+        let list = buckets
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "MOD(('0x' || SUBSTR({}, 1, 8))::UBIGINT, {modulus}) IN ({list})",
+            self.row_hash_expr(exprs)
+        )
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -395,6 +412,17 @@ mod tests {
 
     // Issue #100: DuckDB's default schema is `main`, exposed via
     // current_schema(); there is no "public".
+    #[test]
+    fn bucket_set_predicate_reuses_hash_template_with_in_list() {
+        let sql = DuckDbDialect.render_bucket_set_predicate(
+            &["\"a\"".to_string(), "\"b\"".to_string()],
+            197,
+            &[3, 41],
+        );
+        assert!(sql.contains("::UBIGINT, 197) IN (3, 41)"), "{sql}");
+        assert!(sql.contains("MD5("), "{sql}");
+    }
+
     #[test]
     fn current_schema_sql_selects_current_schema() {
         let sql = DuckDbDialect.current_schema_sql().expect("duckdb has one");

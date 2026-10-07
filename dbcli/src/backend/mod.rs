@@ -279,6 +279,15 @@ pub trait Dialect: Send + Sync {
     /// Bucket membership predicate using the same hash template as checksum.
     fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String;
 
+    /// 同一哈希模板下的桶集合谓词（issue #124 共享键序扫描）：
+    /// `MOD(hash, N) IN (b1, b2, ...)`。
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String;
+
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 
@@ -1030,6 +1039,14 @@ mod tests {
                 _exprs: &[String],
                 _modulus: u64,
                 _bucket: u64,
+            ) -> String {
+                String::new()
+            }
+            fn render_bucket_set_predicate(
+                &self,
+                _exprs: &[String],
+                _modulus: u64,
+                _buckets: &[u64],
             ) -> String {
                 String::new()
             }
