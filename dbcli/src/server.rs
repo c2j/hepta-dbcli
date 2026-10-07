@@ -1154,6 +1154,13 @@ impl DbMcp {
 
         match diff_result {
             Ok(mut report) => {
+                let (_, summary_downgrade) = crate::delta_diff::effective_summary_only(
+                    params.summary_only.unwrap_or(false),
+                    params.export.as_deref(),
+                );
+                if let Some(w) = summary_downgrade {
+                    report.warnings.push(w);
+                }
                 report.modified_columns =
                     crate::delta_diff::sample::compute_modified_columns(&report);
                 let mut export_path = None;
@@ -1449,6 +1456,7 @@ fn build_mcp_diff_options(
         fetch_all_threshold: 4096,
         naive_max_rows: 200_000,
         strict: false,
+        summary_only: params.summary_only.unwrap_or(false) && params.export.is_none(),
         strategy,
         key: params.key_columns.clone().unwrap_or_default(),
         columns: params.columns.clone().unwrap_or_default(),

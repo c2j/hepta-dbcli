@@ -33,6 +33,9 @@ pub(crate) struct TablePlan {
     pub key_specs: Vec<ColumnNormSpec>,
     /// Non-fatal issues (e.g. excluded LOB/JSON columns).
     pub warnings: Vec<String>,
+    /// 键列由主键派生，或显式 --key 恰被唯一/主键索引覆盖（issue #124）。
+    /// 唯一性是倾斜点查「缺失 = COUNT − 命中」记账的前提。
+    pub key_unique: bool,
 }
 
 impl TablePlan {
@@ -337,6 +340,12 @@ pub(crate) async fn build_table_plan(
         .filter_map(|k| find_column_ci(&columns, k).map(|col| col.norm_spec(rtrim_char_columns)))
         .collect();
 
+    let key_unique = if explicit_key.is_empty() {
+        !key_columns.is_empty()
+    } else {
+        index_covers_unique(&idx_result, &key_columns)
+    };
+
     Ok(TablePlan {
         url_scheme: conn.dialect().url_scheme().to_string(),
         key_columns,
@@ -344,6 +353,7 @@ pub(crate) async fn build_table_plan(
         norm_specs,
         key_specs,
         warnings,
+        key_unique,
     })
 }
 
@@ -641,6 +651,7 @@ mod tests {
     #[test]
     fn identity_hash_exprs_includes_key_excluded_from_columns() {
         let plan = TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["c_int".into()],
@@ -671,6 +682,7 @@ mod tests {
     #[test]
     fn string_key_flags_follow_requested_key_order() {
         let plan = TablePlan {
+            key_unique: false,
             url_scheme: "oracle".into(),
             key_columns: vec!["A".into(), "B".into()],
             compare_columns: vec!["A".into(), "B".into()],
@@ -802,6 +814,77 @@ mod tests {
         let exprs = plan.normalized_exprs(conn.dialect()).unwrap();
         assert_eq!(exprs.len(), 7);
         assert_eq!(exprs[0], "CAST(`id` AS CHAR)");
+    }
+
+    #[tokio::test]
+    async fn primary_key_derived_plan_marks_key_unique() {
+        let mut conn = mock(verify_columns(), primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert!(plan.key_unique);
+    }
+
+    #[tokio::test]
+    async fn explicit_key_with_unique_index_marks_key_unique() {
+        let mut idx = as_result(vec![vec![
+            json!("uk_c_int"),
+            json!(true),
+            json!(false),
+            json!("c_int"),
+            json!("BTREE"),
+        ]]);
+        idx.row_count = 1;
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_int".into()],
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(plan.key_unique);
+        assert!(!plan.warnings.iter().any(|w| w.contains("unique/primary")));
+    }
+
+    #[tokio::test]
+    async fn explicit_key_without_unique_index_marks_not_unique() {
+        let mut idx = as_result(vec![vec![
+            json!("idx_c_int"),
+            json!(false),
+            json!(false),
+            json!("c_int"),
+            json!("BTREE"),
+        ]]);
+        idx.row_count = 1;
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["c_int".into()],
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(!plan.key_unique);
+        assert!(plan.warnings.iter().any(|w| w.contains("unique/primary")));
+    }
+
+    #[tokio::test]
+    async fn plan_without_key_marks_not_unique() {
+        let mut conn = mock(verify_columns(), as_result(vec![]));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert!(plan.key_columns.is_empty());
+        assert!(!plan.key_unique);
     }
 
     #[tokio::test]

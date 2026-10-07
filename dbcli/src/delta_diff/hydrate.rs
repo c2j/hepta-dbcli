@@ -413,6 +413,7 @@ mod tests {
             schema: Some("s".into()),
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: vec![],
                 compare_columns: compare_columns

@@ -1075,6 +1075,7 @@ mod tests {
     #[test]
     fn assemble_keeps_hash_count_payload_despite_plan_columns() {
         let plan = crate::delta_diff::metadata::TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["id".into(), "name".into()],
@@ -1115,6 +1116,7 @@ mod tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 4096,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         };
@@ -1318,6 +1320,7 @@ mod tests {
 
     fn probe_plan(columns: &[(&str, &str)]) -> crate::delta_diff::metadata::TablePlan {
         crate::delta_diff::metadata::TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec![],
             compare_columns: columns.iter().map(|(n, _)| (*n).to_string()).collect(),
@@ -1393,6 +1396,7 @@ mod tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 4096,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }
@@ -1402,6 +1406,7 @@ mod tests {
     /// --exclude-columns while its declared type stays in `key_specs`.
     fn probe_ctx_for_excluded_key(name: &str, ty: &str) -> DiffContext {
         let plan = crate::delta_diff::metadata::TablePlan {
+            key_unique: false,
             key_columns: vec![name.to_string()],
             key_specs: vec![crate::backend::ColumnNormSpec {
                 name: name.to_string(),
@@ -1875,6 +1880,7 @@ mod range_tests {
     fn test_ctx() -> DiffContext {
         fn side_plan() -> crate::delta_diff::metadata::TablePlan {
             crate::delta_diff::metadata::TablePlan {
+                key_unique: false,
                 url_scheme: "duckdb".into(),
                 key_columns: vec!["id".into()],
                 compare_columns: vec!["id".into(), "v".into()],
@@ -1916,6 +1922,7 @@ mod range_tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 4096,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }

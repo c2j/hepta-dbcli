@@ -766,6 +766,7 @@ mod tests {
                 });
             }
             TablePlan {
+                key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: keys.iter().map(|k| (*k).into()).collect(),
                 compare_columns: specs.iter().map(|s| s.name.clone()).collect(),
@@ -824,6 +825,7 @@ mod tests {
                 fetch_all_threshold: 4096,
                 naive_max_rows,
                 strict: false,
+                summary_only: false,
                 scns: std::sync::OnceLock::new(),
                 verbose: false,
             };
@@ -1066,6 +1068,7 @@ mod tests {
                 fetch_all_threshold: 4096,
                 naive_max_rows: 200_000,
                 strict: false,
+                summary_only: false,
                 scns: std::sync::OnceLock::new(),
                 verbose: false,
             };
@@ -1126,6 +1129,7 @@ mod tests {
                 fetch_all_threshold: 4096,
                 naive_max_rows: 200_000,
                 strict: false,
+                summary_only: false,
                 scns: std::sync::OnceLock::new(),
                 verbose: false,
             };
@@ -1186,6 +1190,7 @@ mod duckdb_e2e_tests {
 
     fn plan(amt_type: &str) -> TablePlan {
         TablePlan {
+            key_unique: false,
             url_scheme: "duckdb".into(),
             key_columns: vec!["k1".into(), "k2".into()],
             compare_columns: vec!["k1".into(), "k2".into(), "amt".into()],
@@ -1255,6 +1260,7 @@ mod duckdb_e2e_tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 200_000,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         };

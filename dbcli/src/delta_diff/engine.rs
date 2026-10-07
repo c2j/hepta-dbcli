@@ -298,6 +298,7 @@ mod tests {
 
     fn plan(keys: Vec<&str>, key_ty: &str) -> TablePlan {
         TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: keys.iter().map(|k| k.to_string()).collect(),
             compare_columns: vec![],
@@ -558,6 +559,7 @@ mod tests {
     fn non_bisectable_reason_for_excluded_key_column() {
         // --columns excludes the integer PK, so is_int_key cannot see its type.
         let excluded = TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".to_string()],
             compare_columns: vec!["c1".to_string()],
@@ -582,6 +584,7 @@ mod tests {
         // type (key_specs): the reason is about the type, not about
         // visibility, so routing keeps the bisectable decision.
         let typed = TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".to_string()],
             compare_columns: vec!["c1".to_string()],
@@ -611,6 +614,7 @@ mod tests {
         // declared type in key_specs, so the fast path stays available
         // (review of #109).
         let excluded = || TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".to_string()],
             compare_columns: vec!["amt".to_string()],
