@@ -49,6 +49,9 @@ pub(crate) struct DiffContext {
     pub(crate) naive_max_rows: u64,
     /// IBLT 解码失败时报错（exit 2）而非透明回退
     pub(crate) strict: bool,
+    /// 仅输出统计（issue #124）：倾斜时 KeyedDiffer 走点查快路径，
+    /// 不物化大表缺失行。CLI 已扣除 --export 优先级。
+    pub(crate) summary_only: bool,
     /// Oracle AS OF SCN 锚点（左, 右），快照开启后由策略捕获（§8.2）
     pub(crate) scns: std::sync::OnceLock<(Option<u64>, Option<u64>)>,
     /// 输出分片级进度与每步 SQL 到 stderr（§2.2 --verbose）
@@ -177,6 +180,7 @@ mod filter_tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 4096,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }
@@ -188,6 +192,7 @@ mod filter_tests {
             schema: None,
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: vec![],
                 compare_columns: vec![],

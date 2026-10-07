@@ -129,6 +129,7 @@ mod tests {
 
     fn plan(compare: &[&str]) -> TablePlan {
         TablePlan {
+            key_unique: false,
             url_scheme: String::new(),
             key_columns: Vec::new(),
             compare_columns: compare.iter().map(|name| (*name).to_string()).collect(),

@@ -329,6 +329,22 @@ impl Dialect for GaussdbDialect {
         format!("MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) = {bucket}")
     }
 
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String {
+        let concat = exprs.join(", ");
+        let row_hash = format!("MD5(concat_ws('#', {concat}))");
+        let list = buckets
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("MOD(('x' || SUBSTR({row_hash}, 1, 8))::bit(32)::bigint, {modulus}) IN ({list})")
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -447,6 +463,17 @@ mod tests {
 
     // Issue #100: GaussDB (PG family) resolves the schema-less default via
     // current_schema().
+    #[test]
+    fn bucket_set_predicate_reuses_hash_template_with_in_list() {
+        let sql = GaussdbDialect.render_bucket_set_predicate(
+            &["\"a\"".to_string(), "\"b\"".to_string()],
+            197,
+            &[3, 41],
+        );
+        assert!(sql.contains("MD5(concat_ws('#', \"a\", \"b\"))"), "{sql}");
+        assert!(sql.contains("::bit(32)::bigint, 197) IN (3, 41)"), "{sql}");
+    }
+
     #[test]
     fn current_schema_sql_selects_current_schema() {
         let sql = GaussdbDialect

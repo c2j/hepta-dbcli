@@ -238,7 +238,7 @@ fn cmp_value(l: &Value, r: &Value, numeric: bool) -> std::cmp::Ordering {
     value_text(l).cmp(&value_text(r))
 }
 
-fn cmp_key(a: &[Value], b: &[Value], numeric_value: &[bool]) -> std::cmp::Ordering {
+pub(crate) fn cmp_key(a: &[Value], b: &[Value], numeric_value: &[bool]) -> std::cmp::Ordering {
     for (index, (l, r)) in a.iter().zip(b.iter()).enumerate() {
         match cmp_value(l, r, numeric_value.get(index).copied().unwrap_or(false)) {
             std::cmp::Ordering::Equal => continue,

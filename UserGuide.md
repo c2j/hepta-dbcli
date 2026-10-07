@@ -744,7 +744,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理），两者皆缺会明确报错；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`exclude_columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`exclude_columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`（与 `export` 并存时被忽略，行为与 CLI 一致，warnings 会写明）、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 
 `where_condition` 禁止包含分号。`update_column` 与 `where_condition` 互斥，同时提供会被拒绝。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
@@ -825,7 +825,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | 策略 | `auto` 何时选用 | 说明 |
 |------|-----------------|------|
 | `bucketdiff` | 无可用主键，或左右键无法 1:1 配对 | 按行内容做多重集合比对，不定位具体主键 |
-| `keyeddiff` | 有键但不是单列整数（复合键、字符串等） | 按键拉取比对 |
+| `keyeddiff` | 有键但不是单列整数（复合键、字符串等） | 按键拉取比对；超出 `--fetch-all-threshold` 后按哈希桶校验 + 失配桶拉取。行数悬殊（≥8 倍）时失配桶合并为一次键序扫描，不再逐桶过滤扫描 |
 | `joindiff` | 同一连接 + MySQL 系 + 单列整数键 | 同库两表联邦 JOIN |
 | `iblt` | 跨连接（或非 MySQL）+ 单列整数键 | 可逆布隆表快路径；`--strict` 时解码失败 exit 2 而不回退 |
 | `hashdiff` | `auto` **不会**选它 | `--strategy hashdiff` 强制二分 checksum |
@@ -860,7 +860,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 |------|------|
 | `--sample N` | 终端差异明细行数上限，默认 20；`0` 表示终端也打全量。**不裁剪** `--export`。抽样默认 `diverse` |
 | `--sample-mode` | 终端抽样模式：`diverse`（默认；status 配额 + 变化列覆盖 + 签名去重，按 key 序展示）或 `prefix`（key 序前 N 行）。只影响终端样本与 MCP payload，**不影响** `--export` |
-| `--summary-only` | 只打统计，不打明细 |
+| `--summary-only` | 只打统计，不打明细。**倾斜快路径**（issue #124）：keyeddiff 两侧行数悬殊（大/小 ≥ 8 且大侧超过 `--fetch-all-threshold`）且两侧键均有唯一/主键索引背书时，只整读小表并对大表做主键点查——缺失按「COUNT − 命中」计数，不物化差异行，查询数从 O(桶数×页数) 降到个位数。与 `--export` 同时给出时 `--summary-only` 被忽略（导出需要全量差异行，warnings 会写明） |
 | `--wide` | 终端显示全部比对列，不只变化列 |
 | `--format` | 终端/ `--output` 的汇总格式：`table` / `json` / `csv` / `vertical` |
 | `--output FILE` | 把终端那份报告写到文件 |

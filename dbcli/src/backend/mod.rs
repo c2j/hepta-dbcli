@@ -279,6 +279,15 @@ pub trait Dialect: Send + Sync {
     /// Bucket membership predicate using the same hash template as checksum.
     fn render_bucket_predicate(&self, exprs: &[String], modulus: u64, bucket: u64) -> String;
 
+    /// 同一哈希模板下的桶集合谓词（issue #124 共享键序扫描）：
+    /// `MOD(hash, N) IN (b1, b2, ...)`。
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String;
+
     /// Render one keyset-paginated row fetch (v2.1 §6.2.2).
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String;
 
@@ -690,6 +699,36 @@ fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool)
     }
 }
 
+/// 点查键等值谓词：与客户端 `cmp_key` 一致的**空格敏感**逐字节比较
+/// （issue #125 review 二轮）。MySQL `utf8mb4_bin` 是 PAD SPACE（
+/// `'ABC' = 'ABC '` 为真），必须双侧 `CAST … AS BINARY`；GaussDB
+/// `character`/bpchar 的比较忽略尾部填充，`::text` 剥掉后再按 `COLLATE "C"`
+/// 逐字节；Oracle `NLSSORT BINARY` 对物理填充后的 CHAR 值本就逐字节；
+/// DuckDB varchar 天然空格敏感。非字符串键维持裸列；NULL 走 `IS NULL`。
+pub(crate) fn render_key_equality(
+    quote: char,
+    name: &str,
+    is_string: bool,
+    scheme: &str,
+    value: &Value,
+    backslash_escape: bool,
+) -> String {
+    let q = quote_ident(quote, name);
+    if value.is_null() {
+        return format!("{q} IS NULL");
+    }
+    if !is_string {
+        return format!("{q} = {}", sql_literal(value, backslash_escape));
+    }
+    let lit = sql_literal_as_text(value, backslash_escape);
+    match scheme {
+        "mysql" => format!("CAST({q} AS BINARY) = CAST({lit} AS BINARY)"),
+        "gaussdb" => format!("{q}::text COLLATE \"C\" = {lit}"),
+        "oracle" => format!("NLSSORT({q},'NLS_SORT=BINARY') = NLSSORT({lit},'NLS_SORT=BINARY')"),
+        _ => format!("{q} = {lit}"),
+    }
+}
+
 fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
     spec.string_key.get(i).copied().unwrap_or(false)
 }
@@ -1030,6 +1069,14 @@ mod tests {
                 _exprs: &[String],
                 _modulus: u64,
                 _bucket: u64,
+            ) -> String {
+                String::new()
+            }
+            fn render_bucket_set_predicate(
+                &self,
+                _exprs: &[String],
+                _modulus: u64,
+                _buckets: &[u64],
             ) -> String {
                 String::new()
             }

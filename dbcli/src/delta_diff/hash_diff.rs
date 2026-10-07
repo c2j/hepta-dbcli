@@ -1164,6 +1164,7 @@ mod tests {
     fn plan() -> crate::delta_diff::metadata::TablePlan {
         use crate::backend::ColumnNormSpec;
         crate::delta_diff::metadata::TablePlan {
+            key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
             compare_columns: vec!["id".into(), "v".into()],
@@ -1252,6 +1253,7 @@ mod tests {
             fetch_all_threshold: 4096,
             naive_max_rows: 10_000,
             strict: false,
+            summary_only: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }

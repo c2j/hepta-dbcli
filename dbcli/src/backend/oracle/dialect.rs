@@ -382,6 +382,36 @@ impl Dialect for OracleDialect {
         )
     }
 
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String {
+        let concat = exprs.join(" || '#' || ");
+        let row_hash = self.md5_hash(&concat);
+        // ORA-01795: IN 列表上限 1000 表达式，超限拆为多段 OR
+        let disjuncts: Vec<String> = buckets
+            .chunks(1000)
+            .map(|chunk| {
+                let list = chunk
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "MOD(TO_NUMBER(SUBSTR(RAWTOHEX({row_hash}), 1, 8), 'XXXXXXXX'), \
+                     {modulus}) IN ({list})"
+                )
+            })
+            .collect();
+        if disjuncts.len() == 1 {
+            disjuncts.into_iter().next().unwrap_or_default()
+        } else {
+            format!("({})", disjuncts.join(" OR "))
+        }
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -530,6 +560,33 @@ mod tests {
     use crate::backend::Dialect;
 
     // Issue #100: Oracle's schema-less default is the session's current schema.
+    #[test]
+    fn bucket_set_predicate_reuses_hash_template_with_in_list() {
+        let sql = OracleDialect::new().render_bucket_set_predicate(
+            &["A".to_string(), "B".to_string()],
+            197,
+            &[3, 41],
+        );
+        assert!(sql.contains("'XXXXXXXX'), 197) IN (3, 41)"), "{sql}");
+    }
+
+    #[test]
+    fn bucket_set_predicate_splits_in_list_beyond_ora_01795_limit() {
+        let buckets: Vec<u64> = (0..1200).collect();
+        let sql =
+            OracleDialect::new().render_bucket_set_predicate(&["A".to_string()], 1024, &buckets);
+        assert!(sql.starts_with('('), "{sql}");
+        assert_eq!(sql.matches(" IN (").count(), 2, "{sql}");
+        assert!(sql.contains(") OR MOD(TO_NUMBER"), "{sql}");
+        // 边界：第一段恰 1000 项（0..=999），第二段 200 项（1000..=1199）
+        assert!(sql.contains(", 999)"), "{sql}");
+        assert!(sql.contains("IN (1000, 1001,"), "{sql}");
+        assert!(
+            sql.ends_with("IN (1199))") || sql.ends_with("1199))"),
+            "{sql}"
+        );
+    }
+
     #[test]
     fn current_schema_sql_selects_syscontext_current_schema() {
         let dialect = OracleDialect::new();

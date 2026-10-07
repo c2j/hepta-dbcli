@@ -44,6 +44,8 @@ pub(crate) struct DiffOptions {
     pub(crate) fetch_all_threshold: u64,
     pub(crate) naive_max_rows: u64,
     pub(crate) strict: bool,
+    /// 仅统计模式（issue #124）；调用方负责扣除 export 优先级
+    pub(crate) summary_only: bool,
     pub(crate) key: Vec<String>,
     pub(crate) columns: Vec<String>,
     /// --exclude-columns: deny list applied after `columns` (issue #109)
@@ -162,6 +164,7 @@ pub(crate) async fn run_diff(
         fetch_all_threshold: opts.fetch_all_threshold,
         naive_max_rows: opts.naive_max_rows,
         strict: opts.strict,
+        summary_only: opts.summary_only,
         scns: std::sync::OnceLock::new(),
         verbose: opts.verbose,
     };
@@ -372,6 +375,7 @@ mod tests {
 
     fn plan(scheme: &str, columns: &[(&str, &str)]) -> metadata::TablePlan {
         metadata::TablePlan {
+            key_unique: false,
             url_scheme: scheme.to_string(),
             key_columns: Vec::new(),
             compare_columns: columns
@@ -557,6 +561,7 @@ mod duckdb_e2e_tests {
             fetch_all_threshold: 1,
             naive_max_rows: 200_000,
             strict: false,
+            summary_only: false,
             key: vec![],
             columns: vec![],
             exclude_columns: vec![],
@@ -671,5 +676,297 @@ mod duckdb_e2e_tests {
         .expect("run");
         assert_eq!(report.strategy, "bucketdiff", "no key");
         assert_eq!(report.summary.modified, 0);
+    }
+}
+
+// ─── DuckDB skew tests (issue #124; embedded, no service) ──────────────
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_skew_tests {
+    use super::*;
+    use crate::backend::duckdb::DuckDbFactory;
+    use crate::backend::{BackendFactory, DbPool};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const BIG_DDL: &str = "CREATE TABLE skew_big (\
+         bcrq VARCHAR NOT NULL, trade_no VARCHAR NOT NULL, \
+         amt BIGINT NOT NULL, qty INTEGER NOT NULL, \
+         PRIMARY KEY (bcrq, trade_no))";
+    const SMALL_DDL: &str = "CREATE TABLE skew_small (\
+         bcrq VARCHAR NOT NULL, trade_no VARCHAR NOT NULL, \
+         amt BIGINT NOT NULL, qty INTEGER NOT NULL, \
+         PRIMARY KEY (bcrq, trade_no))";
+    const SMALL_ROWS: &str = "\
+         INSERT INTO skew_small VALUES \
+         ('20260105','00000000',0,1),('20260105','00000001',-1,1)";
+
+    async fn skew_pool(big_rows: i64) -> Arc<dyn DbPool> {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.query_drop(BIG_DDL).await.expect("create big");
+        conn.query_drop(&format!(
+            "INSERT INTO skew_big SELECT '20260105', printf('%08d', i), i % 1000, 1 \
+             FROM range({big_rows}) t(i)"
+        ))
+        .await
+        .expect("insert big");
+        conn.query_drop(SMALL_DDL).await.expect("create small");
+        conn.query_drop(SMALL_ROWS).await.expect("insert small");
+        pool
+    }
+
+    async fn side_at(pool: &Arc<dyn DbPool>, name: &str, table: &str) -> SideInput {
+        SideInput {
+            pool: Arc::clone(pool),
+            conn: pool.acquire().await.expect("conn"),
+            name: name.to_string(),
+            schema: Some("main".to_string()),
+            table: table.to_string(),
+            connection_url: "duckdb://:memory:".to_string(),
+        }
+    }
+
+    fn skew_opts(summary_only: bool) -> DiffOptions {
+        DiffOptions {
+            strategy: None,
+            iblt_capacity: 65536,
+            iblt_auto: false,
+            fetch_all_threshold: 4096,
+            naive_max_rows: 200_000,
+            strict: false,
+            summary_only,
+            key: vec![],
+            columns: vec![],
+            exclude_columns: vec![],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16384,
+            sample_limit: 1000,
+            threads: 4,
+            snapshot: false,
+            recheck: false,
+            checkpoint: None,
+            verbose: false,
+            rtrim_char_columns: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn skewed_summary_only_matches_counts_with_few_queries() {
+        let pool = skew_pool(100_000).await;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_big").await,
+            side_at(&pool, "r", "skew_small").await,
+            skew_opts(true),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.left_total, 100_000);
+        assert_eq!(report.summary.right_total, 2);
+        assert_eq!(report.summary.missing_left, 0);
+        assert_eq!(report.summary.missing_right, 99_998);
+        assert_eq!(report.summary.modified, 1);
+        assert_eq!(
+            report.sample_diffs.len(),
+            1,
+            "only the modified row is materialized: {:?}",
+            report.sample_diffs
+        );
+        assert_eq!(report.sample_diffs[0].key, json!(["20260105", "00000001"]));
+        assert!(
+            report.perf.queries_total <= 6,
+            "point-query path must stay under 6 queries, got {}",
+            report.perf.queries_total
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("exceeds 100000")),
+            "no mass-materialization warning: {:?}",
+            report.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn skewed_without_summary_only_keeps_full_materialization() {
+        let pool = skew_pool(20_000).await;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_big").await,
+            side_at(&pool, "r", "skew_small").await,
+            skew_opts(false),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.left_total, 20_000);
+        assert_eq!(report.summary.right_total, 2);
+        assert_eq!(report.summary.missing_left, 0);
+        assert_eq!(report.summary.missing_right, 19_998);
+        assert_eq!(report.summary.modified, 1);
+        assert_eq!(
+            report.sample_diffs.len(),
+            19_999,
+            "without summary-only every diff row stays exportable"
+        );
+    }
+
+    #[tokio::test]
+    async fn skewed_non_summary_uses_single_shared_scan() {
+        let pool = skew_pool(20_000).await;
+        let mut opts = skew_opts(false);
+        opts.bisection_threshold = 512;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_big").await,
+            side_at(&pool, "r", "skew_small").await,
+            opts,
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.left_total, 20_000);
+        assert_eq!(report.summary.right_total, 2);
+        assert_eq!(report.summary.missing_left, 0);
+        assert_eq!(report.summary.missing_right, 19_998);
+        assert_eq!(report.summary.modified, 1);
+        assert_eq!(report.sample_diffs.len(), 19_999);
+        // 40 桶共享一次键序扫描：2 COUNT + 2 checksum + 少量分页；
+        // 逐桶形状此处会是 2 + 2 + ≥40 次
+        assert!(
+            report.perf.queries_total <= 12,
+            "shared scan must collapse per-bucket fetches, got {}",
+            report.perf.queries_total
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_scan_covers_big_side_on_right() {
+        let pool = skew_pool(20_000).await;
+        let mut opts = skew_opts(false);
+        opts.bisection_threshold = 512;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_small").await,
+            side_at(&pool, "r", "skew_big").await,
+            opts,
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.left_total, 2);
+        assert_eq!(report.summary.right_total, 20_000);
+        assert_eq!(report.summary.missing_left, 19_998);
+        assert_eq!(report.summary.missing_right, 0);
+        assert_eq!(report.summary.modified, 1);
+        assert_eq!(report.sample_diffs.len(), 19_999);
+        assert!(report.perf.queries_total <= 12);
+    }
+
+    #[tokio::test]
+    async fn equal_checksums_end_after_summary_without_row_fetch() {
+        let pool = skew_pool(20_000).await;
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop("DELETE FROM skew_small")
+                .await
+                .expect("clear");
+            conn.query_drop(
+                "INSERT INTO skew_small \
+                 SELECT bcrq, trade_no, amt, qty FROM skew_big",
+            )
+            .await
+            .expect("copy");
+        }
+        let mut opts = skew_opts(true);
+        opts.bisection_threshold = 512;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_big").await,
+            side_at(&pool, "r", "skew_small").await,
+            opts,
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.left_total, 20_000);
+        assert_eq!(report.summary.right_total, 20_000);
+        assert_eq!(
+            report.summary.missing_left + report.summary.missing_right + report.summary.modified,
+            0
+        );
+        assert!(report.sample_diffs.is_empty());
+        // 2 COUNT + 2 checksum，失配桶为空即结束，不拉任何行
+        assert_eq!(report.perf.queries_total, 4);
+    }
+
+    #[tokio::test]
+    async fn ratio_below_eight_stays_on_per_bucket_path() {
+        // 5000 vs 2000：比例 2.5 < 8，超出阈值后保持逐桶形状（查询数下界代理）
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop(
+                "CREATE TABLE lft (bcrq VARCHAR NOT NULL, trade_no VARCHAR NOT NULL, \
+                 amt BIGINT NOT NULL, PRIMARY KEY (bcrq, trade_no))",
+            )
+            .await
+            .expect("create");
+            conn.query_drop(
+                "INSERT INTO lft SELECT 'd', printf('%08d', i), i FROM range(5000) t(i)",
+            )
+            .await
+            .expect("insert");
+            conn.query_drop(
+                "CREATE TABLE rgt (bcrq VARCHAR NOT NULL, trade_no VARCHAR NOT NULL, \
+                 amt BIGINT NOT NULL, PRIMARY KEY (bcrq, trade_no))",
+            )
+            .await
+            .expect("create");
+            conn.query_drop(
+                "INSERT INTO rgt SELECT 'd', printf('%08d', i), i FROM range(2000) t(i)",
+            )
+            .await
+            .expect("insert");
+        }
+        let mut opts = skew_opts(true);
+        opts.bisection_threshold = 256;
+        let report = run_diff(
+            side_at(&pool, "l", "lft").await,
+            side_at(&pool, "r", "rgt").await,
+            opts,
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "keyeddiff");
+        assert_eq!(report.summary.modified, 0);
+        assert_eq!(
+            report.summary.missing_left + report.summary.missing_right,
+            3000
+        );
+        // 逐桶循环：桶数 = ceil(5000/256) = 20，每桶至少各一次分页拉取
+        assert!(
+            report.perf.queries_total >= 22,
+            "per-bucket shape does at least one query per bucket, got {}",
+            report.perf.queries_total
+        );
+    }
+
+    #[tokio::test]
+    async fn skewed_summary_only_ignored_when_export_requested() {
+        // export 优先（用户决策）：走全量物化路径，sample_diffs 含全部缺失行。
+        // effective_summary_only 的降级文案在 CLI/server 层注入，此处锁定路径选择。
+        let pool = skew_pool(20_000).await;
+        let report = run_diff(
+            side_at(&pool, "l", "skew_big").await,
+            side_at(&pool, "r", "skew_small").await,
+            skew_opts(false),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.sample_diffs.len(), 19_999);
     }
 }

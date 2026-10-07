@@ -269,6 +269,22 @@ impl Dialect for MySqlDialect {
         format!("MOD(CONV(SUBSTRING({row_hash}, 1, 8), 16, 10), {modulus}) = {bucket}")
     }
 
+    fn render_bucket_set_predicate(
+        &self,
+        exprs: &[String],
+        modulus: u64,
+        buckets: &[u64],
+    ) -> String {
+        let concat = exprs.join(", ");
+        let row_hash = format!("MD5(CONCAT_WS('#', {concat}))");
+        let list = buckets
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("MOD(CONV(SUBSTRING({row_hash}, 1, 8), 16, 10), {modulus}) IN ({list})")
+    }
+
     fn render_keyset_page_sql(&self, spec: &KeysetPageSpec) -> String {
         let cols: Vec<String> = if spec.raw_exprs {
             spec.columns.clone()
@@ -379,6 +395,19 @@ impl Dialect for MySqlDialect {
 mod tests {
     use super::*;
     use crate::backend::is_polardbx_version;
+
+    #[test]
+    fn bucket_set_predicate_reuses_hash_template_with_in_list() {
+        let sql = MySqlDialect.render_bucket_set_predicate(
+            &["`a`".to_string(), "`b`".to_string()],
+            197,
+            &[3, 41, 196],
+        );
+        assert!(sql.contains("MD5(CONCAT_WS('#', `a`, `b`))"), "{sql}");
+        assert!(sql.contains("MOD(CONV(SUBSTRING("), "{sql}");
+        assert!(sql.contains(", 197) IN (3, 41, 196)"), "{sql}");
+        assert!(!sql.contains("= "), "{sql}");
+    }
 
     // Issue #100: MySQL has no "public" schema; the schema-less default is
     // the connection's current database.

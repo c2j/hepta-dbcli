@@ -558,6 +558,10 @@ async fn execute_diff_inner(
     )?;
 
     let (filter, incremental) = effective_filter(args);
+    let (summary_only_effective, summary_downgrade) =
+        effective_summary_only(args.summary_only, args.export.as_deref());
+    let mut warnings = warnings;
+    warnings.extend(summary_downgrade);
     let checkpoint = match &args.checkpoint {
         Some(path) => {
             let cp = progress::CheckpointManager::open(path).map_err(|e| e.to_string())?;
@@ -611,6 +615,7 @@ async fn execute_diff_inner(
         fetch_all_threshold: args.fetch_all_threshold,
         naive_max_rows: args.naive_max_rows,
         strict: args.strict,
+        summary_only: summary_only_effective,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,
     };
@@ -730,6 +735,25 @@ fn effective_filter(args: &cmd::DeltaDiffArgs) -> (Option<String>, Option<(Strin
         ),
         _ => (None, None),
     }
+}
+
+/// `--summary-only` 与 `--export` 并存时忽略前者（issue #124 决策）：
+/// 导出需要全量差异行，倾斜点查路径会跳过物化。返回 (生效值, 降级告警)。
+pub(crate) fn effective_summary_only(
+    summary_only: bool,
+    export: Option<&str>,
+) -> (bool, Option<String>) {
+    if summary_only && export.is_some() {
+        return (
+            false,
+            Some(
+                "--summary-only ignored: --export takes precedence; \
+                 all diff rows are materialized"
+                    .to_string(),
+            ),
+        );
+    }
+    (summary_only, None)
 }
 
 fn default_schema_from_url(url: &str) -> Option<String> {
@@ -947,7 +971,7 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
 
 #[cfg(test)]
 mod resolve_side_tests {
-    use super::resolve_side;
+    use super::{effective_summary_only, resolve_side};
     use crate::config;
 
     /// URL 提供的一侧直接生效，即使配置文件缺失/无连接也不查配置。
@@ -975,6 +999,29 @@ mod resolve_side_tests {
         let resolved =
             resolve_side(&raw, Some("ghost"), Some("duckdb://:memory:")).expect("url wins");
         assert_eq!(resolved.connection_url, "duckdb://:memory:");
+    }
+
+    #[test]
+    fn summary_only_ignored_when_export_present() {
+        let (effective, warn) = effective_summary_only(true, Some("/tmp/out.csv"));
+        assert!(!effective);
+        let warn = warn.expect("downgrade warning");
+        assert!(warn.contains("--summary-only ignored"), "{warn}");
+        assert!(warn.contains("--export takes precedence"), "{warn}");
+    }
+
+    #[test]
+    fn summary_only_kept_without_export() {
+        let (effective, warn) = effective_summary_only(true, None);
+        assert!(effective);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn summary_only_false_stays_false_with_export() {
+        let (effective, warn) = effective_summary_only(false, Some("/tmp/out.csv"));
+        assert!(!effective);
+        assert!(warn.is_none());
     }
 }
 
