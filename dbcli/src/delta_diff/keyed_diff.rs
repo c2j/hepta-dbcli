@@ -375,7 +375,7 @@ impl KeyedDiffer {
         Ok((rows, scan.left_total, scan.right_total, None, extra))
     }
 
-    /// 倾斜点查：小表整读 + 大表分块 IN 点查 + 客户端归并；
+    /// 倾斜点查：小表整读 + 大表分块等值点查 + 客户端归并；
     /// 大表缺失按「COUNT − 命中」记账，不物化。
     async fn point_query_diff(
         &self,
@@ -469,6 +469,14 @@ impl KeyedDiffer {
             big_total,
         );
         extra.extend(merge.extra_warnings);
+        if merge.unpaired_hits > 0 {
+            return Err(DbError::query(format!(
+                "delta-diff point-query: {} big-side hit(s) could not be paired by key \
+                 order; summary would be unreliable (concurrent writes, non-unique keys, \
+                 or cross-engine key-type mismatch)",
+                merge.unpaired_hits
+            )));
+        }
 
         let mut missing_left = 0u64;
         let mut missing_right = 0u64;
@@ -504,8 +512,9 @@ impl KeyedDiffer {
     }
 }
 
-/// 点查谓词：小表键值 OR-of-ANDs 等式（`(k1=v1 AND k2=v2) OR ...`），
-/// 列名按大表目录形式引用，字面量按大表方言转义（仅 MySQL 反斜杠）。
+/// 点查等值谓词：每行 `AND` 连接各键列等值，行间 `OR`。等值语义与 keyset
+/// 完全一致（二进制校对 + 文本字面量 + NULL 用 IS NULL），见
+/// `render_key_equality`；谓词是 OR-of-ANDs，不受 ORA-01795 约束。
 fn render_point_query_predicate(
     ctx: &DiffContext,
     big_is_left: bool,
@@ -516,15 +525,21 @@ fn render_point_query_predicate(
     let scheme = side.plan.url_scheme.as_str();
     let backslash_escape = scheme == "mysql";
     let key_columns = ctx.side_key_columns(big_is_left);
+    let string_flags = side.plan.string_key_flags_for(key_columns);
     let arity = key_columns.len().max(1);
     let mut terms = Vec::with_capacity(rows.len());
     for row in rows {
         let mut conds = Vec::with_capacity(arity);
         for (idx, key) in key_columns.iter().enumerate() {
-            let column = crate::backend::quote_ident_catalog(scheme, quote, key);
             let value = row.get(idx).cloned().unwrap_or(Value::Null);
-            let literal = crate::backend::sql_literal(&value, backslash_escape);
-            conds.push(format!("{column} = {literal}"));
+            conds.push(crate::backend::render_key_equality(
+                quote,
+                key,
+                string_flags.get(idx).copied().unwrap_or(false),
+                scheme,
+                &value,
+                backslash_escape,
+            ));
         }
         terms.push(format!("({})", conds.join(" AND ")));
     }
@@ -870,14 +885,15 @@ fn assemble(
 /// 无上限时 1 亿 vs 1250 万会退化成数万条块状点查。超过走共享键序扫描。
 pub(crate) const POINT_QUERY_MAX_KEYS: u64 = 1_048_576;
 
-/// 点查谓词单块行字面量预算（跨方言保守值：Oracle ORA-01795 上限 1000 表达式；
-/// 实际块行数 = budget / 键列数，复合键不超限）。
+/// 点查谓词单块行字面量预算（语句长度/表达式复杂度的保守上限；点查谓词是
+/// OR-of-ANDs，不受 Oracle ORA-01795 的 IN 列表限制。实际块行数 =
+/// budget / 键列数，复合键不超限）。
 pub(crate) const POINT_QUERY_LITERAL_BUDGET: u64 = 1000;
 
 /// 倾斜路径选择。调用前提：两侧均非空（空侧短路已由 diff_inner 处理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkewRoute {
-    /// 小表整读 + 大表分块 IN 点查 + 客户端归并；大表缺失按计数记账不物化。
+    /// 小表整读 + 大表分块等值点查 + 客户端归并；大表缺失按计数记账不物化。
     PointQuery { big_is_left: bool },
     /// 全部失配桶合并为一次键序扫描（MOD IN 谓词），行仍全量物化。
     SharedScan,
@@ -921,6 +937,9 @@ pub(crate) fn point_query_chunk_rows(arity: usize) -> usize {
 pub(crate) struct PointQueryMerge {
     pub(crate) rows: Vec<DiffRow>,
     pub(crate) missing_big: u64,
+    /// 未能与 cmp_key 配对的大侧命中（排序失步/语义不一致）。非零即不可信，
+    /// 调用方必须报错而不是静默给出摘要。
+    pub(crate) unpaired_hits: u64,
     pub(crate) extra_warnings: Vec<String>,
 }
 
@@ -936,7 +955,6 @@ pub(crate) fn merge_small_vs_hits(
 ) -> PointQueryMerge {
     let mut rows = Vec::new();
     let mut extra_warnings = Vec::new();
-    let hits = big_hits.len() as u64;
 
     let small_status = if small_is_left {
         DiffStatus::MissingRight
@@ -969,13 +987,9 @@ pub(crate) fn merge_small_vs_hits(
                 ));
                 si += 1;
             }
+            // 命中键必然来自小表键集：Greater 只能是排序失步。命中不配对，
+            // 由 unpaired_hits 让调用方报错；`COUNT − 命中` 只扣配对上的。
             std::cmp::Ordering::Greater => {
-                // 命中键必然来自小表键集：Greater 只能是排序失步，告警跳过
-                extra_warnings.push(
-                    "point-query merge ordering mismatch; concurrent writes or \
-                     non-unique keys may have distorted results"
-                        .to_string(),
-                );
                 bi += 1;
             }
             std::cmp::Ordering::Equal => {
@@ -1004,16 +1018,25 @@ pub(crate) fn merge_small_vs_hits(
         }
     }
 
-    if hits > big_total {
+    let paired = bi as u64;
+    let unpaired_hits = (big_hits.len() as u64).saturating_sub(paired);
+    if unpaired_hits > 0 {
         extra_warnings.push(format!(
-            "point-query hits ({hits}) exceed big-side COUNT ({big_total}); \
-             key uniqueness assumption violated"
+            "point-query: {unpaired_hits} big-side hit(s) could not be paired by key order"
         ));
     }
-    let missing_big = big_total.saturating_sub(hits);
+    if (big_hits.len() as u64) > big_total {
+        extra_warnings.push(format!(
+            "point-query hits ({}) exceed big-side COUNT ({big_total}); \
+             concurrent writes may have shifted the table",
+            big_hits.len()
+        ));
+    }
+    let missing_big = big_total.saturating_sub(paired);
     PointQueryMerge {
         rows,
         missing_big,
+        unpaired_hits,
         extra_warnings,
     }
 }
@@ -1160,10 +1183,132 @@ mod skew_tests {
         let hits = vec![row(&[json!(1), json!("a")]), row(&[json!(2), json!("b")])];
         let out = merge_small_vs_hits(&small, &hits, 1, &[false, false], true, 1);
         assert_eq!(out.missing_big, 0);
+        assert_eq!(out.unpaired_hits, 0);
         assert!(out
             .extra_warnings
             .iter()
-            .any(|w| w.contains("uniqueness assumption violated")));
+            .any(|w| w.contains("exceed big-side COUNT")));
+    }
+
+    #[test]
+    fn merge_counts_unpaired_hits_for_caller_to_error() {
+        // 排序失步：命中键比当前小表键大且小表已耗尽后续命中 —— bi 前进但不配对
+        let small = vec![row(&[json!(1), json!("a")])];
+        let hits = vec![row(&[json!(1), json!("a")]), row(&[json!(9), json!("z")])];
+        let out = merge_small_vs_hits(&small, &hits, 1, &[false, false], true, 5);
+        assert_eq!(out.unpaired_hits, 1);
+        // 只扣配对上的 1 个命中
+        assert_eq!(out.missing_big, 4);
+        assert!(out
+            .extra_warnings
+            .iter()
+            .any(|w| w.contains("could not be paired")));
+    }
+
+    fn string_key_ctx(scheme: &str) -> DiffContext {
+        fn side(scheme: &str, key: &str) -> crate::delta_diff::strategy::SideCtx {
+            crate::delta_diff::strategy::SideCtx {
+                connection_name: "x".into(),
+                schema: Some("s".into()),
+                table: "t".into(),
+                plan: crate::delta_diff::metadata::TablePlan {
+                    url_scheme: scheme.into(),
+                    key_columns: vec![key.into()],
+                    compare_columns: vec![key.into(), "v".into()],
+                    norm_specs: vec![],
+                    warnings: vec![],
+                    key_specs: vec![crate::backend::ColumnNormSpec {
+                        name: key.into(),
+                        data_type: "varchar(64)".into(),
+                        nullable: false,
+                        rtrim_fixed_char: false,
+                    }],
+                    key_unique: true,
+                },
+            }
+        }
+        DiffContext {
+            left: side(scheme, "K"),
+            right: side(scheme, "k"),
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column: "K".into(),
+            key_columns: vec!["K".into()],
+            left_key_columns: vec!["K".into()],
+            right_key_columns: vec!["k".into()],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 4,
+            consistency: crate::delta_diff::strategy::ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
+            strict: false,
+            summary_only: true,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        }
+    }
+
+    fn dummy_pool() -> std::sync::Arc<dyn crate::backend::DbPool> {
+        struct Pool;
+        #[async_trait::async_trait]
+        impl crate::backend::DbPool for Pool {
+            async fn acquire(
+                &self,
+            ) -> Result<Box<dyn crate::backend::DbConn + Send>, crate::backend::DbError>
+            {
+                Err(crate::backend::DbError::unsupported("dummy"))
+            }
+        }
+        std::sync::Arc::new(Pool)
+    }
+
+    #[test]
+    fn point_predicate_uses_binary_collation_for_mysql_string_keys() {
+        let ctx = string_key_ctx("mysql");
+        let sql = render_point_query_predicate(&ctx, true, '`', &[vec![json!("ABC"), json!("v1")]])
+            .unwrap();
+        assert!(
+            sql.contains("`K` COLLATE utf8mb4_bin = 'ABC'"),
+            "must pin binary collation: {sql}"
+        );
+        assert!(!sql.contains("= NULL"), "{sql}");
+    }
+
+    #[test]
+    fn point_predicate_uses_binary_collation_for_gaussdb_string_keys() {
+        let ctx = string_key_ctx("gaussdb");
+        let sql =
+            render_point_query_predicate(&ctx, false, '"', &[vec![json!("ABC"), json!("v1")]])
+                .unwrap();
+        assert!(sql.contains("\"k\" COLLATE \"C\" = 'ABC'"), "{sql}");
+    }
+
+    #[test]
+    fn point_predicate_wraps_oracle_string_keys_in_nlssort() {
+        let ctx = string_key_ctx("oracle");
+        let sql = render_point_query_predicate(&ctx, true, '"', &[vec![json!("ABC"), json!("v1")]])
+            .unwrap();
+        assert!(
+            sql.contains("NLSSORT(\"K\",'NLS_SORT=BINARY') = NLSSORT('ABC','NLS_SORT=BINARY')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn point_predicate_renders_is_null_for_null_key_values() {
+        let ctx = string_key_ctx("mysql");
+        let sql = render_point_query_predicate(&ctx, true, '`', &[vec![json!(null), json!("v1")]])
+            .unwrap();
+        assert!(sql.contains("`K` COLLATE utf8mb4_bin IS NULL"), "{sql}");
+        assert!(!sql.contains("= NULL"), "{sql}");
     }
 
     #[test]

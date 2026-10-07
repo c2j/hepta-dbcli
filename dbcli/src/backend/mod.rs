@@ -699,6 +699,28 @@ fn key_cmp_rhs(v: &Value, is_string: bool, scheme: &str, backslash_escape: bool)
     }
 }
 
+/// 点查等值谓词，与 keyset 的键比较语义完全一致（issue #125 review）：
+/// 字符串键走 `key_sort_expr` 的二进制校对与 `key_cmp_rhs` 的文本字面量，
+/// 避免 MySQL `ai_ci` 大小写折叠、Oracle CHAR 空格填充与客户端 `cmp_key`
+/// 判定不一致；NULL 值必须写 `IS NULL`（`col = NULL` 永不为真）。
+pub(crate) fn render_key_equality(
+    quote: char,
+    name: &str,
+    is_string: bool,
+    scheme: &str,
+    value: &Value,
+    backslash_escape: bool,
+) -> String {
+    let lhs = key_sort_expr(quote, name, is_string, scheme);
+    if value.is_null() {
+        return format!("{lhs} IS NULL");
+    }
+    format!(
+        "{lhs} = {}",
+        key_cmp_rhs(value, is_string, scheme, backslash_escape)
+    )
+}
+
 fn is_string_key(spec: &KeysetPageSpec, i: usize) -> bool {
     spec.string_key.get(i).copied().unwrap_or(false)
 }

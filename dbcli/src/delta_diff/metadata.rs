@@ -340,11 +340,19 @@ pub(crate) async fn build_table_plan(
         .filter_map(|k| find_column_ci(&columns, k).map(|col| col.norm_spec(rtrim_char_columns)))
         .collect();
 
-    let key_unique = if explicit_key.is_empty() {
-        !key_columns.is_empty()
+    let all_keys_not_null = key_columns.iter().all(|k| {
+        find_column_ci(&columns, k)
+            .map(|col| !col.nullable)
+            .unwrap_or(false)
+    });
+    let index_backs_unique = if explicit_key.is_empty() {
+        // 主键天然全表唯一且不可部分；唯一性证明之外还需每列 NOT NULL
+        true
     } else {
         index_covers_unique(&idx_result, &key_columns)
+            && !index_is_partial(&idx_result, &key_columns)
     };
+    let key_unique = !key_columns.is_empty() && all_keys_not_null && index_backs_unique;
 
     Ok(TablePlan {
         url_scheme: conn.dialect().url_scheme().to_string(),
@@ -387,6 +395,29 @@ fn index_covers_unique(idx: &QueryResult, keys: &[String]) -> bool {
         have.sort();
         if have == want {
             return true;
+        }
+    }
+    false
+}
+
+/// 匹配键集合的唯一/主键索引是否为部分索引（GaussDB/PG `indpred`，表现为
+/// indexdef 携带 `WHERE …`；MySQL/Oracle/DuckDB 无部分索引）。部分索引只
+/// 保证谓词内的唯一性，`COUNT − 命中` 记账对其余行不成立。
+fn index_is_partial(idx: &QueryResult, keys: &[String]) -> bool {
+    let mut want: Vec<String> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+    want.sort();
+    for r in &idx.rows {
+        if !(value_bool(r.get(1)) || value_bool(r.get(2))) {
+            continue;
+        }
+        let raw = value_str(r.get(3));
+        let mut have: Vec<String> = parse_index_columns(&raw)
+            .into_iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        have.sort();
+        if have == want {
+            return raw.to_ascii_uppercase().contains(" WHERE ");
         }
     }
     false
@@ -828,6 +859,32 @@ mod tests {
     #[tokio::test]
     async fn explicit_key_with_unique_index_marks_key_unique() {
         let mut idx = as_result(vec![vec![
+            json!("uk_id"),
+            json!(true),
+            json!(false),
+            json!("id"),
+            json!("BTREE"),
+        ]]);
+        idx.row_count = 1;
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["id".into()],
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(plan.key_unique);
+        assert!(!plan.warnings.iter().any(|w| w.contains("unique/primary")));
+    }
+
+    #[tokio::test]
+    async fn unique_index_on_nullable_column_marks_not_unique() {
+        let mut idx = as_result(vec![vec![
             json!("uk_c_int"),
             json!(true),
             json!(false),
@@ -847,8 +904,49 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(plan.key_unique);
-        assert!(!plan.warnings.iter().any(|w| w.contains("unique/primary")));
+        assert!(!plan.key_unique, "可空列允许多个 NULL，COUNT − 命中不成立");
+    }
+
+    #[tokio::test]
+    async fn partial_unique_index_marks_not_unique() {
+        // GaussDB/PG pg_get_indexdef：部分唯一索引的 WHERE 出现在列清单之后
+        let mut idx = as_result(vec![vec![
+            json!("uk_id_active"),
+            json!(true),
+            json!(false),
+            json!(
+                "CREATE UNIQUE INDEX uk_id_active ON public.verify_t \
+                   USING btree (id) WHERE (active)"
+            ),
+            json!("btree"),
+        ]]);
+        idx.row_count = 1;
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(
+            &mut conn,
+            "verify",
+            "verify_t",
+            &[],
+            &["id".into()],
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !plan.key_unique,
+            "部分索引只保证谓词内唯一，全表 COUNT − 命中不成立"
+        );
+    }
+
+    #[tokio::test]
+    async fn nullable_primary_key_column_marks_not_unique() {
+        let mut conn = mock(verify_columns(), primary_index("c_int"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert_eq!(plan.key_columns, vec!["c_int"]);
+        assert!(!plan.key_unique, "可空主键列同样破坏 COUNT − 命中");
     }
 
     #[tokio::test]
