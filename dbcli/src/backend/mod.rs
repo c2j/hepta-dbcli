@@ -660,7 +660,7 @@ pub(crate) fn sql_literal(v: &Value, backslash_escape: bool) -> String {
 /// Quote `v` as a SQL string literal. Used for string-typed key columns even
 /// when the driver stored a digit-only VARCHAR as a JSON number (`55958` →
 /// `'55958'`). Unquoted numbers inside Oracle `NLSSORT(...)` raise ORA-01722.
-fn sql_literal_as_text(v: &Value, backslash_escape: bool) -> String {
+pub(crate) fn sql_literal_as_text(v: &Value, backslash_escape: bool) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::String(s) => format!("'{}'", escape_sql_string(s, backslash_escape)),

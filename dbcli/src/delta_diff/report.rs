@@ -479,6 +479,7 @@ mod tests {
     #[test]
     fn stamp_columns_from_plan_types_an_excluded_key_from_key_specs() {
         let plan = crate::delta_diff::metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "gaussdb".into(),
             key_columns: vec!["id".into()],

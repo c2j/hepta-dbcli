@@ -766,6 +766,7 @@ mod tests {
                 });
             }
             TablePlan {
+                aux: Default::default(),
                 key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: keys.iter().map(|k| (*k).into()).collect(),
@@ -1190,6 +1191,7 @@ mod duckdb_e2e_tests {
 
     fn plan(amt_type: &str) -> TablePlan {
         TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "duckdb".into(),
             key_columns: vec!["k1".into(), "k2".into()],

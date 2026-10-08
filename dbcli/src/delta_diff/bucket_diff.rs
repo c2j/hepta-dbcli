@@ -13,6 +13,8 @@ use serde_json::Value;
 use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
 use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
+use crate::delta_diff::keyed_diff;
+use crate::delta_diff::point_lookup;
 use crate::delta_diff::report::{
     DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics, RowPayload, ShardResult,
     ShardStatus, TableRef,
@@ -375,9 +377,16 @@ impl DiffStrategy for BucketDiffer {
             let _ = left.query_drop("COMMIT").await;
             let _ = right.query_drop("COMMIT").await;
         }
-        let (buckets, diff_rows, bucket_count) = result?;
+        let (buckets, diff_rows, bucket_count, point) = result?;
 
-        let mut report = assemble(ctx, buckets, diff_rows, bucket_count, ctx.sample_limit);
+        let mut report = assemble(
+            ctx,
+            buckets,
+            diff_rows,
+            bucket_count,
+            ctx.sample_limit,
+            point.as_ref(),
+        );
         report.started_at = started;
         report.finished_at = Utc::now();
         report.perf.queries_total = queries;
@@ -392,8 +401,38 @@ impl BucketDiffer {
         right: &mut (dyn DbConn + Send),
         ctx: &DiffContext,
         queries: &mut u64,
-    ) -> Result<(Vec<ShardResult>, Vec<DiffRow>, u64), DbError> {
-        let n = self.bucket_count(left, right, ctx, queries).await?;
+    ) -> Result<
+        (
+            Vec<ShardResult>,
+            Vec<DiffRow>,
+            u64,
+            Option<point_lookup::KeylessPointCounts>,
+        ),
+        DbError,
+    > {
+        let (n, le, re, exact) = self.bucket_count(left, right, ctx, queries).await?;
+        let mut n = n;
+        if let Some(counts) =
+            maybe_point_lookup(left, right, ctx, queries, &mut n, le, re, exact).await?
+        {
+            let t0 = Instant::now();
+            let status = if counts.small_only == 0 && counts.big_only == 0 {
+                ShardStatus::Match
+            } else {
+                ShardStatus::Diff
+            };
+            let shards = vec![ShardResult {
+                shard_id: "point-lookup".into(),
+                key_range: (Value::from(0), Value::from(0)),
+                // 复核后的精确计数，不是可能的 catalog 估计值。
+                left_count: counts.left_total,
+                right_count: counts.right_total,
+                diff_count: u64::from(status == ShardStatus::Diff),
+                status,
+                duration_ms: t0.elapsed().as_millis() as u64,
+            }];
+            return Ok((shards, Vec::new(), n, Some(counts)));
+        }
         let range_plan = self.probe_key_domain(left, right, ctx, n, queries).await?;
         let t0 = Instant::now();
 
@@ -490,22 +529,25 @@ impl BucketDiffer {
             *queries += 2;
             rows.extend(multiset_diff(lr?.rows, rr?.rows));
         }
-        Ok((shards, rows, total_n))
+        Ok((shards, rows, total_n, None))
     }
 
     /// Estimate bucket count: target ~threshold rows per bucket, capped at
     /// MAX_BUCKETS (v2.1 section 6.3). Runs before the key-domain probe and
-    /// stays authoritative for the legacy MOD(rowHash, N) path.
+    /// stays authoritative for the legacy MOD(rowHash, N) path. Returns
+    /// `(n, left_count, right_count, counts_exact)`: the skew gate (#127)
+    /// needs both side counts; `counts_exact` is false when the counts came
+    /// from catalog estimates instead of `COUNT(*)`.
     async fn bucket_count(
         &self,
         left: &mut (dyn DbConn + Send),
         right: &mut (dyn DbConn + Send),
         ctx: &DiffContext,
         queries: &mut u64,
-    ) -> Result<u64, DbError> {
+    ) -> Result<(u64, u64, u64, bool), DbError> {
         let lf = side_filter(ctx, left.dialect().url_scheme());
         let rf = side_filter(ctx, right.dialect().url_scheme());
-        let (le, re) = if lf.is_some() || rf.is_some() {
+        let (le, re, exact) = if lf.is_some() || rf.is_some() {
             let lsql = filtered_count_sql(
                 left.dialect().url_scheme(),
                 left.dialect().identifier_quote(),
@@ -523,17 +565,17 @@ impl BucketDiffer {
             ctx.vlog(format!("[sql:left] {lsql}"));
             ctx.vlog(format!("[sql:right] {rsql}"));
             let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
-            (parse_count_cell(&lr?)?, parse_count_cell(&rr?)?)
+            (parse_count_cell(&lr?)?, parse_count_cell(&rr?)?, true)
         } else {
             (
                 estimate_rows(left, ctx, true).await?,
                 estimate_rows(right, ctx, false).await?,
+                false,
             )
         };
         *queries += 2;
-        let rows = le.max(re).max(1);
-        let per = ctx.bisection_threshold.max(1);
-        Ok((rows.div_ceil(per)).clamp(1, MAX_BUCKETS))
+        let n = bucket_n_from_counts(le, re, ctx);
+        Ok((n, le, re, exact))
     }
 
     /// Probe the overlapping integer key domain [min, max] via MIN/MAX on
@@ -779,6 +821,185 @@ fn filtered_count_sql(
     }
 }
 
+fn bucket_n_from_counts(le: u64, re: u64, ctx: &DiffContext) -> u64 {
+    let rows = le.max(re).max(1);
+    let per = ctx.bisection_threshold.max(1);
+    rows.div_ceil(per).clamp(1, MAX_BUCKETS)
+}
+
+/// Issue #127：summary-only 且行数严重倾斜的无键表，读回小表内容做逐内容
+/// 点查，替代 MOD(rowHash, N) 对大表的 N 遍全表扫描。`Ok(None)` 表示不启用
+/// 或中途放弃（门控不过、估计计数复核失败、小表读回超上限），调用方回落
+/// 常规分桶路径；已发出的查询照常计入 queries_total。
+#[allow(clippy::too_many_arguments)]
+async fn maybe_point_lookup(
+    left: &mut (dyn DbConn + Send),
+    right: &mut (dyn DbConn + Send),
+    ctx: &DiffContext,
+    queries: &mut u64,
+    n_out: &mut u64,
+    le: u64,
+    re: u64,
+    exact: bool,
+) -> Result<Option<point_lookup::KeylessPointCounts>, DbError> {
+    let (big, small) = (le.max(re), le.min(re));
+    if !point_lookup::point_lookup_gate(big, small, ctx.fetch_all_threshold, ctx.summary_only) {
+        return Ok(None);
+    }
+
+    // 无过滤时计数来自 catalog 估计，可能过期：门控通过后补精确 COUNT
+    // 重验，记账也只认精确值。
+    let (le, re) = if exact {
+        (le, re)
+    } else {
+        let lsql = filtered_count_sql(
+            left.dialect().url_scheme(),
+            left.dialect().identifier_quote(),
+            ctx.left.schema.as_deref(),
+            &ctx.left.table,
+            side_filter(ctx, left.dialect().url_scheme()).as_deref(),
+        );
+        let rsql = filtered_count_sql(
+            right.dialect().url_scheme(),
+            right.dialect().identifier_quote(),
+            ctx.right.schema.as_deref(),
+            &ctx.right.table,
+            side_filter(ctx, right.dialect().url_scheme()).as_deref(),
+        );
+        ctx.vlog(format!("[sql:left] {lsql}"));
+        ctx.vlog(format!("[sql:right] {rsql}"));
+        let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
+        *queries += 2;
+        let (le, re) = (parse_count_cell(&lr?)?, parse_count_cell(&rr?)?);
+        let (big, small) = (le.max(re), le.min(re));
+        if !point_lookup::point_lookup_gate(big, small, ctx.fetch_all_threshold, ctx.summary_only) {
+            *n_out = bucket_n_from_counts(le, re, ctx);
+            return Ok(None);
+        }
+        (le, re)
+    };
+    // 大小侧判定必须基于最终精确计数：估计偏差可能翻转两侧，按估计值选
+    // 小侧会把大表整读进内存。
+    let small_is_left = le <= re;
+
+    let small_side = if small_is_left { &ctx.left } else { &ctx.right };
+    let big_side = if small_is_left { &ctx.right } else { &ctx.left };
+    if !point_lookup::compare_columns_align(
+        &small_side.plan.compare_columns,
+        &big_side.plan.compare_columns,
+    ) {
+        ctx.vlog(
+            "[delta-diff] point-lookup abandoned: compare column sets differ across sides; \
+             falling back to MOD(rowHash, N) bucketing",
+        );
+        *n_out = bucket_n_from_counts(le, re, ctx);
+        return Ok(None);
+    }
+    let small_filter = side_filter(ctx, small_side.plan.url_scheme.as_str());
+    let read_sql = {
+        let dialect = if small_is_left {
+            left.dialect()
+        } else {
+            right.dialect()
+        };
+        let exprs = small_side.plan.normalized_exprs(dialect)?;
+        let table = crate::backend::quote_table_scheme(
+            dialect.url_scheme(),
+            dialect.identifier_quote(),
+            small_side.schema.as_deref(),
+            &small_side.table,
+        );
+        match small_filter.as_deref() {
+            Some(f) => format!("SELECT {} FROM {table} WHERE ({f})", exprs.join(", ")),
+            None => format!("SELECT {} FROM {table}", exprs.join(", ")),
+        }
+    };
+    ctx.vlog(format!("[sql:small] {read_sql}"));
+    let small_rows: Vec<Vec<Value>> = {
+        let conn: &mut (dyn DbConn + Send) = if small_is_left { left } else { right };
+        let result = conn.query(&read_sql).await?;
+        result.rows
+    };
+    *queries += 1;
+    if small_rows.len() as u64 > point_lookup::KEYLESS_POINT_LOOKUP_MAX_SMALL_ROWS {
+        ctx.vlog(
+            "[delta-diff] point-lookup abandoned: small side grew past the row cap; \
+             falling back to MOD(rowHash, N) bucketing",
+        );
+        *n_out = bucket_n_from_counts(le, re, ctx);
+        return Ok(None);
+    }
+    let expected_small = if small_is_left { le } else { re };
+    let mut warnings = Vec::new();
+    if small_rows.len() as u64 != expected_small {
+        warnings.push(format!(
+            "point-lookup small-side count mismatch: checksum={expected_small} fetched={}; \
+             concurrent writes may skew the accounting",
+            small_rows.len()
+        ));
+    }
+
+    let multiset = point_lookup::multiset_from_rows(&small_rows);
+    let big_scheme = big_side.plan.url_scheme.clone();
+    let big_specs = big_side.plan.norm_specs.clone();
+    let small_specs = small_side.plan.norm_specs.clone();
+    let aligned = point_lookup::bare_aligned_flags(&big_side.plan);
+    let collations = &big_side.plan.aux.collations;
+    let big_filter = side_filter(ctx, &big_scheme);
+    let big_total = if small_is_left { re } else { le };
+    let mut small_only = 0u64;
+    let mut total_paired = 0u64;
+    for (content, mult) in &multiset {
+        let sql = {
+            let big_dialect = if small_is_left {
+                right.dialect()
+            } else {
+                left.dialect()
+            };
+            let pred = point_lookup::render_content_predicate(
+                big_dialect,
+                &big_specs,
+                &small_specs,
+                &aligned,
+                collations,
+                content,
+            )?;
+            let full_pred = match big_filter.as_deref() {
+                Some(f) => format!("({f}) AND ({pred})"),
+                None => pred,
+            };
+            keyed_diff::render_count_sql(
+                &big_scheme,
+                big_dialect.identifier_quote(),
+                big_side.schema.as_deref(),
+                &big_side.table,
+                Some(&full_pred),
+            )
+        };
+        ctx.vlog(format!("[sql:big] {sql}"));
+        let result: crate::backend::QueryResult = {
+            let conn: &mut (dyn DbConn + Send) = if small_is_left { right } else { left };
+            conn.query(&sql).await?
+        };
+        *queries += 1;
+        let big_count = keyed_diff::parse_count(&result)?;
+        let (only, paired) = point_lookup::pair_contents(*mult, big_count);
+        small_only += only;
+        total_paired += paired;
+    }
+    let big_only = big_total.saturating_sub(total_paired);
+    Ok(Some(point_lookup::KeylessPointCounts {
+        small_is_left,
+        small_only,
+        big_only,
+        left_total: le,
+        right_total: re,
+        small_rows: small_rows.len() as u64,
+        point_queries: multiset.len() as u64,
+        warnings,
+    }))
+}
+
 fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
     match result.rows.first().and_then(|r| r.first()) {
         None | Some(Value::Null) => Ok(0),
@@ -982,17 +1203,30 @@ fn assemble(
     diff_rows: Vec<DiffRow>,
     bucket_count: u64,
     _sample_limit: usize,
+    point: Option<&point_lookup::KeylessPointCounts>,
 ) -> DiffReport {
     let mut summary = DiffSummary {
         left_total: shards.iter().map(|s| s.left_count).sum(),
         right_total: shards.iter().map(|s| s.right_count).sum(),
         ..Default::default()
     };
-    for d in &diff_rows {
-        match d.status {
-            DiffStatus::MissingLeft => summary.missing_left += 1,
-            DiffStatus::MissingRight => summary.missing_right += 1,
-            DiffStatus::Modified => summary.modified += 1,
+    if let Some(pc) = point {
+        // 点查路径不落 diff_rows：方向感知地记账，永不产生 modified。
+        // MissingLeft = 仅大表有（左缺）；MissingRight = 仅小表有（右缺）。
+        if pc.small_is_left {
+            summary.missing_right = pc.small_only;
+            summary.missing_left = pc.big_only;
+        } else {
+            summary.missing_left = pc.small_only;
+            summary.missing_right = pc.big_only;
+        }
+    } else {
+        for d in &diff_rows {
+            match d.status {
+                DiffStatus::MissingLeft => summary.missing_left += 1,
+                DiffStatus::MissingRight => summary.missing_right += 1,
+                DiffStatus::Modified => summary.modified += 1,
+            }
         }
     }
     let total = summary.left_total.max(summary.right_total);
@@ -1010,11 +1244,31 @@ fn assemble(
         .chain(ctx.route_warnings.iter())
         .cloned()
         .collect();
-    let note = format!(
-        "note: keyless table diff reports row-content multiset differences only \
-         (buckets={bucket_count})"
-    );
-    if !warnings
+    if let Some(pc) = point {
+        warnings.extend(pc.warnings.iter().cloned());
+    }
+    let note = match point {
+        Some(pc) => format!(
+            "note: keyless table diff reports row-content multiset differences only \
+             (point-lookup small_rows={} point_queries={})",
+            pc.small_rows, pc.point_queries
+        ),
+        None => format!(
+            "note: keyless table diff reports row-content multiset differences only \
+             (buckets={bucket_count})"
+        ),
+    };
+    if point.is_some() {
+        // 点查路径用具体 note 替换 engine 的通用提示；MOD 路径保持既有行为
+        // （通用 note 已在 warnings 里时不再重复入列）。
+        match warnings
+            .iter_mut()
+            .find(|w| w.starts_with("note: keyless table diff"))
+        {
+            Some(existing) => *existing = note,
+            None => warnings.push(note),
+        }
+    } else if !warnings
         .iter()
         .any(|w| w.starts_with("note: keyless table diff"))
     {
@@ -1075,6 +1329,7 @@ mod tests {
     #[test]
     fn assemble_keeps_hash_count_payload_despite_plan_columns() {
         let plan = crate::delta_diff::metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
@@ -1121,7 +1376,7 @@ mod tests {
             verbose: false,
         };
 
-        let report = assemble(&ctx, vec![], vec![], 1, 20);
+        let report = assemble(&ctx, vec![], vec![], 1, 20, None);
 
         assert!(report.key_columns.is_empty());
         assert!(report.value_columns.is_empty());
@@ -1320,6 +1575,7 @@ mod tests {
 
     fn probe_plan(columns: &[(&str, &str)]) -> crate::delta_diff::metadata::TablePlan {
         crate::delta_diff::metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec![],
@@ -1406,6 +1662,7 @@ mod tests {
     /// --exclude-columns while its declared type stays in `key_specs`.
     fn probe_ctx_for_excluded_key(name: &str, ty: &str) -> DiffContext {
         let plan = crate::delta_diff::metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             key_columns: vec![name.to_string()],
             key_specs: vec![crate::backend::ColumnNormSpec {
@@ -1880,6 +2137,7 @@ mod range_tests {
     fn test_ctx() -> DiffContext {
         fn side_plan() -> crate::delta_diff::metadata::TablePlan {
             crate::delta_diff::metadata::TablePlan {
+                aux: Default::default(),
                 key_unique: false,
                 url_scheme: "duckdb".into(),
                 key_columns: vec!["id".into()],

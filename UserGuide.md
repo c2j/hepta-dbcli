@@ -844,6 +844,8 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 - **有单列整数键**（类型为整数/数值/decimal 等）：先探针一次 `MIN/MAX` 拿键域，再按键区间分桶，每个桶的拉取都走索引范围。
 - **无键表，或键类型不可能是整数**（VARCHAR/日期/JSON 等）：不做任何探针，直接按 `MOD(rowHash, N)` 内容分桶。
 
+无键表在 `--summary-only` 下还有一条**内容点查快路径**（issue #127）：两侧行数悬殊（大侧超过 `--fetch-all-threshold`、大/小 ≥ 8）且小侧 ≤ 64 行时，整读小表的规范化内容，按「逐内容 `COUNT(*)` 点查」对大表配对——配对数 = min(小表重数, 大表 COUNT)，小表独有按行计、大表独有 = 大表 COUNT − 配对总数（只记账不拉回）。多重集合语义不变：无 `modified`，NULL 列与内容重复行都参与配对。能对齐索引前导前缀的列用裸等值（可走索引 seek；数值仅限整数族与两侧声明标度一致的小数——无 typmod 的 `numeric`/`NUMBER` 文本身份保留存储标度，一律走规范化；MySQL 字符串仅 NO PAD 二进制 collation 的变长列接受裸等值，变长列其余 collation 用字面量侧 `CAST(lit AS BINARY)` 的空格敏感比较，`CHAR` 定长列检索会剥尾部填充，谓词用 `RTRIM` 后字节比较），其余列沿用与行哈希一致的规范化等值。哨兵值沿用该列的规范化表达式（`--rtrim-char-columns` 下全空白定长字符与 NULL 同一哈希身份，不退化成 `IS NULL`）。小侧超过 64 行、两侧比对列集不一致（点查谓词按位置映射，要求逐位同名同序）、或估计计数复核失败时自动回落常规分桶。
+
 探针只在能构成整数键域时才发；探针语句本身被库拒绝（例如键列不支持 `MIN()`）会直接报错并给出替代策略提示，不会静默降级。键没有单列整数形态时请改用 `--strategy naivediff` 或 `--strategy keyeddiff`。
 
 ### 9.4 一致性与复核
@@ -860,7 +862,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 |------|------|
 | `--sample N` | 终端差异明细行数上限，默认 20；`0` 表示终端也打全量。**不裁剪** `--export`。抽样默认 `diverse` |
 | `--sample-mode` | 终端抽样模式：`diverse`（默认；status 配额 + 变化列覆盖 + 签名去重，按 key 序展示）或 `prefix`（key 序前 N 行）。只影响终端样本与 MCP payload，**不影响** `--export` |
-| `--summary-only` | 只打统计，不打明细。**倾斜快路径**（issue #124）：keyeddiff 两侧行数悬殊（大/小 ≥ 8 且大侧超过 `--fetch-all-threshold`）且两侧键均有唯一/主键索引背书时，只整读小表并对大表做主键点查——缺失按「COUNT − 命中」计数，不物化差异行，查询数从 O(桶数×页数) 降到个位数。与 `--export` 同时给出时 `--summary-only` 被忽略（导出需要全量差异行，warnings 会写明） |
+| `--summary-only` | 只打统计，不打明细。**倾斜快路径**（issue #124）：keyeddiff 两侧行数悬殊（大/小 ≥ 8 且大侧超过 `--fetch-all-threshold`）且两侧键均有唯一/主键索引背书时，只整读小表并对大表做主键点查——缺失按「COUNT − 命中」计数，不物化差异行，查询数从 O(桶数×页数) 降到个位数。无键 bucketdiff 也有对应快路径（issue #127，见 9.3 节）：小侧 ≤ 64 行时按逐内容 `COUNT(*)` 点查配对，大表独有行不拉回。与 `--export` 同时给出时 `--summary-only` 被忽略（导出需要全量差异行，warnings 会写明） |
 | `--wide` | 终端显示全部比对列，不只变化列 |
 | `--format` | 终端/ `--output` 的汇总格式：`table` / `json` / `csv` / `vertical` |
 | `--output FILE` | 把终端那份报告写到文件 |

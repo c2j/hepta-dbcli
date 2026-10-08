@@ -921,7 +921,7 @@ pub(crate) enum SkewRoute {
 }
 
 /// 倾斜判定：`big / 8 >= small`（等价 `big >= small * 8`，防溢出写法）。
-fn is_skewed(big: u64, small: u64) -> bool {
+pub(crate) fn is_skewed(big: u64, small: u64) -> bool {
     small > 0 && big / 8 >= small
 }
 
@@ -1232,6 +1232,7 @@ mod skew_tests {
                 schema: Some("s".into()),
                 table: "t".into(),
                 plan: crate::delta_diff::metadata::TablePlan {
+                    aux: Default::default(),
                     url_scheme: scheme.into(),
                     key_columns: vec![key.into()],
                     compare_columns: vec![key.into(), "v".into()],
@@ -1436,6 +1437,7 @@ mod tests {
             schema: Some("s".into()),
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                aux: Default::default(),
                 key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: key_columns.iter().map(|name| (*name).into()).collect(),

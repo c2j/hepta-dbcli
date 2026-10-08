@@ -26,6 +26,9 @@ pub(crate) mod naive_diff;
 pub(crate) mod output;
 pub(crate) mod pairing;
 pub(crate) mod paths;
+pub(crate) mod point_lookup;
+#[cfg(all(test, feature = "duckdb"))]
+mod point_lookup_live_tests;
 pub(crate) mod progress;
 pub(crate) mod recheck;
 pub(crate) mod report;

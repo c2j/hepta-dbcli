@@ -1164,6 +1164,7 @@ mod tests {
     fn plan() -> crate::delta_diff::metadata::TablePlan {
         use crate::backend::ColumnNormSpec;
         crate::delta_diff::metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],

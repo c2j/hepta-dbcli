@@ -192,6 +192,7 @@ mod filter_tests {
             schema: None,
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                aux: Default::default(),
                 key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: vec![],
