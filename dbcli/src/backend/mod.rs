@@ -325,8 +325,10 @@ pub trait Dialect: Send + Sync {
 pub struct IbltSqlSpec {
     pub schema: Option<String>,
     pub table: String,
-    /// key 表达式（定长整数：数值列或 epoch 转换），用于 key_xor
-    pub key_expr: String,
+    /// key 表达式（定长整数：数值列或 epoch 转换），用于 key_xor。
+    /// `None` = key 从行哈希前 8 字节派生（keyless 内容哈希 IBLT，#129）：
+    /// 各方言在渲染时内部生成，行哈希只算一次。
+    pub key_expr: Option<String>,
     /// §九 规范化表达式（row_hash = MD5(concat_ws('#', ...))）
     pub normalized_exprs: Vec<String>,
     /// 每个哈希子表的桶数（m = ⌈3d/4⌉，总桶数 k=4m≈3d）

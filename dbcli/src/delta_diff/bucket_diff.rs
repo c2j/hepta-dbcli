@@ -10,9 +10,10 @@ use std::time::Instant;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::backend::{ChecksumSqlSpec, DbConn, DbError};
+use crate::backend::{ChecksumSqlSpec, DbConn, DbError, IbltSqlSpec};
 use crate::delta_diff::checksum::{run_batch_checksum, ChecksumTuple};
 use crate::delta_diff::hash_diff::open_snapshot;
+use crate::delta_diff::iblt_diff;
 use crate::delta_diff::keyed_diff;
 use crate::delta_diff::point_lookup;
 use crate::delta_diff::report::{
@@ -339,6 +340,31 @@ impl RangePlan {
 
 pub(crate) struct BucketDiffer;
 
+/// Keyless 快路径结果（#129）：分桶兜底 / 点查(#127) / IBLT 免回扫(#129)。
+/// `FastCounts.note` 是括号内后缀（如 `(iblt decoded m=…)`），完整 note 文案由
+/// `assemble` 拼上固定前缀。
+enum KeylessPath {
+    Buckets,
+    PointLookup(point_lookup::KeylessPointCounts),
+    FastCounts {
+        missing_left: u64,
+        missing_right: u64,
+        note: String,
+        warnings: Vec<String>,
+    },
+}
+
+/// keyless IBLT 解码结果（#129）：方向计数 + note + 采样行 + 两侧精确行数。
+struct KeylessOutcome {
+    missing_left: u64,
+    missing_right: u64,
+    note: String,
+    rows: Vec<DiffRow>,
+    left_total: u64,
+    right_total: u64,
+    warnings: Vec<String>,
+}
+
 #[async_trait::async_trait]
 impl DiffStrategy for BucketDiffer {
     fn name(&self) -> &'static str {
@@ -377,7 +403,7 @@ impl DiffStrategy for BucketDiffer {
             let _ = left.query_drop("COMMIT").await;
             let _ = right.query_drop("COMMIT").await;
         }
-        let (buckets, diff_rows, bucket_count, point) = result?;
+        let (buckets, diff_rows, bucket_count, path) = result?;
 
         let mut report = assemble(
             ctx,
@@ -385,7 +411,7 @@ impl DiffStrategy for BucketDiffer {
             diff_rows,
             bucket_count,
             ctx.sample_limit,
-            point.as_ref(),
+            &path,
         );
         report.started_at = started;
         report.finished_at = Utc::now();
@@ -401,15 +427,7 @@ impl BucketDiffer {
         right: &mut (dyn DbConn + Send),
         ctx: &DiffContext,
         queries: &mut u64,
-    ) -> Result<
-        (
-            Vec<ShardResult>,
-            Vec<DiffRow>,
-            u64,
-            Option<point_lookup::KeylessPointCounts>,
-        ),
-        DbError,
-    > {
+    ) -> Result<(Vec<ShardResult>, Vec<DiffRow>, u64, KeylessPath), DbError> {
         let (n, le, re, exact) = self.bucket_count(left, right, ctx, queries).await?;
         let mut n = n;
         if let Some(counts) =
@@ -431,7 +449,46 @@ impl BucketDiffer {
                 status,
                 duration_ms: t0.elapsed().as_millis() as u64,
             }];
-            return Ok((shards, Vec::new(), n, Some(counts)));
+            return Ok((shards, Vec::new(), n, KeylessPath::PointLookup(counts)));
+        }
+        // Tier 2 (#129)：keyless 内容哈希 IBLT 免回扫（仅 summary-only）。
+        if let Some(out) = maybe_keyless_iblt(
+            left,
+            right,
+            ctx,
+            queries,
+            le,
+            re,
+            keyless_iblt_capacity(le, re),
+        )
+        .await?
+        {
+            let t0 = Instant::now();
+            let status = if out.missing_left == 0 && out.missing_right == 0 {
+                ShardStatus::Match
+            } else {
+                ShardStatus::Diff
+            };
+            let shards = vec![ShardResult {
+                shard_id: "keyless-iblt".into(),
+                key_range: (Value::from(0), Value::from(0)),
+                left_count: out.left_total,
+                right_count: out.right_total,
+                diff_count: u64::from(status == ShardStatus::Diff),
+                status,
+                duration_ms: t0.elapsed().as_millis() as u64,
+            }];
+            return Ok((
+                shards,
+                out.rows,
+                n,
+                KeylessPath::FastCounts {
+                    missing_left: out.missing_left,
+                    missing_right: out.missing_right,
+                    note: out.note,
+                    warnings: out.warnings,
+                },
+            ));
         }
         let range_plan = self.probe_key_domain(left, right, ctx, n, queries).await?;
         let t0 = Instant::now();
@@ -541,7 +598,7 @@ impl BucketDiffer {
             }
             None => {}
         }
-        Ok((shards, rows, total_n, None))
+        Ok((shards, rows, total_n, KeylessPath::Buckets))
     }
 
     /// Estimate bucket count: target ~threshold rows per bucket, capped at
@@ -854,6 +911,12 @@ fn expected_queries_new(diff_buckets: u64) -> u64 {
     }
 }
 
+/// 无键 IBLT 容量（#129）：|ΔCOUNT| 只是差异下界（行数几乎相等时真实对称差
+/// 可以远大于它），取 8× 下界并设固定地板/天花板；m = 3d/4 ≤ AUTO_MAX_CELLS。
+fn keyless_iblt_capacity(le: u64, re: u64) -> u64 {
+    le.abs_diff(re).max(1024).saturating_mul(8).min(65_536)
+}
+
 fn filtered_count_sql(
     scheme: &str,
     quote: char,
@@ -872,6 +935,127 @@ fn bucket_n_from_counts(le: u64, re: u64, ctx: &DiffContext) -> u64 {
     let rows = le.max(re).max(1);
     let per = ctx.bisection_threshold.max(1);
     rows.div_ceil(per).clamp(1, MAX_BUCKETS)
+}
+
+/// 渲染单侧 keyless IBLT 摘要 SQL（#129）：key_expr = None，由方言从行哈希
+/// 前 8 字节派生 key；filter/scn 与 keyed render_iblt 一致。
+fn render_keyless_iblt(
+    conn: &mut (dyn DbConn + Send),
+    ctx: &DiffContext,
+    m: u64,
+    is_left: bool,
+) -> Result<String, DbError> {
+    let dialect = conn.dialect();
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let spec = IbltSqlSpec {
+        schema: side.schema.clone(),
+        table: side.table.clone(),
+        key_expr: None,
+        normalized_exprs: side.plan.normalized_exprs(dialect)?,
+        cells_per_subtable: m,
+        filter: side_filter(ctx, dialect.url_scheme()),
+        scn: ctx.scn_of(is_left),
+    };
+    dialect.render_iblt_sql(&spec)
+}
+
+/// Issue #129 Tier 2：summary-only 下的无键内容哈希 IBLT 单遍快路径。
+///
+/// 每侧一条 keyless IBLT 摘要（各 1 遍全表哈希），客户端相减 + 剥洋葱解码，
+/// 直接得到方向计数——免去 Tier 1 的 2 条 GROUP BY + 2 条失配桶拉取。任何失败
+/// （Db 错误 / 解码失败 / 渲染失败）都 vlog 原因并返回 `Ok(None)` 落入 Tier 1
+/// 分桶路径，真错误在那里上抛；净差为空（两侧一致）是合法命中，返回空计数。
+///
+/// 已知取舍：Tier 2 失败退 Tier 1 最坏比「只做 Tier 1」多 1 遍扫描（IBLT 白扫）；
+/// 但解码失败意味着真实差异 > 容量（≥8×|ΔCOUNT|），失配桶几乎必然 ≥2，相比改动前
+/// 的 1+D 遍仍不慢。
+async fn maybe_keyless_iblt(
+    left: &mut (dyn DbConn + Send),
+    right: &mut (dyn DbConn + Send),
+    ctx: &DiffContext,
+    queries: &mut u64,
+    le: u64,
+    re: u64,
+    capacity: u64,
+) -> Result<Option<KeylessOutcome>, DbError> {
+    if !ctx.summary_only {
+        return Ok(None);
+    }
+    let m = (3 * capacity / 4).max(16);
+    let lsql = match render_keyless_iblt(left, ctx, m, true) {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.vlog(format!("[delta-diff] keyless IBLT render failed: {e}"));
+            return Ok(None);
+        }
+    };
+    let rsql = match render_keyless_iblt(right, ctx, m, false) {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.vlog(format!("[delta-diff] keyless IBLT render failed: {e}"));
+            return Ok(None);
+        }
+    };
+    ctx.vlog(format!("[sql:left] {lsql}"));
+    ctx.vlog(format!("[sql:right] {rsql}"));
+
+    let (l_scheme, r_scheme) = (
+        left.dialect().url_scheme().to_owned(),
+        right.dialect().url_scheme().to_owned(),
+    );
+    let (diff, left_total, right_total) = match iblt_diff::run_iblt_summaries(
+        left, right, &lsql, &rsql, &l_scheme, &r_scheme, queries,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            ctx.vlog(format!("[delta-diff] keyless IBLT summary failed: {e}"));
+            return Ok(None);
+        }
+    };
+
+    let mut warnings = Vec::new();
+    if left_total != le || right_total != re {
+        warnings.push(format!(
+            "iblt count mismatch: checksum_left={le} checksum_right={re} \
+             iblt_left={left_total} iblt_right={right_total}; \
+             concurrent writes may skew the accounting"
+        ));
+    }
+
+    if diff.values().all(|c| *c == iblt_diff::Cell::default()) {
+        return Ok(Some(KeylessOutcome {
+            missing_left: 0,
+            missing_right: 0,
+            note: format!("(iblt decoded-empty m={m})"),
+            rows: vec![],
+            left_total,
+            right_total,
+            warnings,
+        }));
+    }
+    // 净差偶数条目（同内容左右等份抵消后 key_xor=0、|cnt|≥2）剥不出 → 安全回退。
+    let entries = match iblt_diff::peel(&diff, m) {
+        Ok(e) => e,
+        Err(()) => {
+            ctx.vlog(format!(
+                "[delta-diff] keyless IBLT decode failed (d > capacity {capacity}); \
+                 falling back to MOD(rowHash, N) bucketing"
+            ));
+            return Ok(None);
+        }
+    };
+    let (missing_left, missing_right, rows) = iblt_diff::classify_keyless(&entries);
+    Ok(Some(KeylessOutcome {
+        missing_left,
+        missing_right,
+        note: format!("(iblt decoded m={m} entries={})", entries.len()),
+        rows,
+        left_total,
+        right_total,
+        warnings,
+    }))
 }
 
 /// Issue #127：summary-only 且行数严重倾斜的无键表，读回小表内容做逐内容
@@ -1250,29 +1434,40 @@ fn assemble(
     diff_rows: Vec<DiffRow>,
     bucket_count: u64,
     _sample_limit: usize,
-    point: Option<&point_lookup::KeylessPointCounts>,
+    path: &KeylessPath,
 ) -> DiffReport {
     let mut summary = DiffSummary {
         left_total: shards.iter().map(|s| s.left_count).sum(),
         right_total: shards.iter().map(|s| s.right_count).sum(),
         ..Default::default()
     };
-    if let Some(pc) = point {
-        // 点查路径不落 diff_rows：方向感知地记账，永不产生 modified。
-        // MissingLeft = 仅大表有（左缺）；MissingRight = 仅小表有（右缺）。
-        if pc.small_is_left {
-            summary.missing_right = pc.small_only;
-            summary.missing_left = pc.big_only;
-        } else {
-            summary.missing_left = pc.small_only;
-            summary.missing_right = pc.big_only;
+    match path {
+        KeylessPath::PointLookup(pc) => {
+            // 点查路径不落 diff_rows：方向感知地记账，永不产生 modified。
+            // MissingLeft = 仅大表有（左缺）；MissingRight = 仅小表有（右缺）。
+            if pc.small_is_left {
+                summary.missing_right = pc.small_only;
+                summary.missing_left = pc.big_only;
+            } else {
+                summary.missing_left = pc.small_only;
+                summary.missing_right = pc.big_only;
+            }
         }
-    } else {
-        for d in &diff_rows {
-            match d.status {
-                DiffStatus::MissingLeft => summary.missing_left += 1,
-                DiffStatus::MissingRight => summary.missing_right += 1,
-                DiffStatus::Modified => summary.modified += 1,
+        KeylessPath::FastCounts {
+            missing_left,
+            missing_right,
+            ..
+        } => {
+            summary.missing_left = *missing_left;
+            summary.missing_right = *missing_right;
+        }
+        KeylessPath::Buckets => {
+            for d in &diff_rows {
+                match d.status {
+                    DiffStatus::MissingLeft => summary.missing_left += 1,
+                    DiffStatus::MissingRight => summary.missing_right += 1,
+                    DiffStatus::Modified => summary.modified += 1,
+                }
             }
         }
     }
@@ -1291,35 +1486,45 @@ fn assemble(
         .chain(ctx.route_warnings.iter())
         .cloned()
         .collect();
-    if let Some(pc) = point {
-        warnings.extend(pc.warnings.iter().cloned());
+    match path {
+        KeylessPath::PointLookup(pc) => warnings.extend(pc.warnings.iter().cloned()),
+        KeylessPath::FastCounts { warnings: fw, .. } => warnings.extend(fw.iter().cloned()),
+        KeylessPath::Buckets => {}
     }
-    let note = match point {
-        Some(pc) => format!(
+    let note = match path {
+        KeylessPath::PointLookup(pc) => format!(
             "note: keyless table diff reports row-content multiset differences only \
              (point-lookup small_rows={} point_queries={})",
             pc.small_rows, pc.point_queries
         ),
-        None => format!(
+        KeylessPath::FastCounts { note, .. } => {
+            format!("note: keyless table diff reports row-content multiset differences only {note}")
+        }
+        KeylessPath::Buckets => format!(
             "note: keyless table diff reports row-content multiset differences only \
              (buckets={bucket_count})"
         ),
     };
-    if point.is_some() {
-        // 点查路径用具体 note 替换 engine 的通用提示；MOD 路径保持既有行为
-        // （通用 note 已在 warnings 里时不再重复入列）。
-        match warnings
-            .iter_mut()
-            .find(|w| w.starts_with("note: keyless table diff"))
-        {
-            Some(existing) => *existing = note,
-            None => warnings.push(note),
+    match path {
+        KeylessPath::Buckets => {
+            // MOD 路径保持既有行为：通用 note 已在 warnings 里时不再重复入列。
+            if !warnings
+                .iter()
+                .any(|w| w.starts_with("note: keyless table diff"))
+            {
+                warnings.push(note);
+            }
         }
-    } else if !warnings
-        .iter()
-        .any(|w| w.starts_with("note: keyless table diff"))
-    {
-        warnings.push(note);
+        _ => {
+            // 点查/IBLT 路径用具体 note 替换 engine 的通用提示。
+            match warnings
+                .iter_mut()
+                .find(|w| w.starts_with("note: keyless table diff"))
+            {
+                Some(existing) => *existing = note,
+                None => warnings.push(note),
+            }
+        }
     }
     DiffReport {
         started_at: Utc::now(),
@@ -1423,7 +1628,7 @@ mod tests {
             verbose: false,
         };
 
-        let report = assemble(&ctx, vec![], vec![], 1, 20, None);
+        let report = assemble(&ctx, vec![], vec![], 1, 20, &KeylessPath::Buckets);
 
         assert!(report.key_columns.is_empty());
         assert!(report.value_columns.is_empty());
@@ -2084,6 +2289,17 @@ mod tests {
         assert_eq!(expected_queries_new(2), 6);
         assert_eq!(expected_queries_new(197), 6);
     }
+
+    #[test]
+    fn keyless_iblt_capacity_scales_floor_and_cap() {
+        // |Δ| = 2 → floor 1024 → ×8 = 8192
+        assert_eq!(keyless_iblt_capacity(3_212_540, 3_212_538), 8192);
+        // 零差也吃地板
+        assert_eq!(keyless_iblt_capacity(0, 0), 8192);
+        // 极端差饱和到 8× 后封顶 65536，不得 panic
+        assert_eq!(keyless_iblt_capacity(u64::MAX, 0), 65_536);
+        assert_eq!(keyless_iblt_capacity(0, u64::MAX), 65_536);
+    }
 }
 
 // ─── WP2 tests: PK-range bucketing (issue #77) ──────────────────────────
@@ -2572,5 +2788,105 @@ mod range_tests {
         let sql = conn.dialect().render_bucket_multiset_sql(&mk(0));
         let r = conn.query(&sql).await.expect("multiset pull");
         assert_eq!(r.rows.len(), 4, "bucket 0 covers ids 0..=4");
+    }
+
+    // ── keyless IBLT direct-call fallback (issue #129) ──
+
+    fn keyless_summary_ctx(left_table: &str, right_table: &str) -> DiffContext {
+        fn plan() -> crate::delta_diff::metadata::TablePlan {
+            crate::delta_diff::metadata::TablePlan {
+                aux: Default::default(),
+                key_unique: false,
+                url_scheme: "duckdb".into(),
+                key_columns: vec![],
+                compare_columns: vec!["id".into(), "v".into()],
+                norm_specs: vec![
+                    crate::backend::ColumnNormSpec {
+                        name: "id".into(),
+                        data_type: "BIGINT".into(),
+                        nullable: false,
+                        rtrim_fixed_char: false,
+                    },
+                    crate::backend::ColumnNormSpec {
+                        name: "v".into(),
+                        data_type: "VARCHAR".into(),
+                        nullable: false,
+                        rtrim_fixed_char: false,
+                    },
+                ],
+                warnings: vec![],
+                key_specs: vec![],
+            }
+        }
+        DiffContext {
+            left: crate::delta_diff::strategy::SideCtx {
+                connection_name: "l".into(),
+                schema: None,
+                table: left_table.into(),
+                plan: plan(),
+            },
+            right: crate::delta_diff::strategy::SideCtx {
+                connection_name: "r".into(),
+                schema: None,
+                table: right_table.into(),
+                plan: plan(),
+            },
+            left_pool: dummy_pool(),
+            right_pool: dummy_pool(),
+            key_column: String::new(),
+            key_columns: vec![],
+            left_key_columns: vec![],
+            right_key_columns: vec![],
+            filter: None,
+            incremental: None,
+            bisection_factor: 32,
+            bisection_threshold: 16_384,
+            sample_limit: 20,
+            threads: 1,
+            consistency: ConsistencyMode::None,
+            recheck: false,
+            route_warnings: vec![],
+            checkpoint: None,
+            iblt_capacity: 65_536,
+            fetch_all_threshold: 4096,
+            naive_max_rows: 4096,
+            strict: false,
+            summary_only: true,
+            scns: std::sync::OnceLock::new(),
+            verbose: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn keyless_iblt_capacity_exceeded_returns_none() {
+        let pool = duck_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.query("CREATE OR REPLACE TABLE t_left (id BIGINT, v VARCHAR)")
+            .await
+            .expect("create l");
+        conn.query("CREATE OR REPLACE TABLE t_right (id BIGINT, v VARCHAR)")
+            .await
+            .expect("create r");
+        for i in 0..200i64 {
+            conn.query(&format!("INSERT INTO t_left VALUES ({i}, 'v{i}')"))
+                .await
+                .expect("insert l");
+        }
+        drop(conn);
+
+        let ctx = keyless_summary_ctx("t_left", "t_right");
+        let (mut lc, mut rc) = (
+            pool.acquire().await.expect("l"),
+            pool.acquire().await.expect("r"),
+        );
+        let mut queries = 0u64;
+        let outcome = maybe_keyless_iblt(&mut *lc, &mut *rc, &ctx, &mut queries, 200, 0, 16)
+            .await
+            .expect("no db error");
+        assert!(
+            outcome.is_none(),
+            "capacity 16 must be exceeded by 200 distinct contents"
+        );
+        assert_eq!(queries, 2, "two wasted IBLT summaries");
     }
 }

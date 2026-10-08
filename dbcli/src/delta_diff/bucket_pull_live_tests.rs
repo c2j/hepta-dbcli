@@ -45,6 +45,14 @@ fn keyless_opts() -> DiffOptions {
     }
 }
 
+fn keyless_summary_opts() -> DiffOptions {
+    DiffOptions {
+        summary_only: true,
+        bisection_threshold: 4,
+        ..Default::default()
+    }
+}
+
 fn bootstrap(path: &std::path::Path, tables: &[(&str, &[(&str, &str)])]) -> Result<(), String> {
     let boot = duckdb::Connection::open(path).map_err(|e| e.to_string())?;
     let mut batch = String::new();
@@ -211,6 +219,86 @@ async fn identical_tables_skip_the_pull_pair() -> Result<(), String> {
 
     assert_eq!(report.perf.queries_total, 4);
     assert_eq!(report.summary.missing_right, 0);
+    assert_eq!(report.summary.missing_left, 0);
+    assert_eq!(report.summary.modified, 0);
+    Ok(())
+}
+
+// ─── issue #129：keyless 内容哈希 IBLT（summary-only 单遍）──────────
+
+#[tokio::test]
+async fn keyless_summary_only_iblt_skips_bucket_pulls() -> Result<(), String> {
+    // 5 vs 3 行、2 个不同内容只在左侧（各 1 份，净差 +1 可剥）→ IBLT 直接
+    // 解码：queries_total == 4（2 COUNT + 2 IBLT；无 GROUP BY、无拉取）。
+    let left = [
+        ("r00", "x"),
+        ("r01", "x"),
+        ("r02", "x"),
+        ("r03", "x"),
+        ("r04", "x"),
+    ];
+    let right = [("r00", "x"), ("r01", "x"), ("r02", "x")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("issue129_summary.duckdb");
+    bootstrap(&path, &[("t_left", &left[..]), ("t_right", &right[..])]).expect("bootstrap");
+    let pool = file_pool(&path).await.expect("pool");
+    let url = format!("duckdb://{}", path.display());
+
+    let report = run_diff(
+        side_input(&pool, &url, "t_left").await?,
+        side_input(&pool, &url, "t_right").await?,
+        keyless_summary_opts(),
+    )
+    .await
+    .expect("run_diff");
+
+    assert_eq!(report.strategy, "bucketdiff");
+    assert_eq!(report.perf.queries_total, 4);
+    assert_eq!(report.summary.missing_right, 2);
+    assert_eq!(report.summary.missing_left, 0);
+    assert_eq!(report.summary.modified, 0);
+    let note = report
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("note: keyless table diff"))
+        .expect("keyless note");
+    assert!(note.contains("iblt"), "{note}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn keyless_iblt_decode_failure_falls_back_to_combined_pull() -> Result<(), String> {
+    // 同内容左 4 份右 2 份：净差 +2、key_xor=0、val_xor=0 → 剥不出 → 安全回退
+    // Tier 1。queries_total == 8（2 COUNT + 2 白扫 IBLT + 2 GROUP BY + 2 拉取），
+    // summary 与 Tier 1 语义一致（1 个不同内容 → missing_right=1）。
+    let left = [
+        ("a", "x"),
+        ("a", "x"),
+        ("a", "x"),
+        ("a", "x"),
+        ("b", "x"),
+        ("c", "x"),
+    ];
+    let right = [("a", "x"), ("a", "x"), ("b", "x"), ("c", "x")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("issue129_fallback.duckdb");
+    bootstrap(&path, &[("t_left", &left[..]), ("t_right", &right[..])]).expect("bootstrap");
+    let pool = file_pool(&path).await.expect("pool");
+    let url = format!("duckdb://{}", path.display());
+
+    let report = run_diff(
+        side_input(&pool, &url, "t_left").await?,
+        side_input(&pool, &url, "t_right").await?,
+        keyless_summary_opts(),
+    )
+    .await
+    .expect("run_diff");
+
+    assert_eq!(report.strategy, "bucketdiff");
+    assert_eq!(report.perf.queries_total, 8);
+    assert_eq!(report.summary.missing_right, 1);
     assert_eq!(report.summary.missing_left, 0);
     assert_eq!(report.summary.modified, 0);
     Ok(())
