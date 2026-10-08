@@ -942,6 +942,7 @@ async fn maybe_point_lookup(
     let multiset = point_lookup::multiset_from_rows(&small_rows);
     let big_scheme = big_side.plan.url_scheme.clone();
     let big_specs = big_side.plan.norm_specs.clone();
+    let small_specs = small_side.plan.norm_specs.clone();
     let aligned = point_lookup::bare_aligned_flags(&big_side.plan);
     let collations = &big_side.plan.aux.collations;
     let big_filter = side_filter(ctx, &big_scheme);
@@ -958,6 +959,7 @@ async fn maybe_point_lookup(
             let pred = point_lookup::render_content_predicate(
                 big_dialect,
                 &big_specs,
+                &small_specs,
                 &aligned,
                 collations,
                 content,

@@ -81,12 +81,7 @@ fn base_type(data_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 数值等值与文本等值恒等的类型族（scale 固定）。
-fn is_numeric_exact(data_type: &str) -> bool {
-    let b = base_type(data_type);
-    b.contains("int") || matches!(b.as_str(), "decimal" | "numeric" | "number" | "dec")
-}
-
+/// 浮点族：表示不稳定，裸等值与文本等值都可能踩坑，一律规范化。
 fn is_float_family(data_type: &str) -> bool {
     let b = base_type(data_type);
     b.contains("float") || b.contains("double") || b == "real"
@@ -124,6 +119,29 @@ fn is_string_family(data_type: &str) -> bool {
     )
 }
 
+/// 整数族：数学等值与文本等值恒等，无标度问题。
+fn integer_family(data_type: &str) -> bool {
+    base_type(data_type).contains("int")
+}
+
+/// 类型串里显式声明的小数标度（`decimal(10,2)` / `NUMBER(10,2)` /
+/// `numeric(16,4)`）。无 typmod（裸 `numeric`）或只有精度（`NUMBER(10)`）
+/// 返回 None——存储/检索标度不受声明约束，裸数值等值会与文本哈希身份漂移。
+fn declared_scale(data_type: &str) -> Option<u64> {
+    let inner = data_type.split('(').nth(1)?.trim_end_matches(')');
+    let scale = inner.split(',').nth(1)?.trim();
+    scale.parse().ok()
+}
+
+/// MySQL 定长字符：检索时剥尾部填充（默认 sql_mode），哈希身份是剥过的
+/// 文本，与变长字符串的逐字节身份不同。
+fn is_fixed_char(data_type: &str) -> bool {
+    matches!(
+        base_type(data_type).as_str(),
+        "char" | "nchar" | "character"
+    )
+}
+
 fn bare_numeric_literal_ok(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -133,13 +151,16 @@ fn bare_numeric_literal_ok(value: &str) -> bool {
 }
 
 /// 裸等值资格：索引对齐 + 类型白名单 + 方言修正。白名单外一律规范化等值。
+/// 数值要求两侧标度一致（见 `render_content_predicate`），这里先放行
+/// 「整数族或声明了标度的小数」；`--rtrim-char-columns` 改写哈希身份的
+/// 定长字符列永不裸等值。
 pub(crate) fn bare_eligible(
     spec: &ColumnNormSpec,
     scheme: &str,
     collation: Option<&str>,
     aligned: bool,
 ) -> bool {
-    if !aligned {
+    if !aligned || spec.rtrim_fixed_char {
         return false;
     }
     if crate::delta_diff::metadata::is_temporal_type(&spec.data_type)
@@ -149,24 +170,33 @@ pub(crate) fn bare_eligible(
     {
         return false;
     }
-    if is_numeric_exact(&spec.data_type) {
+    if integer_family(&spec.data_type) || declared_scale(&spec.data_type).is_some() {
         return true;
     }
     if is_string_family(&spec.data_type) {
         return match scheme {
-            // MySQL `=` 受 collation 影响（ci / PAD SPACE），只有 NO PAD
-            // 二进制 collation 的裸等值与 checksum 字节级身份恒等。
-            "mysql" => matches!(collation, Some(c) if c.ends_with("_0900_bin")),
+            // MySQL `=` 受 collation 影响（ci / PAD SPACE），且定长字符的
+            // 存储填充在 NO PAD 下会被当成有效字符：裸等值只对声明了
+            // NO PAD 二进制 collation 的变长字符串成立。
+            "mysql" => {
+                !is_fixed_char(&spec.data_type)
+                    && matches!(collation, Some(c) if c.ends_with("_0900_bin"))
+            }
             _ => true,
         };
     }
     false
 }
 
-/// 单条内容的点查谓词：`<裸或规范化等值> AND ...`。NULL 一律 `IS NULL`。
+/// 单条内容的点查谓词：`<裸或规范化等值> AND ...`。
+///
+/// 数值裸等值额外要求两侧声明标度一致：字面量来自小侧规范化文本，裸
+/// `=` 是数学等值，`1.50` 与 `1.5` 在大侧 `=` 同真但文本哈希不同——两种
+/// 内容会配到同一批行，`total_paired` 被重复累加。
 pub(crate) fn render_content_predicate(
     dialect: &dyn crate::backend::Dialect,
     specs: &[ColumnNormSpec],
+    small_specs: &[ColumnNormSpec],
     aligned: &[bool],
     collations: &std::collections::HashMap<String, String>,
     values: &[String],
@@ -178,31 +208,57 @@ pub(crate) fn render_content_predicate(
     for (idx, spec) in specs.iter().enumerate() {
         let value = &values[idx];
         let q = crate::backend::quote_ident(quote, &spec.name);
+        let norm_fallback = |terms: &mut Vec<String>| -> Result<(), DbError> {
+            let norm = dialect.normalize_expr(spec)?;
+            terms.push(format!(
+                "({norm}) = {}",
+                sql_literal_as_text(&Value::String(value.clone()), backslash)
+            ));
+            Ok(())
+        };
         if value == NULL_SENTINEL {
-            terms.push(format!("{q} IS NULL"));
+            if spec.rtrim_fixed_char {
+                // 哨兵在此列的规范化里还吸收全空白（NULLIF+rtrim），不是
+                // 纯 SQL NULL：沿用规范化表达式保持同一哈希身份。
+                norm_fallback(&mut terms)?;
+            } else {
+                terms.push(format!("{q} IS NULL"));
+            }
             continue;
         }
         let coll = collations.get(&spec.name).map(String::as_str);
         let aligned_flag = aligned.get(idx).copied().unwrap_or(false);
         let value_lit = || sql_literal_as_text(&Value::String(value.clone()), backslash);
         if is_string_family(&spec.data_type) && scheme == "mysql" {
-            if bare_eligible(spec, scheme, coll, aligned_flag) {
+            if is_fixed_char(&spec.data_type) {
+                // CHAR 检索剥填充，RTRIM 后按字节比较才与 CONCAT_WS 身份一致；
+                // 函数在列侧，放弃索引 seek。
+                terms.push(format!(
+                    "CAST(RTRIM({q}) AS BINARY) = CAST({} AS BINARY)",
+                    value_lit()
+                ));
+            } else if bare_eligible(spec, scheme, coll, aligned_flag) {
                 terms.push(format!("{q} = {}", value_lit()));
             } else {
-                // 与 #124 点查同款空格敏感逐字节比较：PAD SPACE / ci 修正。
-                terms.push(crate::backend::render_key_equality(
-                    quote,
-                    &spec.name,
-                    true,
-                    "mysql",
-                    &Value::String(value.clone()),
-                    true,
-                ));
+                // 空格敏感逐字节比较，字面量侧 BINARY，列侧保持可 seek。
+                terms.push(format!("{q} = CAST({} AS BINARY)", value_lit()));
             }
             continue;
         }
         if bare_eligible(spec, scheme, coll, aligned_flag) {
-            if is_numeric_exact(&spec.data_type) && bare_numeric_literal_ok(value) {
+            let small = small_specs.get(idx);
+            let scale_agrees = match small {
+                Some(s) => {
+                    (integer_family(&spec.data_type) && integer_family(&s.data_type))
+                        || (declared_scale(&spec.data_type).is_some()
+                            && declared_scale(&spec.data_type) == declared_scale(&s.data_type))
+                }
+                None => false,
+            };
+            if (integer_family(&spec.data_type) || declared_scale(&spec.data_type).is_some())
+                && scale_agrees
+                && bare_numeric_literal_ok(value)
+            {
                 terms.push(format!("{q} = {value}"));
                 continue;
             }
@@ -211,8 +267,7 @@ pub(crate) fn render_content_predicate(
                 continue;
             }
         }
-        let norm = dialect.normalize_expr(spec)?;
-        terms.push(format!("({norm}) = {}", value_lit()));
+        norm_fallback(&mut terms)?;
     }
     Ok(terms.join(" AND "))
 }
@@ -333,6 +388,7 @@ mod tests {
         let p = render_content_predicate(
             &MySqlDialect,
             &specs,
+            &specs,
             &[true, true],
             &HashMap::new(),
             &["5".to_string(), "1.10".to_string()],
@@ -346,6 +402,7 @@ mod tests {
         let specs = vec![spec("amt", "decimal(10,2)")];
         let p = render_content_predicate(
             &MySqlDialect,
+            &specs,
             &specs,
             &[false],
             &HashMap::new(),
@@ -364,6 +421,7 @@ mod tests {
         let p = render_content_predicate(
             &GaussdbDialect,
             &specs,
+            &specs,
             &[true],
             &HashMap::new(),
             &[NULL_SENTINEL.to_string()],
@@ -376,19 +434,31 @@ mod tests {
     fn predicate_mysql_string_is_space_sensitive_byte_equality_even_when_aligned() {
         let specs = vec![spec("code", "varchar(32)")];
         let coll = mysql_collations(&[("code", "utf8mb4_general_ci")]);
-        let p =
-            render_content_predicate(&MySqlDialect, &specs, &[true], &coll, &["ABC".to_string()])
-                .unwrap();
-        assert_eq!(p, "CAST(`code` AS BINARY) = CAST('ABC' AS BINARY)");
+        let p = render_content_predicate(
+            &MySqlDialect,
+            &specs,
+            &specs,
+            &[true],
+            &coll,
+            &["ABC".to_string()],
+        )
+        .unwrap();
+        assert_eq!(p, "`code` = CAST('ABC' AS BINARY)");
     }
 
     #[test]
     fn predicate_mysql_nopad_bin_collation_gets_plain_bare_equality() {
         let specs = vec![spec("code", "varchar(32)")];
         let coll = mysql_collations(&[("code", "utf8mb4_0900_bin")]);
-        let p =
-            render_content_predicate(&MySqlDialect, &specs, &[true], &coll, &["ABC".to_string()])
-                .unwrap();
+        let p = render_content_predicate(
+            &MySqlDialect,
+            &specs,
+            &specs,
+            &[true],
+            &coll,
+            &["ABC".to_string()],
+        )
+        .unwrap();
         assert_eq!(p, "`code` = 'ABC'");
     }
 
@@ -397,6 +467,7 @@ mod tests {
         let specs = vec![spec("bcrq", "character varying(16)")];
         let p = render_content_predicate(
             &GaussdbDialect,
+            &specs,
             &specs,
             &[true],
             &HashMap::new(),
@@ -415,6 +486,7 @@ mod tests {
         ];
         let p = render_content_predicate(
             &GaussdbDialect,
+            &specs,
             &specs,
             &[true, true, true],
             &HashMap::new(),
@@ -436,6 +508,7 @@ mod tests {
         let p = render_content_predicate(
             &MySqlDialect,
             &specs,
+            &specs,
             &[true],
             &HashMap::new(),
             &["abc".to_string()],
@@ -453,6 +526,7 @@ mod tests {
         let p = render_content_predicate(
             &GaussdbDialect,
             &specs,
+            &specs,
             &[true],
             &HashMap::new(),
             &["O'Brien".to_string()],
@@ -466,6 +540,7 @@ mod tests {
         let specs = vec![spec("bcrq", "character varying(16)"), spec("n", "integer")];
         let p = render_content_predicate(
             &GaussdbDialect,
+            &specs,
             &specs,
             &[true, false],
             &HashMap::new(),
@@ -484,6 +559,7 @@ mod tests {
         let specs = vec![spec("code", "VARCHAR")];
         let p = render_content_predicate(
             &crate::backend::duckdb::dialect::DuckDbDialect,
+            &specs,
             &specs,
             &[true],
             &HashMap::new(),
@@ -512,6 +588,149 @@ mod tests {
         let m = multiset_from_rows(&rows);
         assert_eq!(m.get(&vec!["a".to_string(), "1".to_string()]), Some(&2));
         assert_eq!(m.get(&vec!["b".to_string(), "2".to_string()]), Some(&1));
+    }
+
+    fn spec_rtrim(name: &str, ty: &str) -> ColumnNormSpec {
+        ColumnNormSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable: true,
+            rtrim_fixed_char: true,
+        }
+    }
+
+    // ── review round 2: predicate/checksum identity gaps ──
+
+    #[test]
+    fn predicate_numeric_without_declared_scale_falls_back_to_normalized() {
+        let specs = vec![spec("amt", "numeric")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &specs,
+            &specs,
+            &[true],
+            &HashMap::new(),
+            &["1.50".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            format!("(COALESCE(\"amt\"::text, '{NULL_SENTINEL}')) = '1.50'")
+        );
+    }
+
+    #[test]
+    fn predicate_numeric_scale_mismatch_across_sides_falls_back() {
+        let big = vec![spec("amt", "decimal(10,2)")];
+        let small = vec![spec("amt", "numeric(16,4)")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &big,
+            &small,
+            &[true],
+            &HashMap::new(),
+            &["1.50".to_string()],
+        )
+        .unwrap();
+        assert!(p.contains("::text"), "{p}");
+        assert!(!p.contains("\"amt\" = "), "{p}");
+    }
+
+    #[test]
+    fn predicate_numeric_same_declared_scale_stays_bare() {
+        let big = vec![spec("amt", "numeric(16,4)")];
+        let small = vec![spec("amt", "numeric(16,4)")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &big,
+            &small,
+            &[true],
+            &HashMap::new(),
+            &["1.5000".to_string()],
+        )
+        .unwrap();
+        assert_eq!(p, "\"amt\" = 1.5000");
+    }
+
+    #[test]
+    fn predicate_integer_cross_dialect_names_stay_bare() {
+        let big = vec![spec("n", "int")];
+        let small = vec![spec("n", "integer")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &big,
+            &small,
+            &[true],
+            &HashMap::new(),
+            &["7".to_string()],
+        )
+        .unwrap();
+        assert_eq!(p, "\"n\" = 7");
+    }
+
+    #[test]
+    fn predicate_sentinel_keeps_normalized_identity_under_rtrim_flag() {
+        let specs = vec![spec_rtrim("code", "character(8)")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &specs,
+            &specs,
+            &[true],
+            &HashMap::new(),
+            &[NULL_SENTINEL.to_string()],
+        )
+        .unwrap();
+        assert!(
+            p.contains("NULLIF(rtrim"),
+            "全空白与 NULL 同身份，不能退化成 IS NULL: {p}"
+        );
+        assert!(p.contains(&format!("'{NULL_SENTINEL}'")), "{p}");
+    }
+
+    #[test]
+    fn predicate_rtrim_flag_column_never_goes_bare() {
+        let specs = vec![spec_rtrim("code", "character(8)")];
+        let p = render_content_predicate(
+            &GaussdbDialect,
+            &specs,
+            &specs,
+            &[true],
+            &HashMap::new(),
+            &["ABC".to_string()],
+        )
+        .unwrap();
+        assert!(p.contains("NULLIF(rtrim"), "{p}");
+    }
+
+    #[test]
+    fn predicate_mysql_char_strips_padding_before_byte_compare() {
+        let specs = vec![spec("code", "char(4)")];
+        let p = render_content_predicate(
+            &MySqlDialect,
+            &specs,
+            &specs,
+            &[true],
+            &HashMap::new(),
+            &["ABC".to_string()],
+        )
+        .unwrap();
+        assert_eq!(p, "CAST(RTRIM(`code`) AS BINARY) = CAST('ABC' AS BINARY)");
+    }
+
+    #[test]
+    fn predicate_mysql_nopad_bin_char_also_strips_padding() {
+        let specs = vec![spec("code", "char(4)")];
+        let coll = mysql_collations(&[("code", "utf8mb4_0900_bin")]);
+        let p = render_content_predicate(
+            &MySqlDialect,
+            &specs,
+            &specs,
+            &[true],
+            &coll,
+            &["ABC".to_string()],
+        )
+        .unwrap();
+        assert_eq!(p, "CAST(RTRIM(`code`) AS BINARY) = CAST('ABC' AS BINARY)");
     }
 
     #[test]
