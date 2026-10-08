@@ -948,6 +948,9 @@ fn keyless_iblt_capacity(le: u64, re: u64) -> u64 {
 
 /// Issue #129 Tier 3 门控：同连接 + summary-only + 两侧同 scheme 且 scheme 属于
 /// {gaussdb, oracle, duckdb}。MySQL 无 FULL OUTER JOIN，排除。
+/// 已知误判：两侧都是 `duckdb://:memory:` 时 URL 相等但实为两个独立内存库，
+/// 汇总语句会因表不存在而报错——maybe_same_conn_summary 捕获后透明回落
+/// IBLT/分桶，只浪费一条查询，不会产出错误结果。
 fn same_conn_summary_gate(ctx: &DiffContext, l_scheme: &str, r_scheme: &str) -> bool {
     ctx.same_connection
         && ctx.summary_only
@@ -959,6 +962,8 @@ fn same_conn_summary_gate(ctx: &DiffContext, l_scheme: &str, r_scheme: &str) -> 
 /// 完成两侧行哈希多重集合比对，返回每个「次数不等」的不同内容的计数
 /// （only_left=左多、only_right=右多）。SUM(CASE) 而非 FILTER——Oracle 19c 无
 /// FILTER 子句；ON 而非 USING——各方言最稳。无 filter 时省略两侧 WHERE 子句。
+/// 两个 CASE 都对两侧计数 COALESCE：FULL OUTER JOIN 下单侧独有的行另一侧
+/// 计数为 NULL，裸列比较判 NULL 为假会静默漏掉该方向的全部内容。
 fn render_same_conn_summary_sql(
     dialect: &dyn crate::backend::Dialect,
     l: (&str, Option<&str>, &[String]),
@@ -975,7 +980,7 @@ fn render_same_conn_summary_sql(
     let rtab = crate::backend::quote_table_scheme(scheme, quote, rschema, rtable);
     let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
     format!(
-        "WITH l AS (SELECT {lhash} AS h, COUNT(*) AS c FROM {ltab}{where_clause} GROUP BY h),\n     r AS (SELECT {rhash} AS h, COUNT(*) AS c FROM {rtab}{where_clause} GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > l.c THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h"
+        "WITH l AS (SELECT {lhash} AS h, COUNT(*) AS c FROM {ltab}{where_clause} GROUP BY h),\n     r AS (SELECT {rhash} AS h, COUNT(*) AS c FROM {rtab}{where_clause} GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h"
     )
 }
 
@@ -1001,6 +1006,10 @@ fn bucket_n_from_counts(le: u64, re: u64, ctx: &DiffContext) -> u64 {
 
 /// 渲染单侧 keyless IBLT 摘要 SQL（#129）：key_expr = None，由方言从行哈希
 /// 前 8 字节派生 key；filter/scn 与 keyed render_iblt 一致。
+/// 已知取舍：key 只有 32 位，两个不同内容前 8 字节碰撞时会被
+/// classify_keyless 合并成一个条目（同侧合并 → 欠计 1；异侧 → 每侧各计 1）。
+/// 碰撞概率随差异量增大（容量 65536 时 birthday 期望 ~0.5 次），属快路径
+/// 的有意精度让步；语义要求精确时用非 summary-only 的合并拉取路径。
 fn render_keyless_iblt(
     conn: &mut (dyn DbConn + Send),
     ctx: &DiffContext,
@@ -1734,8 +1743,10 @@ fn assert_same_conn_summary_sql(dialect: &dyn crate::backend::Dialect) {
         sql.contains("SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END)"),
         "{sql}"
     );
+    // 两侧都 COALESCE：FULL OUTER JOIN 下仅右表存在的行 l.c 为 NULL，
+    // 裸 `> l.c` 判 NULL 为假会静默漏掉全部 missing_left（评审修复回归）。
     assert!(
-        sql.contains("SUM(CASE WHEN COALESCE(r.c, 0) > l.c THEN 1 ELSE 0 END)"),
+        sql.contains("SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END)"),
         "{sql}"
     );
     assert!(sql.contains(&ltab), "left table: {sql}");

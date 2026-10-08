@@ -357,6 +357,44 @@ async fn same_conn_summary_single_statement_end_to_end() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn same_conn_summary_counts_right_only_contents() -> Result<(), String> {
+    // 评审修复回归：FULL OUTER JOIN 下仅右表存在的内容 l.c 为 NULL，
+    // only_right 分支必须对 l.c 同样 COALESCE，否则 missing_left 静默少计。
+    // 右表多出 d、e 两个内容 → missing_left == 2。
+    let left = [("a", "x"), ("b", "x"), ("c", "x")];
+    let right = [("a", "x"), ("b", "x"), ("c", "x"), ("d", "x"), ("e", "x")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("issue129_sameconn_rightonly.duckdb");
+    bootstrap(&path, &[("t_left", &left[..]), ("t_right", &right[..])]).expect("bootstrap");
+    let pool = file_pool(&path).await.expect("pool");
+    let url = format!("duckdb://{}", path.display());
+
+    let report = run_diff(
+        side_input(&pool, &url, "t_left").await?,
+        side_input(&pool, &url, "t_right").await?,
+        keyless_summary_opts(),
+    )
+    .await
+    .expect("run_diff");
+
+    assert_eq!(report.strategy, "bucketdiff");
+    assert_eq!(report.perf.queries_total, 3);
+    assert_eq!(report.summary.left_total, 3);
+    assert_eq!(report.summary.right_total, 5);
+    assert_eq!(report.summary.missing_left, 2);
+    assert_eq!(report.summary.missing_right, 0);
+    assert_eq!(report.summary.modified, 0);
+    let note = report
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("note: keyless table diff"))
+        .expect("keyless note");
+    assert!(note.contains("same-conn"), "{note}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn same_conn_summary_falls_back_when_columns_misalign() -> Result<(), String> {
     // 两侧比对列集不同（左 v 右 w）→ compare_columns_align 不过 → 同连接汇总被
     // 放弃，落入 IBLT（queries_total == 4，note 含 "iblt" 而非 "same-conn"）。
