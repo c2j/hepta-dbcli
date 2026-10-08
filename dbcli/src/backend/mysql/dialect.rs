@@ -31,7 +31,8 @@ impl Dialect for MySqlDialect {
         "SELECT c.COLUMN_NAME AS column_name, c.COLUMN_TYPE AS data_type, \
          IF(c.IS_NULLABLE = 'YES', true, false) AS nullable, \
          c.COLUMN_DEFAULT AS default_value, c.ORDINAL_POSITION AS ordinal_position, \
-         c.COLUMN_COMMENT AS `comment`, c.COLUMN_KEY AS column_key \
+         c.COLUMN_COMMENT AS `comment`, c.COLUMN_KEY AS column_key, \
+         c.COLLATION_NAME AS collation_name \
          FROM information_schema.COLUMNS c \
          WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ? \
          ORDER BY c.ORDINAL_POSITION"

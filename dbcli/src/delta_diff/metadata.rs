@@ -36,6 +36,21 @@ pub(crate) struct TablePlan {
     /// 键列由主键派生，或显式 --key 恰被唯一/主键索引覆盖（issue #124）。
     /// 唯一性是倾斜点查「缺失 = COUNT − 命中」记账的前提。
     pub key_unique: bool,
+    /// Sidecar 元数据（issue #127）：只有点查快路径消费，其余策略忽略。
+    pub aux: TablePlanAux,
+}
+
+/// 非核心计划元数据。单独一个字段挂进 `TablePlan`，避免为每个附加项
+/// 扩散结构体字面量改动。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TablePlanAux {
+    /// `table_indexes` 报告的每条索引的有序列清单（PRIMARY/唯一/普通一并
+    /// 保留）。token 原样保留（大小写、未解析 token 都不动），前导前缀
+    /// 对齐靠「第一个不在比对集里的 token 处断开」判定。
+    pub(crate) index_prefixes: Vec<Vec<String>>,
+    /// 列名（规范大小写）→ collation。目前仅 MySQL 的 table_columns 上报
+    /// （information_schema.COLUMNS.COLLATION_NAME，第 8 格）；其余后端为空。
+    pub(crate) collations: std::collections::HashMap<String, String>,
 }
 
 impl TablePlan {
@@ -354,6 +369,21 @@ pub(crate) async fn build_table_plan(
     };
     let key_unique = !key_columns.is_empty() && all_keys_not_null && index_backs_unique;
 
+    let index_prefixes: Vec<Vec<String>> = idx_result
+        .rows
+        .iter()
+        .map(|r| parse_index_columns(&value_str(r.get(3))))
+        .filter(|cols| !cols.is_empty())
+        .collect();
+    let collations: std::collections::HashMap<String, String> = columns
+        .iter()
+        .filter_map(|col| {
+            col.collation
+                .as_ref()
+                .map(|cl| (col.name.clone(), cl.clone()))
+        })
+        .collect();
+
     Ok(TablePlan {
         url_scheme: conn.dialect().url_scheme().to_string(),
         key_columns,
@@ -362,10 +392,14 @@ pub(crate) async fn build_table_plan(
         key_specs,
         warnings,
         key_unique,
+        aux: TablePlanAux {
+            index_prefixes,
+            collations,
+        },
     })
 }
 
-fn is_temporal_type(ty: &str) -> bool {
+pub(crate) fn is_temporal_type(ty: &str) -> bool {
     let b = ty.split('(').next().unwrap_or(ty).trim().to_lowercase();
     matches!(
         b.as_str(),
@@ -504,6 +538,8 @@ struct ColumnRow {
     name: String,
     data_type: String,
     nullable: bool,
+    /// MySQL 独有第 8 格（COLLATION_NAME）；其余后端恒 None。
+    collation: Option<String>,
 }
 
 impl ColumnRow {
@@ -522,6 +558,14 @@ fn parse_column_row(row: &[Value]) -> ColumnRow {
         name: value_str(row.first()),
         data_type: value_str(row.get(1)),
         nullable: value_bool(row.get(2)),
+        collation: value_opt_str(row.get(7)),
+    }
+}
+
+fn value_opt_str(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -682,6 +726,7 @@ mod tests {
     #[test]
     fn identity_hash_exprs_includes_key_excluded_from_columns() {
         let plan = TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "mysql".into(),
             key_columns: vec!["id".into()],
@@ -713,6 +758,7 @@ mod tests {
     #[test]
     fn string_key_flags_follow_requested_key_order() {
         let plan = TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: "oracle".into(),
             key_columns: vec!["A".into(), "B".into()],
@@ -845,6 +891,114 @@ mod tests {
         let exprs = plan.normalized_exprs(conn.dialect()).unwrap();
         assert_eq!(exprs.len(), 7);
         assert_eq!(exprs[0], "CAST(`id` AS CHAR)");
+    }
+
+    // ── Issue #127: index prefixes + collation sidecar ──
+
+    #[tokio::test]
+    async fn plan_keeps_all_index_column_prefixes() {
+        let idx = as_result(vec![
+            vec![
+                json!("PRIMARY"),
+                json!(true),
+                json!(true),
+                json!("id"),
+                json!("BTREE"),
+            ],
+            vec![
+                json!("idx_vc_int"),
+                json!(false),
+                json!(false),
+                json!("c_vc, c_int"),
+                json!("BTREE"),
+            ],
+            vec![
+                json!("idx_dt"),
+                json!(false),
+                json!(false),
+                json!("c_dt"),
+                json!("BTREE"),
+            ],
+        ]);
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.aux.index_prefixes,
+            vec![
+                vec!["id".to_string()],
+                vec!["c_vc".to_string(), "c_int".to_string()],
+                vec!["c_dt".to_string()],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_keeps_unresolved_index_tokens_for_prefix_breaks() {
+        // GaussDB pg_get_indexdef 风格：表达式索引的系统生成列名不落在
+        // 真实列集里。token 必须原样保留，前导前缀对齐才知道在它处断开，
+        // 而不是把后续列误判为可对齐。
+        let idx = as_result(vec![vec![
+            json!("idx_expr"),
+            json!(false),
+            json!(false),
+            json!("c_vc, SYS_NC00008$, c_int"),
+            json!("BTREE"),
+        ]]);
+        let mut conn = mock(verify_columns(), idx);
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.aux.index_prefixes,
+            vec![vec![
+                "c_vc".to_string(),
+                "SYS_NC00008$".to_string(),
+                "c_int".to_string(),
+            ]]
+        );
+    }
+
+    fn col_row_with_collation(
+        name: &str,
+        ty: &str,
+        nullable: bool,
+        column_key: &str,
+        collation: Option<&str>,
+    ) -> Vec<Value> {
+        vec![
+            json!(name),
+            json!(ty),
+            json!(nullable),
+            Value::Null,
+            json!(1),
+            Value::Null,
+            json!(column_key),
+            collation.map(|c| json!(c)).unwrap_or(Value::Null),
+        ]
+    }
+
+    #[tokio::test]
+    async fn plan_collation_sidecar_reads_eighth_column_cell() {
+        let columns = as_result(vec![
+            col_row_with_collation("code", "varchar(32)", false, "", Some("utf8mb4_0900_bin")),
+            col_row_with_collation("name", "varchar(64)", true, "", Some("utf8mb4_general_ci")),
+            col_row_with_collation("id", "int", false, "PRI", None),
+        ]);
+        let mut conn = mock(columns, primary_index("id"));
+        let plan = build_table_plan(&mut conn, "verify", "verify_t", &[], &[], false, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.aux.collations.get("code").map(String::as_str),
+            Some("utf8mb4_0900_bin")
+        );
+        assert_eq!(
+            plan.aux.collations.get("name").map(String::as_str),
+            Some("utf8mb4_general_ci")
+        );
+        assert!(!plan.aux.collations.contains_key("id"));
     }
 
     #[tokio::test]

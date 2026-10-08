@@ -1232,6 +1232,7 @@ mod skew_tests {
                 schema: Some("s".into()),
                 table: "t".into(),
                 plan: crate::delta_diff::metadata::TablePlan {
+                    aux: Default::default(),
                     url_scheme: scheme.into(),
                     key_columns: vec![key.into()],
                     compare_columns: vec![key.into(), "v".into()],
@@ -1436,6 +1437,7 @@ mod tests {
             schema: Some("s".into()),
             table: "t".into(),
             plan: crate::delta_diff::metadata::TablePlan {
+                aux: Default::default(),
                 key_unique: false,
                 url_scheme: "mysql".into(),
                 key_columns: key_columns.iter().map(|name| (*name).into()).collect(),

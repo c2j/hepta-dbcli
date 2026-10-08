@@ -375,6 +375,7 @@ mod tests {
 
     fn plan(scheme: &str, columns: &[(&str, &str)]) -> metadata::TablePlan {
         metadata::TablePlan {
+            aux: Default::default(),
             key_unique: false,
             url_scheme: scheme.to_string(),
             key_columns: Vec::new(),
