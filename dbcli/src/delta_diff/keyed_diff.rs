@@ -921,7 +921,7 @@ pub(crate) enum SkewRoute {
 }
 
 /// 倾斜判定：`big / 8 >= small`（等价 `big >= small * 8`，防溢出写法）。
-fn is_skewed(big: u64, small: u64) -> bool {
+pub(crate) fn is_skewed(big: u64, small: u64) -> bool {
     small > 0 && big / 8 >= small
 }
 
