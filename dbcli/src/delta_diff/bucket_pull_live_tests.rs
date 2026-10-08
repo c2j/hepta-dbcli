@@ -230,6 +230,8 @@ async fn identical_tables_skip_the_pull_pair() -> Result<(), String> {
 async fn keyless_summary_only_iblt_skips_bucket_pulls() -> Result<(), String> {
     // 5 vs 3 行、2 个不同内容只在左侧（各 1 份，净差 +1 可剥）→ IBLT 直接
     // 解码：queries_total == 4（2 COUNT + 2 IBLT；无 GROUP BY、无拉取）。
+    // 两侧用不同的 DuckDB 文件（connection_url 不同）→ same_connection=false，
+    // 否则 Tier 3 同连接汇总会先于 IBLT 命中。
     let left = [
         ("r00", "x"),
         ("r01", "x"),
@@ -240,14 +242,18 @@ async fn keyless_summary_only_iblt_skips_bucket_pulls() -> Result<(), String> {
     let right = [("r00", "x"), ("r01", "x"), ("r02", "x")];
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("issue129_summary.duckdb");
-    bootstrap(&path, &[("t_left", &left[..]), ("t_right", &right[..])]).expect("bootstrap");
-    let pool = file_pool(&path).await.expect("pool");
-    let url = format!("duckdb://{}", path.display());
+    let lpath = dir.path().join("left.duckdb");
+    let rpath = dir.path().join("right.duckdb");
+    bootstrap(&lpath, &[("t_left", &left[..])]).expect("bootstrap l");
+    bootstrap(&rpath, &[("t_right", &right[..])]).expect("bootstrap r");
+    let lpool = file_pool(&lpath).await.expect("pool l");
+    let rpool = file_pool(&rpath).await.expect("pool r");
+    let lurl = format!("duckdb://{}", lpath.display());
+    let rurl = format!("duckdb://{}", rpath.display());
 
     let report = run_diff(
-        side_input(&pool, &url, "t_left").await?,
-        side_input(&pool, &url, "t_right").await?,
+        side_input(&lpool, &lurl, "t_left").await?,
+        side_input(&rpool, &rurl, "t_right").await?,
         keyless_summary_opts(),
     )
     .await
@@ -272,6 +278,8 @@ async fn keyless_iblt_decode_failure_falls_back_to_combined_pull() -> Result<(),
     // 同内容左 4 份右 2 份：净差 +2、key_xor=0、val_xor=0 → 剥不出 → 安全回退
     // Tier 1。queries_total == 8（2 COUNT + 2 白扫 IBLT + 2 GROUP BY + 2 拉取），
     // summary 与 Tier 1 语义一致（1 个不同内容 → missing_right=1）。
+    // 两侧用不同的 DuckDB 文件（connection_url 不同）→ same_connection=false，
+    // 否则 Tier 3 同连接汇总会先于 IBLT 命中。
     let left = [
         ("a", "x"),
         ("a", "x"),
@@ -283,7 +291,43 @@ async fn keyless_iblt_decode_failure_falls_back_to_combined_pull() -> Result<(),
     let right = [("a", "x"), ("a", "x"), ("b", "x"), ("c", "x")];
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("issue129_fallback.duckdb");
+    let lpath = dir.path().join("left.duckdb");
+    let rpath = dir.path().join("right.duckdb");
+    bootstrap(&lpath, &[("t_left", &left[..])]).expect("bootstrap l");
+    bootstrap(&rpath, &[("t_right", &right[..])]).expect("bootstrap r");
+    let lpool = file_pool(&lpath).await.expect("pool l");
+    let rpool = file_pool(&rpath).await.expect("pool r");
+    let lurl = format!("duckdb://{}", lpath.display());
+    let rurl = format!("duckdb://{}", rpath.display());
+
+    let report = run_diff(
+        side_input(&lpool, &lurl, "t_left").await?,
+        side_input(&rpool, &rurl, "t_right").await?,
+        keyless_summary_opts(),
+    )
+    .await
+    .expect("run_diff");
+
+    assert_eq!(report.strategy, "bucketdiff");
+    assert_eq!(report.perf.queries_total, 8);
+    assert_eq!(report.summary.missing_right, 1);
+    assert_eq!(report.summary.missing_left, 0);
+    assert_eq!(report.summary.modified, 0);
+    Ok(())
+}
+
+// ─── issue #129：同连接服务器端汇总（Tier 3，summary-only 单语句）──────────
+
+#[tokio::test]
+async fn same_conn_summary_single_statement_end_to_end() -> Result<(), String> {
+    // 左右 SideInput 共用一个 Arc<dyn DbPool> + 相同 connection_url（同库两表）。
+    // summary_only=true → queries_total == 3（2 COUNT + 1 汇总语句，无 GROUP BY、
+    // 无 IBLT、无拉取）。内容 a 左 3 份右 1 份 → missing_right 只 +1（distinct-content）。
+    let left = [("a", "x"), ("a", "x"), ("a", "x"), ("b", "x"), ("c", "x")];
+    let right = [("a", "x"), ("b", "x"), ("c", "x")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("issue129_sameconn.duckdb");
     bootstrap(&path, &[("t_left", &left[..]), ("t_right", &right[..])]).expect("bootstrap");
     let pool = file_pool(&path).await.expect("pool");
     let url = format!("duckdb://{}", path.display());
@@ -297,9 +341,76 @@ async fn keyless_iblt_decode_failure_falls_back_to_combined_pull() -> Result<(),
     .expect("run_diff");
 
     assert_eq!(report.strategy, "bucketdiff");
-    assert_eq!(report.perf.queries_total, 8);
+    assert_eq!(report.perf.queries_total, 3);
+    assert_eq!(report.summary.left_total, 5);
+    assert_eq!(report.summary.right_total, 3);
     assert_eq!(report.summary.missing_right, 1);
     assert_eq!(report.summary.missing_left, 0);
     assert_eq!(report.summary.modified, 0);
+    let note = report
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("note: keyless table diff"))
+        .expect("keyless note");
+    assert!(note.contains("same-conn"), "{note}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_conn_summary_falls_back_when_columns_misalign() -> Result<(), String> {
+    // 两侧比对列集不同（左 v 右 w）→ compare_columns_align 不过 → 同连接汇总被
+    // 放弃，落入 IBLT（queries_total == 4，note 含 "iblt" 而非 "same-conn"）。
+    // 值域相同，故行哈希一致，IBLT 净差可剥，summary 方向正确。
+    let left = [
+        ("r00", "x"),
+        ("r01", "x"),
+        ("r02", "x"),
+        ("r03", "x"),
+        ("r04", "x"),
+    ];
+    let right = [("r00", "x"), ("r01", "x"), ("r02", "x")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("issue129_misalign.duckdb");
+    {
+        let boot = duckdb::Connection::open(&path).map_err(|e| e.to_string())?;
+        let lvalues: Vec<String> = left.iter().map(|(k, v)| format!("('{k}','{v}')")).collect();
+        let rvalues: Vec<String> = right
+            .iter()
+            .map(|(k, v)| format!("('{k}','{v}')"))
+            .collect();
+        boot.execute_batch(&format!(
+            "CREATE TABLE t_left (k VARCHAR(8), v VARCHAR(8));
+             CREATE TABLE t_right (k VARCHAR(8), w VARCHAR(8));
+             INSERT INTO t_left VALUES {};
+             INSERT INTO t_right VALUES {};",
+            lvalues.join(","),
+            rvalues.join(","),
+        ))
+        .map_err(|e| e.to_string())?;
+    }
+    let pool = file_pool(&path).await.expect("pool");
+    let url = format!("duckdb://{}", path.display());
+
+    let report = run_diff(
+        side_input(&pool, &url, "t_left").await?,
+        side_input(&pool, &url, "t_right").await?,
+        keyless_summary_opts(),
+    )
+    .await
+    .expect("run_diff");
+
+    assert_eq!(report.strategy, "bucketdiff");
+    assert_eq!(report.perf.queries_total, 4);
+    assert_eq!(report.summary.missing_right, 2);
+    assert_eq!(report.summary.missing_left, 0);
+    assert_eq!(report.summary.modified, 0);
+    let note = report
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("note: keyless table diff"))
+        .expect("keyless note");
+    assert!(note.contains("iblt"), "{note}");
+    assert!(!note.contains("same-conn"), "{note}");
     Ok(())
 }

@@ -451,6 +451,35 @@ impl BucketDiffer {
             }];
             return Ok((shards, Vec::new(), n, KeylessPath::PointLookup(counts)));
         }
+        // Tier 3 (#129)：同连接服务器端汇总（仅 same_connection && summary-only）。
+        if let Some(out) = maybe_same_conn_summary(left, right, ctx, queries, le, re).await? {
+            let t0 = Instant::now();
+            let status = if out.missing_left == 0 && out.missing_right == 0 {
+                ShardStatus::Match
+            } else {
+                ShardStatus::Diff
+            };
+            let shards = vec![ShardResult {
+                shard_id: "same-conn-summary".into(),
+                key_range: (Value::from(0), Value::from(0)),
+                left_count: out.left_total,
+                right_count: out.right_total,
+                diff_count: u64::from(status == ShardStatus::Diff),
+                status,
+                duration_ms: t0.elapsed().as_millis() as u64,
+            }];
+            return Ok((
+                shards,
+                out.rows,
+                n,
+                KeylessPath::FastCounts {
+                    missing_left: out.missing_left,
+                    missing_right: out.missing_right,
+                    note: out.note,
+                    warnings: out.warnings,
+                },
+            ));
+        }
         // Tier 2 (#129)：keyless 内容哈希 IBLT 免回扫（仅 summary-only）。
         if let Some(out) = maybe_keyless_iblt(
             left,
@@ -917,6 +946,39 @@ fn keyless_iblt_capacity(le: u64, re: u64) -> u64 {
     le.abs_diff(re).max(1024).saturating_mul(8).min(65_536)
 }
 
+/// Issue #129 Tier 3 门控：同连接 + summary-only + 两侧同 scheme 且 scheme 属于
+/// {gaussdb, oracle, duckdb}。MySQL 无 FULL OUTER JOIN，排除。
+fn same_conn_summary_gate(ctx: &DiffContext, l_scheme: &str, r_scheme: &str) -> bool {
+    ctx.same_connection
+        && ctx.summary_only
+        && l_scheme == r_scheme
+        && matches!(l_scheme, "gaussdb" | "oracle" | "duckdb")
+}
+
+/// 渲染同连接服务器端汇总 SQL（#129 Tier 3）：一条 FULL OUTER JOIN 在服务器端
+/// 完成两侧行哈希多重集合比对，返回每个「次数不等」的不同内容的计数
+/// （only_left=左多、only_right=右多）。SUM(CASE) 而非 FILTER——Oracle 19c 无
+/// FILTER 子句；ON 而非 USING——各方言最稳。无 filter 时省略两侧 WHERE 子句。
+fn render_same_conn_summary_sql(
+    dialect: &dyn crate::backend::Dialect,
+    l: (&str, Option<&str>, &[String]),
+    r: (&str, Option<&str>, &[String]),
+    filter: Option<&str>,
+) -> String {
+    let (ltable, lschema, lexprs) = l;
+    let (rtable, rschema, rexprs) = r;
+    let scheme = dialect.url_scheme();
+    let quote = dialect.identifier_quote();
+    let lhash = dialect.row_hash_expr(lexprs);
+    let rhash = dialect.row_hash_expr(rexprs);
+    let ltab = crate::backend::quote_table_scheme(scheme, quote, lschema, ltable);
+    let rtab = crate::backend::quote_table_scheme(scheme, quote, rschema, rtable);
+    let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
+    format!(
+        "WITH l AS (SELECT {lhash} AS h, COUNT(*) AS c FROM {ltab}{where_clause} GROUP BY h),\n     r AS (SELECT {rhash} AS h, COUNT(*) AS c FROM {rtab}{where_clause} GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > l.c THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h"
+    )
+}
+
 fn filtered_count_sql(
     scheme: &str,
     quote: char,
@@ -957,6 +1019,75 @@ fn render_keyless_iblt(
         scn: ctx.scn_of(is_left),
     };
     dialect.render_iblt_sql(&spec)
+}
+
+/// Issue #129 Tier 3：同连接服务器端汇总（仅 same_connection && summary-only）。
+///
+/// 在左连接已开的快照事务内跑一条 FULL OUTER JOIN，两表在同一语句的同一时刻读
+/// （自洽快照；右连接快照未用；Oracle 单语句单快照天然一致，无需 AS OF）。任何
+/// 失败（列不对齐 / 查询报错 / 计数不可解析）都 vlog 原因并返回 `Ok(None)` 落入
+/// Tier 2 / Tier 1，真错误在那里上抛。方向映射：only_left（左多）→ missing_right；
+/// only_right（右多）→ missing_left。
+async fn maybe_same_conn_summary(
+    left: &mut (dyn DbConn + Send),
+    right: &mut (dyn DbConn + Send),
+    ctx: &DiffContext,
+    queries: &mut u64,
+    le: u64,
+    re: u64,
+) -> Result<Option<KeylessOutcome>, DbError> {
+    let (l_scheme, r_scheme) = (
+        left.dialect().url_scheme().to_owned(),
+        right.dialect().url_scheme().to_owned(),
+    );
+    if !same_conn_summary_gate(ctx, &l_scheme, &r_scheme) {
+        return Ok(None);
+    }
+    if !point_lookup::compare_columns_align(
+        &ctx.left.plan.compare_columns,
+        &ctx.right.plan.compare_columns,
+    ) {
+        ctx.vlog(
+            "[delta-diff] same-conn summary abandoned: compare column sets differ across sides; \
+             falling back to IBLT / bucketing",
+        );
+        return Ok(None);
+    }
+    let dialect = left.dialect();
+    let lexprs = ctx.left.plan.normalized_exprs(dialect)?;
+    let rexprs = ctx.right.plan.normalized_exprs(dialect)?;
+    let filter = side_filter(ctx, &l_scheme);
+    let sql = render_same_conn_summary_sql(
+        dialect,
+        (&ctx.left.table, ctx.left.schema.as_deref(), &lexprs),
+        (&ctx.right.table, ctx.right.schema.as_deref(), &rexprs),
+        filter.as_deref(),
+    );
+    ctx.vlog(format!("[sql:left] {sql}"));
+    let result = match left.query(&sql).await {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.vlog(format!("[delta-diff] same-conn summary query failed: {e}"));
+            return Ok(None);
+        }
+    };
+    *queries += 1;
+    let (only_left, only_right) = match parse_summary_counts(&result) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.vlog(format!("[delta-diff] same-conn summary parse failed: {e}"));
+            return Ok(None);
+        }
+    };
+    Ok(Some(KeylessOutcome {
+        missing_left: only_right,
+        missing_right: only_left,
+        note: "(same-conn summary)".to_string(),
+        rows: vec![],
+        left_total: le,
+        right_total: re,
+        warnings: vec![],
+    }))
 }
 
 /// Issue #129 Tier 2：summary-only 下的无键内容哈希 IBLT 单遍快路径。
@@ -1232,7 +1363,11 @@ async fn maybe_point_lookup(
 }
 
 fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError> {
-    match result.rows.first().and_then(|r| r.first()) {
+    parse_count_cell_value(result.rows.first().and_then(|r| r.first()))
+}
+
+fn parse_count_cell_value(cell: Option<&Value>) -> Result<u64, DbError> {
+    match cell {
         None | Some(Value::Null) => Ok(0),
         Some(Value::Number(n)) => n
             .as_u64()
@@ -1247,6 +1382,16 @@ fn parse_count_cell(result: &crate::backend::QueryResult) -> Result<u64, DbError
             .map_err(|_| DbError::query(format!("unparseable COUNT: {s}"))),
         Some(other) => Err(DbError::query(format!("unparseable COUNT: {other}"))),
     }
+}
+
+fn parse_summary_counts(result: &crate::backend::QueryResult) -> Result<(u64, u64), DbError> {
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| DbError::query("same-conn summary returned no rows"))?;
+    let only_left = parse_count_cell_value(row.first())?;
+    let only_right = parse_count_cell_value(row.get(1))?;
+    Ok((only_left, only_right))
 }
 
 /// 行数估算：优先读方言的轻量 catalog 统计（issue #111），无可用值时降级
@@ -1561,6 +1706,46 @@ fn assemble(
 }
 
 #[cfg(test)]
+fn assert_same_conn_summary_sql(dialect: &dyn crate::backend::Dialect) {
+    let lexprs = vec!["a".to_string()];
+    let rexprs = vec!["b".to_string()];
+    let lhash = dialect.row_hash_expr(&lexprs);
+    let rhash = dialect.row_hash_expr(&rexprs);
+    let ltab = crate::backend::quote_table_scheme(
+        dialect.url_scheme(),
+        dialect.identifier_quote(),
+        Some("ls"),
+        "lt",
+    );
+    let rtab = crate::backend::quote_table_scheme(
+        dialect.url_scheme(),
+        dialect.identifier_quote(),
+        Some("rs"),
+        "rt",
+    );
+    let sql = render_same_conn_summary_sql(
+        dialect,
+        ("lt", Some("ls"), &lexprs),
+        ("rt", Some("rs"), &rexprs),
+        Some("f > 1"),
+    );
+    assert!(sql.contains("FULL OUTER JOIN r ON l.h = r.h"), "{sql}");
+    assert!(
+        sql.contains("SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END)"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("SUM(CASE WHEN COALESCE(r.c, 0) > l.c THEN 1 ELSE 0 END)"),
+        "{sql}"
+    );
+    assert!(sql.contains(&ltab), "left table: {sql}");
+    assert!(sql.contains(&rtab), "right table: {sql}");
+    assert!(sql.contains("WHERE (f > 1)"), "filter injected: {sql}");
+    assert_eq!(sql.matches(&lhash).count(), 1, "left hash once: {sql}");
+    assert_eq!(sql.matches(&rhash).count(), 1, "right hash once: {sql}");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1625,6 +1810,7 @@ mod tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         };
 
@@ -1906,6 +2092,7 @@ mod tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }
@@ -2300,6 +2487,65 @@ mod tests {
         assert_eq!(keyless_iblt_capacity(u64::MAX, 0), 65_536);
         assert_eq!(keyless_iblt_capacity(0, u64::MAX), 65_536);
     }
+
+    // ── issue #129: 同连接服务器端汇总（Tier 3）门控与渲染 ──
+
+    fn gate_ctx(same_connection: bool, summary_only: bool) -> DiffContext {
+        let mut ctx = probe_ctx(None);
+        ctx.same_connection = same_connection;
+        ctx.summary_only = summary_only;
+        ctx
+    }
+
+    #[test]
+    fn same_conn_summary_gate_cases() {
+        // mysql+mysql → false（无 FULL OUTER JOIN）
+        assert!(!same_conn_summary_gate(
+            &gate_ctx(true, true),
+            "mysql",
+            "mysql"
+        ));
+        // oracle+oracle → true
+        assert!(same_conn_summary_gate(
+            &gate_ctx(true, true),
+            "oracle",
+            "oracle"
+        ));
+        // gaussdb+mysql → false（scheme 不同）
+        assert!(!same_conn_summary_gate(
+            &gate_ctx(true, true),
+            "gaussdb",
+            "mysql"
+        ));
+        // summary_only=false → false
+        assert!(!same_conn_summary_gate(
+            &gate_ctx(true, false),
+            "oracle",
+            "oracle"
+        ));
+        // same_connection=false → false
+        assert!(!same_conn_summary_gate(
+            &gate_ctx(false, true),
+            "oracle",
+            "oracle"
+        ));
+        // duckdb+duckdb → true
+        assert!(same_conn_summary_gate(
+            &gate_ctx(true, true),
+            "duckdb",
+            "duckdb"
+        ));
+    }
+
+    #[test]
+    fn same_conn_summary_sql_gaussdb() {
+        assert_same_conn_summary_sql(&crate::backend::gaussdb::GaussdbDialect);
+    }
+
+    #[test]
+    fn same_conn_summary_sql_oracle() {
+        assert_same_conn_summary_sql(&crate::backend::oracle::dialect::OracleDialect::new());
+    }
 }
 
 // ─── WP2 tests: PK-range bucketing (issue #77) ──────────────────────────
@@ -2489,6 +2735,7 @@ mod range_tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }
@@ -2853,6 +3100,7 @@ mod range_tests {
             strict: false,
             summary_only: true,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }
@@ -2888,5 +3136,12 @@ mod range_tests {
             "capacity 16 must be exceeded by 200 distinct contents"
         );
         assert_eq!(queries, 2, "two wasted IBLT summaries");
+    }
+
+    // ── issue #129: 同连接服务器端汇总（Tier 3）渲染 ──
+
+    #[test]
+    fn same_conn_summary_sql_duckdb() {
+        assert_same_conn_summary_sql(&crate::backend::duckdb::dialect::DuckDbDialect);
     }
 }

@@ -1388,6 +1388,7 @@ mod tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }

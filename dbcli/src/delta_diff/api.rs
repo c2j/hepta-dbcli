@@ -165,6 +165,7 @@ pub(crate) async fn run_diff(
         naive_max_rows: opts.naive_max_rows,
         strict: opts.strict,
         summary_only: opts.summary_only,
+        same_connection: left.connection_url == right.connection_url,
         scns: std::sync::OnceLock::new(),
         verbose: opts.verbose,
     };
