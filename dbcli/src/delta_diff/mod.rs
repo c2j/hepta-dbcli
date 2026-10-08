@@ -12,6 +12,8 @@ use crate::config;
 
 pub(crate) mod api;
 pub(crate) mod bucket_diff;
+#[cfg(all(test, feature = "duckdb"))]
+mod bucket_pull_live_tests;
 pub(crate) mod checksum;
 pub(crate) mod cmd;
 pub(crate) mod engine;

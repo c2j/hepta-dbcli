@@ -485,49 +485,61 @@ impl BucketDiffer {
         let diff_buckets = maps_to_diff_buckets(&lmap, &rmap, total_n);
 
         let mut rows = Vec::new();
-        for b in &diff_buckets {
-            let (lsql, rsql) = match &range_plan {
-                Some(plan) => (
-                    left.dialect().render_bucket_multiset_sql(&range_pull_spec(
-                        ctx,
-                        true,
-                        plan,
-                        *b,
-                        left.dialect(),
-                    )?),
-                    right.dialect().render_bucket_multiset_sql(&range_pull_spec(
-                        ctx,
-                        false,
-                        plan,
-                        *b,
-                        right.dialect(),
-                    )?),
-                ),
-                None => (
+        match &range_plan {
+            // range 路径逐桶循环原样不动：每桶按 PK 区间拉取。
+            Some(plan) => {
+                for b in &diff_buckets {
+                    let (lsql, rsql) = (
+                        left.dialect().render_bucket_multiset_sql(&range_pull_spec(
+                            ctx,
+                            true,
+                            plan,
+                            *b,
+                            left.dialect(),
+                        )?),
+                        right.dialect().render_bucket_multiset_sql(&range_pull_spec(
+                            ctx,
+                            false,
+                            plan,
+                            *b,
+                            right.dialect(),
+                        )?),
+                    );
+                    ctx.vlog(format!("[sql:left] {lsql}"));
+                    ctx.vlog(format!("[sql:right] {rsql}"));
+                    let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
+                    *queries += 2;
+                    rows.extend(multiset_diff(lr?.rows, rr?.rows));
+                }
+            }
+            // MOD 路径：D 个失配桶合并为每侧一条 `MOD(hash, N) IN (...)`。
+            None if !diff_buckets.is_empty() => {
+                let (lsql, rsql) = (
                     left.dialect()
-                        .render_bucket_multiset_sql(&bucket_checksum_spec(
+                        .render_bucket_multiset_sql(&combined_pull_spec(
                             ctx,
                             true,
                             n,
-                            *b,
+                            &diff_buckets,
                             left.dialect(),
                         )?),
                     right
                         .dialect()
-                        .render_bucket_multiset_sql(&bucket_checksum_spec(
+                        .render_bucket_multiset_sql(&combined_pull_spec(
                             ctx,
                             false,
                             n,
-                            *b,
+                            &diff_buckets,
                             right.dialect(),
                         )?),
-                ),
-            };
-            ctx.vlog(format!("[sql:left] {lsql}"));
-            ctx.vlog(format!("[sql:right] {rsql}"));
-            let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
-            *queries += 2;
-            rows.extend(multiset_diff(lr?.rows, rr?.rows));
+                );
+                ctx.vlog(format!("[sql:left] {lsql}"));
+                ctx.vlog(format!("[sql:right] {rsql}"));
+                let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
+                *queries += 2;
+                rows.extend(multiset_diff(lr?.rows, rr?.rows));
+            }
+            None => {}
         }
         Ok((shards, rows, total_n, None))
     }
@@ -717,6 +729,35 @@ fn range_pull_spec(
     Ok(spec)
 }
 
+/// Issue #129 Tier 1：失配桶合并拉取。
+///
+/// 语义等价依据：桶 id = `MOD(rowHash, N)` 是 hash 的函数，同一内容哈希必落
+/// 同一桶。因此对每个失配桶单独做 multiset_diff 再取并集，与对全部行一次
+/// multiset_diff 结果一致——桶只是把全集按 hash 做了一次划分，划分不改变任意
+/// 内容在两侧的次数差。合并后行顺序可能变为全局按 hash 排序（原为逐桶排序），
+/// summary 数字逐项不变。
+///
+/// MOD 路径原本每失配桶一条 `MOD(hash, N) = b` 全表哈希；D 个失配桶合并为
+/// 每侧一条 `MOD(hash, N) IN (...)`。桶条件中性化（modulus 1）与 range 路径
+/// 同模式；集合谓词复用方言 render_bucket_set_predicate——与校验/拉取共用同一
+/// 哈希模板，身份天然对齐。Oracle 1000 上限由该谓词内部 chunks(1000) 处理
+/// （MAX_BUCKETS=1024 时真实可达）。
+fn combined_pull_spec(
+    ctx: &DiffContext,
+    is_left: bool,
+    modulus: u64,
+    buckets: &[u64],
+    dialect: &dyn crate::backend::Dialect,
+) -> Result<ChecksumSqlSpec, DbError> {
+    let mut spec = bucket_checksum_spec(ctx, is_left, 1, 0, dialect)?;
+    let set = dialect.render_bucket_set_predicate(&spec.normalized_exprs, modulus, buckets);
+    spec.filter = match spec.filter {
+        Some(f) => Some(format!("({f}) AND {set}")),
+        None => Some(set),
+    };
+    Ok(spec)
+}
+
 /// One range-path checksum spec for bucket `b`: the bucket's key range
 /// selects the rows, the side's own key column carries the predicate.
 fn range_checksum_spec(
@@ -803,8 +844,14 @@ fn maps_to_diff_buckets(
         .collect()
 }
 
-fn expected_queries(diff_buckets: u64) -> u64 {
-    2 + 2 + 2 * diff_buckets
+/// 合并拉取后的查询计数：无 diff bucket 时 2 COUNT + 2 GROUP BY = 4；
+/// 有 diff bucket 时再加每侧一条合并拉取（2），与桶数无关，恒为 6。
+fn expected_queries_new(diff_buckets: u64) -> u64 {
+    if diff_buckets == 0 {
+        4
+    } else {
+        6
+    }
 }
 
 fn filtered_count_sql(
@@ -1416,7 +1463,7 @@ mod tests {
 
     #[test]
     fn batch_query_count_formula() {
-        assert_eq!(expected_queries(5), 2 + 2 + 10);
+        assert_eq!(expected_queries_new(5), 6);
     }
 
     #[test]
@@ -1992,6 +2039,50 @@ mod tests {
 
         assert_eq!(lp.filter.as_deref(), Some("(`ID` >= 6 AND `ID` <= 10)"));
         assert_eq!(rp.filter.as_deref(), Some("(`rid` >= 6 AND `rid` <= 10)"));
+    }
+
+    // ── issue #129: 失配桶合并拉取 ──
+
+    #[test]
+    fn combined_pull_spec_filters_on_bucket_set_and_user_filter() {
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        // probe_ctx 无 --where → filter None；先造一个带 filter 的 ctx
+        let mut ctx_f = probe_ctx(None);
+        ctx_f.filter = Some("bcrq = '20260105'".into());
+
+        let spec = combined_pull_spec(&ctx_f, true, 197, &[3, 41], &dialect).expect("spec");
+        let f = spec.filter.as_deref().expect("set predicate in filter");
+        assert!(f.contains("MOD(CONV(SUBSTRING(MD5(CONCAT_WS('#"), "{f}");
+        assert!(
+            f.contains(", 197) IN (3, 41)"),
+            "bucket set must be IN-list: {f}"
+        );
+        assert!(
+            f.contains("(bcrq = '20260105')"),
+            "user filter preserved: {f}"
+        );
+        // 中性化桶条件（与 range_pull_spec 同模式）：modulus 1, bucket 0
+        assert_eq!(spec.bucket, Some((1, 0)));
+    }
+
+    #[test]
+    fn combined_pull_spec_without_user_filter_is_just_the_set() {
+        let ctx = probe_ctx(None);
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        let spec = combined_pull_spec(&ctx, false, 197, &[7], &dialect).expect("spec");
+        assert!(spec
+            .filter
+            .as_deref()
+            .expect("set")
+            .contains(", 197) IN (7)"));
+    }
+
+    #[test]
+    fn combined_pull_query_count_formula() {
+        // 无 diff bucket：2 COUNT + 2 GROUP BY；有：再加 1 对合并拉取
+        assert_eq!(expected_queries_new(0), 4);
+        assert_eq!(expected_queries_new(2), 6);
+        assert_eq!(expected_queries_new(197), 6);
     }
 }
 
