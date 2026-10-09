@@ -952,6 +952,8 @@ fn same_conn_summary_gate(ctx: &DiffContext, l_scheme: &str, r_scheme: &str) -> 
 /// 渲染同连接服务器端汇总 SQL（#129 Tier 3）。约束：
 /// - 哈希先入派生表再 `GROUP BY h`：Oracle 19c/21c 拒绝同层选择列表别名进
 ///   GROUP BY（ORA-00904），派生列才合法；
+/// - 内联视图必须以**裸别名**收尾（`) lt`，不能 `AS lt`）：Oracle 要求每个
+///   内联视图都有关联名，缺别名 ORA-00933，带 AS 同样 ORA-00933；
 /// - SUM(CASE) 而非 FILTER（Oracle 19c 无 FILTER）；ON 而非 USING（方言最稳）；
 /// - 两个 CASE 都对两侧计数 COALESCE：FULL OUTER JOIN 下单侧独有的行另一侧
 ///   计数为 NULL，裸列比较判 NULL 为假会静默漏掉该方向的全部内容；
@@ -973,7 +975,7 @@ fn render_same_conn_summary_sql(
     let scn_clause = |scn: Option<u64>| scn.map(|s| format!(" AS OF SCN {s}")).unwrap_or_default();
     let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
     format!(
-        "WITH l AS (SELECT h, COUNT(*) AS c FROM (SELECT {lhash} AS h FROM {ltab}{}{}) GROUP BY h),\n     r AS (SELECT h, COUNT(*) AS c FROM (SELECT {rhash} AS h FROM {rtab}{}{}) GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h",
+        "WITH l AS (SELECT h, COUNT(*) AS c FROM (SELECT {lhash} AS h FROM {ltab}{}{}) lt GROUP BY h),\n     r AS (SELECT h, COUNT(*) AS c FROM (SELECT {rhash} AS h FROM {rtab}{}{}) rt GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h",
         scn_clause(lscn),
         where_clause,
         scn_clause(rscn),
@@ -1801,6 +1803,14 @@ fn assert_same_conn_summary_sql(dialect: &dyn crate::backend::Dialect) {
         sql.contains("FROM (SELECT"),
         "derived-table GROUP BY (Oracle 19c ORA-00904): {sql}"
     );
+    // 内联视图必须裸别名收尾：缺别名 ORA-00933，`AS lt` 同样 ORA-00933
+    // （复审 bug：`) GROUP BY` 无关联名在 Oracle 上整句被拒）。
+    assert!(sql.contains(") lt GROUP BY h"), "{sql}");
+    assert!(sql.contains(") rt GROUP BY h"), "{sql}");
+    assert!(
+        !sql.contains(")) GROUP BY"),
+        "inline views must carry a bare alias: {sql}"
+    );
     assert!(
         sql.contains("SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END)"),
         "{sql}"
@@ -1834,8 +1844,8 @@ fn same_conn_summary_sql_oracle_anchors_both_sides_to_scn() {
         ("RT", Some("RS"), &lexprs, Some(5353)),
         None,
     );
-    assert!(sql.contains(" AS OF SCN 4242) GROUP BY h"), "{sql}");
-    assert!(sql.contains(" AS OF SCN 5353) GROUP BY h"), "{sql}");
+    assert!(sql.contains(" AS OF SCN 4242) lt GROUP BY h"), "{sql}");
+    assert!(sql.contains(" AS OF SCN 5353) rt GROUP BY h"), "{sql}");
     assert!(
         !sql.contains("WHERE"),
         "no filter clause when filter absent: {sql}"
