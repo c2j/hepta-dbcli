@@ -1273,6 +1273,7 @@ mod skew_tests {
             strict: false,
             summary_only: true,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }
@@ -1476,6 +1477,7 @@ mod tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         };
         let dialect = crate::backend::gaussdb::GaussdbFactory.create_dialect();

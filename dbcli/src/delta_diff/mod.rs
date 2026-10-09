@@ -12,6 +12,8 @@ use crate::config;
 
 pub(crate) mod api;
 pub(crate) mod bucket_diff;
+#[cfg(all(test, feature = "duckdb"))]
+mod bucket_pull_live_tests;
 pub(crate) mod checksum;
 pub(crate) mod cmd;
 pub(crate) mod engine;
@@ -619,6 +621,7 @@ async fn execute_diff_inner(
         naive_max_rows: args.naive_max_rows,
         strict: args.strict,
         summary_only: summary_only_effective,
+        same_connection: left.connection_url == right.connection_url,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,
     };

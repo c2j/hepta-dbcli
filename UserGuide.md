@@ -846,6 +846,14 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 
 无键表在 `--summary-only` 下还有一条**内容点查快路径**（issue #127）：两侧行数悬殊（大侧超过 `--fetch-all-threshold`、大/小 ≥ 8）且小侧 ≤ 64 行时，整读小表的规范化内容，按「逐内容 `COUNT(*)` 点查」对大表配对——配对数 = min(小表重数, 大表 COUNT)，小表独有按行计、大表独有 = 大表 COUNT − 配对总数（只记账不拉回）。多重集合语义不变：无 `modified`，NULL 列与内容重复行都参与配对。能对齐索引前导前缀的列用裸等值（可走索引 seek；数值仅限整数族与两侧声明标度一致的小数——无 typmod 的 `numeric`/`NUMBER` 文本身份保留存储标度，一律走规范化；MySQL 字符串仅 NO PAD 二进制 collation 的变长列接受裸等值，变长列其余 collation 用字面量侧 `CAST(lit AS BINARY)` 的空格敏感比较，`CHAR` 定长列检索会剥尾部填充，谓词用 `RTRIM` 后字节比较），其余列沿用与行哈希一致的规范化等值。哨兵值沿用该列的规范化表达式（`--rtrim-char-columns` 下全空白定长字符与 NULL 同一哈希身份，不退化成 `IS NULL`）。小侧超过 64 行、两侧比对列集不一致（点查谓词按位置映射，要求逐位同名同序）、或估计计数复核失败时自动回落常规分桶。
 
+无键表在点查不适用时还有三条**降低全表重扫的路径**（issue #129），按序尝试、任一失败透明回落下一条：
+
+- **失配桶合并拉取**（始终生效，非 summary-only 的唯一路径）：分组校验找出失配桶后，不再逐桶回扫，两侧各发一条 `MOD(rowHash, N) IN (b1, b2, …)` 合并拉取（Oracle `IN` 列表超 1000 自动按 ORA-01795 拆段）。每侧全列哈希从 `1+失配桶数` 遍降到 **2 遍**（无失配桶时不发拉取）；两侧行数接近、只差几行的场景不再为每个失配桶把整表再哈希一遍。多重集合结果与逐桶拉取逐项一致（桶是 hash 的函数，逐桶 diff 的并集 == 全集 diff）。
+- **无键内容 IBLT**（仅 `--summary-only`）：校验前先各发一条内容哈希 IBLT 摘要（key 取行哈希前 8 位，服务端只算一次哈希），客户端逐桶相减、剥洋葱解码——解得开就同时得到两侧独有的内容哈希与净差，每侧全列哈希 **1 遍**。容量按 `max(|COUNT_L−COUNT_R|, 1024)×8`（上限 65536）自适应；`|ΔCOUNT|` 只是差异下界，真实对称差远大于它时解码会失败。回落合并拉取的代价：最坏比直接走合并拉取**多 1 遍扫描**。三类失败都会触发回落——差异超容量；偶数重数的内容净差（同内容左 4 右 2）剥不出 key（这类失败可能只脏 1 个失配桶，即 D=1 时比改造前「校验 + 拉取各 1 遍」多 1 遍，D≥2 时不慢于改造前）；32 位内容 key 前缀碰撞（同一 key 解出多于一条差异即视为解码失败，成功路径永不发布近似计数）。正确性始终由兜底路径保证。
+- **同连接服务器端汇总**（仅 `--summary-only` 且两侧同一连接）：两侧同为 GaussDB/Oracle/DuckDB 时，一条 `FULL OUTER JOIN` 汇总语句在服务端完成逐内容配对（哈希入派生表再 `GROUP BY` 以兼容 Oracle 19c，`SUM(CASE)` 计「仅一侧多出的不同内容数」），每侧全列哈希 **1 遍**、不向客户端拉任何哈希。语句在左侧连接已开的快照事务内执行，两侧各按 `AS OF SCN` 锚点读（与 COUNT 同基准）；MySQL 无 `FULL OUTER JOIN`，不支持此路径。列集不对齐或语句报错时回落——GaussDB 快照下投机语句失败会先把事务 `ROLLBACK TO SAVEPOINT` 解除中止，再走回落。
+
+三条路径的 summary 语义与常规分桶一致：每个「两侧次数不同的内容」计 1 条 missing，永不产生 `modified`；`--export` 优先于 `--summary-only` 的规则不变。
+
 探针只在能构成整数键域时才发；探针语句本身被库拒绝（例如键列不支持 `MIN()`）会直接报错并给出替代策略提示，不会静默降级。键没有单列整数形态时请改用 `--strategy naivediff` 或 `--strategy keyeddiff`。
 
 ### 9.4 一致性与复核
@@ -862,7 +870,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders --dry-r
 |------|------|
 | `--sample N` | 终端差异明细行数上限，默认 20；`0` 表示终端也打全量。**不裁剪** `--export`。抽样默认 `diverse` |
 | `--sample-mode` | 终端抽样模式：`diverse`（默认；status 配额 + 变化列覆盖 + 签名去重，按 key 序展示）或 `prefix`（key 序前 N 行）。只影响终端样本与 MCP payload，**不影响** `--export` |
-| `--summary-only` | 只打统计，不打明细。**倾斜快路径**（issue #124）：keyeddiff 两侧行数悬殊（大/小 ≥ 8 且大侧超过 `--fetch-all-threshold`）且两侧键均有唯一/主键索引背书时，只整读小表并对大表做主键点查——缺失按「COUNT − 命中」计数，不物化差异行，查询数从 O(桶数×页数) 降到个位数。无键 bucketdiff 也有对应快路径（issue #127，见 9.3 节）：小侧 ≤ 64 行时按逐内容 `COUNT(*)` 点查配对，大表独有行不拉回。与 `--export` 同时给出时 `--summary-only` 被忽略（导出需要全量差异行，warnings 会写明） |
+| `--summary-only` | 只打统计，不打明细。**倾斜快路径**（issue #124）：keyeddiff 两侧行数悬殊（大/小 ≥ 8 且大侧超过 `--fetch-all-threshold`）且两侧键均有唯一/主键索引背书时，只整读小表并对大表做主键点查——缺失按「COUNT − 命中」计数，不物化差异行，查询数从 O(桶数×页数) 降到个位数。无键 bucketdiff 也有对应快路径（issue #127，见 9.3 节）：小侧 ≤ 64 行时按逐内容 `COUNT(*)` 点查配对，大表独有行不拉回；点查不适用时还有合并拉取 / 无键 IBLT / 同连接汇总三条降扫路径（issue #129，见 9.3 节）。与 `--export` 同时给出时 `--summary-only` 被忽略（导出需要全量差异行，warnings 会写明） |
 | `--wide` | 终端显示全部比对列，不只变化列 |
 | `--format` | 终端/ `--output` 的汇总格式：`table` / `json` / `csv` / `vertical` |
 | `--output FILE` | 把终端那份报告写到文件 |

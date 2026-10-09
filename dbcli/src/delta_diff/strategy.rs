@@ -52,6 +52,11 @@ pub(crate) struct DiffContext {
     /// 仅输出统计（issue #124）：倾斜时 KeyedDiffer 走点查快路径，
     /// 不物化大表缺失行。CLI 已扣除 --export 优先级。
     pub(crate) summary_only: bool,
+    /// 两侧解析后的 URL 相同（引擎路由 same_conn 语义）：同连接时两表在同一
+    /// 服务器上，可用单条 FULL OUTER JOIN 语句在左连接的一次快照里汇总
+    /// （#129 Tier 3）。由构造点按 `left.connection_url == right.connection_url`
+    /// 设定；测试构造默认 false。
+    pub(crate) same_connection: bool,
     /// Oracle AS OF SCN 锚点（左, 右），快照开启后由策略捕获（§8.2）
     pub(crate) scns: std::sync::OnceLock<(Option<u64>, Option<u64>)>,
     /// 输出分片级进度与每步 SQL 到 stderr（§2.2 --verbose）
@@ -181,6 +186,7 @@ mod filter_tests {
             naive_max_rows: 4096,
             strict: false,
             summary_only: false,
+            same_connection: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }
@@ -270,5 +276,18 @@ mod filter_tests {
         let mut c = ctx(None, None);
         c.verbose = true;
         assert!(c.verbose);
+    }
+
+    #[test]
+    fn same_connection_flag_default_false() {
+        let c = ctx(None, None);
+        assert!(!c.same_connection);
+    }
+
+    #[test]
+    fn same_connection_flag_settable() {
+        let mut c = ctx(None, None);
+        c.same_connection = true;
+        assert!(c.same_connection);
     }
 }

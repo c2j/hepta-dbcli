@@ -386,10 +386,18 @@ impl Dialect for DuckDbDialect {
                 ));
             }
         }
+        // key 从行哈希派生（keyless）：MD5 只算一次，内层产 h、外层派生 k。
+        let from_t = match &spec.key_expr {
+            Some(key) => format!(
+                "FROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t"
+            ),
+            None => format!(
+                "FROM (\n  SELECT h, ('0x' || SUBSTR(h, 1, 8))::UBIGINT AS k\n  FROM (\n    SELECT {row_hash} AS h\n    FROM {table}{where_clause}\n  ) h0\n) t"
+            ),
+        };
         Ok(format!(
-            "SELECT g.grp AS grp,\n       MOD(('0x' || SUBSTR(h, g.grp * 8 - 7, 8))::UBIGINT, {m}) AS cell,\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            "SELECT g.grp AS grp,\n       MOD(('0x' || SUBSTR(h, g.grp * 8 - 7, 8))::UBIGINT, {m}) AS cell,\n       {}\n{from_t}\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
             cols.join(",\n       "),
-            key = spec.key_expr
         ))
     }
 }
@@ -421,6 +429,28 @@ mod tests {
         );
         assert!(sql.contains("::UBIGINT, 197) IN (3, 41)"), "{sql}");
         assert!(sql.contains("MD5("), "{sql}");
+    }
+
+    // Issue #129: keyless IBLT derives its key from the row hash's first 8
+    // bytes; the row-hash expression must appear exactly once (no MD5
+    // double-computation).
+    #[test]
+    fn iblt_keyless_derives_key_from_row_hash_once() {
+        let spec = IbltSqlSpec {
+            schema: None,
+            table: "t".into(),
+            key_expr: None,
+            normalized_exprs: vec!["\"a\"".into(), "\"b\"".into()],
+            cells_per_subtable: 3,
+            filter: Some("x=1".into()),
+            scn: None,
+        };
+        let sql = DuckDbDialect.render_iblt_sql(&spec).expect("render");
+        assert!(
+            sql.contains("('0x' || SUBSTR(h, 1, 8))::UBIGINT AS k"),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("MD5(concat_ws(").count(), 1, "{sql}");
     }
 
     #[test]
@@ -533,7 +563,7 @@ mod tests {
         let spec = IbltSqlSpec {
             schema: Some("main".into()),
             table: "t".into(),
-            key_expr: "\"id\"".into(),
+            key_expr: Some("\"id\"".into()),
             normalized_exprs: vec!["CAST(\"id\" AS VARCHAR)".into()],
             cells_per_subtable: 3,
             filter: Some("x=1".into()),
@@ -900,7 +930,7 @@ mod live_tests {
         let spec = IbltSqlSpec {
             schema: None,
             table: "iblt_probe".into(),
-            key_expr: "\"id\"".into(),
+            key_expr: Some("\"id\"".into()),
             normalized_exprs: vec![
                 "CAST(\"id\" AS VARCHAR)".into(),
                 format!("COALESCE(CAST(\"v\" AS VARCHAR), '{NULL_SENTINEL}')"),

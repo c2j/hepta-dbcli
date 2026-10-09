@@ -381,13 +381,21 @@ impl Dialect for MySqlDialect {
                 (i - 1) * 8 + 1
             )
         };
+        // key 从行哈希派生（keyless）：MD5 只算一次，内层产 h、外层派生 k。
+        let from_t = match &spec.key_expr {
+            Some(key) => format!(
+                "FROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t"
+            ),
+            None => format!(
+                "FROM (\n  SELECT h, CONV(SUBSTRING(h, 1, 8), 16, 10) AS k\n  FROM (\n    SELECT {row_hash} AS h\n    FROM {table}{where_clause}\n  ) h0\n) t"
+            ),
+        };
         Ok(format!(
-            "SELECT g.grp AS grp,\n       MOD(CONV(SUBSTRING(h, g.grp * 8 - 7, 8), 16, 10), {m}) AS cell,\n       COUNT(*) AS cnt,\n       BIT_XOR(CAST(k AS UNSIGNED)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\nFROM (\n  SELECT {row_hash} AS h, {key} AS k\n  FROM {table}{where_clause}\n) t\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
+            "SELECT g.grp AS grp,\n       MOD(CONV(SUBSTRING(h, g.grp * 8 - 7, 8), 16, 10), {m}) AS cell,\n       COUNT(*) AS cnt,\n       BIT_XOR(CAST(k AS UNSIGNED)) AS key_xor,\n       {},\n       {},\n       {},\n       {}\n{from_t}\nCROSS JOIN (SELECT 1 AS grp UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) g\nGROUP BY g.grp, cell",
             val_xor(1),
             val_xor(2),
             val_xor(3),
             val_xor(4),
-            key = spec.key_expr
         ))
     }
 }
@@ -408,6 +416,28 @@ mod tests {
         assert!(sql.contains("MOD(CONV(SUBSTRING("), "{sql}");
         assert!(sql.contains(", 197) IN (3, 41, 196)"), "{sql}");
         assert!(!sql.contains("= "), "{sql}");
+    }
+
+    // Issue #129: keyless IBLT derives its key from the row hash's first 8
+    // bytes, and the row-hash expression must appear exactly once (no MD5
+    // double-computation).
+    #[test]
+    fn iblt_keyless_derives_key_from_row_hash_once() {
+        let spec = crate::backend::IbltSqlSpec {
+            schema: None,
+            table: "t".into(),
+            key_expr: None,
+            normalized_exprs: vec!["`a`".into(), "`b`".into()],
+            cells_per_subtable: 3,
+            filter: Some("x=1".into()),
+            scn: None,
+        };
+        let sql = MySqlDialect.render_iblt_sql(&spec).expect("render");
+        assert!(
+            sql.contains("CONV(SUBSTRING(h, 1, 8), 16, 10) AS k"),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("MD5(CONCAT_WS(").count(), 1, "{sql}");
     }
 
     // Issue #100: MySQL has no "public" schema; the schema-less default is

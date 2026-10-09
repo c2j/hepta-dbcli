@@ -20,13 +20,13 @@ use crate::delta_diff::strategy::{ConsistencyMode, DiffContext, DiffStrategy};
 
 /// IBLT 桶（相减后）：cnt 为代数和，key/val 为 XOR 余量
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Cell {
+pub(crate) struct Cell {
     cnt: i64,
     key_xor: u64,
     val_xor: [u64; 4],
 }
 
-type Summary = HashMap<(u8, u64), Cell>;
+pub(crate) type Summary = HashMap<(u8, u64), Cell>;
 
 /// `--iblt-auto-capacity` 的 `DiffContext::iblt_capacity` 哨兵值：
 /// 0 表示两轮自协商容量（选项层负责翻译，strategy 路由不读该值）。
@@ -70,7 +70,7 @@ fn auto_cells_for(dhat: u64) -> u64 {
 
 /// 解码出的差异条目：key、行哈希（4 切片）、来源侧
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Entry {
+pub(crate) struct Entry {
     key: u64,
     val: [u64; 4],
     from_left: bool,
@@ -362,18 +362,16 @@ impl IbltDiffer {
         let rsql = render_iblt(right, ctx, m, false).map_err(IbltFailure::Db)?;
         ctx.vlog(format!("[sql:left] {lsql}"));
         ctx.vlog(format!("[sql:right] {rsql}"));
+        let (l_scheme, r_scheme) = (
+            left.dialect().url_scheme().to_owned(),
+            right.dialect().url_scheme().to_owned(),
+        );
 
-        let (lr, rr) = tokio::join!(left.query(&lsql), right.query(&rsql));
-        *queries += 2;
-        let (lr, rr) = (lr.map_err(IbltFailure::Db)?, rr.map_err(IbltFailure::Db)?);
+        let (diff, left_total, right_total) =
+            run_iblt_summaries(left, right, &lsql, &rsql, &l_scheme, &r_scheme, queries)
+                .await
+                .map_err(IbltFailure::Db)?;
 
-        let lsum = parse_summary(&lr.rows, left.dialect().url_scheme());
-        let rsum = parse_summary(&rr.rows, right.dialect().url_scheme());
-        // 行数 = 各桶 cnt 之和 / 4（每行入 4 子表）
-        let left_total = lsum.values().map(|c| c.cnt).sum::<i64>() as u64 / 4;
-        let right_total = rsum.values().map(|c| c.cnt).sum::<i64>() as u64 / 4;
-
-        let diff = subtract(&lsum, &rsum);
         if diff.values().all(|c| *c == Cell::default()) {
             return Ok((vec![], "decoded-empty".to_string(), left_total, right_total));
         }
@@ -401,13 +399,34 @@ fn render_iblt(
         schema: side.schema.clone(),
         table: side.table.clone(),
         // Catalog-physical name: quote without re-folding (issue #116).
-        key_expr: dialect.quote_catalog_ident(&ctx.side_key_columns(is_left)[0]),
+        key_expr: Some(dialect.quote_catalog_ident(&ctx.side_key_columns(is_left)[0])),
         normalized_exprs: side.plan.normalized_exprs(dialect)?,
         cells_per_subtable: m,
         filter: crate::delta_diff::strategy::side_filter(ctx, dialect.url_scheme()),
         scn: ctx.scn_of(is_left),
     };
     dialect.render_iblt_sql(&spec)
+}
+
+/// 执行两侧 IBLT 摘要 SQL 并相减。返回 (相减后摘要, 左侧行数, 右侧行数)。
+/// 行数 = 各桶 cnt 之和 / 4（每行入 4 子表）。keyless IBLT（#129）复用此核心。
+pub(crate) async fn run_iblt_summaries(
+    left: &mut (dyn DbConn + Send),
+    right: &mut (dyn DbConn + Send),
+    lsql: &str,
+    rsql: &str,
+    left_scheme: &str,
+    right_scheme: &str,
+    queries: &mut u64,
+) -> Result<(Summary, u64, u64), DbError> {
+    let (lr, rr) = tokio::join!(left.query(lsql), right.query(rsql));
+    *queries += 2;
+    let (lr, rr) = (lr?, rr?);
+    let lsum = parse_summary(&lr.rows, left_scheme);
+    let rsum = parse_summary(&rr.rows, right_scheme);
+    let left_total = lsum.values().map(|c| c.cnt).sum::<i64>() as u64 / 4;
+    let right_total = rsum.values().map(|c| c.cnt).sum::<i64>() as u64 / 4;
+    Ok((subtract(&lsum, &rsum), left_total, right_total))
 }
 
 fn subtract(l: &Summary, r: &Summary) -> Summary {
@@ -432,7 +451,7 @@ fn subtract(l: &Summary, r: &Summary) -> Summary {
 }
 
 /// 剥洋葱解码（Addendum §1.2）：cnt=±1 纯桶 → 校验桶位 → 从 4 子表剔除。
-fn peel(diff: &Summary, m: u64) -> Result<Vec<Entry>, ()> {
+pub(crate) fn peel(diff: &Summary, m: u64) -> Result<Vec<Entry>, ()> {
     let mut cells = diff.clone();
     let mut queue: VecDeque<(u8, u64)> = cells
         .iter()
@@ -527,6 +546,62 @@ fn classify(entries: &[Entry]) -> Vec<DiffRow> {
     }
     out.sort_by_key(|d| d.key.to_string());
     out
+}
+
+/// 无键内容差异分类（#129）。约束：key 只有 32 位（行哈希前 8 个 hex 字符），
+/// 而同内容的重数差剥出来至多一条 entry（净差 ±1 一条；偶数或 |cnt|>1 剥不出
+/// 走回落）——因此**同一 key 出现多于一次必然是不同内容**（32 位前缀碰撞），
+/// 按 key 聚合会把不同内容的差异合并成少计。撞到重复 key 必须报 `Err`，由调用
+/// 方回落 Tier 1，成功路径永不发布近似计数。
+/// `Ok((missing_left, missing_right, rows))`：DiffRow 的 left/right 置 None
+/// （净差还原不了两侧真实份数，不编造计数）。
+pub(crate) fn classify_keyless(entries: &[Entry]) -> Result<(u64, u64, Vec<DiffRow>), ()> {
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    for e in entries {
+        let n = seen.entry(e.key).or_default();
+        *n += 1;
+        if *n > 1 {
+            return Err(());
+        }
+    }
+    let mut by_key: HashMap<u64, (bool, bool)> = HashMap::new();
+    for e in entries {
+        let slot = by_key.entry(e.key).or_default();
+        if e.from_left {
+            slot.0 = true;
+        } else {
+            slot.1 = true;
+        }
+    }
+    let mut missing_left = 0u64;
+    let mut missing_right = 0u64;
+    let mut rows = Vec::new();
+    let mut keys: Vec<u64> = by_key.keys().copied().collect();
+    keys.sort_unstable();
+    for k in keys {
+        let (has_left, has_right) = by_key[&k];
+        let status = match (has_left, has_right) {
+            (true, false) => DiffStatus::MissingRight,
+            (false, true) => DiffStatus::MissingLeft,
+            // 重复 key 已在上面拦截，这里 (true, true) 不可达，防御性跳过。
+            _ => continue,
+        };
+        if has_left {
+            missing_right += 1;
+        }
+        if has_right {
+            missing_left += 1;
+        }
+        rows.push(DiffRow {
+            key: Value::from(k),
+            left: None,
+            right: None,
+            status,
+            confirmed: true,
+        });
+    }
+    rows.sort_by_key(|d| d.key.to_string());
+    Ok((missing_left, missing_right, rows))
 }
 
 // ─── 摘要解析（两种 SQL 形态）────────────────────────────────────────────
@@ -888,6 +963,76 @@ mod tests {
         );
     }
 
+    // Issue #129：净差偶数条目（同内容左 4 右 2 → key_xor=0、|cnt|=2）无法剥
+    // 洋葱——这是回退 Tier 1 的合法路径，peel 必须返回 Err。
+    #[test]
+    fn peel_rejects_even_net_duplicate_contents() {
+        let val = [0x1234_5678, 0x9abc_def0, 0x0f0f_0f0f, 0xdead_beef];
+        let m = 64u64;
+        let mut diff = Summary::new();
+        for (i, &v) in val.iter().enumerate() {
+            let cell = diff.entry((i as u8 + 1, v % m)).or_default();
+            // 左 4 份右 2 份：cnt 净 +2，key/val 因偶次 XOR 抵消为 0。
+            cell.cnt += 2;
+        }
+        assert!(diff
+            .values()
+            .all(|c| c.cnt == 2 && c.key_xor == 0 && c.val_xor == [0; 4]));
+        assert!(peel(&diff, m).is_err());
+    }
+    // ── keyless classify（issue #129）──────────────────────────────────
+
+    fn entry(key: u64, from_left: bool) -> Entry {
+        Entry {
+            key,
+            val: [key, key + 1, key + 2, key + 3],
+            from_left,
+        }
+    }
+
+    #[test]
+    fn classify_keyless_single_left_entry_counts_missing_right() {
+        let (ml, mr, rows) = classify_keyless(&[entry(7, true)]).expect("distinct keys");
+        assert_eq!((ml, mr), (0, 1));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, DiffStatus::MissingRight);
+        assert!(rows[0].left.is_none() && rows[0].right.is_none());
+    }
+
+    #[test]
+    fn classify_keyless_duplicate_key_is_decode_failure() {
+        // 真实解码不可能产生同 key 同 val 的两条（净差 ±1 至多一条）——
+        // 重复 key 只能是 32 位前缀碰撞的不同内容，必须报 Err 回落。
+        let a = Entry {
+            key: 7,
+            val: [7, 8, 9, 10],
+            from_left: true,
+        };
+        let b = Entry {
+            key: 7,
+            val: [7, 99, 9, 10],
+            from_left: true,
+        };
+        assert!(classify_keyless(&[a, b]).is_err());
+
+        let c = Entry {
+            key: 7,
+            val: [7, 8, 9, 10],
+            from_left: false,
+        };
+        assert!(
+            classify_keyless(&[a, c]).is_err(),
+            "cross-side repeat also collides"
+        );
+    }
+
+    #[test]
+    fn classify_keyless_empty_returns_zero() {
+        let (ml, mr, rows) = classify_keyless(&[]).expect("empty");
+        assert_eq!((ml, mr), (0, 0));
+        assert!(rows.is_empty());
+    }
+
     // ── Two-round protocol via mock connections ──────────────────────
 
     /// Deterministic re-aggregation of raw per-row entries into an IBLT
@@ -1239,6 +1384,7 @@ mod tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         }
     }
@@ -1419,7 +1565,7 @@ mod tests {
         let spec = crate::backend::IbltSqlSpec {
             schema: None,
             table: "t".into(),
-            key_expr: "`id`".into(),
+            key_expr: Some("`id`".into()),
             normalized_exprs: vec!["CAST(`id` AS CHAR)".into()],
             cells_per_subtable: 64,
             filter: None,

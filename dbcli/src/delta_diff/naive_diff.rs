@@ -828,6 +828,7 @@ mod tests {
                 strict: false,
                 summary_only: false,
                 scns: std::sync::OnceLock::new(),
+                same_connection: false,
                 verbose: false,
             };
             let mut left = flow.left;
@@ -1071,6 +1072,7 @@ mod tests {
                 strict: false,
                 summary_only: false,
                 scns: std::sync::OnceLock::new(),
+                same_connection: false,
                 verbose: false,
             };
             let mut left = Box::new(ScriptedConn {
@@ -1132,6 +1134,7 @@ mod tests {
                 strict: false,
                 summary_only: false,
                 scns: std::sync::OnceLock::new(),
+                same_connection: false,
                 verbose: false,
             };
             let mut left = Box::new(ScriptedConn {
@@ -1264,6 +1267,7 @@ mod duckdb_e2e_tests {
             strict: false,
             summary_only: false,
             scns: std::sync::OnceLock::new(),
+            same_connection: false,
             verbose: false,
         };
         NaiveDiffer

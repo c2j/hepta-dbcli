@@ -610,4 +610,153 @@ mod tests {
 
         drop_mixed_case_fixture(&mut *conn).await;
     }
+
+    // ── issue #129: keyless same-connection summary must EXECUTE on Oracle ──
+
+    const KL_L: &str = "DD129_KL_L";
+    const KL_R: &str = "DD129_KL_R";
+
+    /// Keyless pair for the Tier 3 same-connection summary: right-only
+    /// contents (d, e) exercise the COALESCE(l.c) arm on a real engine.
+    async fn create_keyless_fixture(conn: &mut dyn DbConn) {
+        for t in [KL_L, KL_R] {
+            let _ = conn
+                .query_drop(&format!(
+                    "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {t}'; \
+                     EXCEPTION WHEN OTHERS THEN NULL; END;"
+                ))
+                .await;
+            conn.query_drop(&format!("CREATE TABLE {t} (k VARCHAR2(8), v VARCHAR2(8))"))
+                .await
+                .expect("create keyless table");
+        }
+        for k in ["a", "b", "c"] {
+            conn.query_drop(&format!("INSERT INTO {KL_L} VALUES ('{k}', 'x')"))
+                .await
+                .expect("insert l");
+        }
+        for k in ["a", "b", "c", "d", "e"] {
+            conn.query_drop(&format!("INSERT INTO {KL_R} VALUES ('{k}', 'x')"))
+                .await
+                .expect("insert r");
+        }
+        // oracle-rs has no autocommit; without COMMIT the child-process diff
+        // would see empty tables (same as create_mixed_case_fixture).
+        conn.query_drop("COMMIT")
+            .await
+            .expect("commit fixture rows");
+    }
+
+    async fn drop_keyless_fixture(conn: &mut dyn DbConn) {
+        for t in [KL_L, KL_R] {
+            let _ = conn.query_drop(&format!("DROP TABLE {t}")).await;
+        }
+    }
+
+    /// Standalone command builder: unlike `delta_diff_command` this carries
+    /// no `--left-table/--right-table/--key` preargs (the keyed fixture's
+    /// flags), so the keyless tables can be passed per-test.
+    fn keyless_summary_command(extra: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_hepta_dbcli"));
+        let home = tempfile::tempdir().expect("tempdir home");
+        let home_path = home.path().to_path_buf();
+        std::mem::forget(home);
+        cmd.env("HOME", home_path)
+            .env_remove("HEPTA_DBCLI_URL")
+            .args([
+                "delta-diff",
+                "--left-url",
+                &oracle_url().expect("oracle url"),
+                "--right-url",
+                &oracle_url().expect("oracle url"),
+                "--left-table",
+                KL_L,
+                "--right-table",
+                KL_R,
+                "--summary-only",
+                "--format",
+                "json",
+            ]);
+        cmd.args(extra);
+        cmd
+    }
+
+    fn read_report_json(cmd: &mut std::process::Command) -> (Option<i32>, Value) {
+        let out = cmd.output().expect("spawn delta-diff");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let json_start = stdout
+            .find('{')
+            .unwrap_or_else(|| panic!("no JSON report on stdout: {stdout} / stderr: {stderr}"));
+        let report: Value = serde_json::from_str(&stdout[json_start..])
+            .unwrap_or_else(|e| panic!("bad JSON report: {e}: {stdout}"));
+        (out.status.code(), report)
+    }
+
+    /// Review round-2 fix proof: the Tier 3 same-connection summary statement
+    /// (derived tables with bare inline-view aliases + symmetric COALESCE)
+    /// must EXECUTE on real Oracle. With `--consistency none` the fast path
+    /// costs exactly 3 queries (2 COUNT + 1 summary); a fallback would show
+    /// 4 (IBLT) or more. `queries_total` is the discriminator, not substring
+    /// matching on rendered SQL.
+    #[tokio::test]
+    async fn oracle_keyless_same_conn_summary_executes_end_to_end() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        create_keyless_fixture(&mut *conn).await;
+
+        let (code, report) =
+            read_report_json(&mut keyless_summary_command(&["--consistency", "none"]));
+        assert_eq!(code, Some(1), "diff must exit EXIT_DIFF: {report}");
+        assert_eq!(report["strategy"], "bucketdiff");
+        assert_eq!(report["perf"]["queries_total"], 3, "report: {report}");
+        assert_eq!(report["summary"]["left_total"], 3, "report: {report}");
+        assert_eq!(report["summary"]["right_total"], 5, "report: {report}");
+        assert_eq!(report["summary"]["missing_left"], 2, "report: {report}");
+        assert_eq!(report["summary"]["missing_right"], 0, "report: {report}");
+        assert_eq!(report["summary"]["modified"], 0, "report: {report}");
+        let warnings = report["warnings"].as_array().expect("warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("same-conn")),
+            "summary path note missing (fell back?): {report}"
+        );
+
+        drop_keyless_fixture(&mut *conn).await;
+    }
+
+    /// Same statement under the default snapshot consistency, where both
+    /// CTEs carry `AS OF SCN` anchors captured like every other statement.
+    ///
+    /// The settle wait is load-bearing: flashback query (`AS OF SCN`) fired
+    /// milliseconds after the fixture's DDL intermittently makes oracle-free
+    /// 23-slim kill the session (connection reset, no error packet). Giving
+    /// the DDL SCN a moment to settle makes the run deterministic.
+    #[tokio::test]
+    async fn oracle_keyless_same_conn_summary_executes_under_snapshot() {
+        let Some(mut conn) = connect().await else {
+            return;
+        };
+        create_keyless_fixture(&mut *conn).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // No --consistency flag: CLI default is snapshot.
+        let (code, report) = read_report_json(&mut keyless_summary_command(&[]));
+        assert_eq!(code, Some(1), "diff must exit EXIT_DIFF: {report}");
+        assert_eq!(report["strategy"], "bucketdiff");
+        assert_eq!(report["summary"]["missing_left"], 2, "report: {report}");
+        assert_eq!(report["summary"]["missing_right"], 0, "report: {report}");
+        assert_eq!(report["summary"]["modified"], 0, "report: {report}");
+        let warnings = report["warnings"].as_array().expect("warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("same-conn")),
+            "summary path note missing under snapshot (fell back?): {report}"
+        );
+
+        drop_keyless_fixture(&mut *conn).await;
+    }
 }
