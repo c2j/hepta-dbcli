@@ -88,24 +88,17 @@ fn route_impl(
             ));
         }
         Strategy::Joindiff => {
-            if key_columns.len() != 1 {
+            // joindiff 仍是单列整数键（issue「明确不做」；JOIN 的裸等值
+            // 没有 keyeddiff 的 cmp_key/CHAR 补空语义，#130 review bug 1）。
+            if !bisectable {
                 return Ok(keyed_or_bucket_fallback(
                     key_columns,
                     warnings,
-                    "strategy 'joindiff' requires a single comparison key",
+                    "strategy 'joindiff' requires a single integer key",
                     &reason,
                 ));
             }
             if !same_conn {
-                if !bisectable {
-                    return Ok(keyed_or_bucket_fallback(
-                        key_columns,
-                        warnings,
-                        "strategy 'joindiff' is unavailable across connections; \
-                         its hashdiff fallback requires a single integer key",
-                        &reason,
-                    ));
-                }
                 warnings.push(
                     "joindiff requires same-connection; falling back to hashdiff".to_string(),
                 );
@@ -430,9 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_joindiff_same_url_single_varchar_key_is_joindiff() {
-        // issue #130：显式 joindiff 门槛 = 同一条 URL + 单列键（不要求
-        // 整数——JOIN 等值不依赖整数）。
+    fn explicit_joindiff_same_url_varchar_key_falls_back_to_keyeddiff() {
+        // #130 review bug 1：「明确不做」限定 joindiff 仍是单列整数键；
+        // JOIN 的裸等值也没有 keyeddiff 的 cmp_key/CHAR 补空语义，
+        // 非整数单列键同 URL 仍回退 keyeddiff（无键回退 bucketdiff）。
         let r = route(
             &args(Strategy::Joindiff),
             &conn("gaussdb://a/t"),
@@ -441,7 +435,8 @@ mod tests {
             &plan(vec!["code"], "varchar(32)"),
         )
         .unwrap();
-        assert_eq!(r.strategy.name(), "joindiff");
+        assert_eq!(r.strategy.name(), "keyeddiff");
+        assert!(r.warnings.iter().any(|w| w.contains("joindiff")));
     }
 
     #[test]

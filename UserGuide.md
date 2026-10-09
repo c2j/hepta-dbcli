@@ -826,7 +826,7 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 |------|-----------------|------|
 | `bucketdiff` | 无可用主键，或左右键无法 1:1 配对 | 按行内容做多重集合比对，不定位具体主键 |
 | `keyeddiff` | 有键但不是单列整数（复合键、字符串等） | 按键拉取比对；超出 `--fetch-all-threshold` 后按哈希桶校验 + 失配桶拉取。行数悬殊（≥8 倍）时失配桶合并为一次键序扫描，不再逐桶过滤扫描 |
-| `joindiff` | 左右同一条 URL + 单列整数键（MySQL/PolarDB-X、Oracle、GaussDB、DuckDB） | 同库两表联邦 JOIN；JOIN 投影直接带出行体，不再逐键回表。MySQL 系用 `LEFT JOIN UNION ALL`，其余方言用 `FULL OUTER JOIN`。显式 `--strategy joindiff` 只要求同一条 URL + 单列键（不要求整数） |
+| `joindiff` | 左右同一条 URL + 单列整数键（MySQL/PolarDB-X、Oracle、GaussDB、DuckDB） | 同库两表联邦 JOIN；JOIN 投影直接带出行体，不再逐键回表。MySQL 系用 `LEFT JOIN UNION ALL`，其余方言用 `FULL OUTER JOIN`；键等值 NULL 安全（两侧都是 NULL 键仍可配对，由行哈希判定 Modified）。显式 `--strategy joindiff` 同样要求单列整数键，非整数单列/复合键回退 keyeddiff |
 | `hashdiff` | 跨连接 + 单列整数键 | 二分 checksum；首轮两侧各一条全范围校验和，相等即停（0% 只发 2 条聚合）。snapshot 复核按批 `key IN (...)`（Oracle 按 1000 拆批），不再逐键点查。`--strategy hashdiff` 强制 |
 | `iblt` | `auto` **不会**选它 | `--strategy iblt` 强制可逆布隆表快路径；`--strict` 时解码失败 exit 2 而不回退 |
 | `naivediff` | `auto` **不会**选它 | `--strategy naivediff` 强制「每侧一次全扫描 + 客户端归并」：裸键 ORDER BY、无 NLSSORT/COLLATE、无 LIMIT，正确性不依赖库端行序；适合单日数万行、复合 VARCHAR 主键、经常零差/少量差的日对账。超过 `--naive-max-rows` 行数硬顶直接拒绝并提示改用 keyeddiff；无键表走全行多重集差（不回退 bucketdiff） |
