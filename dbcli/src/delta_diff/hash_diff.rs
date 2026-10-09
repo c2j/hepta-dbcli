@@ -2,11 +2,13 @@
 //
 // 算法（设计文档 §6.2）：MIN/MAX 取键域 → 首轮快筛 → 不一致段递归二分
 // （factor=32）→ 段内行数 ≤ threshold 时 keyset 分页行级归并。
+// snapshot 档（issue #130）：首轮两侧各一条全范围校验和，相等即停，
+// 不再切段；不等才按 threads×8 段下切。
 // none 档首轮为 WP3 聚合下推：每侧一条 UNION ALL 宽聚合语句（全部首段
 // 的 render_checksum_sql 串接，结果第 k 行即第 k 段的精确校验元组），
 // 全等段直接判 Match，零行级传输；失配段走既有二分路径。snapshot 档
-// 绑定单连接（会话快照无法跨池化会话），保持逐段聚合。SQL 形态完全
-// 复用既有 render_checksum_sql，零方言改动。
+// 绑定单连接（会话快照无法跨池化会话），SQL 形态完全复用既有
+// render_checksum_sql，零方言改动。
 // MVP 约束：单列整型键（§6.4）；侧间并行（两条宽聚合 tokio::join!）、
 // 侧内串行（快照兼容，§8.2）。
 
@@ -85,12 +87,11 @@ impl DiffStrategy for HashDiffer {
         }
         let (shards, mut diffs) = result?;
 
-        // §8.3 二次复核：快照提交后的当前读点查，剔除比对窗口内的并发伪差异
+        // §8.3 二次复核：快照提交后的当前读按批 IN 查询，剔除比对窗口内的
+        // 并发伪差异（issue #130：查询数随批增长，不再 2×差异行数）
         if ctx.recheck && !diffs.is_empty() {
-            let lspec = keyset_spec(ctx, true, left.dialect())?;
-            let rspec = keyset_spec(ctx, false, right.dialect())?;
-            recheck_diffs(left, right, &lspec, &rspec, &mut diffs, ctx.verbose).await?;
-            counters.queries += 2 * diffs.len() as u64;
+            let out = recheck_diffs(left, right, ctx, &mut diffs).await?;
+            counters.queries += out.queries;
         }
 
         let mut report = assemble_report(ctx, shards, diffs, ctx.sample_limit);
@@ -133,6 +134,37 @@ impl HashDiffer {
 
         match ctx.consistency {
             ConsistencyMode::Snapshot => {
+                // issue #130：首轮两侧各一条全范围 COUNT+校验和，相等即
+                // 结束（0% = 2 条聚合）；不等再按 threads×8 段走既有
+                // compare_segment 路径（多付 2 条重复聚合，换分段与
+                // checkpoint 语义零改动）。
+                let t0_full = Instant::now();
+                let lspec = checksum_spec(ctx, true, domain, left.dialect())?;
+                let rspec = checksum_spec(ctx, false, domain, right.dialect())?;
+                let (lfull, rfull) = tokio::join!(
+                    run_checksum(left, &lspec, ctx.verbose),
+                    run_checksum(right, &rspec, ctx.verbose)
+                );
+                let (lfull, rfull) = (lfull?, rfull?);
+                counters.queries += 2;
+                if lfull == rfull {
+                    let elapsed_ms = t0_full.elapsed().as_millis() as u64;
+                    shards.push(shard_result(
+                        domain,
+                        lfull,
+                        rfull,
+                        ShardStatus::Match,
+                        0,
+                        elapsed_ms,
+                    ));
+                    self.record_checkpoint(ctx, domain, "Match", lfull.count, rfull.count, 0)
+                        .await?;
+                    ctx.vlog(format!(
+                        "[shard] {}-{} match left={} right={} diff=0 ({}ms, full-range)",
+                        domain.0, domain.1, lfull.count, rfull.count, elapsed_ms
+                    ));
+                    return Ok((shards, diffs));
+                }
                 for seg in segments {
                     self.compare_segment(
                         left,
@@ -1017,6 +1049,10 @@ mod tests {
     // ── WP3 wide segment aggregate: execution + decode ──
 
     /// Mock conn: scripted `query` responses, records last SQL.
+    ///
+    /// snapshot 开销（SELECT VERSION()、BEGIN/COMMIT）由 mock 内联应答、
+    /// 不消耗脚本队列——脚本只对齐 diff_inner 的比对查询，使
+    /// queries_total 断言（4 / 20）只覆盖比对本身。
     struct WideConn {
         responses: VecDeque<QueryResult>,
         last_sql: String,
@@ -1027,6 +1063,14 @@ mod tests {
     impl DbConn for WideConn {
         async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
             self.last_sql = sql.to_string();
+            if sql == "SELECT VERSION()" {
+                return Ok(QueryResult {
+                    columns: vec!["VERSION()".into()],
+                    rows: vec![vec![json!("8.4.0")]],
+                    row_count: 1,
+                    rows_affected: None,
+                });
+            }
             self.responses
                 .pop_front()
                 .ok_or_else(|| DbError::query("mock: no scripted response"))
@@ -1035,7 +1079,7 @@ mod tests {
             Err(DbError::unsupported("mock"))
         }
         async fn query_drop(&mut self, _sql: &str) -> Result<(), DbError> {
-            Err(DbError::unsupported("mock"))
+            Ok(())
         }
         fn dialect(&self) -> &dyn Dialect {
             &self.dialect
@@ -1373,5 +1417,126 @@ mod tests {
             report.shards.len() >= 8,
             "mismatched segments descend, matched ones stay single shards"
         );
+    }
+
+    // ── snapshot 全范围短路（issue #130 验收 #5）────────────────────────
+
+    fn checksum_result(cnt: u64, s: [u64; 4]) -> QueryResult {
+        QueryResult {
+            columns: vec![
+                "cnt".into(),
+                "s1".into(),
+                "s2".into(),
+                "s3".into(),
+                "s4".into(),
+            ],
+            rows: vec![vec![
+                json!(cnt),
+                json!(s[0]),
+                json!(s[1]),
+                json!(s[2]),
+                json!(s[3]),
+            ]],
+            row_count: 1,
+            rows_affected: None,
+        }
+    }
+
+    fn minmax_result((a, b): (i64, i64)) -> QueryResult {
+        QueryResult {
+            columns: vec!["MIN(id)".into(), "MAX(id)".into()],
+            rows: vec![vec![json!(a), json!(b)]],
+            row_count: 1,
+            rows_affected: None,
+        }
+    }
+
+    fn snapshot_ctx() -> DiffContext {
+        let mut c = ctx();
+        c.consistency = ConsistencyMode::Snapshot;
+        c
+    }
+
+    #[tokio::test]
+    async fn snapshot_full_range_checksum_equal_stops_before_segments() {
+        // 两侧 minmax + 全范围校验和相等 → 结束。查询数 = 4
+        //（2 minmax + 2 全范围聚合），不再按 threads×8 切段（issue #130）。
+        let sum = [1u64, 2, 3, 4];
+        let mut lconn = WideConn {
+            responses: VecDeque::from([minmax_result((0, 99)), checksum_result(50, sum)]),
+            last_sql: String::new(),
+            dialect: MySqlDialect,
+        };
+        let mut rconn = WideConn {
+            responses: VecDeque::from([minmax_result((0, 99)), checksum_result(50, sum)]),
+            last_sql: String::new(),
+            dialect: MySqlDialect,
+        };
+        let report = HashDiffer
+            .diff(&mut lconn, &mut rconn, &snapshot_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.perf.queries_total, 4,
+            "2 minmax + 2 full-range checksums, nothing else"
+        );
+        assert_eq!(report.shards.len(), 1, "single full-range shard");
+        let shard = &report.shards[0];
+        assert_eq!(shard.status, ShardStatus::Match);
+        assert_eq!(shard.shard_id, "0-100", "shard covers the whole domain");
+        assert_eq!(report.summary.diff_rate, 0.0);
+        // 脚本已耗尽：若实现多发任何段查询，WideConn 会返回
+        // "no scripted response" 错误而使本测试失败。
+    }
+
+    #[tokio::test]
+    async fn snapshot_full_range_checksum_mismatch_descends_to_segmented_path() {
+        // 全范围校验和不等 → 落回现有分段扫描（threads=1 → 8 段，
+        // 每段两侧各 1 条校验和）。所有段相等 → 8 个 Match 分片。
+        // 查询数 = 2 minmax + 2 全范围 + 16 段 = 20。
+        let sum = [1u64, 2, 3, 4];
+        let other = [9u64, 9, 9, 9];
+        let mut lconn = WideConn {
+            responses: VecDeque::from([
+                minmax_result((0, 99)),
+                checksum_result(50, sum),
+                checksum_result(50, sum), // 段 0..8 逐段校验和
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+            ]),
+            last_sql: String::new(),
+            dialect: MySqlDialect,
+        };
+        let mut rconn = WideConn {
+            responses: VecDeque::from([
+                minmax_result((0, 99)),
+                checksum_result(50, other),
+                checksum_result(50, sum),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+                checksum_result(0, [0, 0, 0, 0]),
+            ]),
+            last_sql: String::new(),
+            dialect: MySqlDialect,
+        };
+        let report = HashDiffer
+            .diff(&mut lconn, &mut rconn, &snapshot_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(report.perf.queries_total, 20);
+        assert_eq!(report.shards.len(), 8);
+        assert!(report.shards.iter().all(|s| s.status == ShardStatus::Match));
+        assert_eq!(report.summary.diff_rate, 0.0);
     }
 }
