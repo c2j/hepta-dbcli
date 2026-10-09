@@ -586,16 +586,18 @@ mod duckdb_e2e_tests {
         let left_pool = int_key_pool().await;
         let right_pool = int_key_pool().await;
 
+        // issue #130：auto 不再选 iblt（跨实例单列整数 → hashdiff），
+        // iblt 的 e2e 覆盖改为显式 --strategy iblt。
         let report = run_diff(
             side_at(&left_pool, "l").await,
             side_at(&right_pool, "r").await,
-            opts(None),
+            opts(Some(crate::delta_diff::cmd::Strategy::Iblt)),
         )
         .await
         .expect("identical run");
         assert_eq!(
             report.strategy, "iblt",
-            "cross-instance int key routes iblt"
+            "explicit iblt stays iblt on duckdb"
         );
         assert_eq!(report.summary.modified, 0);
         assert_eq!(report.summary.missing_left, 0);
@@ -611,7 +613,7 @@ mod duckdb_e2e_tests {
         let report2 = run_diff(
             side_at(&left_pool, "l").await,
             side_at(&right_pool, "r").await,
-            opts(None),
+            opts(Some(crate::delta_diff::cmd::Strategy::Iblt)),
         )
         .await
         .expect("diff run");
