@@ -86,10 +86,12 @@ impl DiffStrategy for JoinDiffer {
     }
 }
 
-/// 行布局：[k, in_l, in_r, lh, rh, l_c0..l_cn, r_c0..r_m]。
+/// 行布局：[k, in_l, in_r, lh, rh, l_c0..l_c{n}, r_c0..r_c{m}]。
+/// 行体列数是「键 + 非键比较列」：键被 --exclude-columns 移出比较列时
+/// 仍是 1+n，不能用 norm_specs.len()（#130 review bug 3）。
 fn parse_join_rows(ctx: &DiffContext, rows: &[Vec<Value>]) -> Result<Vec<DiffRow>, DbError> {
-    let lcount = ctx.left.plan.norm_specs.len();
-    let rcount = ctx.right.plan.norm_specs.len();
+    let lcount = body_len(ctx, true);
+    let rcount = body_len(ctx, false);
     let mut diffs = Vec::with_capacity(rows.len());
     for row in rows {
         let key = row.first().cloned().unwrap_or(Value::Null);
@@ -132,8 +134,23 @@ fn parse_join_rows(ctx: &DiffContext, rows: &[Vec<Value>]) -> Result<Vec<DiffRow
     Ok(diffs)
 }
 
-/// 单侧子查询：`SELECT key AS k, <row_hash_expr> AS h, key AS c0, <v> AS c1 ..
-/// FROM table [WHERE ..]`。行体列 c0.. 与 plan.norm_specs 同序。
+/// 单侧行体列数：键 + 非键比较列（与 keyset 行、stamp_columns 同构）。
+/// 键被 --exclude-columns 移出比较列时仍是 1+n，不能用 norm_specs.len()
+///（#130 review bug 3）。
+fn body_len(ctx: &DiffContext, is_left: bool) -> usize {
+    let side = if is_left { &ctx.left } else { &ctx.right };
+    let side_key = &ctx.side_key_columns(is_left)[0];
+    1 + side
+        .plan
+        .norm_specs
+        .iter()
+        .filter(|s| &s.name != side_key)
+        .count()
+}
+
+/// 单侧子查询：`SELECT key AS k, 1 AS p, <row_hash_expr> AS h, key AS c0,
+/// <v> AS c1 .. FROM table [WHERE ..]`。行体列 c0.. 与键+非键比较列同序；
+/// 常量存在列 p 供外层判定这一侧有没有行（键本身可为 NULL，#130 review）。
 fn side_select_sql(
     ctx: &DiffContext,
     is_left: bool,
@@ -162,19 +179,21 @@ fn side_select_sql(
         .map(|f| format!(" WHERE ({f})"))
         .unwrap_or_default();
     Ok(format!(
-        "SELECT {key} AS k, {hash} AS h, {body} FROM {table}{where_clause}"
+        "SELECT {key} AS k, 1 AS p, {hash} AS h, {body} FROM {table}{where_clause}"
     ))
 }
 
 /// 差异判定 + 行体外层：`WHERE in_r = 0 OR in_l = 0 OR lh != rh`。
-/// 存在性标志用 CASE 渲染成 0/1——MySQL 的"布尔即整数"不可移植到
-/// GaussDB/DuckDB/Oracle（issue #130）。
+/// 存在性标志用常量存在列 p 渲染成 0/1——键本身可为 NULL，用键判存在
+/// 会把 NULL 键行误判成"这一侧没有行"（#130 review bug 2）。键等值
+/// NULL 安全：两侧都是 NULL 键按 cmp_key 语义配对，由行哈希比出
+/// Modified 或相等；行内容比较仍是哈希，不用 IS DISTINCT FROM。
 fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbError> {
     let dialect = conn.dialect();
     let l = side_select_sql(ctx, true, dialect)?;
     let r = side_select_sql(ctx, false, dialect)?;
-    let lcount = ctx.left.plan.norm_specs.len();
-    let rcount = ctx.right.plan.norm_specs.len();
+    let lcount = body_len(ctx, true);
+    let rcount = body_len(ctx, false);
     let outer_cols = {
         let mut cols = vec![
             "k".to_string(),
@@ -195,6 +214,8 @@ fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbE
     };
     let l_body = body_aliases("l", lcount);
     let r_body = body_aliases("r", rcount);
+    // 键谓词 NULL 安全：`NULL = NULL` 不成立，双 NULL 键必须仍能配对。
+    let on = "ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL)";
 
     // 表别名不写 AS：Oracle 的 FROM 子查询别名不允许 AS（ORA-00933），
     // 其余方言省略 AS 同样合法——五方言统一 `) l` 形态。
@@ -203,14 +224,15 @@ fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbE
         let r_body_b = body_aliases("r", rcount);
         format!(
             "SELECT {outer_cols} FROM (\n\
-               SELECT l.k AS k, 1 AS in_l, CASE WHEN r.k IS NULL THEN 0 ELSE 1 END AS in_r, \
+               SELECT l.k AS k, 1 AS in_l, CASE WHEN r.p IS NULL THEN 0 ELSE 1 END AS in_r, \
 l.h AS lh, r.h AS rh, {l_body_b}, {r_body_b}\n\
-               FROM ({l}) l LEFT JOIN ({r}) r ON l.k = r.k\n\
+               FROM ({l}) l LEFT JOIN ({r}) r {on}\n\
                UNION ALL\n\
-               SELECT r.k AS k, CASE WHEN l.k IS NULL THEN 0 ELSE 1 END AS in_l, 1 AS in_r, \
+               SELECT r.k AS k, CASE WHEN l.p IS NULL THEN 0 ELSE 1 END AS in_l, 1 AS in_r, \
 l.h AS lh, r.h AS rh, {l_body_b}, {r_body_b}\n\
-               FROM ({r}) r LEFT JOIN ({l}) l ON r.k = l.k\n\
-               WHERE l.k IS NULL\n\
+               FROM ({r}) r LEFT JOIN ({l}) l ON r.k = l.k \
+OR (r.k IS NULL AND l.k IS NULL)\n\
+               WHERE l.p IS NULL\n\
              ) j\n\
              WHERE in_r = 0 OR in_l = 0 OR lh != rh\n\
              ORDER BY k"
@@ -219,10 +241,10 @@ l.h AS lh, r.h AS rh, {l_body_b}, {r_body_b}\n\
         format!(
             "SELECT {outer_cols} FROM (\n\
                SELECT COALESCE(l.k, r.k) AS k, \
-CASE WHEN l.k IS NULL THEN 0 ELSE 1 END AS in_l, \
-CASE WHEN r.k IS NULL THEN 0 ELSE 1 END AS in_r, \
+CASE WHEN l.p IS NULL THEN 0 ELSE 1 END AS in_l, \
+CASE WHEN r.p IS NULL THEN 0 ELSE 1 END AS in_r, \
 l.h AS lh, r.h AS rh, {l_body}, {r_body}\n\
-               FROM ({l}) l FULL OUTER JOIN ({r}) r ON l.k = r.k\n\
+               FROM ({l}) l FULL OUTER JOIN ({r}) r {on}\n\
              ) j\n\
              WHERE in_r = 0 OR in_l = 0 OR lh != rh\n\
              ORDER BY k"
@@ -455,7 +477,27 @@ mod tests {
         }
     }
 
-    // ── SQL 形态（issue #130 验收 #8）──────────────────────────────────
+    // ── SQL 形态（issue #130 验收 #8 + #130 review NULL 键修复）────────
+
+    /// NULL 键正确性（#130 review bug 2/3）的公共断言：
+    /// - 存在性判定必须用常量存在列 p，而不是键是否为 NULL；
+    /// - 键等值必须 NULL 安全（两个 NULL 键按 cmp_key 语义配对）。
+    fn assert_null_safe_shape(name: &str, sql: &str) {
+        assert!(
+            sql.contains("CASE WHEN l.p IS NULL THEN 0 ELSE 1 END AS in_l")
+                && sql.contains("CASE WHEN r.p IS NULL THEN 0 ELSE 1 END AS in_r"),
+            "{name}: existence flags must test the presence column, not the key: {sql}"
+        );
+        assert!(
+            sql.contains("ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL)"),
+            "{name}: key equality must be NULL-safe: {sql}"
+        );
+        assert!(
+            !sql.contains("l.k IS NULL THEN 0 ELSE 1 END AS in_l")
+                && !sql.contains("r.k IS NULL THEN 0 ELSE 1 END AS in_r"),
+            "{name}: flags must not be derived from key nullability: {sql}"
+        );
+    }
 
     #[test]
     fn mysql_keeps_left_join_union_all_shape() {
@@ -478,6 +520,7 @@ mod tests {
             sql.contains("WHERE in_r = 0 OR in_l = 0 OR lh != rh"),
             "diff predicate compares 0/1 flags: {sql}"
         );
+        assert_null_safe_shape("mysql", &sql);
     }
 
     #[test]
@@ -504,6 +547,7 @@ mod tests {
             !sql.contains("CONCAT_WS"),
             "hash must come from row_hash_expr, not MySQL CONCAT_WS: {sql}"
         );
+        assert_null_safe_shape("gaussdb", &sql);
     }
 
     #[test]
@@ -520,6 +564,7 @@ mod tests {
         assert!(sql.contains("CASE WHEN"), "duckdb: {sql}");
         assert!(sql.contains("COALESCE(l.k, r.k) AS k"), "duckdb: {sql}");
         assert!(!sql.contains("CONCAT_WS"), "duckdb: {sql}");
+        assert_null_safe_shape("duckdb", &sql);
     }
 
     #[test]
@@ -542,6 +587,7 @@ mod tests {
             assert!(!sql.contains("CONCAT_WS"), "{name}: {sql}");
             assert!(sql.contains("CASE WHEN"), "{name}: {sql}");
             assert!(sql.contains("COALESCE(l.k, r.k) AS k"), "{name}: {sql}");
+            assert_null_safe_shape(name, sql);
         };
         {
             // Oracle 无 BIGINT/INT：类型用 normalize 规则表内的 INTEGER。
@@ -696,6 +742,57 @@ mod tests {
             d2.right,
             Some(vec![json!(2), json!("r2")]),
             "body from JOIN r segment"
+        );
+    }
+
+    #[test]
+    fn parse_keeps_full_body_when_key_is_excluded_from_compare_columns() {
+        // #130 review bug 3：--exclude-columns 把键移出比较列后，子查询
+        // 行体仍是 [键, 全部比较列]（与 keyset 行/stamp_columns 一致）。
+        // 投影别名与切片长度必须用实际行体列数（1+非键数），
+        // 不能用 norm_specs.len()。
+        let mut p = plan();
+        p.norm_specs.retain(|s| s.name != "id");
+        p.key_specs = vec![ColumnNormSpec {
+            name: "id".into(),
+            data_type: "bigint".into(),
+            nullable: false,
+            rtrim_fixed_char: false,
+        }];
+        let c = ctx_with_plan(p);
+
+        let mut conn = DialectOnly {
+            dialect: MySqlDialect,
+        };
+        let sql = join_diff_sql(&c, &mut conn).unwrap();
+        assert!(
+            sql.contains("l.c1 AS l_c1") && sql.contains("r.c1 AS r_c1"),
+            "both body columns must survive the projection: {sql}"
+        );
+
+        // 行布局 [k, in_l, in_r, lh, rh, l_id, l_v, r_id, r_v]。
+        let rows = vec![vec![
+            json!(1),
+            json!(1),
+            json!(1),
+            json!("ha"),
+            json!("hb"),
+            json!(1),
+            json!("lv"),
+            json!(1),
+            json!("rv"),
+        ]];
+        let diffs = parse_join_rows(&c, &rows).unwrap();
+        assert_eq!(diffs[0].status, DiffStatus::Modified);
+        assert_eq!(
+            diffs[0].left,
+            Some(vec![json!(1), json!("lv")]),
+            "left body = key + compare column"
+        );
+        assert_eq!(
+            diffs[0].right,
+            Some(vec![json!(1), json!("rv")]),
+            "right body = key + compare column"
         );
     }
 
