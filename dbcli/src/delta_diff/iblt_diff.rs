@@ -548,11 +548,22 @@ fn classify(entries: &[Entry]) -> Vec<DiffRow> {
     out
 }
 
-/// 无键内容差异分类（#129）：按 key 聚合净差条目，每 key 每侧最多计 1 条。
-/// 净差还原不了两侧真实份数 → DiffRow 的 left/right 置 None（不编造计数）；
-/// 同 key 双侧都有条目（前 8 字节碰撞幽灵）各计 1 条，永不产生 Modified。
-/// 返回 (missing_left, missing_right, rows)。
-pub(crate) fn classify_keyless(entries: &[Entry]) -> (u64, u64, Vec<DiffRow>) {
+/// 无键内容差异分类（#129）。约束：key 只有 32 位（行哈希前 8 个 hex 字符），
+/// 而同内容的重数差剥出来至多一条 entry（净差 ±1 一条；偶数或 |cnt|>1 剥不出
+/// 走回落）——因此**同一 key 出现多于一次必然是不同内容**（32 位前缀碰撞），
+/// 按 key 聚合会把不同内容的差异合并成少计。撞到重复 key 必须报 `Err`，由调用
+/// 方回落 Tier 1，成功路径永不发布近似计数。
+/// `Ok((missing_left, missing_right, rows))`：DiffRow 的 left/right 置 None
+/// （净差还原不了两侧真实份数，不编造计数）。
+pub(crate) fn classify_keyless(entries: &[Entry]) -> Result<(u64, u64, Vec<DiffRow>), ()> {
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    for e in entries {
+        let n = seen.entry(e.key).or_default();
+        *n += 1;
+        if *n > 1 {
+            return Err(());
+        }
+    }
     let mut by_key: HashMap<u64, (bool, bool)> = HashMap::new();
     for e in entries {
         let slot = by_key.entry(e.key).or_default();
@@ -569,51 +580,28 @@ pub(crate) fn classify_keyless(entries: &[Entry]) -> (u64, u64, Vec<DiffRow>) {
     keys.sort_unstable();
     for k in keys {
         let (has_left, has_right) = by_key[&k];
-        match (has_left, has_right) {
-            (true, false) => {
-                missing_right += 1;
-                rows.push(DiffRow {
-                    key: Value::from(k),
-                    left: None,
-                    right: None,
-                    status: DiffStatus::MissingRight,
-                    confirmed: true,
-                });
-            }
-            (false, true) => {
-                missing_left += 1;
-                rows.push(DiffRow {
-                    key: Value::from(k),
-                    left: None,
-                    right: None,
-                    status: DiffStatus::MissingLeft,
-                    confirmed: true,
-                });
-            }
-            (true, true) => {
-                // 前 8 字节碰撞幽灵：两侧各持一个不同内容，各计 1，永不 Modified。
-                missing_left += 1;
-                missing_right += 1;
-                rows.push(DiffRow {
-                    key: Value::from(k),
-                    left: None,
-                    right: None,
-                    status: DiffStatus::MissingLeft,
-                    confirmed: true,
-                });
-                rows.push(DiffRow {
-                    key: Value::from(k),
-                    left: None,
-                    right: None,
-                    status: DiffStatus::MissingRight,
-                    confirmed: true,
-                });
-            }
-            (false, false) => {}
+        let status = match (has_left, has_right) {
+            (true, false) => DiffStatus::MissingRight,
+            (false, true) => DiffStatus::MissingLeft,
+            // 重复 key 已在上面拦截，这里 (true, true) 不可达，防御性跳过。
+            _ => continue,
+        };
+        if has_left {
+            missing_right += 1;
         }
+        if has_right {
+            missing_left += 1;
+        }
+        rows.push(DiffRow {
+            key: Value::from(k),
+            left: None,
+            right: None,
+            status,
+            confirmed: true,
+        });
     }
     rows.sort_by_key(|d| d.key.to_string());
-    (missing_left, missing_right, rows)
+    Ok((missing_left, missing_right, rows))
 }
 
 // ─── 摘要解析（两种 SQL 形态）────────────────────────────────────────────
@@ -1004,7 +992,7 @@ mod tests {
 
     #[test]
     fn classify_keyless_single_left_entry_counts_missing_right() {
-        let (ml, mr, rows) = classify_keyless(&[entry(7, true)]);
+        let (ml, mr, rows) = classify_keyless(&[entry(7, true)]).expect("distinct keys");
         assert_eq!((ml, mr), (0, 1));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, DiffStatus::MissingRight);
@@ -1012,27 +1000,35 @@ mod tests {
     }
 
     #[test]
-    fn classify_keyless_two_left_same_key_still_one_distinct() {
-        // 同 key 的两条左净差条目 → distinct-content 语义：仍只计 1。
-        let (ml, mr, rows) = classify_keyless(&[entry(7, true), entry(7, true)]);
-        assert_eq!((ml, mr), (0, 1));
-        assert_eq!(rows.len(), 1);
-    }
+    fn classify_keyless_duplicate_key_is_decode_failure() {
+        // 真实解码不可能产生同 key 同 val 的两条（净差 ±1 至多一条）——
+        // 重复 key 只能是 32 位前缀碰撞的不同内容，必须报 Err 回落。
+        let a = Entry {
+            key: 7,
+            val: [7, 8, 9, 10],
+            from_left: true,
+        };
+        let b = Entry {
+            key: 7,
+            val: [7, 99, 9, 10],
+            from_left: true,
+        };
+        assert!(classify_keyless(&[a, b]).is_err());
 
-    #[test]
-    fn classify_keyless_collision_ghost_counts_per_side_never_modified() {
-        // 同 key 双侧各 1 条（前 8 字节碰撞幽灵）→ 各计 1，不产生 Modified。
-        let (ml, mr, rows) = classify_keyless(&[entry(7, true), entry(7, false)]);
-        assert_eq!((ml, mr), (1, 1));
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.status != DiffStatus::Modified));
-        assert!(rows.iter().any(|r| r.status == DiffStatus::MissingLeft));
-        assert!(rows.iter().any(|r| r.status == DiffStatus::MissingRight));
+        let c = Entry {
+            key: 7,
+            val: [7, 8, 9, 10],
+            from_left: false,
+        };
+        assert!(
+            classify_keyless(&[a, c]).is_err(),
+            "cross-side repeat also collides"
+        );
     }
 
     #[test]
     fn classify_keyless_empty_returns_zero() {
-        let (ml, mr, rows) = classify_keyless(&[]);
+        let (ml, mr, rows) = classify_keyless(&[]).expect("empty");
         assert_eq!((ml, mr), (0, 0));
         assert!(rows.is_empty());
     }

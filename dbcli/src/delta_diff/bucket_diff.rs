@@ -815,19 +815,10 @@ fn range_pull_spec(
     Ok(spec)
 }
 
-/// Issue #129 Tier 1：失配桶合并拉取。
-///
-/// 语义等价依据：桶 id = `MOD(rowHash, N)` 是 hash 的函数，同一内容哈希必落
-/// 同一桶。因此对每个失配桶单独做 multiset_diff 再取并集，与对全部行一次
-/// multiset_diff 结果一致——桶只是把全集按 hash 做了一次划分，划分不改变任意
-/// 内容在两侧的次数差。合并后行顺序可能变为全局按 hash 排序（原为逐桶排序），
-/// summary 数字逐项不变。
-///
-/// MOD 路径原本每失配桶一条 `MOD(hash, N) = b` 全表哈希；D 个失配桶合并为
-/// 每侧一条 `MOD(hash, N) IN (...)`。桶条件中性化（modulus 1）与 range 路径
-/// 同模式；集合谓词复用方言 render_bucket_set_predicate——与校验/拉取共用同一
-/// 哈希模板，身份天然对齐。Oracle 1000 上限由该谓词内部 chunks(1000) 处理
-/// （MAX_BUCKETS=1024 时真实可达）。
+/// Issue #129 Tier 1：失配桶合并拉取。桶 = `MOD(hash, N)` 是 hash 的函数，
+/// 合并拉取与逐桶 multiset_diff 等价。桶条件中性化（modulus 1）与 range 路径
+/// 同模式；集合谓词复用方言 render_bucket_set_predicate（与校验共用哈希模板，
+/// Oracle 1000 上限在其内部 chunks(1000) 处理）。
 fn combined_pull_spec(
     ctx: &DiffContext,
     is_left: bool,
@@ -958,29 +949,35 @@ fn same_conn_summary_gate(ctx: &DiffContext, l_scheme: &str, r_scheme: &str) -> 
         && matches!(l_scheme, "gaussdb" | "oracle" | "duckdb")
 }
 
-/// 渲染同连接服务器端汇总 SQL（#129 Tier 3）：一条 FULL OUTER JOIN 在服务器端
-/// 完成两侧行哈希多重集合比对，返回每个「次数不等」的不同内容的计数
-/// （only_left=左多、only_right=右多）。SUM(CASE) 而非 FILTER——Oracle 19c 无
-/// FILTER 子句；ON 而非 USING——各方言最稳。无 filter 时省略两侧 WHERE 子句。
-/// 两个 CASE 都对两侧计数 COALESCE：FULL OUTER JOIN 下单侧独有的行另一侧
-/// 计数为 NULL，裸列比较判 NULL 为假会静默漏掉该方向的全部内容。
+/// 渲染同连接服务器端汇总 SQL（#129 Tier 3）。约束：
+/// - 哈希先入派生表再 `GROUP BY h`：Oracle 19c/21c 拒绝同层选择列表别名进
+///   GROUP BY（ORA-00904），派生列才合法；
+/// - SUM(CASE) 而非 FILTER（Oracle 19c 无 FILTER）；ON 而非 USING（方言最稳）；
+/// - 两个 CASE 都对两侧计数 COALESCE：FULL OUTER JOIN 下单侧独有的行另一侧
+///   计数为 NULL，裸列比较判 NULL 为假会静默漏掉该方向的全部内容；
+/// - SCN 锚点与其它语句同源（`scn_of`），快照模式下两侧各按自己的 SCN 读。
 fn render_same_conn_summary_sql(
     dialect: &dyn crate::backend::Dialect,
-    l: (&str, Option<&str>, &[String]),
-    r: (&str, Option<&str>, &[String]),
+    l: (&str, Option<&str>, &[String], Option<u64>),
+    r: (&str, Option<&str>, &[String], Option<u64>),
     filter: Option<&str>,
 ) -> String {
-    let (ltable, lschema, lexprs) = l;
-    let (rtable, rschema, rexprs) = r;
+    let (ltable, lschema, lexprs, lscn) = l;
+    let (rtable, rschema, rexprs, rscn) = r;
     let scheme = dialect.url_scheme();
     let quote = dialect.identifier_quote();
     let lhash = dialect.row_hash_expr(lexprs);
     let rhash = dialect.row_hash_expr(rexprs);
     let ltab = crate::backend::quote_table_scheme(scheme, quote, lschema, ltable);
     let rtab = crate::backend::quote_table_scheme(scheme, quote, rschema, rtable);
+    let scn_clause = |scn: Option<u64>| scn.map(|s| format!(" AS OF SCN {s}")).unwrap_or_default();
     let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
     format!(
-        "WITH l AS (SELECT {lhash} AS h, COUNT(*) AS c FROM {ltab}{where_clause} GROUP BY h),\n     r AS (SELECT {rhash} AS h, COUNT(*) AS c FROM {rtab}{where_clause} GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h"
+        "WITH l AS (SELECT h, COUNT(*) AS c FROM (SELECT {lhash} AS h FROM {ltab}{}{}) GROUP BY h),\n     r AS (SELECT h, COUNT(*) AS c FROM (SELECT {rhash} AS h FROM {rtab}{}{}) GROUP BY h)\nSELECT COALESCE(SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END), 0) AS only_left,\n       COALESCE(SUM(CASE WHEN COALESCE(r.c, 0) > COALESCE(l.c, 0) THEN 1 ELSE 0 END), 0) AS only_right\nFROM l FULL OUTER JOIN r ON l.h = r.h",
+        scn_clause(lscn),
+        where_clause,
+        scn_clause(rscn),
+        where_clause,
     )
 }
 
@@ -1005,11 +1002,8 @@ fn bucket_n_from_counts(le: u64, re: u64, ctx: &DiffContext) -> u64 {
 }
 
 /// 渲染单侧 keyless IBLT 摘要 SQL（#129）：key_expr = None，由方言从行哈希
-/// 前 8 字节派生 key；filter/scn 与 keyed render_iblt 一致。
-/// 已知取舍：key 只有 32 位，两个不同内容前 8 字节碰撞时会被
-/// classify_keyless 合并成一个条目（同侧合并 → 欠计 1；异侧 → 每侧各计 1）。
-/// 碰撞概率随差异量增大（容量 65536 时 birthday 期望 ~0.5 次），属快路径
-/// 的有意精度让步；语义要求精确时用非 summary-only 的合并拉取路径。
+/// 前 8 字节派生 key；filter/scn 与 keyed render_iblt 一致。碰撞安全性由
+/// `classify_keyless` 的重复 key 拦截兜底。
 fn render_keyless_iblt(
     conn: &mut (dyn DbConn + Send),
     ctx: &DiffContext,
@@ -1030,13 +1024,34 @@ fn render_keyless_iblt(
     dialect.render_iblt_sql(&spec)
 }
 
+/// GaussDB 快照事务内语句失败会把事务置为 aborted（SQLSTATE 25P02），后续回落
+/// 查询全部被拒。投机语句（同连接汇总 / 无键 IBLT）失败后必须先
+/// `ROLLBACK TO SAVEPOINT` 才允许回落。仅 snapshot + gaussdb 需要：
+/// consistency=none 是 autocommit，语句失败不污染会话；MySQL/Oracle 语句错误
+/// 不中止事务；DuckDB catalog 错误后仍可继续查询。
+const SPECULATIVE_SAVEPOINT: &str = "hepta_speculative";
+
+async fn speculative_savepoint(conn: &mut (dyn DbConn + Send), ctx: &DiffContext, scheme: &str) {
+    if ctx.consistency == ConsistencyMode::Snapshot && scheme == "gaussdb" {
+        let _ = conn
+            .query_drop(&format!("SAVEPOINT {SPECULATIVE_SAVEPOINT}"))
+            .await;
+    }
+}
+
+async fn speculative_rollback(conn: &mut (dyn DbConn + Send), ctx: &DiffContext, scheme: &str) {
+    if ctx.consistency == ConsistencyMode::Snapshot && scheme == "gaussdb" {
+        let _ = conn
+            .query_drop(&format!("ROLLBACK TO SAVEPOINT {SPECULATIVE_SAVEPOINT}"))
+            .await;
+    }
+}
+
 /// Issue #129 Tier 3：同连接服务器端汇总（仅 same_connection && summary-only）。
-///
-/// 在左连接已开的快照事务内跑一条 FULL OUTER JOIN，两表在同一语句的同一时刻读
-/// （自洽快照；右连接快照未用；Oracle 单语句单快照天然一致，无需 AS OF）。任何
-/// 失败（列不对齐 / 查询报错 / 计数不可解析）都 vlog 原因并返回 `Ok(None)` 落入
-/// Tier 2 / Tier 1，真错误在那里上抛。方向映射：only_left（左多）→ missing_right；
-/// only_right（右多）→ missing_left。
+/// 两侧按各自 `scn_of` 锚点读（与 COUNT 同源）。任何失败（列不对齐 / 查询报错 /
+/// 计数不可解析）都 vlog 原因并返回 `Ok(None)` 落入 Tier 2 / Tier 1，真错误在
+/// 那里上抛。方向映射：only_left（左多）→ missing_right；only_right（右多）→
+/// missing_left。
 async fn maybe_same_conn_summary(
     left: &mut (dyn DbConn + Send),
     right: &mut (dyn DbConn + Send),
@@ -1068,14 +1083,26 @@ async fn maybe_same_conn_summary(
     let filter = side_filter(ctx, &l_scheme);
     let sql = render_same_conn_summary_sql(
         dialect,
-        (&ctx.left.table, ctx.left.schema.as_deref(), &lexprs),
-        (&ctx.right.table, ctx.right.schema.as_deref(), &rexprs),
+        (
+            &ctx.left.table,
+            ctx.left.schema.as_deref(),
+            &lexprs,
+            ctx.scn_of(true),
+        ),
+        (
+            &ctx.right.table,
+            ctx.right.schema.as_deref(),
+            &rexprs,
+            ctx.scn_of(false),
+        ),
         filter.as_deref(),
     );
     ctx.vlog(format!("[sql:left] {sql}"));
+    speculative_savepoint(left, ctx, &l_scheme).await;
     let result = match left.query(&sql).await {
         Ok(r) => r,
         Err(e) => {
+            speculative_rollback(left, ctx, &l_scheme).await;
             ctx.vlog(format!("[delta-diff] same-conn summary query failed: {e}"));
             return Ok(None);
         }
@@ -1106,9 +1133,10 @@ async fn maybe_same_conn_summary(
 /// （Db 错误 / 解码失败 / 渲染失败）都 vlog 原因并返回 `Ok(None)` 落入 Tier 1
 /// 分桶路径，真错误在那里上抛；净差为空（两侧一致）是合法命中，返回空计数。
 ///
-/// 已知取舍：Tier 2 失败退 Tier 1 最坏比「只做 Tier 1」多 1 遍扫描（IBLT 白扫）；
-/// 但解码失败意味着真实差异 > 容量（≥8×|ΔCOUNT|），失配桶几乎必然 ≥2，相比改动前
-/// 的 1+D 遍仍不慢。
+/// 已知取舍：Tier 2 失败退 Tier 1 最坏比「只做 Tier 1」多 1 遍扫描（IBLT 白扫）。
+/// 解码失败不止超容量一种：偶数重数的内容净差（同内容左 4 右 2）同样剥不出，
+/// 且可能只脏 1 个失配桶——D=1 时比改造前（1 遍校验 + 1 遍拉取）慢 1 遍；
+/// D≥2 的失败路径不慢于改造前。
 async fn maybe_keyless_iblt(
     left: &mut (dyn DbConn + Send),
     right: &mut (dyn DbConn + Send),
@@ -1143,6 +1171,8 @@ async fn maybe_keyless_iblt(
         left.dialect().url_scheme().to_owned(),
         right.dialect().url_scheme().to_owned(),
     );
+    speculative_savepoint(left, ctx, &l_scheme).await;
+    speculative_savepoint(right, ctx, &r_scheme).await;
     let (diff, left_total, right_total) = match iblt_diff::run_iblt_summaries(
         left, right, &lsql, &rsql, &l_scheme, &r_scheme, queries,
     )
@@ -1150,6 +1180,8 @@ async fn maybe_keyless_iblt(
     {
         Ok(x) => x,
         Err(e) => {
+            speculative_rollback(left, ctx, &l_scheme).await;
+            speculative_rollback(right, ctx, &r_scheme).await;
             ctx.vlog(format!("[delta-diff] keyless IBLT summary failed: {e}"));
             return Ok(None);
         }
@@ -1186,7 +1218,16 @@ async fn maybe_keyless_iblt(
             return Ok(None);
         }
     };
-    let (missing_left, missing_right, rows) = iblt_diff::classify_keyless(&entries);
+    let (missing_left, missing_right, rows) = match iblt_diff::classify_keyless(&entries) {
+        Ok(v) => v,
+        Err(()) => {
+            ctx.vlog(
+                "[delta-diff] keyless IBLT decode hit a duplicate 32-bit content-key \
+                 (prefix collision), falling back to MOD(rowHash, N) bucketing",
+            );
+            return Ok(None);
+        }
+    };
     Ok(Some(KeylessOutcome {
         missing_left,
         missing_right,
@@ -1734,11 +1775,32 @@ fn assert_same_conn_summary_sql(dialect: &dyn crate::backend::Dialect) {
     );
     let sql = render_same_conn_summary_sql(
         dialect,
-        ("lt", Some("ls"), &lexprs),
-        ("rt", Some("rs"), &rexprs),
+        ("lt", Some("ls"), &lexprs, None),
+        ("rt", Some("rs"), &rexprs, None),
         Some("f > 1"),
     );
     assert!(sql.contains("FULL OUTER JOIN r ON l.h = r.h"), "{sql}");
+    // 19c 认派生列不认同层别名：哈希必须先入派生表，外层再 GROUP BY h。
+    assert!(
+        sql.contains(
+            "COUNT(*) AS c FROM (SELECT {lhash} AS h FROM"
+                .replace("{lhash}", &lhash)
+                .as_str()
+        ),
+        "left hash in derived table: {sql}"
+    );
+    assert!(
+        sql.contains(
+            "COUNT(*) AS c FROM (SELECT {rhash} AS h FROM"
+                .replace("{rhash}", &rhash)
+                .as_str()
+        ),
+        "right hash in derived table: {sql}"
+    );
+    assert!(
+        sql.contains("FROM (SELECT"),
+        "derived-table GROUP BY (Oracle 19c ORA-00904): {sql}"
+    );
     assert!(
         sql.contains("SUM(CASE WHEN l.c > COALESCE(r.c, 0) THEN 1 ELSE 0 END)"),
         "{sql}"
@@ -1754,6 +1816,30 @@ fn assert_same_conn_summary_sql(dialect: &dyn crate::backend::Dialect) {
     assert!(sql.contains("WHERE (f > 1)"), "filter injected: {sql}");
     assert_eq!(sql.matches(&lhash).count(), 1, "left hash once: {sql}");
     assert_eq!(sql.matches(&rhash).count(), 1, "right hash once: {sql}");
+    assert!(
+        !sql.contains("AS OF SCN"),
+        "no scn anchor without snapshot: {sql}"
+    );
+}
+
+#[test]
+fn same_conn_summary_sql_oracle_anchors_both_sides_to_scn() {
+    // 快照模式下 COUNT 走 capture_scn 锚点，汇总两侧必须用同一 SCN，
+    // 否则 left_total 与 missing 计数各说各话（评审 bug 3）。
+    let dialect = crate::backend::oracle::dialect::OracleDialect::new();
+    let lexprs = vec!["a".to_string()];
+    let sql = render_same_conn_summary_sql(
+        &dialect,
+        ("LT", Some("LS"), &lexprs, Some(4242)),
+        ("RT", Some("RS"), &lexprs, Some(5353)),
+        None,
+    );
+    assert!(sql.contains(" AS OF SCN 4242) GROUP BY h"), "{sql}");
+    assert!(sql.contains(" AS OF SCN 5353) GROUP BY h"), "{sql}");
+    assert!(
+        !sql.contains("WHERE"),
+        "no filter clause when filter absent: {sql}"
+    );
 }
 
 #[cfg(test)]
@@ -2486,6 +2572,164 @@ mod tests {
         assert_eq!(expected_queries_new(0), 4);
         assert_eq!(expected_queries_new(2), 6);
         assert_eq!(expected_queries_new(197), 6);
+    }
+
+    // ── issue #129 review: GaussDB 快照投机语句的 savepoint 保护 ──
+
+    /// 记录全部 SQL（含 query_drop）并可配置失败 query 的 mock 连接。
+    struct SpeculativeConn {
+        dialect: Box<dyn crate::backend::Dialect>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_query: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl DbConn for SpeculativeConn {
+        async fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+            self.seen.lock().expect("lock").push(sql.to_string());
+            if self.fail_query {
+                Err(DbError::query("speculative boom"))
+            } else {
+                Ok(QueryResult {
+                    columns: vec!["only_left".into(), "only_right".into()],
+                    row_count: 1,
+                    rows: vec![vec![Value::from(0), Value::from(0)]],
+                    rows_affected: None,
+                })
+            }
+        }
+
+        async fn exec(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, DbError> {
+            Err(DbError::unsupported("speculative: exec"))
+        }
+
+        async fn query_drop(&mut self, sql: &str) -> Result<(), DbError> {
+            self.seen.lock().expect("lock").push(sql.to_string());
+            Ok(())
+        }
+
+        fn dialect(&self) -> &dyn crate::backend::Dialect {
+            self.dialect.as_ref()
+        }
+    }
+
+    fn spec_conn(
+        dialect: Box<dyn crate::backend::Dialect>,
+        fail_query: bool,
+    ) -> (
+        SpeculativeConn,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            SpeculativeConn {
+                dialect,
+                seen: std::sync::Arc::clone(&seen),
+                fail_query,
+            },
+            seen,
+        )
+    }
+
+    fn spec_ctx(consistency: ConsistencyMode) -> DiffContext {
+        let mut ctx = probe_ctx(None);
+        ctx.summary_only = true;
+        ctx.same_connection = true;
+        ctx.consistency = consistency;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn gaussdb_snapshot_rolls_speculative_failure_back_to_savepoint() {
+        let ctx = spec_ctx(ConsistencyMode::Snapshot);
+        let (mut left, lseen) = spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let (mut right, _rseen) =
+            spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let mut queries = 0;
+
+        let out = maybe_same_conn_summary(&mut left, &mut right, &ctx, &mut queries, 5, 3)
+            .await
+            .expect("failure must fall through, not hard-error");
+
+        assert!(out.is_none(), "aborted speculative run must return None");
+        let seen = lseen.lock().expect("lock");
+        assert_eq!(seen[0], "SAVEPOINT hepta_speculative");
+        let speculative_sql = &seen[1];
+        assert!(
+            speculative_sql.contains("FULL OUTER JOIN"),
+            "speculative sql: {speculative_sql}"
+        );
+        assert_eq!(
+            seen[2], "ROLLBACK TO SAVEPOINT hepta_speculative",
+            "aborted snapshot txn must be un-poisoned before fallback: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_iblt_skips_savepoint() {
+        // IBLT 路径不限方言，用它做对照：MySQL 语句错误从不中止事务，
+        // 不需要 savepoint，失败的 IBLT 直接回落。
+        let ctx = spec_ctx(ConsistencyMode::Snapshot);
+        let (mut left, lseen) =
+            spec_conn(Box::new(crate::backend::mysql::dialect::MySqlDialect), true);
+        let (mut right, rseen) =
+            spec_conn(Box::new(crate::backend::mysql::dialect::MySqlDialect), true);
+        let mut queries = 0;
+
+        let out = maybe_keyless_iblt(&mut left, &mut right, &ctx, &mut queries, 5, 3, 1024)
+            .await
+            .expect("no hard error");
+        assert!(out.is_none());
+        for seen in [&lseen, &rseen] {
+            let seen = seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1, "no savepoint on mysql: {seen:?}");
+            let iblt_sql = &seen[0];
+            assert!(iblt_sql.contains("BIT_XOR"), "iblt summary sql: {iblt_sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gaussdb_iblt_rolls_back_to_savepoint_on_failure() {
+        let ctx = spec_ctx(ConsistencyMode::Snapshot);
+        let (mut left, lseen) = spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let (mut right, rseen) = spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let mut queries = 0;
+
+        let out = maybe_keyless_iblt(&mut left, &mut right, &ctx, &mut queries, 5, 3, 1024)
+            .await
+            .expect("no hard error");
+        assert!(out.is_none());
+        for seen in [&lseen, &rseen] {
+            let seen = seen.lock().expect("lock");
+            assert_eq!(
+                seen[0], "SAVEPOINT hepta_speculative",
+                "aborted snapshot txn would poison the fallback: {seen:?}"
+            );
+            assert_eq!(
+                seen[2], "ROLLBACK TO SAVEPOINT hepta_speculative",
+                "must un-poison before falling back: {seen:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gaussdb_none_mode_skips_savepoint() {
+        let ctx = spec_ctx(ConsistencyMode::None);
+        let (mut left, lseen) = spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let (mut right, _rseen) =
+            spec_conn(Box::new(crate::backend::gaussdb::GaussdbDialect), true);
+        let mut queries = 0;
+
+        let out = maybe_same_conn_summary(&mut left, &mut right, &ctx, &mut queries, 5, 3)
+            .await
+            .expect("no hard error");
+        assert!(out.is_none());
+        let seen = lseen.lock().expect("lock");
+        assert_eq!(
+            seen.len(),
+            1,
+            "autocommit statements cannot poison the session: {seen:?}"
+        );
     }
 
     #[test]
