@@ -109,6 +109,8 @@ mod tests {
                 "ordinal_position",
                 "comment",
                 "column_key",
+                // #127 起 TablePlan sidecar 保留字符集 collation，SQL 已选出
+                "collation_name",
             ],
         );
         drop_table(conn, &name).await;
