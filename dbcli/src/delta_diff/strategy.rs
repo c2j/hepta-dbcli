@@ -104,6 +104,9 @@ impl ConsistencyMode {
 }
 
 /// 比对策略（§5.2 DiffStrategy）
+// 同 backend/mod.rs 的三个 trait：async_trait 的 #[must_use] ×
+// clippy 1.99 double_must_use，宏产物无源码可修点，按 lint 帮助豁免。
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait DiffStrategy: Send + Sync {
     fn name(&self) -> &'static str;

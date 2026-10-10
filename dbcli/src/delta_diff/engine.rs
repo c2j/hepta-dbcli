@@ -1,10 +1,11 @@
 // ─── delta-diff engine: SmartRouter 策略路由（v2.1 §6.1）────────────────
 //
-// auto 路由规则：
+// auto 路由规则（issue #130 收紧为四条出口）：
 //   无主键 / 键形态不一致                → bucketdiff
 //   有键但不可二分（复合/字符串）        → keyeddiff
-//   同连接（同库两表）且 MySQL 系        → joindiff
-//   其余单列整型                         → iblt
+//   单列整型且左右同一条 URL             → joindiff（五方言）
+//   其余单列整型（URL 不同）             → hashdiff
+// iblt、naivediff 只在显式 --strategy 时进入。
 
 use crate::config::ResolvedConnection;
 use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
@@ -57,11 +58,6 @@ fn route_impl(
     let mut warnings = Vec::new();
     let key_columns = resolve_key(lplan, rplan);
     let same_conn = left_url == right_url;
-    let mysql_family = left_url
-        .split("://")
-        .next()
-        .map(|s| s == "mysql")
-        .unwrap_or(true);
 
     let bisectable = key_columns.len() == 1
         && is_int_key(lplan, &key_columns[0])
@@ -92,27 +88,19 @@ fn route_impl(
             ));
         }
         Strategy::Joindiff => {
-            if key_columns.len() != 1 {
+            // joindiff 仍是单列整数键（issue「明确不做」；JOIN 的裸等值
+            // 没有 keyeddiff 的 cmp_key/CHAR 补空语义，#130 review bug 1）。
+            if !bisectable {
                 return Ok(keyed_or_bucket_fallback(
                     key_columns,
                     warnings,
-                    "strategy 'joindiff' requires a single comparison key",
+                    "strategy 'joindiff' requires a single integer key",
                     &reason,
                 ));
             }
-            if !same_conn || !mysql_family {
-                if !bisectable {
-                    return Ok(keyed_or_bucket_fallback(
-                        key_columns,
-                        warnings,
-                        "strategy 'joindiff' is unavailable across connections or non-MySQL; \
-                         its hashdiff fallback requires a single integer key",
-                        &reason,
-                    ));
-                }
+            if !same_conn {
                 warnings.push(
-                    "joindiff requires same-connection MySQL-family; falling back to hashdiff"
-                        .to_string(),
+                    "joindiff requires same-connection; falling back to hashdiff".to_string(),
                 );
                 return Ok(finish_route(
                     Box::new(hash_diff::HashDiffer),
@@ -145,8 +133,10 @@ fn route_impl(
                 Box::new(bucket_diff::BucketDiffer)
             }
             (false, false) => Box::new(keyed_diff::KeyedDiffer),
-            (false, true) if same_conn && mysql_family => Box::new(join_diff::JoinDiffer),
-            (false, true) => Box::new(iblt_diff::IbltDiffer),
+            // issue #130：同一条 URL 单列整数走五方言 joindiff；
+            // 跨库单列整数走 hashdiff（iblt 只在显式 --strategy 时进入）。
+            (false, true) if same_conn => Box::new(join_diff::JoinDiffer),
+            (false, true) => Box::new(hash_diff::HashDiffer),
         },
         Strategy::Iblt => {
             if bisectable {
@@ -372,7 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_routes_iblt_cross_instance() {
+    fn auto_routes_hashdiff_cross_instance() {
+        // issue #130 验收 #1：跨库单列整数 auto=hashdiff（原 iblt），
+        // 警告里没有 fallback:。
         let r = route(
             &args(Strategy::Auto),
             &conn("mysql://a/t"),
@@ -381,7 +373,125 @@ mod tests {
             &plan(vec!["id"], "int"),
         )
         .unwrap();
-        assert_eq!(r.strategy.name(), "iblt");
+        assert_eq!(r.strategy.name(), "hashdiff");
+        assert!(
+            r.warnings.iter().all(|w| !w.contains("fallback:")),
+            "auto cross-instance must not warn fallback: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn auto_routes_joindiff_same_url_each_dialect() {
+        // issue #130 验收 #2：同一条 URL、单列整数 → 五方言 auto 全是
+        // joindiff（MySQL 用例见 auto_routes_joindiff_same_connection）。
+        // 路由只看 URL 字符串相等性，无需 feature 门。
+        for scheme in ["oracle", "gaussdb", "duckdb"] {
+            let url = format!("{scheme}://a/t");
+            let r = route(
+                &args(Strategy::Auto),
+                &conn(&url),
+                &conn(&url),
+                &plan(vec!["id"], "int"),
+                &plan(vec!["id"], "int"),
+            )
+            .unwrap();
+            assert_eq!(r.strategy.name(), "joindiff", "scheme={scheme}");
+        }
+    }
+
+    #[test]
+    fn explicit_joindiff_same_url_non_mysql_is_joindiff_without_fallback_warning() {
+        // issue #130 验收 #3 前半：显式 joindiff 同一条非 MySQL URL
+        // 不再回退 hashdiff。
+        let r = route(
+            &args(Strategy::Joindiff),
+            &conn("oracle://a/t"),
+            &conn("oracle://a/t"),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "joindiff");
+        assert!(
+            r.warnings
+                .iter()
+                .all(|w| !w.contains("falling back to hashdiff")),
+            "same-URL joindiff must not warn fallback: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn explicit_joindiff_same_url_varchar_key_falls_back_to_keyeddiff() {
+        // #130 review bug 1：「明确不做」限定 joindiff 仍是单列整数键；
+        // JOIN 的裸等值也没有 keyeddiff 的 cmp_key/CHAR 补空语义，
+        // 非整数单列键同 URL 仍回退 keyeddiff（无键回退 bucketdiff）。
+        let r = route(
+            &args(Strategy::Joindiff),
+            &conn("gaussdb://a/t"),
+            &conn("gaussdb://a/t"),
+            &plan(vec!["code"], "varchar(32)"),
+            &plan(vec!["code"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
+        assert!(r.warnings.iter().any(|w| w.contains("joindiff")));
+    }
+
+    #[test]
+    fn auto_never_picks_iblt_or_naivediff_across_key_shapes() {
+        // issue #130 验收 #4：auto 四出口之外无它者；naivediff/iblt
+        // 只能显式进入。
+        let cases = [
+            (vec![], "int", "mysql://a/t", "mysql://b/t", "bucketdiff"),
+            (vec![], "int", "oracle://a/t", "oracle://a/t", "bucketdiff"),
+            (
+                vec!["code"],
+                "varchar(32)",
+                "mysql://a/t",
+                "mysql://b/t",
+                "keyeddiff",
+            ),
+            (
+                vec!["code"],
+                "varchar(32)",
+                "oracle://a/t",
+                "oracle://a/t",
+                "keyeddiff",
+            ),
+            (
+                vec!["id", "tenant_id"],
+                "int",
+                "mysql://a/t",
+                "mysql://b/t",
+                "keyeddiff",
+            ),
+            (
+                vec!["id", "tenant_id"],
+                "int",
+                "gaussdb://a/t",
+                "gaussdb://a/t",
+                "keyeddiff",
+            ),
+            (vec!["id"], "int", "mysql://a/t", "mysql://b/t", "hashdiff"),
+            (vec!["id"], "int", "mysql://a/t", "mysql://a/t", "joindiff"),
+        ];
+        for (keys, ty, left, right, expected) in cases {
+            let r = route(
+                &args(Strategy::Auto),
+                &conn(left),
+                &conn(right),
+                &plan(keys.clone(), ty),
+                &plan(keys, ty),
+            )
+            .unwrap();
+            assert_eq!(r.strategy.name(), expected, "{left} vs {right}");
+            assert!(
+                r.strategy.name() != "iblt" && r.strategy.name() != "naivediff",
+                "auto must never pick iblt/naivediff"
+            );
+        }
     }
 
     #[test]
@@ -647,7 +757,7 @@ mod tests {
         assert_eq!(
             routed.strategy.name(),
             "joindiff",
-            "an excluded integer key keeps the same-connection MySQL fast path"
+            "an excluded integer key keeps the same-connection fast path"
         );
     }
 

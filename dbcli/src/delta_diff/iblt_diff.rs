@@ -330,12 +330,10 @@ impl IbltDiffer {
             let _ = right.query_drop("COMMIT").await;
         }
 
-        // §8.3 复核：点查确认差异类型与真伪（复用现有通道）
+        // §8.3 复核：提交后当前读按批 IN 查询确认真伪（issue #130 批量化）
         if ctx.recheck && !diffs.is_empty() {
-            let lspec = hash_diff::keyset_spec(ctx, true, left.dialect())?;
-            let rspec = hash_diff::keyset_spec(ctx, false, right.dialect())?;
-            recheck_diffs(left, right, &lspec, &rspec, &mut diffs, ctx.verbose).await?;
-            queries += 2 * diffs.len() as u64;
+            let out = recheck_diffs(left, right, ctx, &mut diffs).await?;
+            queries += out.queries;
         }
 
         Ok(assemble(

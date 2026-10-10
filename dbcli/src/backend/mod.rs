@@ -75,6 +75,10 @@ impl fmt::Display for QueryResult {
 /// A single database connection obtained from a pool.
 /// All query methods consume `&mut self` because mysql_async requires it;
 /// other backends (oracle-rs, etc.) get auto-deref and it's a no-op.
+// async_trait 给生成的 boxed-future 方法加 #[must_use]；clippy 1.99 起
+// 对「返回值本身已 must_use」报 double_must_use（-D warnings 下即错误）。
+// must_use 出自宏产物，源码侧无可修点，按 lint 帮助在此范围豁免。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DbConn: Send {
     /// Execute a SQL query and return normalized results.
@@ -105,6 +109,8 @@ pub trait DbConn: Send {
 
 /// A pool of database connections. Each call to `acquire()` returns a
 /// fresh or recycled connection from the pool.
+// 同 DbConn：async_trait 的 #[must_use] × clippy 1.99 double_must_use。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DbPool: Send + Sync {
     /// Obtain a connection from the pool.
@@ -799,6 +805,8 @@ pub(crate) fn keyset_order_by(quote: char, spec: &KeysetPageSpec, scheme: &str) 
 /// A factory that creates DbPool instances and Dialect objects for a
 /// specific database backend. One factory exists per supported database
 /// type and can create many connections/pools.
+// 同 DbConn：async_trait 的 #[must_use] × clippy 1.99 double_must_use。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BackendFactory: Send + Sync {
     /// Human-readable name (e.g. "MySQL", "Oracle").

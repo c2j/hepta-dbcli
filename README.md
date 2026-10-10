@@ -340,9 +340,9 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 |--------------|----------------------|
 | `bucketdiff` | No usable key, or left/right keys cannot be paired |
 | `keyeddiff` | Key exists but is not a single integer column (composite / string / …) |
-| `joindiff` | Same-connection MySQL-family with a single integer key |
-| `iblt` | Cross-connection (or non-MySQL) with a single integer key |
-| `hashdiff` | Not chosen by `auto`; pass `--strategy hashdiff` for bisection checksums |
+| `joindiff` | Both sides on the same connection URL with a single integer key (MySQL/PolarDB-X, Oracle, GaussDB, DuckDB) |
+| `hashdiff` | Cross-connection with a single integer key; pass `--strategy hashdiff` to force bisection checksums |
+| `iblt` | Not chosen by `auto`; pass `--strategy iblt` for the invertible-bloom fast path |
 | `naivediff` | Not chosen by `auto`; pass `--strategy naivediff` for one full scan per side + client-side merge (fast daily reconciliation on composite VARCHAR keys; see `--naive-max-rows`) |
 
 Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dry-run` exits `0` on success.
