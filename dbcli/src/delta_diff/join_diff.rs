@@ -178,8 +178,15 @@ fn side_select_sql(
         .as_ref()
         .map(|f| format!(" WHERE ({f})"))
         .unwrap_or_default();
+    // NULL 键窗口编号：PARTITION 只分 NULL/非 NULL 两组，NULL 组按行
+    // 哈希排序编号——两侧同哈希的 NULL 键按序一一配对（多重集语义），
+    // 多余的落 Missing，不会 N×M 笛卡尔（#130 review bug 5）。
+    let rn = format!(
+        "ROW_NUMBER() OVER (PARTITION BY CASE WHEN {key} IS NULL THEN 1 ELSE 0 END \
+         ORDER BY {hash}) AS rn"
+    );
     Ok(format!(
-        "SELECT {key} AS k, 1 AS p, {hash} AS h, {body} FROM {table}{where_clause}"
+        "SELECT {key} AS k, 1 AS p, {hash} AS h, {body}, {rn} FROM {table}{where_clause}"
     ))
 }
 
@@ -214,8 +221,11 @@ fn join_diff_sql(ctx: &DiffContext, conn: &mut dyn DbConn) -> Result<String, DbE
     };
     let l_body = body_aliases("l", lcount);
     let r_body = body_aliases("r", rcount);
-    // 键谓词 NULL 安全：`NULL = NULL` 不成立，双 NULL 键必须仍能配对。
-    let on = "ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL)";
+    // 键谓词 NULL 安全 + 一一配对：`NULL = NULL` 不成立，双 NULL 键
+    // 靠窗口编号 rn 相等配对（非 NULL 组的 rn 不参与），多余 NULL 键
+    // 自然落 Missing；行内容比较仍是哈希，不用 IS DISTINCT FROM。
+    let on = "ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL AND l.rn = r.rn)";
+    let on_reversed = "ON r.k = l.k OR (r.k IS NULL AND l.k IS NULL AND r.rn = l.rn)";
 
     // 表别名不写 AS：Oracle 的 FROM 子查询别名不允许 AS（ORA-00933），
     // 其余方言省略 AS 同样合法——五方言统一 `) l` 形态。
@@ -230,8 +240,7 @@ l.h AS lh, r.h AS rh, {l_body_b}, {r_body_b}\n\
                UNION ALL\n\
                SELECT r.k AS k, CASE WHEN l.p IS NULL THEN 0 ELSE 1 END AS in_l, 1 AS in_r, \
 l.h AS lh, r.h AS rh, {l_body_b}, {r_body_b}\n\
-               FROM ({r}) r LEFT JOIN ({l}) l ON r.k = l.k \
-OR (r.k IS NULL AND l.k IS NULL)\n\
+               FROM ({r}) r LEFT JOIN ({l}) l {on_reversed}\n\
                WHERE l.p IS NULL\n\
              ) j\n\
              WHERE in_r = 0 OR in_l = 0 OR lh != rh\n\
@@ -489,8 +498,12 @@ mod tests {
             "{name}: existence flags must test the presence column, not the key: {sql}"
         );
         assert!(
-            sql.contains("ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL)"),
-            "{name}: key equality must be NULL-safe: {sql}"
+            sql.contains("ON l.k = r.k OR (l.k IS NULL AND r.k IS NULL AND l.rn = r.rn)"),
+            "{name}: NULL keys must pair 1:1 by window number, not a cartesian OR: {sql}"
+        );
+        assert!(
+            sql.contains("ROW_NUMBER() OVER"),
+            "{name}: NULL-key rows must be numbered for 1:1 pairing: {sql}"
         );
         assert!(
             !sql.contains("l.k IS NULL THEN 0 ELSE 1 END AS in_l")
@@ -575,9 +588,10 @@ mod tests {
         use crate::backend::oracle_native::dialect::OracleDialect as OracleNativeDialect;
         let assert_oracle_shape = |name: &str, sql: &str| {
             assert!(sql.contains("FULL OUTER JOIN"), "{name}: {sql}");
-            // 表别名紧跟子查询右括号；列别名（如 `... 'MD5') AS h`）合法。
+            // 表别名紧跟子查询右括号；列别名（如 `... 'MD5') AS h`、
+            // 窗口 `...) AS rn`）合法，断言需带词尾边界。
             assert!(
-                !sql.contains(") AS l") && !sql.contains(") AS r") && !sql.contains(") AS j"),
+                !sql.contains(") AS l ") && !sql.contains(") AS r ") && !sql.contains(") AS j"),
                 "oracle table aliases must not use AS (ORA-00933): {sql}"
             );
             assert!(

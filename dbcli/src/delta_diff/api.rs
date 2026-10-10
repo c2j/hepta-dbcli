@@ -681,6 +681,110 @@ mod duckdb_e2e_tests {
         assert_eq!(report.strategy, "bucketdiff", "no key");
         assert_eq!(report.summary.modified, 0);
     }
+
+    // ── joindiff NULL 键一一配对（#130 review bug 5）────────────────────
+    //
+    // 可空单列整数键（UNIQUE 允许多 NULL）仍进 joindiff；两侧的 NULL
+    // 键必须按行哈希一一配对（窗口编号），多余落 Missing，不得出现
+    // N×M 笛卡尔积的假零差/假 Modified。
+
+    async fn nullable_key_pool() -> Arc<dyn DbPool> {
+        let pool = DuckDbFactory
+            .connect("duckdb://:memory:", None)
+            .await
+            .expect("pool");
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.query_drop("CREATE TABLE t_l (id INT, v VARCHAR)")
+            .await
+            .expect("create t_l");
+        conn.query_drop("CREATE TABLE t_r (id INT, v VARCHAR)")
+            .await
+            .expect("create t_r");
+        pool
+    }
+
+    async fn side_table_at(pool: &Arc<dyn DbPool>, name: &str, table: &str) -> SideInput {
+        SideInput {
+            pool: Arc::clone(pool),
+            conn: pool.acquire().await.expect("conn"),
+            name: name.to_string(),
+            schema: Some("main".to_string()),
+            table: table.to_string(),
+            connection_url: "duckdb://:memory:".to_string(),
+        }
+    }
+
+    fn joindiff_opts() -> DiffOptions {
+        let mut o = opts(Some(crate::delta_diff::cmd::Strategy::Joindiff));
+        o.key = vec!["id".into()];
+        o
+    }
+
+    #[tokio::test]
+    async fn duckdb_joindiff_null_key_surplus_is_missing() {
+        // 左 2 个 (NULL,'a')、右 1 个：1 对按哈希配对相等，多出的 1 条
+        // 必须是 MissingRight（旧 OR 谓词下 2×1 全部配对相等 → 假零差）。
+        let pool = nullable_key_pool().await;
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop("INSERT INTO t_l VALUES (NULL,'a'),(NULL,'a')")
+                .await
+                .expect("left rows");
+            conn.query_drop("INSERT INTO t_r VALUES (NULL,'a')")
+                .await
+                .expect("right row");
+        }
+        let report = run_diff(
+            side_table_at(&pool, "l", "t_l").await,
+            side_table_at(&pool, "r", "t_r").await,
+            joindiff_opts(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "joindiff");
+        assert_eq!(
+            report.summary.modified, 0,
+            "identical NULL-key rows must pair 1:1, never Modified: {:?}",
+            report.sample_diffs
+        );
+        assert_eq!(report.summary.missing_right, 1, "surplus NULL key");
+        assert_eq!(report.summary.missing_left, 0);
+        assert_eq!(report.sample_diffs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duckdb_joindiff_null_keys_same_multiset_no_modified() {
+        // 两侧 NULL 键多重集同为 {a,b}：按哈希排序配对必须 a↔a、b↔b，
+        // 全部相等 → 零差异（旧 OR 谓词下交叉对全部假 Modified）。
+        let pool = nullable_key_pool().await;
+        {
+            let mut conn = pool.acquire().await.expect("conn");
+            conn.query_drop("INSERT INTO t_l VALUES (NULL,'a'),(NULL,'b')")
+                .await
+                .expect("left rows");
+            conn.query_drop("INSERT INTO t_r VALUES (NULL,'a'),(NULL,'b')")
+                .await
+                .expect("right rows");
+        }
+        let report = run_diff(
+            side_table_at(&pool, "l", "t_l").await,
+            side_table_at(&pool, "r", "t_r").await,
+            joindiff_opts(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(report.strategy, "joindiff");
+        assert_eq!(
+            report.summary.modified, 0,
+            "same NULL-key multiset must not report Modified: {:?}",
+            report.sample_diffs
+        );
+        assert_eq!(
+            report.summary.missing_left + report.summary.missing_right,
+            0
+        );
+        assert!(report.sample_diffs.is_empty());
+    }
 }
 
 // ─── DuckDB skew tests (issue #124; embedded, no service) ──────────────
