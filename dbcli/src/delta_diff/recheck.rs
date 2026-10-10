@@ -365,6 +365,7 @@ mod tests {
             naive_max_rows: 10_000,
             strict: false,
             summary_only: false,
+            same_connection: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
         }
