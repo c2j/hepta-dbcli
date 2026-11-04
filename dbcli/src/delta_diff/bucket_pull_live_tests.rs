@@ -41,6 +41,7 @@ async fn acquire(pool: &Arc<dyn DbPool>) -> Result<Box<dyn crate::backend::DbCon
 fn keyless_opts() -> DiffOptions {
     DiffOptions {
         bisection_threshold: 4,
+        minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         ..Default::default()
     }
 }
@@ -49,6 +50,7 @@ fn keyless_summary_opts() -> DiffOptions {
     DiffOptions {
         summary_only: true,
         bisection_threshold: 4,
+        minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         ..Default::default()
     }
 }

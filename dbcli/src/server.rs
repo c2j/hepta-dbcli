@@ -166,8 +166,11 @@ pub struct DeltaDiffParams {
     pub exclude_columns: Option<Vec<String>>,
     /// WHERE 条件（两侧同时应用；禁止分号）
     pub where_condition: Option<String>,
-    /// 策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff
+    /// 策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff | naivediff | minusdiff
     pub strategy: Option<String>,
+    /// minusdiff 单元格预算。缺省为 DEFAULT_MINUS_MAX_CELLS。0 = 不限制
+    #[serde(default)]
+    pub minus_max_cells: Option<u64>,
     /// 一致性模式：snapshot | none
     pub consistency: Option<String>,
     /// 差异行二次复核（snapshot 默认开启）
@@ -1333,6 +1336,7 @@ fn parse_delta_diff_strategy(
         Some("iblt") => Ok(Some(crate::delta_diff::cmd::Strategy::Iblt)),
         Some("keyeddiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Keyeddiff)),
         Some("naivediff") => Ok(Some(crate::delta_diff::cmd::Strategy::Naivediff)),
+        Some("minusdiff") => Ok(Some(crate::delta_diff::cmd::Strategy::Minusdiff)),
         Some(other) => Err(format!("unknown strategy '{other}'")),
     }
 }
@@ -1472,6 +1476,9 @@ fn build_mcp_diff_options(
         checkpoint: params.checkpoint.clone(),
         verbose: false,
         rtrim_char_columns: false,
+        minus_max_cells: params
+            .minus_max_cells
+            .unwrap_or(crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS),
     })
 }
 
@@ -1496,6 +1503,7 @@ mod delta_diff_url_side_tests {
             exclude_columns: None,
             where_condition: None,
             strategy: None,
+            minus_max_cells: None,
             consistency: None,
             recheck: None,
             sample_limit: None,
@@ -1611,6 +1619,14 @@ mod delta_diff_strategy_tests {
     }
 
     #[test]
+    fn parse_delta_diff_strategy_accepts_minusdiff() {
+        assert_eq!(
+            parse_delta_diff_strategy(Some("minusdiff")).unwrap(),
+            Some(Strategy::Minusdiff)
+        );
+    }
+
+    #[test]
     fn rejects_unknown() {
         assert!(parse_delta_diff_strategy(Some("magic")).is_err());
     }
@@ -1638,6 +1654,7 @@ mod delta_diff_mcp_plan_tests {
             exclude_columns: None,
             where_condition: None,
             strategy: None,
+            minus_max_cells: None,
             consistency: None,
             recheck: None,
             sample_limit: None,

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use crate::backend::error::DbError;
 use crate::backend::{
     BackendFactory, ChecksumSqlSpec, ColumnNormSpec, DbPool, Dialect, KeysetPageSpec, ScanSqlSpec,
-    NULL_SENTINEL,
+    SetDifferenceOp, NULL_SENTINEL,
 };
 use crate::config::TimeoutConfig;
 
@@ -182,6 +182,10 @@ impl Dialect for GaussdbDialect {
 
     fn begin_snapshot_sql(&self) -> &str {
         "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    }
+
+    fn set_difference_op(&self) -> SetDifferenceOp {
+        SetDifferenceOp::Except
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
@@ -600,6 +604,14 @@ mod tests {
         assert_eq!(
             GaussdbDialect.session_pin_sql(),
             vec!["SET TimeZone = 'UTC'", "SET extra_float_digits = 3"]
+        );
+    }
+
+    #[test]
+    fn gaussdb_set_difference_op_is_except() {
+        assert_eq!(
+            GaussdbDialect.set_difference_op(),
+            crate::backend::SetDifferenceOp::Except
         );
     }
 

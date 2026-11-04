@@ -42,6 +42,7 @@ fn point_opts(filter: &str, summary_only: bool) -> DiffOptions {
         summary_only,
         fetch_all_threshold: 4096,
         filter: Some(filter.to_string()),
+        minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         ..Default::default()
     }
 }

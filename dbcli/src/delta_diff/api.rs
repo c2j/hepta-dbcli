@@ -34,6 +34,12 @@ pub(crate) struct PreflightSide<'a> {
     pub(crate) connection_url: &'a str,
 }
 
+/// 路由输入。`summary_only` 由调用方先扣除 export 优先级。
+pub(crate) struct PreflightRoute {
+    pub(crate) strategy_hint: Option<crate::delta_diff::cmd::Strategy>,
+    pub(crate) summary_only: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DiffOptions {
     pub(crate) strategy: Option<crate::delta_diff::cmd::Strategy>,
@@ -61,6 +67,8 @@ pub(crate) struct DiffOptions {
     pub(crate) checkpoint: Option<String>,
     pub(crate) verbose: bool,
     pub(crate) rtrim_char_columns: bool,
+    /// 0 = 不限制。默认 `DEFAULT_MINUS_MAX_CELLS`。
+    pub(crate) minus_max_cells: u64,
 }
 
 pub(crate) async fn run_diff(
@@ -104,7 +112,10 @@ pub(crate) async fn run_diff(
         },
         &opts.columns,
         &opts.key,
-        opts.strategy,
+        PreflightRoute {
+            strategy_hint: opts.strategy,
+            summary_only: opts.summary_only,
+        },
         opts.rtrim_char_columns,
         &opts.exclude_columns,
     )
@@ -168,6 +179,7 @@ pub(crate) async fn run_diff(
         same_connection: left.connection_url == right.connection_url,
         scns: std::sync::OnceLock::new(),
         verbose: opts.verbose,
+        minus_max_cells: opts.minus_max_cells,
     };
 
     let report = routed
@@ -187,7 +199,7 @@ pub(crate) async fn preflight(
     right: PreflightSide<'_>,
     columns: &[String],
     key: &[String],
-    strategy_hint: Option<crate::delta_diff::cmd::Strategy>,
+    route: PreflightRoute,
     rtrim_char_columns: bool,
     exclude_columns: &[String],
 ) -> Result<Preflight, String> {
@@ -220,7 +232,8 @@ pub(crate) async fn preflight(
         &rplan,
         left.connection_url,
         right.connection_url,
-        strategy_hint,
+        route.strategy_hint,
+        route.summary_only,
     )?;
     let paired = pairing::pair_plans(&lplan, &rplan);
     let mut warnings = routed.warnings.clone();
@@ -578,6 +591,7 @@ mod duckdb_e2e_tests {
             checkpoint: None,
             verbose: false,
             rtrim_char_columns: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 
@@ -861,6 +875,7 @@ mod duckdb_skew_tests {
             checkpoint: None,
             verbose: false,
             rtrim_char_columns: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 

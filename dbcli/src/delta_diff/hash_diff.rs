@@ -1304,6 +1304,7 @@ mod tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 

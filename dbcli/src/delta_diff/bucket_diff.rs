@@ -1919,6 +1919,7 @@ mod tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         };
 
         let report = assemble(&ctx, vec![], vec![], 1, 20, &KeylessPath::Buckets);
@@ -2201,6 +2202,7 @@ mod tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 
@@ -3002,6 +3004,7 @@ mod range_tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 
@@ -3367,6 +3370,7 @@ mod range_tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 

@@ -1,18 +1,25 @@
 // ─── delta-diff engine: SmartRouter 策略路由（v2.1 §6.1）────────────────
 //
-// auto 路由规则（issue #130 收紧为四条出口）：
-//   无主键 / 键形态不一致                → bucketdiff
-//   有键但不可二分（复合/字符串）        → keyeddiff
-//   单列整型且左右同一条 URL             → joindiff（五方言）
-//   其余单列整型（URL 不同）             → hashdiff
-// iblt、naivediff 只在显式 --strategy 时进入。
+// auto 路由规则（issue #130 的四条出口，再加上同库唯一键的 minusdiff）：
+//   无主键 / 键形态不一致                          → bucketdiff
+//   同 URL、两侧 key_unique、且不是单列整数        → minusdiff
+//   同 URL、两侧 key_unique、单列整数、且仅统计，
+//   方言静态支持 MINUS/EXCEPT（Oracle/GaussDB/DuckDB） → minusdiff
+//   有键但不可二分，且上面没有提升                 → keyeddiff
+//   单列整型且左右同一条 URL                       → joindiff（五方言）
+//   其余单列整型（URL 不同）                       → hashdiff
+// MySQL 系单列整数即使仅统计也不提升：能力要到执行期才知道，
+// 失败回退是 keyeddiff，PolarDB-X 会离开 joindiff。
+// iblt、naivediff 只在显式 --strategy 时进入。显式策略不被这次提升覆盖。
 
 use crate::config::ResolvedConnection;
 use crate::delta_diff::cmd::{DeltaDiffArgs, Strategy};
 use crate::delta_diff::metadata::TablePlan;
 use crate::delta_diff::pairing::pair_plans;
 use crate::delta_diff::strategy::DiffStrategy;
-use crate::delta_diff::{bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff, naive_diff};
+use crate::delta_diff::{
+    bucket_diff, hash_diff, iblt_diff, join_diff, keyed_diff, minus_diff, naive_diff,
+};
 
 pub(crate) struct Route {
     pub(crate) strategy: Box<dyn DiffStrategy>,
@@ -28,24 +35,36 @@ pub(crate) fn route(
     lplan: &TablePlan,
     rplan: &TablePlan,
 ) -> Result<Route, String> {
+    let (summary_only, _) =
+        super::effective_summary_only(args.summary_only, args.export.as_deref());
     route_impl(
         lplan,
         rplan,
         &left.connection_url,
         &right.connection_url,
         Some(args.strategy),
+        summary_only,
     )
 }
 
 /// 无 CLI 依赖的路由（api.rs/MCP 共用）；strategy_hint=None 即 auto。
+/// `summary_only` 由调用方先扣除 export 优先级。
 pub(crate) fn route_plan(
     lplan: &TablePlan,
     rplan: &TablePlan,
     left_url: &str,
     right_url: &str,
     strategy_hint: Option<Strategy>,
+    summary_only: bool,
 ) -> Result<Route, String> {
-    route_impl(lplan, rplan, left_url, right_url, strategy_hint)
+    route_impl(
+        lplan,
+        rplan,
+        left_url,
+        right_url,
+        strategy_hint,
+        summary_only,
+    )
 }
 
 fn route_impl(
@@ -54,6 +73,7 @@ fn route_impl(
     left_url: &str,
     right_url: &str,
     strategy_hint: Option<Strategy>,
+    summary_only: bool,
 ) -> Result<Route, String> {
     let mut warnings = Vec::new();
     let key_columns = resolve_key(lplan, rplan);
@@ -114,8 +134,8 @@ fn route_impl(
                 warnings,
             ));
         }
-        Strategy::Auto => match (key_columns.is_empty(), bisectable) {
-            (true, _) => {
+        Strategy::Auto => {
+            if key_columns.is_empty() {
                 if lplan.key_columns.is_empty() && rplan.key_columns.is_empty() {
                     warnings.push(
                         "note: keyless table diff reports row-content multiset differences only"
@@ -131,13 +151,25 @@ fn route_impl(
                     ));
                 }
                 Box::new(bucket_diff::BucketDiffer)
+            } else if auto_prefers_minusdiff(
+                same_conn,
+                lplan,
+                rplan,
+                bisectable,
+                summary_only,
+                left_url,
+            ) {
+                Box::new(minus_diff::MinusDiffer)
+            } else if !bisectable {
+                Box::new(keyed_diff::KeyedDiffer)
+            } else if same_conn {
+                // issue #130：同一条 URL 单列整数走五方言 joindiff；
+                // 跨库单列整数走 hashdiff（iblt 只在显式 --strategy 时进入）。
+                Box::new(join_diff::JoinDiffer)
+            } else {
+                Box::new(hash_diff::HashDiffer)
             }
-            (false, false) => Box::new(keyed_diff::KeyedDiffer),
-            // issue #130：同一条 URL 单列整数走五方言 joindiff；
-            // 跨库单列整数走 hashdiff（iblt 只在显式 --strategy 时进入）。
-            (false, true) if same_conn => Box::new(join_diff::JoinDiffer),
-            (false, true) => Box::new(hash_diff::HashDiffer),
-        },
+        }
         Strategy::Iblt => {
             if bisectable {
                 return Ok(finish_route(
@@ -186,6 +218,52 @@ fn route_impl(
             }
             Box::new(naive_diff::NaiveDiffer)
         }
+        Strategy::Minusdiff => {
+            if key_columns.is_empty() {
+                warnings.push(
+                    "minusdiff requires a unique key; falling back to bucketdiff".to_string(),
+                );
+                return Ok(finish_route(
+                    Box::new(bucket_diff::BucketDiffer),
+                    key_columns,
+                    warnings,
+                ));
+            }
+            if !lplan.key_unique || !rplan.key_unique {
+                warnings
+                    .push("minusdiff requires a unique key; falling back to keyeddiff".to_string());
+                return Ok(finish_route(
+                    Box::new(keyed_diff::KeyedDiffer),
+                    key_columns,
+                    warnings,
+                ));
+            }
+            if !same_conn {
+                if bisectable {
+                    warnings.push(
+                        "minusdiff requires same-connection; falling back to hashdiff".to_string(),
+                    );
+                    return Ok(finish_route(
+                        Box::new(hash_diff::HashDiffer),
+                        key_columns,
+                        warnings,
+                    ));
+                }
+                warnings.push(
+                    "minusdiff requires same-connection; falling back to keyeddiff".to_string(),
+                );
+                return Ok(finish_route(
+                    Box::new(keyed_diff::KeyedDiffer),
+                    key_columns,
+                    warnings,
+                ));
+            }
+            return Ok(finish_route(
+                Box::new(minus_diff::MinusDiffer),
+                key_columns,
+                warnings,
+            ));
+        }
     };
 
     Ok(finish_route(strategy, key_columns, warnings))
@@ -193,6 +271,34 @@ fn route_impl(
 
 fn resolve_key(lplan: &TablePlan, rplan: &TablePlan) -> Vec<String> {
     pair_plans(lplan, rplan).key_columns
+}
+
+/// 同 URL 且两侧键都唯一时，auto 改走 minusdiff。
+/// 复合键 / 非整数键不论是否仅统计都提升（MySQL 也提升：执行期探测失败就回到本来的 keyeddiff）。
+/// 单列整数只在仅统计、且 URL scheme 静态就是 MINUS/EXCEPT 时提升。
+/// MySQL 单列整数留在 joindiff，避免 PolarDB-X 探测失败后掉到 keyeddiff。
+fn auto_prefers_minusdiff(
+    same_conn: bool,
+    lplan: &TablePlan,
+    rplan: &TablePlan,
+    bisectable: bool,
+    summary_only: bool,
+    left_url: &str,
+) -> bool {
+    if !same_conn || !lplan.key_unique || !rplan.key_unique {
+        return false;
+    }
+    if !bisectable {
+        return true;
+    }
+    summary_only && static_set_difference_url(left_url)
+}
+
+fn static_set_difference_url(url: &str) -> bool {
+    let scheme = url.split("://").next().unwrap_or("");
+    scheme.eq_ignore_ascii_case("oracle")
+        || scheme.eq_ignore_ascii_case("gaussdb")
+        || scheme.eq_ignore_ascii_case("duckdb")
 }
 
 fn is_int_key(plan: &TablePlan, key: &str) -> bool {
@@ -359,6 +465,364 @@ mod tests {
         .unwrap();
         assert_eq!(r.strategy.name(), "keyeddiff");
         assert!(r.warnings.iter().all(|w| !w.contains("keyless")));
+    }
+
+    fn unique_plan(keys: Vec<&str>, key_ty: &str) -> TablePlan {
+        let mut plan = plan(keys, key_ty);
+        plan.key_unique = true;
+        plan
+    }
+
+    fn warning_text(route: &Route) -> String {
+        route.warnings.join(" ")
+    }
+
+    fn with_summary(strategy: Strategy) -> DeltaDiffArgs {
+        let mut parsed = args(strategy);
+        parsed.summary_only = true;
+        parsed
+    }
+
+    #[test]
+    fn auto_same_url_unique_composite_key_routes_minusdiff() {
+        for scheme in ["mysql", "oracle", "gaussdb", "duckdb"] {
+            let url = format!("{scheme}://same/t");
+            let r = route(
+                &args(Strategy::Auto),
+                &conn(&url),
+                &conn(&url),
+                &unique_plan(vec!["id", "tenant_id"], "int"),
+                &unique_plan(vec!["id", "tenant_id"], "int"),
+            )
+            .unwrap();
+            assert_eq!(r.strategy.name(), "minusdiff", "scheme={scheme}");
+            assert!(
+                r.warnings.iter().all(|w| !w.contains("falling back")),
+                "{scheme}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn auto_same_url_unique_string_key_routes_minusdiff() {
+        let url = "mysql://same/t";
+        let r = route(
+            &args(Strategy::Auto),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["code"], "varchar(32)"),
+            &unique_plan(vec!["code"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "minusdiff");
+    }
+
+    #[test]
+    fn auto_same_url_unique_integer_key_stays_joindiff() {
+        // 行差仍把单列整数留给 joindiff（索引探测）。仅统计的例外见
+        // auto_summary_only_static_dialect_unique_integer_key_routes_minusdiff。
+        for scheme in ["mysql", "oracle", "gaussdb", "duckdb"] {
+            let url = format!("{scheme}://same/t");
+            let r = route(
+                &args(Strategy::Auto),
+                &conn(&url),
+                &conn(&url),
+                &unique_plan(vec!["id"], "int"),
+                &unique_plan(vec!["id"], "int"),
+            )
+            .unwrap();
+            assert_eq!(r.strategy.name(), "joindiff", "scheme={scheme}");
+        }
+    }
+
+    #[test]
+    fn auto_summary_only_static_dialect_unique_integer_key_routes_minusdiff() {
+        for scheme in ["oracle", "gaussdb", "duckdb"] {
+            let url = format!("{scheme}://same/t");
+            let r = route(
+                &with_summary(Strategy::Auto),
+                &conn(&url),
+                &conn(&url),
+                &unique_plan(vec!["id"], "int"),
+                &unique_plan(vec!["id"], "int"),
+            )
+            .unwrap();
+            assert_eq!(r.strategy.name(), "minusdiff", "scheme={scheme}");
+        }
+    }
+
+    #[test]
+    fn auto_summary_only_mysql_unique_integer_key_stays_joindiff() {
+        // MySQL 系要到执行期才知道有没有 EXCEPT。探测失败的回退是 keyeddiff，
+        // PolarDB-X 会因此离开 joindiff。仅统计的单列整数留在 joindiff。
+        let url = "mysql://same/t";
+        let r = route(
+            &with_summary(Strategy::Auto),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "joindiff");
+    }
+
+    #[test]
+    fn auto_summary_only_non_unique_integer_key_stays_joindiff() {
+        let url = "oracle://same/t";
+        let r = route(
+            &with_summary(Strategy::Auto),
+            &conn(url),
+            &conn(url),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "joindiff");
+    }
+
+    #[test]
+    fn auto_summary_only_keyless_stays_bucketdiff() {
+        let url = "gaussdb://same/t";
+        let r = route(
+            &with_summary(Strategy::Auto),
+            &conn(url),
+            &conn(url),
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+    }
+
+    #[test]
+    fn auto_summary_only_cross_url_unique_key_is_not_minusdiff() {
+        let integer = route(
+            &with_summary(Strategy::Auto),
+            &conn("oracle://a/t"),
+            &conn("oracle://b/t"),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(integer.strategy.name(), "hashdiff");
+
+        let composite = route(
+            &with_summary(Strategy::Auto),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(composite.strategy.name(), "keyeddiff");
+    }
+
+    #[test]
+    fn auto_same_url_one_side_not_unique_stays_keyeddiff() {
+        let url = "oracle://same/t";
+        let r = route(
+            &with_summary(Strategy::Auto),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+            &plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
+    }
+
+    #[test]
+    fn explicit_strategy_is_not_promoted_to_minusdiff() {
+        let url = "oracle://same/t";
+        let keyed = route(
+            &with_summary(Strategy::Keyeddiff),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(keyed.strategy.name(), "keyeddiff");
+
+        let join = route(
+            &with_summary(Strategy::Joindiff),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(join.strategy.name(), "joindiff");
+    }
+
+    #[test]
+    fn route_plan_summary_only_promotes_static_integer_key() {
+        let url = "gaussdb://same/t";
+        let routed = route_plan(
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+            url,
+            url,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(routed.strategy.name(), "minusdiff");
+    }
+
+    #[test]
+    fn auto_summary_only_ignored_when_export_set_keeps_joindiff() {
+        let mut parsed = with_summary(Strategy::Auto);
+        parsed.export = Some("/tmp/out.csv".to_string());
+        let url = "oracle://same/t";
+        let r = route(
+            &parsed,
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "joindiff");
+    }
+
+    #[test]
+    fn explicit_minusdiff_same_url_unique_composite_key_stays_minusdiff() {
+        let url = "oracle://same/t";
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id", "tenant_id"], "varchar(32)"),
+            &unique_plan(vec!["id", "tenant_id"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "minusdiff");
+        assert!(
+            r.warnings.iter().all(|w| !w.contains("falling back")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn explicit_minusdiff_same_url_unique_string_key_stays_minusdiff() {
+        let url = "mysql://same/t";
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["code"], "varchar(32)"),
+            &unique_plan(vec!["code"], "varchar(32)"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "minusdiff");
+    }
+
+    #[test]
+    fn explicit_minusdiff_same_url_integer_key_is_not_rewritten_to_joindiff() {
+        let url = "mysql://same/t";
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn(url),
+            &conn(url),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "minusdiff");
+    }
+
+    #[test]
+    fn explicit_minusdiff_cross_url_integer_falls_back_to_hashdiff() {
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &unique_plan(vec!["id"], "int"),
+            &unique_plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "hashdiff");
+        assert!(
+            warning_text(&r)
+                .contains("minusdiff requires same-connection; falling back to hashdiff"),
+            "{}",
+            warning_text(&r)
+        );
+    }
+
+    #[test]
+    fn explicit_minusdiff_cross_url_composite_falls_back_to_keyeddiff() {
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://b/t"),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+            &unique_plan(vec!["id", "tenant_id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
+        let text = warning_text(&r);
+        assert!(text.contains("same-connection"), "{text}");
+        assert!(text.contains("falling back to keyeddiff"), "{text}");
+    }
+
+    #[test]
+    fn explicit_minusdiff_keyless_falls_back_to_bucketdiff() {
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn("mysql://a/t"),
+            &conn("mysql://a/t"),
+            &plan(vec![], "int"),
+            &plan(vec![], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "bucketdiff");
+        let text = warning_text(&r);
+        assert!(text.contains("minusdiff"), "{text}");
+        assert!(text.contains("unique"), "{text}");
+        assert!(text.contains("falling back to bucketdiff"), "{text}");
+    }
+
+    #[test]
+    fn explicit_minusdiff_non_unique_key_falls_back_to_keyeddiff() {
+        let url = "mysql://same/t";
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn(url),
+            &conn(url),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
+        let text = warning_text(&r);
+        assert!(text.contains("minusdiff"), "{text}");
+        assert!(text.contains("unique"), "{text}");
+        assert!(text.contains("falling back to keyeddiff"), "{text}");
+    }
+
+    #[test]
+    fn explicit_minusdiff_nullable_key_falls_back_to_keyeddiff() {
+        let url = "mysql://same/t";
+        let r = route(
+            &args(Strategy::Minusdiff),
+            &conn(url),
+            &conn(url),
+            &plan(vec!["id"], "int"),
+            &plan(vec!["id"], "int"),
+        )
+        .unwrap();
+        assert_eq!(r.strategy.name(), "keyeddiff");
+        let text = warning_text(&r);
+        assert!(
+            text.contains("minusdiff") && text.contains("unique"),
+            "{text}"
+        );
+        assert!(text.contains("falling back to keyeddiff"), "{text}");
     }
 
     #[test]
@@ -752,6 +1216,7 @@ mod tests {
             "mysql://a/t",
             "mysql://a/t",
             Some(Strategy::Auto),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -903,6 +1368,7 @@ mod tests {
             "oracle://a",
             "oracle://b",
             Some(Strategy::Naivediff),
+            false,
         )
         .unwrap();
         assert_eq!(r.strategy.name(), "naivediff");
@@ -916,6 +1382,7 @@ mod tests {
             "mysql://a",
             "mysql://b",
             Some(Strategy::Naivediff),
+            false,
         )
         .unwrap();
         assert_eq!(r.strategy.name(), "naivediff");
@@ -933,6 +1400,7 @@ mod tests {
             "oracle://a",
             "oracle://b",
             None,
+            false,
         )
         .unwrap();
         assert_eq!(r.strategy.name(), "keyeddiff");

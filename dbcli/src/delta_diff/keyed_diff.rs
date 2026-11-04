@@ -1275,6 +1275,7 @@ mod skew_tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 
@@ -1479,6 +1480,7 @@ mod tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         };
         let dialect = crate::backend::gaussdb::GaussdbFactory.create_dialect();
         let spec = keys_only_spec(&ctx, false, dialect.as_ref()).unwrap();

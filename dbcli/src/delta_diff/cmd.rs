@@ -10,6 +10,9 @@ use crate::cli::OutputFormat;
 
 // ─── Enums ─────────────────────────────────────────────────────────────
 
+/// minusdiff：max(COUNT) × 比对列数超过此值则回退 keyeddiff。0 = 不设上限。
+pub(crate) const DEFAULT_MINUS_MAX_CELLS: u64 = 50_000_000;
+
 /// 比对策略（§2.2 --strategy）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Strategy {
@@ -20,6 +23,7 @@ pub(crate) enum Strategy {
     Iblt,
     Keyeddiff,
     Naivediff,
+    Minusdiff,
 }
 
 impl std::fmt::Display for Strategy {
@@ -32,6 +36,7 @@ impl std::fmt::Display for Strategy {
             Strategy::Iblt => "iblt",
             Strategy::Keyeddiff => "keyeddiff",
             Strategy::Naivediff => "naivediff",
+            Strategy::Minusdiff => "minusdiff",
         };
         write!(f, "{s}")
     }
@@ -149,9 +154,13 @@ pub(crate) struct DeltaDiffArgs {
     #[arg(long)]
     pub update_since: Option<String>,
 
-    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff | naivediff
+    /// 比对策略：auto | hashdiff | joindiff | bucketdiff | iblt | keyeddiff | naivediff | minusdiff
     #[arg(long, value_enum, default_value = "auto")]
     pub strategy: Strategy,
+
+    /// minusdiff：max(COUNT) × 比对列数超过此值则回退 keyeddiff。0 = 不设上限
+    #[arg(long, default_value_t = DEFAULT_MINUS_MAX_CELLS)]
+    pub minus_max_cells: u64,
 
     /// Hashdiff 二分因子
     #[arg(long, default_value_t = 32)]
@@ -597,6 +606,40 @@ mod tests {
         let args =
             parse(&["delta-diff", "--left", "a", "--right", "b", "--table", "t"]).expect("parse");
         assert_eq!(args.naive_max_rows, 200_000);
+    }
+
+    #[test]
+    fn strategy_minusdiff_parses() {
+        let args = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--strategy",
+            "minusdiff",
+        ])
+        .expect("parse");
+        assert_eq!(args.strategy, Strategy::Minusdiff);
+        assert_eq!(args.strategy.to_string(), "minusdiff");
+        assert_eq!(args.minus_max_cells, DEFAULT_MINUS_MAX_CELLS);
+        let unlimited = parse(&[
+            "delta-diff",
+            "--left",
+            "a",
+            "--right",
+            "b",
+            "--table",
+            "t",
+            "--strategy",
+            "minusdiff",
+            "--minus-max-cells",
+            "0",
+        ])
+        .expect("parse");
+        assert_eq!(unlimited.minus_max_cells, 0);
     }
 
     #[test]

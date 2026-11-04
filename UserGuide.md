@@ -744,7 +744,7 @@ MCP 服务器通过 **stdio** 协议与 MCP 客户端（如 Claude Desktop、Cur
 
 必填：每侧 `left_connection` **或** `left_url` 二选一（右侧同理），两者皆缺会明确报错；`table` 必填。URL 侧无需在配置文件中登记任何连接，例如本地 DuckDB 文件可直接传 `left_url: "duckdb:///tmp/a.duckdb"`。同侧同时给出连接名与 `*_url` 会被拒绝（mutually exclusive）；URL 形态须含 `scheme://`。URL 侧在审计与返回报告中的连接名显示为 `inline-<scheme>`（如 `inline-duckdb`）。
 
-可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`exclude_columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff`）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`（与 `export` 并存时被忽略，行为与 CLI 一致，warnings 会写明）、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
+可选：`left_table` / `right_table`、`schema` / `left_schema` / `right_schema`、`key_columns`、`columns`、`exclude_columns`、`where_condition`、`strategy`（`auto` / `hashdiff` / `joindiff` / `bucketdiff` / `iblt` / `keyeddiff` / `naivediff` / `minusdiff`）、`minus_max_cells`（缺省 `50000000`，`0` 表示不限制；只对 `minusdiff` 生效）、`consistency`（`snapshot` / `none`）、`recheck`、`sample_limit`（默认 1000）、`summary_only`（与 `export` 并存时被忽略，行为与 CLI 一致，warnings 会写明）、`update_column` / `update_since`（增量窗口；`update_since` 默认 `"1 day"`，须与 `update_column` 同用，且与 `where_condition` 互斥）、`checkpoint`（JSONL 断点文件路径）、`export`（导出文件路径，后缀推断 csv/jsonl/json）、`export_format`（显式指定 csv/jsonl/json；`sql` 被拒绝——SQL 补丁仍需 CLI `--apply-to`）、`export_rows`（默认 `false`，导出内容不含差异行明细）。`--iblt-auto-capacity` 两轮自适应仅 CLI 提供（MCP/API 走固定 `--iblt-capacity`，小于 16 按 16 处理）。
 
 `where_condition` 禁止包含分号。`update_column` 与 `where_condition` 互斥，同时提供会被拒绝。MCP 返回的差异样本上限由 `sample_limit` 裁剪（导出文件不受影响，始终全量）；CLI 终端默认只显示 20 行（`--sample`），全量走 `--export`。
 
@@ -825,11 +825,14 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | 策略 | `auto` 何时选用 | 说明 |
 |------|-----------------|------|
 | `bucketdiff` | 无可用主键，或左右键无法 1:1 配对 | 按行内容做多重集合比对，不定位具体主键 |
-| `keyeddiff` | 有键但不是单列整数（复合键、字符串等） | 按键拉取比对；超出 `--fetch-all-threshold` 后按哈希桶校验 + 失配桶拉取。行数悬殊（≥8 倍）时失配桶合并为一次键序扫描，不再逐桶过滤扫描 |
-| `joindiff` | 左右同一条 URL + 单列整数键（MySQL/PolarDB-X、Oracle、GaussDB、DuckDB） | 同库两表联邦 JOIN；JOIN 投影直接带出行体，不再逐键回表。MySQL 系用 `LEFT JOIN UNION ALL`，其余方言用 `FULL OUTER JOIN`；键等值 NULL 安全（两侧都是 NULL 键仍可配对，由行哈希判定 Modified）。显式 `--strategy joindiff` 同样要求单列整数键，非整数单列/复合键回退 keyeddiff |
+| `keyeddiff` | 有键，但不是 `joindiff` / `minusdiff` 会接的形状 | 按键拉取比对；超出 `--fetch-all-threshold` 后按哈希桶校验 + 失配桶拉取。行数悬殊（≥8 倍）时失配桶合并为一次键序扫描，不再逐桶过滤扫描 |
+| `joindiff` | 左右同一条 URL + 单列整数键，且没有被下面的 `minusdiff` 仅统计规则拿走 | 同库两表联邦 JOIN；JOIN 投影直接带出行体，不再逐键回表。MySQL 系用 `LEFT JOIN UNION ALL`，其余方言用 `FULL OUTER JOIN`；键等值 NULL 安全（两侧都是 NULL 键仍可配对，由行哈希判定 Modified）。显式 `--strategy joindiff` 同样要求单列整数键，非整数单列/复合键回退 keyeddiff |
 | `hashdiff` | 跨连接 + 单列整数键 | 二分 checksum；首轮两侧各一条全范围校验和，相等即停（0% 只发 2 条聚合）。snapshot 复核按批 `key IN (...)`（Oracle 按 1000 拆批），不再逐键点查。`--strategy hashdiff` 强制 |
 | `iblt` | `auto` **不会**选它 | `--strategy iblt` 强制可逆布隆表快路径；`--strict` 时解码失败 exit 2 而不回退 |
 | `naivediff` | `auto` **不会**选它 | `--strategy naivediff` 强制「每侧一次全扫描 + 客户端归并」：裸键 ORDER BY、无 NLSSORT/COLLATE、无 LIMIT，正确性不依赖库端行序；适合单日数万行、复合 VARCHAR 主键、经常零差/少量差的日对账。超过 `--naive-max-rows` 行数硬顶直接拒绝并提示改用 keyeddiff；无键表走全行多重集差（不回退 bucketdiff） |
+| `minusdiff` | 同 URL 且两侧键都唯一：复合键或非整数键（含 MySQL，执行期再确认能力）；Oracle / GaussDB / DuckDB 在生效的 `--summary-only` 下，单列整数键也选它 | 左连接做集合差。Oracle 发 `MINUS`，MySQL 8.0.31+ / GaussDB / DuckDB 发 `EXCEPT`。行差的单列整数键仍是 `joindiff`。MySQL 系仅统计的单列整数键也留在 `joindiff` |
+
+`minusdiff` 不扩展 joindiff 的多列 `ON`。行差里的单列整数键仍走 `joindiff` 的索引；`minusdiff` 会对全列做哈希。它补的是同 URL、唯一的复合键或字符串键、差异打散在 keyeddiff 哈希桶上的情况，以及 Oracle / GaussDB / DuckDB 上仅统计的唯一整数键（一条三计数语句）。无键、键不唯一或可空、跨 URL 时 auto 不选它。显式 `--strategy minusdiff` 在这些形状上带 warning 回退，比对继续。服务器没有 `MINUS`/`EXCEPT`，或 `max(行数) × 比对列数` 超过 `--minus-max-cells` 时，执行期回退 keyeddiff。列对不齐、集合差语句失败、规范化键重复则 exit 2，不回退。`--sample` 只裁剪终端和 MCP 样本，不减少服务器上的集合差计算。Oracle 与 DuckDB 上 `--statement-timeout` 约束不了这条语句。不写分片断点，取消后整句重头再来；`--recheck` 被忽略。`--summary-only` 与 `--export` 并存时仅统计不生效。操作说明见 [docs/delta-diff 设计补充（minusdiff 使用说明）.md](docs/delta-diff%20设计补充（minusdiff%20使用说明）.md)。
 
 DuckDB 参与比对：两侧均为 DuckDB 连接时用法与上表一致（含 `--update-column`/`--update-since` 增量窗口）。`BLOB` / `JSON` / `TEXT` 列不参与行哈希（预检排除并给出 warning）；`TIMESTAMPTZ` 以 UTC 文本规范化（bundled 构建无 ICU，不受影响）。**增量窗口时区语义**：bundled 构建无 ICU，会话时区固定为 UTC，窗口 cutoff 是 UTC 墙钟（与本地时间相差机器 UTC 偏移）；两侧使用同一 cutoff，比对结果自洽，但短窗口覆盖的行范围可能与本地时间直觉不同。跨引擎注意：UUID / BLOB / 非有限浮点（NaN/Infinity）在 DuckDB 与 GaussDB/Oracle 的规范化行为不同——相应列会被响亮排除或可能报差异，跨引擎比对时先核对。
 
@@ -934,6 +937,7 @@ Checkpoint 为 JSONL，带 `checkpoint_format_version`（当前为 **2**）。�
 | `--iblt-auto-capacity` | 关 | IBLT 自适应两轮：第一轮 m=64，解码失败后按估计差异量 d̂ 放大一轮重试（m₂=clamp(3·d̂)），两轮都失败才回退 hashdiff；内存占用固定在桶表，不随容量预分配增长 |
 | `--fetch-all-threshold` | 4096 | keyeddiff：`max(COUNT)` 不超过此值时一次拉全量 |
 | `--naive-max-rows` | 200000 | naivediff：`max(COUNT)` 超过此值时拒绝（exit 2）并提示改用 `--strategy keyeddiff`；`0` = 不设顶（大表物化内存自负） |
+| `--minus-max-cells` | 50000000 | minusdiff：`max(COUNT) × 比对列数` 超过此值则回退 keyeddiff。`0` = 不限制，确认临时空间够用时才这样设 |
 | `--verbose` | 关 | 分片进度与每步 SQL 打到 stderr |
 
 ---

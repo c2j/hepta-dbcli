@@ -270,6 +270,13 @@ pub trait Dialect: Send + Sync {
         HashCapability::Md5
     }
 
+    /// Set-difference keyword used by explicit `minusdiff` on one session.
+    /// Default is [`SetDifferenceOp::None`] so test dialects and MySQL
+    /// (version-dependent) do not emit `MINUS` or `EXCEPT` from the type.
+    fn set_difference_op(&self) -> SetDifferenceOp {
+        SetDifferenceOp::None
+    }
+
     /// Normalize a column value to its canonical text form for cross-db hashing
     /// (v2.1 §九). Returns Err for unmappable/unsupported column types.
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError>;
@@ -350,6 +357,19 @@ pub struct IbltSqlSpec {
 pub enum HashCapability {
     Md5,
     Crc32Chain,
+}
+
+/// Static set-difference keyword for same-session `minusdiff`.
+/// `None` means the dialect does not emit one from the type alone
+/// (MySQL decides at execution from `VERSION()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetDifferenceOp {
+    /// Do not emit a set-difference keyword.
+    None,
+    /// Oracle `MINUS` (set / DISTINCT). There is no `MINUS ALL`.
+    Minus,
+    /// `EXCEPT` (set / DISTINCT). Not `EXCEPT ALL`.
+    Except,
 }
 
 /// PolarDB-X detection from a VERSION() string (v2.1 §16.3-F5).

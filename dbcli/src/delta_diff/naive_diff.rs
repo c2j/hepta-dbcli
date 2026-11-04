@@ -830,6 +830,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = flow.left;
             let mut right = flow.right;
@@ -1074,6 +1075,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = Box::new(ScriptedConn {
                 responses: VecDeque::from([
@@ -1136,6 +1138,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = Box::new(ScriptedConn {
                 responses: VecDeque::from([ScriptedConn::count(1), ScriptedConn::scan(ctx_rows_l)]),
@@ -1269,6 +1272,7 @@ mod duckdb_e2e_tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         };
         NaiveDiffer
             .diff(&mut *lconn, &mut *rconn, &ctx)
