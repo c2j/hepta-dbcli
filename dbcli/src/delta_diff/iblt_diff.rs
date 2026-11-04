@@ -249,14 +249,13 @@ impl IbltDiffer {
             open_snapshot(right, ctx.verbose)
                 .await
                 .map_err(IbltFailure::Db)?;
-            let _ = ctx.scns.set((
-                hash_diff::capture_scn(left, ctx.verbose)
-                    .await
-                    .map_err(IbltFailure::Db)?,
-                hash_diff::capture_scn(right, ctx.verbose)
-                    .await
-                    .map_err(IbltFailure::Db)?,
-            ));
+            let left_scn = hash_diff::capture_scn(left, ctx.verbose)
+                .await
+                .map_err(IbltFailure::Db)?;
+            let right_scn = hash_diff::capture_scn(right, ctx.verbose)
+                .await
+                .map_err(IbltFailure::Db)?;
+            let _ = ctx.scns.set((left_scn.scn, right_scn.scn));
         }
 
         // 第一轮（auto 与固定容量共用）。
@@ -1384,6 +1383,7 @@ mod tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 

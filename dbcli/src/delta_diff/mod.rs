@@ -24,6 +24,7 @@ pub(crate) mod iblt_diff;
 pub(crate) mod join_diff;
 pub(crate) mod keyed_diff;
 pub(crate) mod metadata;
+pub(crate) mod minus_diff;
 pub(crate) mod naive_diff;
 pub(crate) mod output;
 pub(crate) mod pairing;
@@ -365,6 +366,11 @@ async fn dry_run_inner(
     let routed = engine::route(args, left, right, &lplan, &rplan)?;
     let paired = pairing::pair_plans(&lplan, &rplan);
     let mut dry_run_warnings = routed.warnings.clone();
+    if routed.strategy.name() == "minusdiff" {
+        dry_run_warnings.push(
+            "minusdiff checks capability and cell budget at execution; dry-run does not".into(),
+        );
+    }
     dry_run_warnings.extend(api::cross_db_column_type_warnings(
         &lplan,
         &rplan,
@@ -527,6 +533,8 @@ async fn execute_diff_inner(
     .await?;
     let ltable = args.left_table_name().ok_or("missing --table")?;
     let rtable = args.right_table_name().ok_or("missing --table")?;
+    let (summary_only_effective, summary_downgrade) =
+        effective_summary_only(args.summary_only, args.export.as_deref());
 
     let api::Preflight {
         lplan,
@@ -549,7 +557,10 @@ async fn execute_diff_inner(
         },
         &args.columns_list(),
         &args.key_list(),
-        Some(args.strategy),
+        api::PreflightRoute {
+            strategy_hint: Some(args.strategy),
+            summary_only: summary_only_effective,
+        },
         args.rtrim_char_columns,
         &args.exclude_columns_list(),
     )
@@ -563,8 +574,6 @@ async fn execute_diff_inner(
     )?;
 
     let (filter, incremental) = effective_filter(args);
-    let (summary_only_effective, summary_downgrade) =
-        effective_summary_only(args.summary_only, args.export.as_deref());
     let mut warnings = warnings;
     warnings.extend(summary_downgrade);
     let checkpoint = match &args.checkpoint {
@@ -624,6 +633,7 @@ async fn execute_diff_inner(
         same_connection: left.connection_url == right.connection_url,
         scns: std::sync::OnceLock::new(),
         verbose: args.verbose,
+        minus_max_cells: args.minus_max_cells,
     };
 
     let mut report = routed
@@ -968,6 +978,7 @@ fn format_key_domain_line(strategy: &str, minmax: Option<(i64, i64)>) -> String 
         "keyeddiff" => "  key domain       : (not applicable — keyeddiff)".to_string(),
         "bucketdiff" => "  key domain       : (not applicable — bucketdiff)".to_string(),
         "naivediff" => "  key domain       : (not applicable — naivediff)".to_string(),
+        "minusdiff" => "  key domain       : (not applicable — minusdiff)".to_string(),
         _ => match minmax {
             Some((lo, hi)) => format!("  key domain       : [{lo}, {hi}]"),
             None => "  key domain       : (unavailable)".to_string(),
@@ -1144,6 +1155,18 @@ mod dry_run_format_tests {
         assert_eq!(
             format_key_domain_line("keyeddiff", None),
             "  key domain       : (not applicable — keyeddiff)"
+        );
+    }
+
+    #[test]
+    fn dry_run_minusdiff_key_domain_is_not_applicable() {
+        assert_eq!(
+            format_key_domain_line("minusdiff", Some((1, 9))),
+            "  key domain       : (not applicable — minusdiff)"
+        );
+        assert!(
+            !format_key_domain_line("minusdiff", Some((1, 9))).contains("first-pass"),
+            "minusdiff must not print a probed key domain"
         );
     }
 

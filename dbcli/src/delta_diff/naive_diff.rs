@@ -46,10 +46,9 @@ impl DiffStrategy for NaiveDiffer {
         if ctx.consistency == ConsistencyMode::Snapshot {
             open_snapshot(left, ctx.verbose).await?;
             open_snapshot(right, ctx.verbose).await?;
-            let _ = ctx.scns.set((
-                capture_scn(left, ctx.verbose).await?,
-                capture_scn(right, ctx.verbose).await?,
-            ));
+            let left_scn = capture_scn(left, ctx.verbose).await?;
+            let right_scn = capture_scn(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((left_scn.scn, right_scn.scn));
         }
         let result = self.diff_inner(left, right, ctx, &mut queries).await;
         if ctx.consistency == ConsistencyMode::Snapshot {
@@ -830,6 +829,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = flow.left;
             let mut right = flow.right;
@@ -1074,6 +1074,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = Box::new(ScriptedConn {
                 responses: VecDeque::from([
@@ -1136,6 +1137,7 @@ mod tests {
                 scns: std::sync::OnceLock::new(),
                 same_connection: false,
                 verbose: false,
+                minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
             };
             let mut left = Box::new(ScriptedConn {
                 responses: VecDeque::from([ScriptedConn::count(1), ScriptedConn::scan(ctx_rows_l)]),
@@ -1269,6 +1271,7 @@ mod duckdb_e2e_tests {
             scns: std::sync::OnceLock::new(),
             same_connection: false,
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         };
         NaiveDiffer
             .diff(&mut *lconn, &mut *rconn, &ctx)

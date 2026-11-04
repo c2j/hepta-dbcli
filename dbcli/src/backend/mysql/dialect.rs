@@ -488,6 +488,14 @@ mod tests {
     }
 
     #[test]
+    fn mysql_set_difference_op_is_none() {
+        assert_eq!(
+            MySqlDialect.set_difference_op(),
+            crate::backend::SetDifferenceOp::None
+        );
+    }
+
+    #[test]
     fn polardbx_version_detection() {
         assert!(is_polardbx_version("5.6.29-PXC-5.4.19-SNAPSHOT"));
         assert!(is_polardbx_version("8.0.30-pxc-cluster"));

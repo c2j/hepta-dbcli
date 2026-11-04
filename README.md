@@ -339,17 +339,18 @@ hepta_dbcli delta-diff --left mysql_dev --right gauss_dev --table orders \
 | `--strategy` | When `auto` picks it |
 |--------------|----------------------|
 | `bucketdiff` | No usable key, or left/right keys cannot be paired |
-| `keyeddiff` | Key exists but is not a single integer column (composite / string / …) |
-| `joindiff` | Both sides on the same connection URL with a single integer key (MySQL/PolarDB-X, Oracle, GaussDB, DuckDB) |
+| `keyeddiff` | A key exists, but the shape is not taken by `joindiff` or `minusdiff` |
+| `joindiff` | Same connection URL and a single integer key. `--summary-only` on Oracle, GaussDB, or DuckDB with a unique key uses `minusdiff` instead. MySQL and PolarDB-X keep `joindiff` for that shape |
 | `hashdiff` | Cross-connection with a single integer key; pass `--strategy hashdiff` to force bisection checksums |
 | `iblt` | Not chosen by `auto`; pass `--strategy iblt` for the invertible-bloom fast path |
 | `naivediff` | Not chosen by `auto`; pass `--strategy naivediff` for one full scan per side + client-side merge (fast daily reconciliation on composite VARCHAR keys; see `--naive-max-rows`) |
+| `minusdiff` | Same URL and both keys unique, when the key is composite or not an integer (including MySQL; capability is checked at execution). Also `--summary-only` on Oracle, GaussDB, and DuckDB for a unique single integer key. A row-level single integer key stays on `joindiff`. See `--minus-max-cells` |
 
 Exit codes (CI contract): `0` identical, `1` differences found, `2` error. `--dry-run` exits `0` on success.
 
 `bucketdiff` buckets by integer key ranges (one `MIN/MAX` probe, then indexed range pulls) only when a single integer key is available; keyless tables and non-integer keys go straight to `MOD(rowHash, N)` content bucketing with no probe. A probe statement the engine rejects is reported as an error with a strategy hint instead of being silently downgraded.
 
-See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--rtrim-char-columns`.
+See [UserGuide.md](UserGuide.md) for the full flag list, export formats, and `--rtrim-char-columns`. Operator notes for `minusdiff` are in [docs/delta-diff 设计补充（minusdiff 使用说明）.md](docs/delta-diff%20设计补充（minusdiff%20使用说明）.md).
 
 ### Synthetic data generation
 

@@ -61,6 +61,8 @@ pub(crate) struct DiffContext {
     pub(crate) scns: std::sync::OnceLock<(Option<u64>, Option<u64>)>,
     /// 输出分片级进度与每步 SQL 到 stderr（§2.2 --verbose）
     pub(crate) verbose: bool,
+    /// minusdiff 单元格预算。0 = 不限制。默认 `DEFAULT_MINUS_MAX_CELLS`。
+    pub(crate) minus_max_cells: u64,
 }
 
 impl DiffContext {
@@ -192,6 +194,7 @@ mod filter_tests {
             same_connection: false,
             scns: std::sync::OnceLock::new(),
             verbose: false,
+            minus_max_cells: crate::delta_diff::cmd::DEFAULT_MINUS_MAX_CELLS,
         }
     }
 

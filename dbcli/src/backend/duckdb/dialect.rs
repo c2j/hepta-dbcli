@@ -8,7 +8,7 @@
 use crate::backend::error::DbError;
 use crate::backend::{
     ChecksumSqlSpec, ColumnNormSpec, Dialect, IbltSqlSpec, KeysetPageSpec, ScanSqlSpec,
-    NULL_SENTINEL,
+    SetDifferenceOp, NULL_SENTINEL,
 };
 
 pub(crate) struct DuckDbDialect;
@@ -145,6 +145,10 @@ impl Dialect for DuckDbDialect {
 
     fn begin_snapshot_sql(&self) -> &str {
         "BEGIN TRANSACTION"
+    }
+
+    fn set_difference_op(&self) -> SetDifferenceOp {
+        SetDifferenceOp::Except
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
@@ -670,6 +674,14 @@ mod tests {
         assert!(!d.supports_dollar_quote());
         assert_eq!(d.begin_snapshot_sql(), "BEGIN TRANSACTION");
         assert_eq!(d.hash_capability(), crate::backend::HashCapability::Md5);
+    }
+
+    #[test]
+    fn duckdb_set_difference_op_is_except() {
+        assert_eq!(
+            DuckDbDialect.set_difference_op(),
+            crate::backend::SetDifferenceOp::Except
+        );
     }
 }
 

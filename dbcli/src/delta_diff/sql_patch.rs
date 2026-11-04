@@ -591,6 +591,21 @@ mod tests {
     }
 
     #[test]
+    fn sql_patch_renders_update_for_minusdiff_modified_row() {
+        let mut report = report_keyed();
+        report.strategy = "minusdiff".into();
+        report
+            .sample_diffs
+            .retain(|row| row.status == DiffStatus::Modified);
+        assert!(
+            !report.sample_diffs.is_empty(),
+            "fixture must include a Modified row"
+        );
+        let sql = render_sql_patch(&report, &opts_left()).unwrap();
+        assert!(sql.contains("UPDATE"), "{sql}");
+    }
+
+    #[test]
     fn sql_quotes_identifiers_with_dialect_quote() {
         let mut opts = opts_left();
         opts.quote = '`';

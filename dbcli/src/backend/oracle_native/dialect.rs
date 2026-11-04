@@ -1,6 +1,7 @@
 use crate::backend::error::DbError;
 use crate::backend::{
-    ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, ScanSqlSpec, NULL_SENTINEL,
+    ChecksumSqlSpec, ColumnNormSpec, Dialect, KeysetPageSpec, ScanSqlSpec, SetDifferenceOp,
+    NULL_SENTINEL,
 };
 
 /// MD5 SQL: `STANDARD_HASH` is 12c+; 11g uses `DBMS_CRYPTO.HASH` (same RAW MD5).
@@ -235,6 +236,10 @@ impl Dialect for OracleDialect {
 
     fn snapshot_scn_sql(&self) -> Option<&'static str> {
         Some("SELECT CURRENT_SCN FROM V$DATABASE")
+    }
+
+    fn set_difference_op(&self) -> SetDifferenceOp {
+        SetDifferenceOp::Minus
     }
 
     fn normalize_expr(&self, col: &ColumnNormSpec) -> Result<String, DbError> {
@@ -767,6 +772,18 @@ mod tests {
     #[test]
     fn test_no_hash_comment() {
         assert!(!OracleDialect::new().supports_hash_comment());
+    }
+
+    #[test]
+    fn oracle_set_difference_op_is_minus() {
+        assert_eq!(
+            OracleDialect::new().set_difference_op(),
+            crate::backend::SetDifferenceOp::Minus
+        );
+        assert_eq!(
+            OracleDialect::oracle11().set_difference_op(),
+            crate::backend::SetDifferenceOp::Minus
+        );
     }
 
     fn col(name: &str, ty: &str, nullable: bool) -> crate::backend::ColumnNormSpec {
