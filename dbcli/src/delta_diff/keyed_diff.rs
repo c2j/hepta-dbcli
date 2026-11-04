@@ -47,10 +47,9 @@ impl DiffStrategy for KeyedDiffer {
         if ctx.consistency == ConsistencyMode::Snapshot {
             open_snapshot(left, ctx.verbose).await?;
             open_snapshot(right, ctx.verbose).await?;
-            let _ = ctx.scns.set((
-                crate::delta_diff::hash_diff::capture_scn(left, ctx.verbose).await?,
-                crate::delta_diff::hash_diff::capture_scn(right, ctx.verbose).await?,
-            ));
+            let left_scn = crate::delta_diff::hash_diff::capture_scn(left, ctx.verbose).await?;
+            let right_scn = crate::delta_diff::hash_diff::capture_scn(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((left_scn.scn, right_scn.scn));
         }
 
         let result = self.diff_inner(left, right, ctx, &mut queries).await;

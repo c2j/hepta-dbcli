@@ -662,7 +662,8 @@ mod duckdb_e2e_tests {
         let report = run_diff(
             side_at(&pool, "l").await,
             side_at(&pool, "r").await,
-            opts(None),
+            // 显式 keyeddiff：DuckDB 默认会路由到 minusdiff（EXCEPT）。
+            opts(Some(crate::delta_diff::cmd::Strategy::Keyeddiff)),
         )
         .await
         .expect("run");
@@ -854,7 +855,10 @@ mod duckdb_skew_tests {
 
     fn skew_opts(summary_only: bool) -> DiffOptions {
         DiffOptions {
-            strategy: None,
+            // minusdiff 上线后 DuckDB（EXCEPT）默认路由到 minusdiff。这些
+            // 测试锁定的是 keyeddiff 的查询形状（共享扫描/逐桶分页/查询数
+            // 上下界），必须显式固定策略才能继续测原设计目标。
+            strategy: Some(crate::delta_diff::cmd::Strategy::Keyeddiff),
             iblt_capacity: 65536,
             iblt_auto: false,
             fetch_all_threshold: 4096,

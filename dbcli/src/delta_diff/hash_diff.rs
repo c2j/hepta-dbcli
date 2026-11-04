@@ -73,10 +73,9 @@ impl DiffStrategy for HashDiffer {
         if ctx.consistency == ConsistencyMode::Snapshot {
             open_snapshot(left, ctx.verbose).await?;
             open_snapshot(right, ctx.verbose).await?;
-            let _ = ctx.scns.set((
-                capture_scn(left, ctx.verbose).await?,
-                capture_scn(right, ctx.verbose).await?,
-            ));
+            let left_scn = capture_scn(left, ctx.verbose).await?;
+            let right_scn = capture_scn(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((left_scn.scn, right_scn.scn));
         }
 
         let result = self.diff_inner(left, right, ctx, &mut counters).await;
@@ -594,10 +593,14 @@ async fn run_wide_segment_aggregate(
     Ok(out)
 }
 
+/// Statements actually sent on success. MySQL is `VERSION` plus `START`
+/// (2), or 3 when the version string is PolarDB-X. Every other dialect
+/// sends only its `begin_snapshot_sql` (1). A failure returns the driver
+/// error and no count.
 pub(crate) async fn open_snapshot(
     conn: &mut (dyn DbConn + Send),
     verbose: bool,
-) -> Result<(), DbError> {
+) -> Result<u64, DbError> {
     let (scheme, snapshot_sql, polardbx_sql) = {
         let d = conn.dialect();
         (
@@ -610,6 +613,8 @@ pub(crate) async fn open_snapshot(
         if verbose {
             eprintln!("[sql] SELECT VERSION()");
         }
+        // VERSION() is sent even when the query fails; `.ok()` only drops
+        // the error so a broken version probe still starts the snapshot.
         let version: Option<String> = conn
             .query("SELECT VERSION()")
             .await
@@ -624,25 +629,42 @@ pub(crate) async fn open_snapshot(
                     }
                     conn.query_drop(set_iso).await?;
                     conn.query_drop(start).await?;
-                    return Ok(());
+                    return Ok(3);
                 }
             }
         }
+        if verbose {
+            eprintln!("[sql] {snapshot_sql}");
+        }
+        conn.query_drop(&snapshot_sql).await?;
+        return Ok(2);
     }
     if verbose {
         eprintln!("[sql] {snapshot_sql}");
     }
-    conn.query_drop(&snapshot_sql).await
+    conn.query_drop(&snapshot_sql).await?;
+    Ok(1)
 }
 
-/// Oracle 快照模式下捕获 CURRENT_SCN（§8.2；其余方言返回 None）。
+/// SCN captured for one side, and how many statements that capture sent.
+pub(crate) struct ScnCapture {
+    pub(crate) scn: Option<u64>,
+    pub(crate) statements: u64,
+}
+
+/// Oracle 快照模式下捕获 CURRENT_SCN（§8.2；其余方言 `scn` 为 None，语句数为 0）。
 pub(crate) async fn capture_scn(
     conn: &mut (dyn DbConn + Send),
     verbose: bool,
-) -> Result<Option<u64>, DbError> {
+) -> Result<ScnCapture, DbError> {
     let sql = match conn.dialect().snapshot_scn_sql() {
         Some(s) => s.to_string(),
-        None => return Ok(None),
+        None => {
+            return Ok(ScnCapture {
+                scn: None,
+                statements: 0,
+            });
+        }
     };
     if verbose {
         eprintln!("[sql] {sql}");
@@ -657,7 +679,7 @@ pub(crate) async fn capture_scn(
             Value::String(s) => s.trim().parse().ok(),
             _ => None,
         });
-    Ok(scn)
+    Ok(ScnCapture { scn, statements: 1 })
 }
 
 /// SELECT MIN(k), MAX(k) — 键域探查（单次索引探查）

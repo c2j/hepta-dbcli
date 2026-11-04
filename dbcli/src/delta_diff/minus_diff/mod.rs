@@ -1,24 +1,34 @@
-// ─── delta-diff MinusDiffer: same-session set difference (explicit) ──
+// ─── delta-diff MinusDiffer: same-session set difference ─────────────
 //
-// PR2 is the pure surface: MySQL version decision, one-statement SQL, and
-// key classification. Nothing here opens a connection or registers a route.
+// SQL shape, rendering, and row classification live in sql.rs. This
+// module runs that plan on the left connection: capability probe, one
+// shared snapshot, counts, checksum, then one set-difference statement.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::backend::{ChecksumSqlSpec, DbConn, DbError, Dialect, QueryResult, SetDifferenceOp};
+use crate::backend::{ChecksumSqlSpec, DbConn, DbError, Dialect, SetDifferenceOp};
 use crate::delta_diff::checksum::{run_checksum, tuples_equal};
 use crate::delta_diff::hash_diff::{capture_scn, open_snapshot};
 use crate::delta_diff::keyed_diff::{parse_count, KeyedDiffer};
 use crate::delta_diff::pairing::pair_plans;
 use crate::delta_diff::report::{
-    stamp_columns_from_plan, DiffReport, DiffRow, DiffStatus, DiffSummary, PerfMetrics,
-    ShardResult, ShardStatus, TableRef,
+    stamp_columns_from_plan, DiffReport, DiffRow, DiffSummary, PerfMetrics, ShardResult,
+    ShardStatus, TableRef,
 };
 use crate::delta_diff::strategy::{side_filter, ConsistencyMode, DiffContext, DiffStrategy};
+
+mod sql;
+
+#[cfg(test)]
+use sql::render_minusdiff_sql;
+pub(crate) use sql::{
+    classify_minus_rows, mysql_set_op_decision, prepare_minusdiff, tag_empty_side_rows, MinusShape,
+    MysqlSetOpDecision,
+};
+use sql::{from_clause, render_prepared, summary_counts, tally, value_exprs, MinusCounts};
 
 pub(crate) struct MinusDiffer;
 
@@ -36,11 +46,14 @@ impl DiffStrategy for MinusDiffer {
     ) -> Result<DiffReport, DbError> {
         let started = Utc::now();
         // Shape errors must not probe, open a snapshot, or touch a user table.
-        render_minusdiff_sql(ctx, left.dialect(), SetDifferenceOp::Except, false, None)?;
+        // The operator is not known yet; `None` must not hide a bad plan.
+        let shape = prepare_minusdiff(ctx, left.dialect())?;
 
         let mut sent = 0u64;
         let mut opened = false;
-        let result = self.execute(left, right, ctx, &mut sent, &mut opened).await;
+        let result = self
+            .execute(left, right, ctx, &shape, &mut sent, &mut opened)
+            .await;
         if opened {
             ctx.vlog("[sql] COMMIT");
             let _ = left.query_drop("COMMIT").await;
@@ -55,402 +68,13 @@ impl DiffStrategy for MinusDiffer {
     }
 }
 
-/// What a MySQL-family `VERSION()` string means for `EXCEPT`.
-/// `Refuse` has the same outcome as [`SetDifferenceOp::None`]: do not emit a
-/// set difference. `Except` corresponds to [`SetDifferenceOp::Except`].
-/// `Probe` is not an operator; a later probe becomes `Except` or `None`.
-/// This function never returns [`SetDifferenceOp::Minus`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MysqlSetOpDecision {
-    Refuse,
-    Except,
-    Probe,
-}
-
-pub(crate) fn mysql_set_op_decision(version: &str) -> MysqlSetOpDecision {
-    if crate::backend::is_polardbx_version(version) {
-        return MysqlSetOpDecision::Refuse;
-    }
-    let upper = version.to_ascii_uppercase();
-    if upper.contains("MARIADB") || upper.contains("POLARDB") {
-        return MysqlSetOpDecision::Probe;
-    }
-    match mysql_version_at_least_8_0_31(version) {
-        Some(true) => MysqlSetOpDecision::Except,
-        Some(false) => MysqlSetOpDecision::Refuse,
-        None => MysqlSetOpDecision::Probe,
-    }
-}
-
-fn mysql_version_at_least_8_0_31(version: &str) -> Option<bool> {
-    let mut nums = version
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|part| !part.is_empty());
-    let major: u64 = nums.next()?.parse().ok()?;
-    let minor: u64 = nums.next()?.parse().ok()?;
-    let patch: u64 = nums.next()?.parse().ok()?;
-    Some((major, minor, patch) >= (8, 0, 31))
-}
-
-/// Prepend a constant `side` cell so an empty-side `SELECT` (no `side`
-/// column) matches the set-difference layout `[side, rk…, c…, k…]`.
-/// Left table empty → `"R"`. Right table empty → `"L"`.
-pub(crate) fn tag_empty_side_rows(side: &str, rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
-    rows.iter()
-        .map(|row| {
-            let mut tagged = Vec::with_capacity(row.len() + 1);
-            tagged.push(Value::String(side.to_string()));
-            tagged.extend(row.iter().cloned());
-            tagged
-        })
-        .collect()
-}
-
-pub(crate) fn render_minusdiff_sql(
-    ctx: &DiffContext,
-    dialect: &dyn Dialect,
-    op: SetDifferenceOp,
-    summary_only: bool,
-    scn: Option<u64>,
-) -> Result<String, DbError> {
-    let keyword = match op {
-        SetDifferenceOp::Minus => "MINUS",
-        SetDifferenceOp::Except => "EXCEPT",
-        SetDifferenceOp::None => {
-            return Err(DbError::unsupported(
-                "minusdiff: dialect has no set-difference operator",
-            ));
-        }
-    };
-    if ctx.key_columns.is_empty() {
-        return Err(DbError::config(
-            "minusdiff: set difference requires a comparison key",
-        ));
-    }
-
-    let pairing = pair_plans(&ctx.left.plan, &ctx.right.plan);
-    if !pairing.unmatched_left.is_empty()
-        || !pairing.unmatched_right.is_empty()
-        || !pairing.ambiguous.is_empty()
-    {
-        return Err(DbError::config(format!(
-            "minusdiff: columns are not aligned; unmatched left [{}], unmatched right [{}], ambiguous [{}]",
-            pairing.unmatched_left.join(", "),
-            pairing.unmatched_right.join(", "),
-            pairing.ambiguous.join(", ")
-        )));
-    }
-    require_key_specs(ctx, true)?;
-    require_key_specs(ctx, false)?;
-
-    let oracle_scn = (dialect.url_scheme() == "oracle").then_some(scn).flatten();
-    let where_sql = side_filter(ctx, dialect.url_scheme())
-        .map(|pred| format!(" WHERE ({pred})"))
-        .unwrap_or_default();
-
-    let left_vals = value_exprs(ctx, dialect, &pairing.right_of_left, true)?;
-    let right_vals = value_exprs(ctx, dialect, &pairing.right_of_left, false)?;
-    if left_vals.len() != right_vals.len() {
-        return Err(DbError::config(
-            "minusdiff: value projections differ between the two sides",
-        ));
-    }
-
-    let l = cte_select(ctx, dialect, true, &left_vals, summary_only)?;
-    let r = cte_select(ctx, dialect, false, &right_vals, summary_only)?;
-    let lfrom = from_clause(
-        &dialect.quote_table(ctx.left.schema.as_deref(), &ctx.left.table),
-        oracle_scn,
-    );
-    let rfrom = from_clause(
-        &dialect.quote_table(ctx.right.schema.as_deref(), &ctx.right.table),
-        oracle_scn,
-    );
-    let key_list = (0..ctx.key_columns.len())
-        .map(|i| format!("k{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let operand = format!("SELECT {key_list}, h");
-    // summary_only reads each set-difference CTE more than once. MySQL 8.4
-    // mis-reads that shared EXCEPT temp table (Bug #121239; handler error
-    // 124, or an InnoDB abort once the temp table spills). Copy the rows
-    // through a plain derived table first. The alias has no AS: Oracle
-    // rejects `) AS setdiff`.
-    let ld_body = format!("{operand} FROM l\n  {keyword}\n  {operand} FROM r");
-    let rd_body = format!("{operand} FROM r\n  {keyword}\n  {operand} FROM l");
-    let (ld_sql, rd_sql) = if summary_only {
-        (
-            format!("SELECT * FROM (\n  {ld_body}\n) setdiff"),
-            format!("SELECT * FROM (\n  {rd_body}\n) setdiff"),
-        )
-    } else {
-        (ld_body, rd_body)
-    };
-
-    let mut sql = format!(
-        "WITH l AS (\n  SELECT {l}\n  FROM {lfrom}{where_sql}\n),\nr AS (\n  SELECT {r}\n  FROM {rfrom}{where_sql}\n),\nld AS (\n  {ld_sql}\n),\nrd AS (\n  {rd_sql}\n)\n"
-    );
-    if summary_only {
-        sql.push_str(&summary_select(
-            dialect.url_scheme() == "oracle",
-            ctx.key_columns.len(),
-        ));
-    } else {
-        sql.push_str(&body_select(ctx.key_columns.len(), left_vals.len()));
-    }
-    Ok(sql)
-}
-
-fn require_key_specs(ctx: &DiffContext, is_left: bool) -> Result<(), DbError> {
-    let plan = if is_left {
-        &ctx.left.plan
-    } else {
-        &ctx.right.plan
-    };
-    for key in ctx.side_key_columns(is_left) {
-        if plan.spec_for(key).is_none() {
-            return Err(DbError::config(format!(
-                "minusdiff: key column '{key}' has no normalization spec"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn from_clause(table: &str, scn: Option<u64>) -> String {
-    match scn {
-        Some(n) => format!("{table} AS OF SCN {n}"),
-        None => table.to_string(),
-    }
-}
-
-fn is_key_name(name: &str, keys: &[String]) -> bool {
-    keys.iter().any(|key| key == name)
-}
-
-/// Non-key compare expressions. Left uses its own specs. Right uses
-/// `right.norm_specs[right_of_left[i]]` at the left compare-column index,
-/// not the filtered non-key ordinal.
-fn value_exprs(
-    ctx: &DiffContext,
-    dialect: &dyn Dialect,
-    right_of_left: &[Option<usize>],
-    is_left: bool,
-) -> Result<Vec<String>, DbError> {
-    let left_keys = ctx.side_key_columns(true);
-    let mut out = Vec::new();
-    for (index, spec) in ctx.left.plan.norm_specs.iter().enumerate() {
-        if is_key_name(&spec.name, left_keys) {
-            continue;
-        }
-        let expr = if is_left {
-            dialect.normalize_expr(spec)?
-        } else {
-            let right_index = right_of_left.get(index).copied().flatten().ok_or_else(|| {
-                DbError::config(format!(
-                    "minusdiff: column '{}' has no right-hand match",
-                    spec.name
-                ))
-            })?;
-            let right_spec = ctx.right.plan.norm_specs.get(right_index).ok_or_else(|| {
-                DbError::config(format!(
-                    "minusdiff: column '{}' right index {right_index} is out of range",
-                    spec.name
-                ))
-            })?;
-            dialect.normalize_expr(right_spec)?
-        };
-        out.push(expr);
-    }
-    Ok(out)
-}
-
-fn cte_select(
-    ctx: &DiffContext,
-    dialect: &dyn Dialect,
-    is_left: bool,
-    value_exprs: &[String],
-    summary_only: bool,
-) -> Result<String, DbError> {
-    let plan = if is_left {
-        &ctx.left.plan
-    } else {
-        &ctx.right.plan
-    };
-    let keys = ctx.side_key_columns(is_left);
-    let mut items = Vec::new();
-    let mut raw_keys = Vec::new();
-    for (i, key) in keys.iter().enumerate() {
-        let spec = plan.spec_for(key).ok_or_else(|| {
-            DbError::config(format!(
-                "minusdiff: key column '{key}' has no normalization spec"
-            ))
-        })?;
-        items.push(format!("{} AS k{i}", dialect.normalize_expr(spec)?));
-        raw_keys.push(format!("{} AS rk{i}", dialect.quote_catalog_ident(key)));
-    }
-    let hash_inputs: Vec<String> = plan
-        .norm_specs
-        .iter()
-        .map(|spec| dialect.normalize_expr(spec))
-        .collect::<Result<_, _>>()?;
-    let hashed = if hash_inputs.is_empty() {
-        dialect.row_hash_expr(&["''".to_string()])
-    } else {
-        dialect.row_hash_expr(&hash_inputs)
-    };
-    items.push(format!("{hashed} AS h"));
-    if !summary_only {
-        items.extend(raw_keys);
-        for (j, expr) in value_exprs.iter().enumerate() {
-            items.push(format!("{expr} AS c{j}"));
-        }
-    }
-    Ok(items.join(", "))
-}
-
-fn null_safe_eq(left: &str, right: &str) -> String {
-    format!("({left} = {right} OR ({left} IS NULL AND {right} IS NULL))")
-}
-
-fn key_match(left: &str, right: &str, key_len: usize) -> String {
-    (0..key_len)
-        .map(|i| null_safe_eq(&format!("{left}.k{i}"), &format!("{right}.k{i}")))
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-fn summary_select(oracle: bool, key_len: usize) -> String {
-    let keys = key_match("d", "e", key_len);
-    let missing_right = format!(
-        "(SELECT COUNT(*) FROM ld d WHERE NOT EXISTS (SELECT 1 FROM rd e WHERE {keys})) AS missing_right"
-    );
-    let missing_left = format!(
-        "(SELECT COUNT(*) FROM rd d WHERE NOT EXISTS (SELECT 1 FROM ld e WHERE {keys})) AS missing_left"
-    );
-    let modified = format!(
-        "(SELECT COUNT(*) FROM ld d WHERE EXISTS (SELECT 1 FROM rd e WHERE {keys})) AS modified"
-    );
-    let from = if oracle { " FROM dual" } else { "" };
-    format!("SELECT {missing_right}, {missing_left}, {modified}{from}")
-}
-
-fn body_select(key_len: usize, value_len: usize) -> String {
-    let mut outer = vec!["side".to_string()];
-    outer.extend((0..key_len).map(|i| format!("rk{i}")));
-    outer.extend((0..value_len).map(|i| format!("c{i}")));
-    outer.extend((0..key_len).map(|i| format!("k{i}")));
-    let project = |alias: &str, side: &str| {
-        let mut cols = vec![format!("'{side}' AS side")];
-        cols.extend((0..key_len).map(|i| format!("{alias}.rk{i} AS rk{i}")));
-        cols.extend((0..value_len).map(|i| format!("{alias}.c{i} AS c{i}")));
-        cols.extend((0..key_len).map(|i| format!("{alias}.k{i} AS k{i}")));
-        cols.join(", ")
-    };
-    let lkeys = key_match("ld", "l", key_len);
-    let rkeys = key_match("rd", "r", key_len);
-    let lh = null_safe_eq("ld.h", "l.h");
-    let rh = null_safe_eq("rd.h", "r.h");
-    let order = (0..key_len)
-        .map(|i| format!("k{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "SELECT {outer}\nFROM (\n  SELECT {lproj}\n  FROM ld\n  JOIN l\n    ON {lkeys} AND {lh}\n  UNION ALL\n  SELECT {rproj}\n  FROM rd\n  JOIN r\n    ON {rkeys} AND {rh}\n) d\nORDER BY {order}",
-        outer = outer.join(", "),
-        lproj = project("l", "L"),
-        rproj = project("r", "R"),
-    )
-}
-
-pub(crate) fn classify_minus_rows(
-    key_len: usize,
-    value_len: usize,
-    rows: &[Vec<Value>],
-) -> Result<Vec<DiffRow>, DbError> {
-    let expected = 1 + key_len + value_len + key_len;
-    let mut order = Vec::new();
-    let mut groups: HashMap<String, Group> = HashMap::new();
-    for row in rows {
-        if row.len() < expected {
-            return Err(DbError::query(format!(
-                "minusdiff: projection too short: result row has {} cells, expected {expected}",
-                row.len()
-            )));
-        }
-        if row.len() != expected {
-            return Err(DbError::query(format!(
-                "minusdiff: result row has {} cells, expected {expected}",
-                row.len()
-            )));
-        }
-        let side = match row.first() {
-            Some(Value::String(side)) if side == "L" || side == "R" => side.as_str(),
-            _ => {
-                return Err(DbError::query("minusdiff: result side must be 'L' or 'R'"));
-            }
-        };
-        let rk_end = 1 + key_len;
-        let c_end = rk_end + value_len;
-        let raw_key = diff_key(&row[1..rk_end]);
-        let payload = row[1..c_end].to_vec();
-        let norm_key =
-            serde_json::to_string(&Value::Array(row[c_end..].to_vec())).map_err(|err| {
-                DbError::query(format!("minusdiff: cannot encode normalized key: {err}"))
-            })?;
-        let group = groups.entry(norm_key.clone()).or_insert_with(|| {
-            order.push(norm_key);
-            Group {
-                key: raw_key,
-                left: None,
-                right: None,
-            }
-        });
-        let slot = if side == "L" {
-            &mut group.left
-        } else {
-            &mut group.right
-        };
-        if slot.is_some() {
-            return Err(DbError::query("minusdiff: normalized key is not unique"));
-        }
-        *slot = Some(payload);
-    }
-
-    let mut out = Vec::with_capacity(order.len());
-    for key in order {
-        let group = groups.remove(&key).ok_or_else(|| {
-            DbError::query("minusdiff: normalized key group was lost before classification")
-        })?;
-        let (status, left, right) = match (group.left, group.right) {
-            (Some(left), None) => (DiffStatus::MissingRight, Some(left), None),
-            (None, Some(right)) => (DiffStatus::MissingLeft, None, Some(right)),
-            (Some(left), Some(right)) => (DiffStatus::Modified, Some(left), Some(right)),
-            (None, None) => continue,
-        };
-        out.push(DiffRow {
-            key: group.key,
-            left,
-            right,
-            status,
-            confirmed: true,
-        });
-    }
-    Ok(out)
-}
-
-struct Group {
-    key: Value,
-    left: Option<Vec<Value>>,
-    right: Option<Vec<Value>>,
-}
-
 impl MinusDiffer {
     async fn execute(
         &self,
         left: &mut (dyn DbConn + Send),
         right: &mut (dyn DbConn + Send),
         ctx: &DiffContext,
+        shape: &MinusShape,
         sent: &mut u64,
         opened: &mut bool,
     ) -> Result<DiffReport, DbError> {
@@ -497,9 +121,7 @@ impl MinusDiffer {
                 Vec::new(),
                 0,
                 0,
-                0,
-                0,
-                0,
+                MinusCounts::ZERO,
                 t0,
                 flag_warnings(ctx),
             ));
@@ -524,15 +146,13 @@ impl MinusDiffer {
                 Vec::new(),
                 left_total,
                 right_total,
-                0,
-                0,
-                0,
+                MinusCounts::ZERO,
                 t0,
                 extra,
             ));
         }
 
-        let sql = render_minusdiff_sql(ctx, left.dialect(), op, ctx.summary_only, scn)?;
+        let sql = render_prepared(ctx, left.dialect(), shape, op, ctx.summary_only, scn)?;
         ctx.vlog(format!("[sql] {sql}"));
         *sent += 1;
         let result = left.query(&sql).await.map_err(explain_set_diff_error)?;
@@ -543,24 +163,19 @@ impl MinusDiffer {
                 Vec::new(),
                 left_total,
                 right_total,
-                counts.0,
-                counts.1,
-                counts.2,
+                counts,
                 t0,
                 extra,
             ));
         }
-        let value_len = value_width(ctx, left.dialect())?;
-        let diffs = classify_minus_rows(ctx.key_columns.len(), value_len, &result.rows)?;
-        let (missing_left, missing_right, modified) = tally(&diffs);
+        let diffs = classify_minus_rows(shape.key_len, shape.left_values.len(), &result.rows)?;
+        let counts = tally(&diffs);
         Ok(assemble(
             ctx,
             diffs,
             left_total,
             right_total,
-            missing_left,
-            missing_right,
-            modified,
+            counts,
             t0,
             extra,
         ))
@@ -612,19 +227,13 @@ async fn open_shared_anchor(
     if ctx.consistency != ConsistencyMode::Snapshot {
         return Ok(None);
     }
-    let scheme = left.dialect().url_scheme().to_string();
-    let has_scn = left.dialect().snapshot_scn_sql().is_some();
-    open_snapshot(left, ctx.verbose).await?;
+    let opened_statements = open_snapshot(left, ctx.verbose).await?;
     *opened = true;
-    // PXC is refused before this call, so a MySQL snapshot here is
-    // VERSION + START TRANSACTION (2), never the 3-statement PolarDB-X form.
-    *sent += if scheme == "mysql" { 2 } else { 1 };
-    if has_scn {
-        *sent += 1;
-    }
-    let scn = capture_scn(left, ctx.verbose).await?;
-    let _ = ctx.scns.set((scn, scn));
-    Ok(scn)
+    *sent += opened_statements;
+    let captured = capture_scn(left, ctx.verbose).await?;
+    *sent += captured.statements;
+    let _ = ctx.scns.set((captured.scn, captured.scn));
+    Ok(captured.scn)
 }
 
 async fn count_both(
@@ -686,9 +295,11 @@ async fn empty_side(
             Vec::new(),
             left_total,
             right_total,
-            missing_left,
-            missing_right,
-            0,
+            MinusCounts {
+                missing_left,
+                missing_right,
+                modified: 0,
+            },
             t0,
             flag_warnings(ctx),
         ));
@@ -702,15 +313,13 @@ async fn empty_side(
     let tagged = tag_empty_side_rows(side, &result.rows);
     let value_len = value_width(ctx, left.dialect())?;
     let diffs = classify_minus_rows(ctx.key_columns.len(), value_len, &tagged)?;
-    let (missing_left, missing_right, modified) = tally(&diffs);
+    let counts = tally(&diffs);
     Ok(assemble(
         ctx,
         diffs,
         left_total,
         right_total,
-        missing_left,
-        missing_right,
-        modified,
+        counts,
         t0,
         flag_warnings(ctx),
     ))
@@ -825,46 +434,6 @@ fn value_width(ctx: &DiffContext, dialect: &dyn Dialect) -> Result<usize, DbErro
     Ok(value_exprs(ctx, dialect, &pairing.right_of_left, true)?.len())
 }
 
-fn summary_counts(result: &QueryResult) -> Result<(u64, u64, u64), DbError> {
-    let row = result.rows.first().ok_or_else(|| {
-        DbError::query("minusdiff: projection too short: summary returned no rows")
-    })?;
-    if row.len() < 3 {
-        return Err(DbError::query(format!(
-            "minusdiff: projection too short: summary row has {} cells, expected 3",
-            row.len()
-        )));
-    }
-    Ok((
-        cell_count(&row[1])?,
-        cell_count(&row[0])?,
-        cell_count(&row[2])?,
-    ))
-}
-
-fn cell_count(value: &Value) -> Result<u64, DbError> {
-    parse_count(&QueryResult {
-        columns: vec!["c".into()],
-        rows: vec![vec![value.clone()]],
-        row_count: 1,
-        rows_affected: None,
-    })
-}
-
-fn tally(rows: &[DiffRow]) -> (u64, u64, u64) {
-    let mut missing_left = 0u64;
-    let mut missing_right = 0u64;
-    let mut modified = 0u64;
-    for row in rows {
-        match row.status {
-            DiffStatus::MissingLeft => missing_left += 1,
-            DiffStatus::MissingRight => missing_right += 1,
-            DiffStatus::Modified => modified += 1,
-        }
-    }
-    (missing_left, missing_right, modified)
-}
-
 fn flag_warnings(ctx: &DiffContext) -> Vec<String> {
     let mut warnings = Vec::new();
     if ctx.recheck {
@@ -913,26 +482,23 @@ fn explain_set_diff_error(err: DbError) -> DbError {
     DbError::query(format!("{prefix}: {text}"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn assemble(
     ctx: &DiffContext,
     diffs: Vec<DiffRow>,
     left_total: u64,
     right_total: u64,
-    missing_left: u64,
-    missing_right: u64,
-    modified: u64,
+    counts: MinusCounts,
     t0: Instant,
     extra_warnings: Vec<String>,
 ) -> DiffReport {
     let total = left_total.max(right_total);
-    let diff_count = missing_left + missing_right + modified;
+    let diff_count = counts.missing_left + counts.missing_right + counts.modified;
     let summary = DiffSummary {
         left_total,
         right_total,
-        missing_left,
-        missing_right,
-        modified,
+        missing_left: counts.missing_left,
+        missing_right: counts.missing_right,
+        modified: counts.modified,
         diff_rate: if total > 0 {
             diff_count as f64 / total as f64
         } else {
@@ -996,19 +562,12 @@ fn assemble(
     report
 }
 
-fn diff_key(raw: &[Value]) -> Value {
-    if raw.len() == 1 {
-        raw[0].clone()
-    } else {
-        Value::Array(raw.to_vec())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{ColumnNormSpec, DbConn, DbError, DbPool, SetDifferenceOp};
+    use crate::backend::{ColumnNormSpec, DbConn, DbError, DbPool, QueryResult, SetDifferenceOp};
     use crate::delta_diff::metadata::TablePlan;
+    use crate::delta_diff::report::DiffStatus;
     use crate::delta_diff::strategy::{ConsistencyMode, DiffContext, SideCtx};
     use serde_json::json;
 
@@ -2118,5 +1677,182 @@ mod tests {
             "{:?}",
             none_conn.sqls
         );
+    }
+
+    #[test]
+    fn misaligned_columns_fail_before_the_operator_is_considered() {
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        let left = plan(
+            "mysql",
+            &["id"],
+            &[("id", "int"), ("note", "varchar")],
+            vec![],
+        );
+        let right = plan("mysql", &["id"], &[("id", "int")], vec![]);
+        let ctx = ctx_with(left, right, &["id"], None, None, 1000);
+        let err = render_minusdiff_sql(&ctx, &dialect, SetDifferenceOp::None, false, None)
+            .expect_err("misaligned columns");
+        assert_eq!(err.kind, crate::backend::error::DbErrorKind::Config);
+        let text = err.to_string();
+        assert!(text.contains("unmatched"), "{text}");
+        assert!(text.contains("note"), "{text}");
+    }
+
+    #[test]
+    fn empty_key_fails_before_the_operator_is_considered() {
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        let (left, right) = paired("mysql");
+        let ctx = ctx_with(left, right, &[], None, None, 1000);
+        let err = render_minusdiff_sql(&ctx, &dialect, SetDifferenceOp::None, false, None)
+            .expect_err("empty key");
+        assert_eq!(err.kind, crate::backend::error::DbErrorKind::Config);
+        let text = err.to_string();
+        assert!(text.contains("comparison key"), "{text}");
+    }
+
+    #[test]
+    fn prepare_minusdiff_checks_shape_without_an_operator() {
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        let (left, right) = paired("mysql");
+        let ctx = ctx_with(left, right, &["id"], None, None, 1000);
+        let shape = prepare_minusdiff(&ctx, &dialect).expect("aligned shape");
+        assert_eq!(shape.key_len, 1);
+        assert_eq!(shape.left_values.len(), 1);
+        assert_eq!(shape.left_values.len(), shape.right_values.len());
+
+        let left = plan(
+            "mysql",
+            &["id"],
+            &[("id", "int"), ("note", "varchar")],
+            vec![],
+        );
+        let right = plan("mysql", &["id"], &[("id", "int")], vec![]);
+        let ctx = ctx_with(left, right, &["id"], None, None, 1000);
+        let err = prepare_minusdiff(&ctx, &dialect).expect_err("misaligned");
+        assert_eq!(err.kind, crate::backend::error::DbErrorKind::Config);
+        assert!(err.to_string().contains("unmatched"), "{err}");
+    }
+
+    #[test]
+    fn aligned_plan_without_an_operator_stays_unsupported() {
+        let dialect = crate::backend::mysql::dialect::MySqlDialect;
+        let (left, right) = paired("mysql");
+        let ctx = ctx_with(left, right, &["id"], None, None, 1000);
+        let err = render_minusdiff_sql(&ctx, &dialect, SetDifferenceOp::None, false, None)
+            .expect_err("no operator");
+        assert_eq!(err.kind, crate::backend::error::DbErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn summary_counts_names_a_missing_column() {
+        let result = QueryResult {
+            columns: vec!["missing_right".into(), "modified".into(), "extra".into()],
+            rows: vec![vec![json!(1), json!(2), json!(3)]],
+            row_count: 1,
+            rows_affected: None,
+        };
+        let err = summary_counts(&result).expect_err("missing column");
+        let text = err.to_string();
+        assert!(text.contains("missing_left"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn summary_counts_follow_column_names_not_select_position() {
+        let (left, right) = paired("oracle");
+        let mut ctx = ctx_with(left, right, &["id"], None, None, 1000);
+        ctx.consistency = ConsistencyMode::None;
+        ctx.summary_only = true;
+        // Oracle returns unquoted aliases in uppercase, and not necessarily
+        // in SELECT order. Positional (row[1], row[0], row[2]) would report
+        // missing_left=3, missing_right=7, modified=5.
+        let mut left_conn = oracle_conn(vec![
+            count_step(4),
+            count_step(6),
+            checksum_step(4, 1),
+            checksum_step(6, 2),
+            Step::Rows(QueryResult {
+                columns: vec![
+                    "MODIFIED".into(),
+                    "MISSING_RIGHT".into(),
+                    "MISSING_LEFT".into(),
+                ],
+                rows: vec![vec![json!(7), json!(3), json!(5)]],
+                row_count: 1,
+                rows_affected: None,
+            }),
+        ]);
+        let mut right_conn = idle();
+        let report = MinusDiffer
+            .diff(&mut left_conn, &mut right_conn, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(report.summary.missing_left, 5, "{:?}", report.summary);
+        assert_eq!(report.summary.missing_right, 3, "{:?}", report.summary);
+        assert_eq!(report.summary.modified, 7, "{:?}", report.summary);
+    }
+
+    #[test]
+    fn summary_counts_short_row_stays_projection_too_short() {
+        let result = QueryResult {
+            columns: vec![
+                "missing_right".into(),
+                "missing_left".into(),
+                "modified".into(),
+            ],
+            rows: vec![vec![json!(1), json!(2)]],
+            row_count: 1,
+            rows_affected: None,
+        };
+        let err = summary_counts(&result).expect_err("short row");
+        assert!(err.to_string().contains("projection too short"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn open_snapshot_counts_mysql_version_and_start() {
+        let mut conn = mysql_conn(vec![body_step(vec![vec![json!("8.0.36")]])]);
+        let sent = open_snapshot(&mut conn, false).await.unwrap();
+        assert_eq!(sent, 2);
+        assert_eq!(
+            conn.sqls,
+            vec![
+                "SELECT VERSION()".to_string(),
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_snapshot_counts_polardbx_as_three_statements() {
+        let mut conn = mysql_conn(vec![body_step(vec![vec![json!(
+            "5.6.29-PXC-5.4.19-SNAPSHOT"
+        )]])]);
+        let sent = open_snapshot(&mut conn, false).await.unwrap();
+        assert_eq!(sent, 3);
+        assert_eq!(
+            conn.sqls,
+            vec![
+                "SELECT VERSION()".to_string(),
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_string(),
+                "START TRANSACTION READ ONLY".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_scn_reports_whether_it_queried() {
+        let mut oracle = oracle_conn(vec![scn_step(7)]);
+        let captured = capture_scn(&mut oracle, false).await.unwrap();
+        assert_eq!(captured.scn, Some(7));
+        assert_eq!(captured.statements, 1);
+        assert_eq!(
+            oracle.sqls,
+            vec!["SELECT CURRENT_SCN FROM V$DATABASE".to_string()]
+        );
+
+        let mut mysql = mysql_conn(vec![]);
+        let captured = capture_scn(&mut mysql, false).await.unwrap();
+        assert_eq!(captured.scn, None);
+        assert_eq!(captured.statements, 0);
+        assert!(mysql.sqls.is_empty(), "{:?}", mysql.sqls);
     }
 }

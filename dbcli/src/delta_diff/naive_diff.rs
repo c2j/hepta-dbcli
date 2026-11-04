@@ -46,10 +46,9 @@ impl DiffStrategy for NaiveDiffer {
         if ctx.consistency == ConsistencyMode::Snapshot {
             open_snapshot(left, ctx.verbose).await?;
             open_snapshot(right, ctx.verbose).await?;
-            let _ = ctx.scns.set((
-                capture_scn(left, ctx.verbose).await?,
-                capture_scn(right, ctx.verbose).await?,
-            ));
+            let left_scn = capture_scn(left, ctx.verbose).await?;
+            let right_scn = capture_scn(right, ctx.verbose).await?;
+            let _ = ctx.scns.set((left_scn.scn, right_scn.scn));
         }
         let result = self.diff_inner(left, right, ctx, &mut queries).await;
         if ctx.consistency == ConsistencyMode::Snapshot {
