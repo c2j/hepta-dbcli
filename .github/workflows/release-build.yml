@@ -40,13 +40,29 @@ jobs:
             https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-installer.sh | sh
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev perl make
+      - name: Create zig c++ wrapper for cc crate
+        run: |
+          cat > zig-cxx.sh <<'EOF'
+          #!/bin/sh
+          # The cc crate appends its own --target=<rust triple>; zig rejects the
+          # "unknown" OS segment. Strip it and inject the zig-style target here.
+          args=""
+          for a in "$@"; do
+            case "$a" in
+              --target=*) ;;
+              *) args="$args '$a'" ;;
+            esac
+          done
+          eval "exec zig c++ -target ${ZIG_TARGET}${args}"
+          EOF
+          chmod +x zig-cxx.sh
       - name: Build linux-x86_64 (glibc 2.28)
         run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.28 -p polar-mysql --features "${{ env.CARGO_FEATURES }}"
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG_PATH: "/usr/lib/x86_64-linux-gnu/pkgconfig"
-          # duckdb bundled C++ core: cc has no target g++ on the runner, route it through zig
-          CXX_x86_64_unknown_linux_gnu: "zig c++ -target x86_64-linux-gnu.2.28"
+          ZIG_TARGET: "x86_64-linux-gnu.2.28"
+          CXX_x86_64_unknown_linux_gnu: "./zig-cxx.sh"
       - name: Strip
         run: strip "target/x86_64-unknown-linux-gnu/release/${{ env.BINARY_NAME }}"
       - name: Verify glibc <= 2.28
@@ -87,13 +103,29 @@ jobs:
             https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-installer.sh | sh
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev perl make python3
+      - name: Create zig c++ wrapper for cc crate
+        run: |
+          cat > zig-cxx.sh <<'EOF'
+          #!/bin/sh
+          # The cc crate appends its own --target=<rust triple>; zig rejects the
+          # "unknown" OS segment. Strip it and inject the zig-style target here.
+          args=""
+          for a in "$@"; do
+            case "$a" in
+              --target=*) ;;
+              *) args="$args '$a'" ;;
+            esac
+          done
+          eval "exec zig c++ -target ${ZIG_TARGET}${args}"
+          EOF
+          chmod +x zig-cxx.sh
       - name: Build linux-arm64 (glibc 2.28)
         run: cargo zigbuild --release --locked --target aarch64-unknown-linux-gnu.2.28 -p polar-mysql --features "${{ env.CARGO_FEATURES }}"
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
           PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
-          # duckdb bundled C++ core: cc has no aarch64 g++ on the runner, route it through zig
-          CXX_aarch64_unknown_linux_gnu: "zig c++ -target aarch64-linux-gnu.2.28"
+          ZIG_TARGET: "aarch64-linux-gnu.2.28"
+          CXX_aarch64_unknown_linux_gnu: "./zig-cxx.sh"
       - name: Strip
         run: strip "target/aarch64-unknown-linux-gnu/release/${{ env.BINARY_NAME }}"
       - name: Verify glibc <= 2.28
